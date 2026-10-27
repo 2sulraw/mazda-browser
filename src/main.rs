@@ -521,6 +521,39 @@ fn render(
     scroll: f32,
     page: f32,
 ) {
+    // box backgrounds first (parent-before-child), then text on top
+    for &(x, y, w, h, color, rad) in &laid.rects {
+        let y = y - scroll;
+        if y + h < 0.0 || y > page {
+            continue;
+        }
+        let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + y).max(0.0));
+        let r = rad.min(w * 0.5).min(h * 0.5);
+        for dy in 0..h.max(0.0) as usize {
+            let py = (sy as usize) + dy;
+            if py >= height {
+                break;
+            }
+            let ly = dy as f32; // y relative to rect top
+            for dx in 0..w.max(0.0) as usize {
+                let px = sx as usize + dx;
+                if px >= width {
+                    break;
+                }
+                // rounded corners: cull pixels outside the corner circles
+                if r > 0.5 {
+                    let lx = dx as f32;
+                    let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
+                    let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
+                    let (ex, ey) = (lx - cx, ly - cy);
+                    if ex * ex + ey * ey > r * r {
+                        continue;
+                    }
+                }
+                buf[py * width + px] = color;
+            }
+        }
+    }
     for run in &laid.runs {
         let y = run.y - scroll;
         if y < -run.style.size * 2.0 || y > page + run.style.size {

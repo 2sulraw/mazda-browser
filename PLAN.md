@@ -59,9 +59,17 @@ curve matters more than the baseline (near-flat as tabs grow).
   justify, cross-axis align), flex column (row-gap), grid (fr/px/pct tracks,
   repeat()/minmax(), row-major cells), text-align per line (58 tests; nextjs.org
   hero centered + feature cards stacked, RSS 19.2 → 16.9 MB)**. Known gaps:
-  no flex-wrap, no per-side margin/padding, no min-width, no position:\*,
-  no flex-grow/basis, no line-height, no per-box background-color,
+  no flex-wrap, no min-width, no position:\*, no flex-grow/basis,
   stretch doesn't reflow children
+- [x] **Phase 1d** — box chrome (visual parity): ~~bare text boxes~~ **DONE:
+  padding (border-box model) + per-side margins (block/flex/grid stacking via
+  `place()` outer advance), line-height (`Style.lh`, unitless/%/px; default
+  size×1.35 preserved), rem/em font sizes (rem = 16px root), per-box
+  background-color → filled rects drawn under text (collected parent-first),
+  border-radius (all corners, px/% vs width), rgba() colors (alpha 0 =
+  transparent, >0 opaque — no compositing; 65 tests; nextjs.org hero spacing +
+  terminal bg visible, RSS 15.7 MB)**. Known gaps: no borders/box-shadow,
+  no per-corner radius, no background-image, no alpha blending
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -95,6 +103,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-27 | Phase 1b+: external `<link>` CSS (4 sheets, 260 rules) | nextjs.org | 18.7 MB |
 | 2026-10-27 | Phase 2: HTTP disk cache (3 hits, cold RSS) | Wikipedia | 35.7 MB |
 | 2026-10-27 | Phase 1c: box tree + flex/grid | nextjs.org | **16.9 MB** (was 19.2 MB; box tree = 356 nodes vs 1061 DOM nodes) |
+| 2026-10-27 | Phase 1d: box chrome (pad/margin/lh/radius/bg) | nextjs.org | 15.7 MB (572 runs) |
 
 ### Phase 1c (Track A) findings
 

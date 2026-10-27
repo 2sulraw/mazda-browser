@@ -15,6 +15,8 @@ pub struct Style {
     pub mono: bool,
     /// 0 = left, 1 = center, 2 = right (inherited, text-align)
     pub text_align: u8,
+    /// line-height in px; 0 = default (size * 1.35) — inherited
+    pub lh: f32,
 }
 
 impl Style {
@@ -27,6 +29,16 @@ impl Style {
             underline: false,
             mono: false,
             text_align: 0,
+            lh: 0.0,
+        }
+    }
+
+    /// resolved line box height for this style
+    pub fn line_height(&self) -> f32 {
+        if self.lh > 0.0 {
+            self.lh
+        } else {
+            self.size * 1.35
         }
     }
 }
@@ -240,8 +252,10 @@ pub struct PositionedRun {
 pub struct Layout {
     pub runs: Vec<PositionedRun>,
     pub height: f32,
-    /// x, y, w, thickness, color (matches the run's text color)
+    /// x, y, w, h, color (matches the run's text color)
     pub underline_rects: Vec<(f32, f32, f32, f32, u32)>,
+    /// filled box backgrounds (x, y, w, h, color, radius) — drawn under text
+    pub rects: Vec<(f32, f32, f32, f32, u32, f32)>,
     /// true if the last line still has content on it (no trailing <br>) —
     /// block flow uses this to decide whether to add the paragraph gap
     pub open_line: bool,
@@ -258,11 +272,28 @@ pub fn layout_tree(
     let mut runs = Vec::new();
     let mut uls = Vec::new();
     place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls);
+    let mut rects = Vec::new();
+    collect_bgs(root, &mut rects);
     Layout {
         runs,
         height: root.h,
         underline_rects: uls,
+        rects,
         open_line: root.open,
+    }
+}
+
+/// Post-layout walk: every box with a background-color emits a filled rect
+/// (parent-first, so children paint over their parent's fill).
+fn collect_bgs(n: &BoxNode, out: &mut Vec<(f32, f32, f32, f32, u32, f32)>) {
+    if !n.is_text {
+        if let Some(c) = n.bx.bg {
+            let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
+            out.push((n.x, n.y, n.w, n.h, c, r));
+        }
+        for ch in &n.children {
+            collect_bgs(ch, out);
+        }
     }
 }
 
@@ -294,7 +325,8 @@ fn shift_tree(n: &mut BoxNode, dx: f32, dy: f32) {
 }
 
 /// Place one node. `avail` = containing block's content width.
-/// `runs`/`uls` receive absolute-positioned output.
+/// Returns the outer vertical advance (margin-top + border-box height +
+/// margin-bottom) so block flow can stack siblings without overlap.
 fn place(
     n: &mut BoxNode,
     x: f32,
@@ -303,12 +335,19 @@ fn place(
     measure: &dyn Fn(&str, &Style) -> f32,
     runs: &mut Vec<PositionedRun>,
     uls: &mut Vec<UR>,
-) {
+) -> f32 {
     n.x = x;
     n.y = y;
     debug_assert!(!n.is_text, "text leaves are batched by their container");
-    // resolve this box's width
-    let mut w = avail;
+    // margins (symbolic % resolves against the container width)
+    let ml = resolve_len(n.bx.margin[3], avail);
+    let mr = resolve_len(n.bx.margin[1], avail);
+    let mt = resolve_len(n.bx.margin[0], avail);
+    let mb = resolve_len(n.bx.margin[2], avail);
+    n.x += ml;
+    n.y += mt;
+    // resolve border-box width
+    let mut w = (avail - ml - mr).max(0.0);
     if let Some(l) = n.bx.width {
         w = resolve_len(l, avail);
     }
@@ -318,13 +357,28 @@ fn place(
     if n.bx.margin_x_auto {
         n.x = x + (avail - w).max(0.0) * 0.5;
     }
-    n.w = w;
+    // content box = border box inset by padding (shortcut: border-box model —
+    // an explicit `width` includes padding, matching most modern sites)
+    let pl = resolve_len(n.bx.pad[3], w);
+    let pr = resolve_len(n.bx.pad[1], w);
+    let pt = resolve_len(n.bx.pad[0], w);
+    let pb = resolve_len(n.bx.pad[2], w);
+    let (bx0, by0) = (n.x, n.y);
+    n.x += pl;
+    n.y += pt;
+    n.w = (w - pl - pr).max(0.0);
     match (n.bx.display, n.bx.dir) {
         (Display::Flex, Dir::Row) => flex_row(n, measure, runs, uls),
         (Display::Flex, Dir::Column) => flex_col(n, measure, runs, uls),
         (Display::Grid, _) => grid(n, measure, runs, uls),
         _ => block(n, measure, runs, uls), // Block / Auto(block tag)
     }
+    // restore border-box coords; height includes vertical padding
+    n.h += pt + pb;
+    n.x = bx0;
+    n.y = by0;
+    n.w = w;
+    mt + n.h + mb
 }
 
 type UR = (f32, f32, f32, f32, u32);
@@ -371,8 +425,16 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
     out
 }
 
-/// max-content (unwrapped) width of a node.
+/// max-content (unwrapped) width of a node, including horizontal padding.
 fn natural_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
+    let content = natural_w_inner(n, avail, measure);
+    if n.is_text {
+        return content;
+    }
+    content + resolve_len(n.bx.pad[3], avail) + resolve_len(n.bx.pad[1], avail)
+}
+
+fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
     if n.is_text {
         return if n.hard_break {
             0.0
@@ -524,8 +586,8 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
                 y += n.style.size * 0.6; // leading break before child box
                 open = false;
             }
-            place(&mut n.children[i], n.x, y, n.w, measure, runs, uls);
-            y += n.children[i].h;
+            let adv = place(&mut n.children[i], n.x, y, n.w, measure, runs, uls);
+            y += adv;
             if n.children[i].open {
                 // child's trailing break: gap styled by the child itself
                 y += n.children[i].style.size * 0.6;
@@ -586,8 +648,8 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                place(&mut n.children[*i], x, n.y, w, measure, runs, uls);
-                (n.children[*i].h, n.children[*i].open)
+                let adv = place(&mut n.children[*i], x, n.y, w, measure, runs, uls);
+                (adv, n.children[*i].open) // cross-size = margin box
             }
         };
         marks.push((rs, us, ih, io));
@@ -651,7 +713,7 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                place(&mut n.children[*i], n.x, y, n.w, measure, runs, uls);
+                let adv = place(&mut n.children[*i], n.x, y, n.w, measure, runs, uls);
                 let dx = match n.bx.align {
                     Align::Center => (n.w - n.children[*i].w) * 0.5,
                     Align::End => n.w - n.children[*i].w,
@@ -666,7 +728,7 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
                         u.0 += dx;
                     }
                 }
-                (n.children[*i].h, n.children[*i].open)
+                (adv, n.children[*i].open)
             }
         };
         y += ih;
@@ -720,8 +782,8 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                     (l.height, l.open_line)
                 }
                 Item::Grp(i) => {
-                    place(&mut n.children[i], x, y, w, measure, runs, uls);
-                    (n.children[i].h, n.children[i].open)
+                    let adv = place(&mut n.children[i], x, y, w, measure, runs, uls);
+                    (adv, n.children[i].open)
                 }
             };
             marks.push((rs, us, ih));
@@ -828,7 +890,7 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
             x = 0.0;
             line_height = 0.0;
         }
-        let lh = w.style.size * 1.35;
+        let lh = w.style.line_height();
         runs.push(PositionedRun {
             x,
             y,
@@ -880,6 +942,7 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
         runs,
         height: y,
         underline_rects,
+        rects: Vec::new(),
         open_line: x > 0.0,
     }
 }
@@ -1204,5 +1267,121 @@ mod tests {
         )];
         let l = layout_tree(&mut n, 100.0, &m4);
         assert!((l.runs[0].x - 46.0).abs() < 0.01, "x={}", l.runs[0].x);
+    }
+
+    // ---- box chrome (padding/margin/line-height/background) ----
+
+    #[test]
+    fn padding_insets_content_and_grows_box() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                pad: [Len::Px(10.0), Len::Px(20.0), Len::Px(10.0), Len::Px(20.0)],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("ab")];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        // content starts at left padding; box height = line + top + bottom pad
+        assert!((l.runs[0].x - 20.0).abs() < 0.01, "x={}", l.runs[0].x);
+        assert!((l.runs[0].y - 10.0).abs() < 0.01, "y={}", l.runs[0].y);
+        assert!((n.h - (15.0 * 1.35 + 20.0)).abs() < 0.01, "h={}", n.h);
+        // border-box width unchanged
+        assert!((n.w - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn padding_shrinks_wrap_width() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                pad: [Len::Px(0.0), Len::Px(25.0), Len::Px(0.0), Len::Px(25.0)],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("aaaa bbbb cccc")];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        // content width = 50px → "aaaa"(16)+"bbbb"(16)+"cccc"(16) wraps to 2+ lines
+        let ys: std::collections::HashSet<i32> = l.runs.iter().map(|r| r.y as i32).collect();
+        assert!(ys.len() >= 2, "expected wrap in 50px content, got {} lines", ys.len());
+        for r in &l.runs {
+            assert!(r.x <= 75.0 + 0.001, "run escapes right padding: {:?}", r.text);
+        }
+    }
+
+    #[test]
+    fn margin_top_advances_sibling() {
+        let mk = |mt: Len| {
+            let mut b = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    margin: [mt, Len::Px(0.0), Len::Px(0.0), Len::Px(0.0)],
+                    ..BoxStyle::default()
+                },
+            );
+            b.children = vec![leaf("x")];
+            b
+        };
+        let mut n = BoxNode::group(Style::new(), BoxStyle::default());
+        n.children = vec![mk(Len::Px(0.0)), mk(Len::Px(15.0))];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        let line = 15.0 * 1.35;
+        let gap = 15.0 * 0.6; // block-boundary paragraph gap
+        // second block: first line + gap + 15px margin-top
+        assert!(
+            (l.runs[1].y - (line + gap + 15.0)).abs() < 0.01,
+            "y={}",
+            l.runs[1].y
+        );
+    }
+
+    #[test]
+    fn line_height_overrides_default() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle::default(),
+        );
+        n.children = vec![BoxNode::leaf(
+            Style {
+                lh: 30.0,
+                ..Style::new()
+            },
+            "a b".into(),
+            false,
+            None,
+        )];
+        let l = layout_tree(&mut n, 8.0, &m4); // 4px words, wraps to 2 lines
+        let ys: Vec<f32> = {
+            let mut v: Vec<f32> = l.runs.iter().map(|r| r.y).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v.dedup();
+            v
+        };
+        assert_eq!(ys.len(), 2, "expected 2 lines, runs={}", l.runs.len());
+        assert!((ys[1] - ys[0] - 30.0).abs() < 0.01, "line delta={}", ys[1] - ys[0]);
+    }
+
+    #[test]
+    fn background_emits_rect_under_content() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                bg: Some(0x112233),
+                radius: Len::Px(8.0),
+                pad: [Len::Px(5.0), Len::Px(5.0), Len::Px(5.0), Len::Px(5.0)],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("hi")];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        assert_eq!(l.rects.len(), 1);
+        let &(x, y, w, h, color, rad) = &l.rects[0];
+        assert_eq!(color, 0x112233);
+        assert!((x - 0.0).abs() < 0.01 && (y - 0.0).abs() < 0.01);
+        assert!((w - 100.0).abs() < 0.01, "w={}", w);
+        assert!((h - (15.0 * 1.35 + 10.0)).abs() < 0.01, "h={}", h);
+        assert!((rad - 8.0).abs() < 0.01, "radius={}", rad);
     }
 }

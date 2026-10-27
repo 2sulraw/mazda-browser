@@ -74,6 +74,14 @@ pub struct BoxStyle {
     pub width: Option<Len>,
     pub max_width: Option<Len>,
     pub margin_x_auto: bool,
+    /// top, right, bottom, left (CSS shorthand order)
+    pub pad: [Len; 4],
+    /// top, right, bottom, left — `margin_x_auto` overrides left/right
+    pub margin: [Len; 4],
+    /// per-box background-color
+    pub bg: Option<u32>,
+    /// border-radius (all corners; % resolves against box width at layout)
+    pub radius: Len,
 }
 
 impl Default for BoxStyle {
@@ -89,6 +97,10 @@ impl Default for BoxStyle {
             width: None,
             max_width: None,
             margin_x_auto: false,
+            pad: [Len::Px(0.0); 4],
+            margin: [Len::Px(0.0); 4],
+            bg: None,
+            radius: Len::Px(0.0),
         }
     }
 }
@@ -155,12 +167,21 @@ const KNOWN: &[&str] = &[
     "grid-template-columns",
     "width",
     "max-width",
+    "padding",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "margin-top",
+    "margin-bottom",
+    "line-height",
     "margin",
     "margin-left",
     "margin-right",
     "margin-inline",
     "margin-inline-start",
     "margin-inline-end",
+    "border-radius",
 ];
 
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
@@ -360,6 +381,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         "background" | "background-color" => {
             if let Some(c) = parse_color(&d.1) {
                 *bg = Some(c);
+                bx.bg = Some(c); // per-box fill (cards, nav bars)
             }
         }
         "font-size" => {
@@ -381,6 +403,24 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         "font-style" => style.italic = matches!(d.1.as_str(), "italic" | "oblique"),
         "font-family" => style.mono = d.1.contains("mono") || d.1.contains("courier"),
         "text-decoration" => style.underline = d.1.contains("underline"),
+        "line-height" => {
+            // unitless = multiplier of font-size; px/rem/% absolute (of size)
+            style.lh = if let Some(n) = d.1.strip_suffix('%') {
+                n.trim().parse::<f32>()
+                    .map(|f| f / 100.0 * style.size)
+                    .unwrap_or(0.0)
+            } else if d.1.trim().ends_with("px") {
+                d.1.trim().trim_end_matches("px").trim().parse::<f32>().unwrap_or(0.0)
+            } else if let Ok(n) = d.1.trim().parse::<f32>() {
+                if n > 0.0 && n < 10.0 {
+                    n * style.size // unitless multiplier (1.5, 1.75 …)
+                } else {
+                    0.0 // nonsense → default
+                }
+            } else {
+                0.0
+            };
+        }
         "display" => match d.1.as_str() {
             "none" => return true,
             "flex" => bx.display = Display::Flex,
@@ -452,20 +492,38 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         // shortcut: only the auto (centering) half of margin is honored —
         // fixed margins/padding per side don't exist yet
         "margin" => {
-            let vals: Vec<&str> = d.1.split_whitespace().collect();
-            let auto = match vals.len() {
-                1 => vals[0] == "auto",
-                2 => vals[0] == "auto" || vals[1] == "auto",
-                _ => vals.iter().any(|v| *v == "auto"), // 3/4-value: right or left slot
-            };
-            if auto {
+            let v = parse_sides(&d.1);
+            bx.margin = v;
+            if d.1.contains("auto") {
+                // auto in a horizontal slot → centering shortcut
                 bx.margin_x_auto = true;
             }
         }
-        "margin-left" | "margin-right" | "margin-inline" | "margin-inline-start"
-        | "margin-inline-end" => {
+        "padding" => bx.pad = parse_sides(&d.1),
+        "margin-top" => bx.margin[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "margin-bottom" => bx.margin[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "margin-left" | "margin-inline" | "margin-inline-start" => {
             if d.1.contains("auto") {
                 bx.margin_x_auto = true;
+            } else {
+                bx.margin[3] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            }
+        }
+        "margin-right" | "margin-inline-end" => {
+            if d.1.contains("auto") {
+                bx.margin_x_auto = true;
+            } else {
+                bx.margin[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            }
+        }
+        "padding-top" => bx.pad[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "padding-right" => bx.pad[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "padding-bottom" => bx.pad[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "padding-left" => bx.pad[3] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        // first value only (per-corner radii: shortcut)
+        "border-radius" | "border-top-left-radius" => {
+            if let Some(v) = d.1.split_whitespace().next().and_then(parse_len) {
+                bx.radius = v;
             }
         }
         _ => {}
@@ -473,11 +531,32 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
     false
 }
 
-/// `200px` / `50%` → [`Len`]. Bare numbers are lenient px (matches `parse_size`).
+/// CSS side shorthand (`margin`/`padding`: 1–4 whitespace-separated values)
+/// → [top, right, bottom, left].
+fn parse_sides(v: &str) -> [Len; 4] {
+    let z = Len::Px(0.0);
+    let vals: Vec<Len> = v.split_whitespace().filter_map(parse_len).collect();
+    match vals.len() {
+        1 => [vals[0], vals[0], vals[0], vals[0]],
+        2 => [vals[0], vals[1], vals[0], vals[1]],
+        3 => [vals[0], vals[1], vals[2], vals[1]],
+        4 => [vals[0], vals[1], vals[2], vals[3]],
+        _ => [z, z, z, z], // includes `auto` slots (handled separately)
+    }
+}
+
+/// `200px` / `50%` / `1.5rem` → [`Len`]. Bare numbers are lenient px
+/// (matches `parse_size`); `em`≈rem shortcut (needs element font size).
 fn parse_len(v: &str) -> Option<Len> {
     let v = v.trim();
     if let Some(n) = v.strip_suffix('%') {
         return n.trim().parse::<f32>().ok().map(Len::Pct);
+    }
+    if let Some(n) = v.strip_suffix("rem") {
+        return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
+    }
+    if let Some(n) = v.strip_suffix("em") {
+        return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
     }
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse::<f32>().ok().map(Len::Px);
@@ -574,6 +653,9 @@ fn parse_size(v: &str, current: f32) -> Option<f32> {
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse().ok();
     }
+    if let Some(n) = v.strip_suffix("rem") {
+        return n.trim().parse::<f32>().ok().map(|f| f * 16.0); // root = 16px
+    }
     if let Some(n) = v.strip_suffix("em") {
         return n.trim().parse::<f32>().ok().map(|f| f * current);
     }
@@ -599,13 +681,26 @@ fn parse_color(v: &str) -> Option<u32> {
             _ => None,
         };
     }
-    if let Some(inner) = v.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+    // rgb()/rgba() — alpha 0 = transparent (dropped), alpha > 0 renders
+    // opaque (the rasterizer has no compositing; documented shortcut)
+    let inner = v
+        .strip_prefix("rgba(")
+        .or_else(|| v.strip_prefix("rgb("))
+        .and_then(|s| s.strip_suffix(')'));
+    if let Some(inner) = inner {
         let mut parts = inner.split(',');
         let r = parts.next()?.trim().parse::<u32>().ok()?;
         let g = parts.next()?.trim().parse::<u32>().ok()?;
         let b = parts.next()?.trim().parse::<u32>().ok()?;
         if r > 255 || g > 255 || b > 255 {
             return None;
+        }
+        if v.starts_with("rgba(") {
+            if let Some(a) = parts.next().and_then(|s| s.trim().parse::<f32>().ok()) {
+                if a <= 0.0 {
+                    return None; // transparent
+                }
+            }
         }
         return Some(r << 16 | g << 8 | b);
     }
@@ -1278,7 +1373,7 @@ mod tests {
         assert_eq!(parse_len("50%"), Some(Len::Pct(50.0)));
         assert_eq!(parse_len("24"), Some(Len::Px(24.0)));
         assert_eq!(parse_len("auto"), None);
-        assert_eq!(parse_len("2rem"), None); // shortcut: rem only in media queries
+        assert_eq!(parse_len("1.5rem"), Some(Len::Px(24.0))); // rem = 16px root
     }
 
     #[test]
@@ -1317,6 +1412,52 @@ mod tests {
         // no declarations → Auto (follow the tag)
         let plain = sheet.resolve(&dom, by_attr(&dom, "class", "nocls"), Style::new(), None);
         assert_eq!(plain.bx.display, Display::Auto);
+    }
+
+    #[test]
+    fn padding_margin_lineheight_background_cascade() {
+        let sheet = parse(
+            ".card { padding: 16px 24px; margin: 8px auto; background-color: #222222; line-height: 1.6 }\
+             .hd { font-size: 2rem; line-height: 40px; margin-top: 1.5rem; padding-bottom: 0.5rem }",
+        );
+        let dom = dom_of(r#"<div class=card></div><div class=hd></div>"#);
+
+        let card = sheet.resolve(&dom, by_attr(&dom, "class", "card"), Style::new(), None);
+        assert_eq!(card.bx.pad, [Len::Px(16.0), Len::Px(24.0), Len::Px(16.0), Len::Px(24.0)]);
+        assert!(card.bx.margin_x_auto, "`margin: 8px auto` → auto");
+        assert_eq!(card.bx.margin[0], Len::Px(8.0));
+        assert_eq!(card.bx.bg, Some(0x222222));
+        assert!((card.style.lh - 1.6 * 15.0).abs() < 0.01, "lh={}", card.style.lh);
+
+        // rem = 16px root
+        let hd_style = Style::new();
+        let hd = sheet.resolve(&dom, by_attr(&dom, "class", "hd"), hd_style, None);
+        assert!((hd.style.size - 32.0).abs() < 0.01, "size={}", hd.style.size);
+        assert!((hd.style.lh - 40.0).abs() < 0.01, "lh={}", hd.style.lh);
+        assert_eq!(hd.bx.margin[0], Len::Px(24.0)); // 1.5rem
+        assert_eq!(hd.bx.pad[2], Len::Px(8.0)); // 0.5rem
+
+        // per-side shorthands
+        let sheet2 = parse(".s { padding: 1px 2px 3px 4px; margin-bottom: 9px }");
+        let dom2 = dom_of(r#"<div class=s></div>"#);
+        let s = sheet2.resolve(&dom2, by_attr(&dom2, "class", "s"), Style::new(), None);
+        assert_eq!(
+            s.bx.pad,
+            [Len::Px(1.0), Len::Px(2.0), Len::Px(3.0), Len::Px(4.0)]
+        );
+        assert_eq!(s.bx.margin[2], Len::Px(9.0));
+    }
+
+    #[test]
+    fn border_radius_and_rgba() {
+        let sheet = parse(".c { border-radius: 12px; background: rgba(255, 0, 0, 0.5) }\
+                           .t { background: rgba(0, 0, 0, 0) }");
+        let dom = dom_of(r#"<div class=c></div><div class=t></div>"#);
+        let c = sheet.resolve(&dom, by_attr(&dom, "class", "c"), Style::new(), None);
+        assert_eq!(c.bx.radius, Len::Px(12.0));
+        assert_eq!(c.bx.bg, Some(0xff0000), "rgba alpha>0 renders opaque");
+        let t = sheet.resolve(&dom, by_attr(&dom, "class", "t"), Style::new(), None);
+        assert_eq!(t.bx.bg, None, "rgba(…,0) = transparent = no fill");
     }
 }
 
