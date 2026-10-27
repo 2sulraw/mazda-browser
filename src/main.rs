@@ -181,11 +181,14 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32) -> Page {
     let body = sheet.resolve(&dom, root, Style::new(), dom.attr(root, "style"));
     let bg = body.bg.unwrap_or(BG);
 
-    let mut atoms = Vec::new();
-    layout::walk(&dom, root, body.style, &sheet, &mut atoms);
-    eprintln!("[mem] after walk: {:.1} MB ({} atoms)", working_set_mb(), atoms.len());
+    let mut root_box = layout::build(&dom, root, body.style, body.bx, &sheet);
+    eprintln!(
+        "[mem] after box tree: {:.1} MB ({} boxes)",
+        working_set_mb(),
+        layout::count_boxes(&root_box)
+    );
 
-    let laid = layout::layout(&atoms, max_w, &|s: &str, st: &Style| fonts.measure(s, st));
+    let laid = layout::layout_tree(&mut root_box, max_w, &|s: &str, st: &Style| fonts.measure(s, st));
     eprintln!(
         "[mem] after layout: {:.1} MB ({} runs)",
         working_set_mb(),

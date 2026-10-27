@@ -52,6 +52,16 @@ curve matters more than the baseline (near-flat as tabs grow).
   ~~HTTP disk cache~~ **DONE: `%LOCALAPPDATA%\mazda-cache`, FNV key, 5min TTL,
   oldest-mtime eviction at 300 files, 5MB body cap (Wikipedia reload = 3 hits, no network)**,
   images with LRU decode cap
+- [x] **Phase 1c (Track A)** — box tree + flex/grid layout: ~~flat atom flow~~ **DONE:
+  `BoxNode` tree (block/flex/grid groups + text leaves), `BoxStyle` cascades from CSS
+  (display/gap/justify/align/width/margin-auto/text-align), block flow with legacy
+  paragraph-gap semantics, flex row (max-content sizing, proportional shrink,
+  justify, cross-axis align), flex column (row-gap), grid (fr/px/pct tracks,
+  repeat()/minmax(), row-major cells), text-align per line (58 tests; nextjs.org
+  hero centered + feature cards stacked, RSS 19.2 → 16.9 MB)**. Known gaps:
+  no flex-wrap, no per-side margin/padding, no min-width, no position:\*,
+  no flex-grow/basis, no line-height, no per-box background-color,
+  stretch doesn't reflow children
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -84,6 +94,23 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-27 | Phase 1b: CSS subset (75 rules from real sheet) | Wikipedia | 38.3 MB |
 | 2026-10-27 | Phase 1b+: external `<link>` CSS (4 sheets, 260 rules) | nextjs.org | 18.7 MB |
 | 2026-10-27 | Phase 2: HTTP disk cache (3 hits, cold RSS) | Wikipedia | 35.7 MB |
+| 2026-10-27 | Phase 1c: box tree + flex/grid | nextjs.org | **16.9 MB** (was 19.2 MB; box tree = 356 nodes vs 1061 DOM nodes) |
+
+### Phase 1c (Track A) findings
+
+- **Box tree beats flat atoms on RAM *and* fidelity**: 356 box nodes for
+  nextjs.org (vs the old per-text-chunk atom list); hero is centered via
+  `text-align`/flex justify, feature cards stack as real block boxes instead of
+  one run-length line each. Height 1825 → 2284px because block children now
+  occupy full-width rows (closer to a desktop browser's flow).
+- **Anonymous item merging matters**: consecutive text leaves merge into one
+  flex/grid item (spec behavior) — testing two `leaf()`s as separate items was
+  the top source of test bugs; real DOM always separates items with elements.
+- **Paragraph-gap semantics survived the rewrite**: the legacy `size * 0.6`
+  gap at block boundaries is driven by `BoxNode.open` (last line has content),
+  reproducing old `hard_break` layout without the atom-stream insertions.
+- Latent bug found by live page (fixed): attribute-selector parse indexed past
+  the buffer on an unterminated `[attr=` selector.
 
 ### Phase 1b findings
 

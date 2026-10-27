@@ -1,14 +1,97 @@
 //! CSS subset (Phase 1b, PLAN Recommendations §2): stylesheet text is parsed
 //! ONCE into a rule list with precompiled selectors — never re-parsed per element.
 //! shortcut: no pseudo-classes, no @media/@import, no !important (stripped and
-//! ignored), no external <link> stylesheets, shorthand `font:` unsupported;
-//! background-color is only honored for the page background (body/html), not
-//! per-box (no box tree yet). Upgrade when the CSS engine grows (Phase 1b+).
+//! ignored), shorthand `font:` unsupported; background-color is only honored
+//! for the page background (body/html), not per-box. Box layout properties
+//! (display:flex/grid, width, gap, …) cascade into `BoxStyle` — layout.rs
+//! consumes it. Upgrade when the CSS engine grows (Phase 1c+).
 
 use crate::html::Dom;
 use crate::layout::Style;
 
 pub type Decl = (String, String);
+
+/// A resolved length. `%` stays symbolic — the container width isn't known
+/// until layout walks the tree.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Len {
+    Px(f32),
+    Pct(f32),
+}
+
+/// One `grid-template-columns` track.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Track {
+    Fr(f32),
+    Px(f32),
+    Pct(f32),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Display {
+    /// no `display:` declaration — follow the tag (block tag → block box,
+    /// inline tag → flatten into the parent's text flow)
+    Auto,
+    Inline,
+    Block,
+    Flex,
+    Grid,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Dir {
+    Row,
+    Column,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Justify {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Align {
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+/// Per-element box layout properties — the non-inherited half of CSS.
+/// Default = plain block flow (matches pre-flex rendering).
+#[derive(Clone, PartialEq, Debug)]
+pub struct BoxStyle {
+    pub display: Display,
+    pub dir: Dir,
+    pub justify: Justify,
+    pub align: Align,
+    pub gap_row: f32,
+    pub gap_col: f32,
+    pub cols: Vec<Track>,
+    pub width: Option<Len>,
+    pub max_width: Option<Len>,
+    pub margin_x_auto: bool,
+}
+
+impl Default for BoxStyle {
+    fn default() -> Self {
+        BoxStyle {
+            display: Display::Auto,
+            dir: Dir::Row,
+            justify: Justify::Start,
+            align: Align::Stretch,
+            gap_row: 0.0,
+            gap_col: 0.0,
+            cols: Vec::new(),
+            width: None,
+            max_width: None,
+            margin_x_auto: false,
+        }
+    }
+}
 
 /// One compound step of a selector, e.g. `nav > a.current[href]`.
 struct Seg {
@@ -45,6 +128,8 @@ pub struct StyleOutcome {
     /// background-color (only meaningful for body/html — page fill)
     pub bg: Option<u32>,
     pub display_none: bool,
+    /// non-inherited box layout properties (flex/grid/width/gap/…)
+    pub bx: BoxStyle,
 }
 
 /// Properties we actually use; everything else (margin, padding, …) is dropped
@@ -60,10 +145,27 @@ const KNOWN: &[&str] = &[
     "text-decoration",
     "display",
     "opacity",
+    "text-align",
+    "flex-direction",
+    "justify-content",
+    "align-items",
+    "gap",
+    "row-gap",
+    "column-gap",
+    "grid-template-columns",
+    "width",
+    "max-width",
+    "margin",
+    "margin-left",
+    "margin-right",
+    "margin-inline",
+    "margin-inline-start",
+    "margin-inline-end",
 ];
 
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
 /// cascade-sorted rule list, assuming a 1000px desktop viewport.
+#[cfg(test)] // production uses parse_for (media queries need the viewport)
 pub fn parse(text: &str) -> Sheet {
     parse_for(text, 1000.0)
 }
@@ -196,13 +298,14 @@ impl Sheet {
         let mut style = base;
         let mut bg = None;
         let mut display_none = false;
+        let mut bx = BoxStyle::default();
 
         for rule in &self.rules {
             if !matches(dom, node, &rule.segs) {
                 continue;
             }
             for d in &rule.decls {
-                if apply_decl(d, &mut style, &mut bg) {
+                if apply_decl(d, &mut style, &mut bg, &mut bx) {
                     display_none = true;
                 }
             }
@@ -210,7 +313,7 @@ impl Sheet {
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
-                if apply_decl(d, &mut style, &mut bg) {
+                if apply_decl(d, &mut style, &mut bg, &mut bx) {
                     display_none = true;
                 }
             }
@@ -219,6 +322,7 @@ impl Sheet {
             style,
             bg,
             display_none,
+            bx,
         }
     }
 }
@@ -246,7 +350,7 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
     out
 }
 
-fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>) -> bool {
+fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxStyle) -> bool {
     match d.0.as_str() {
         "color" => {
             if let Some(c) = parse_color(&d.1) {
@@ -277,13 +381,192 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>) -> bool {
         "font-style" => style.italic = matches!(d.1.as_str(), "italic" | "oblique"),
         "font-family" => style.mono = d.1.contains("mono") || d.1.contains("courier"),
         "text-decoration" => style.underline = d.1.contains("underline"),
-        "display" => return d.1 == "none",
+        "display" => match d.1.as_str() {
+            "none" => return true,
+            "flex" => bx.display = Display::Flex,
+            "grid" => bx.display = Display::Grid,
+            "block" => bx.display = Display::Block,
+            "inline" | "inline-block" | "inline-flex" | "inline-grid" => bx.display = Display::Inline,
+            _ => {}
+        },
         // fully transparent = invisible; shortcut: partial opacity ignored
         // (rasterizer has no alpha compositing), so only 0 hides the subtree
         "opacity" => return d.1.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false),
+        "text-align" => {
+            style.text_align = match d.1.as_str() {
+                "center" => 1,
+                "right" | "end" => 2,
+                _ => 0, // left/start; shortcut: justify renders as left
+            }
+        }
+        "flex-direction" => {
+            bx.dir = if d.1.contains("column") { Dir::Column } else { Dir::Row }
+        }
+        "justify-content" => {
+            bx.justify = match d.1.as_str() {
+                "center" => Justify::Center,
+                "flex-end" | "end" | "right" => Justify::End,
+                "space-between" | "space-around" | "space-evenly" => Justify::SpaceBetween,
+                _ => Justify::Start, // flex-start/left/default
+            }
+        }
+        "align-items" => {
+            bx.align = match d.1.as_str() {
+                "center" => Align::Center,
+                "flex-end" | "end" | "bottom" => Align::End,
+                "stretch" => Align::Stretch,
+                _ => Align::Start, // flex-start/baseline/default
+            }
+        }
+        "gap" => {
+            let mut it = d.1.split_whitespace();
+            if let (Some(a), b) = (it.next(), it.next()) {
+                if let Some(v) = parse_len(a) {
+                    bx.gap_row = len_px(v, 0.0);
+                    bx.gap_col = len_px(v, 0.0);
+                }
+                if let Some(v) = b.and_then(parse_len) {
+                    bx.gap_col = len_px(v, 0.0); // `gap: row col`
+                }
+            }
+        }
+        "row-gap" => {
+            if let Some(v) = parse_len(&d.1) {
+                bx.gap_row = len_px(v, 0.0);
+            }
+        }
+        "column-gap" => {
+            if let Some(v) = parse_len(&d.1) {
+                bx.gap_col = len_px(v, 0.0);
+            }
+        }
+        "grid-template-columns" => bx.cols = parse_tracks(&d.1),
+        "width" => bx.width = parse_len(&d.1).filter(|_| d.1 != "auto"),
+        "max-width" => {
+            bx.max_width = if d.1 == "none" {
+                None
+            } else {
+                parse_len(&d.1)
+            }
+        }
+        // shortcut: only the auto (centering) half of margin is honored —
+        // fixed margins/padding per side don't exist yet
+        "margin" => {
+            let vals: Vec<&str> = d.1.split_whitespace().collect();
+            let auto = match vals.len() {
+                1 => vals[0] == "auto",
+                2 => vals[0] == "auto" || vals[1] == "auto",
+                _ => vals.iter().any(|v| *v == "auto"), // 3/4-value: right or left slot
+            };
+            if auto {
+                bx.margin_x_auto = true;
+            }
+        }
+        "margin-left" | "margin-right" | "margin-inline" | "margin-inline-start"
+        | "margin-inline-end" => {
+            if d.1.contains("auto") {
+                bx.margin_x_auto = true;
+            }
+        }
         _ => {}
     }
     false
+}
+
+/// `200px` / `50%` → [`Len`]. Bare numbers are lenient px (matches `parse_size`).
+fn parse_len(v: &str) -> Option<Len> {
+    let v = v.trim();
+    if let Some(n) = v.strip_suffix('%') {
+        return n.trim().parse::<f32>().ok().map(Len::Pct);
+    }
+    if let Some(n) = v.strip_suffix("px") {
+        return n.trim().parse::<f32>().ok().map(Len::Px);
+    }
+    v.parse::<f32>().ok().map(Len::Px)
+}
+
+/// Symbolic length → px against a known container width (Pct resolves here).
+fn len_px(l: Len, container: f32) -> f32 {
+    match l {
+        Len::Px(p) => p,
+        Len::Pct(p) => p / 100.0 * container,
+    }
+}
+
+/// `grid-template-columns`: `1fr 1fr 1fr`, `repeat(3, 1fr)`,
+/// `minmax(0, 1fr)`, `200px 50%`. Empty = single implicit column.
+/// shortcut: `repeat(auto-fill, …)` and named lines are dropped.
+fn parse_tracks(v: &str) -> Vec<Track> {
+    let mut out = Vec::new();
+    let v = v.trim();
+    if v.is_empty() || v == "none" {
+        return out;
+    }
+    // expand repeat(n, …) and minmax(a, b) first so tokens are space-free
+    let mut s = String::new();
+    let mut i = 0;
+    let b = v.as_bytes();
+    while i < b.len() {
+        if v[i..].starts_with("repeat(") {
+            let open = i + 6;
+            let Some(close) = match_paren(b, open) else { break };
+            let inner = &v[open + 1..close];
+            let Some((n, list)) = inner.split_once(',') else { break };
+            if let Ok(n) = n.trim().parse::<usize>() {
+                for _ in 0..n.min(64) {
+                    s.push_str(list);
+                    s.push(' ');
+                }
+            }
+            i = close + 1;
+        } else if v[i..].starts_with("minmax(") {
+            // minmax(a, b) → take the max side (b); handles inner spaces
+            let open = i + 6; // index of '('
+            let Some(close) = match_paren(b, open) else { break };
+            let inner = &v[open + 1..close];
+            if let Some((_, max)) = inner.rsplit_once(',') {
+                s.push_str(max.trim());
+                s.push(' ');
+            }
+            i = close + 1;
+        } else {
+            s.push(b[i] as char);
+            i += 1;
+        }
+    }
+    for tok in s.split_whitespace() {
+        let tok = tok.trim_end_matches(',');
+        if let Some(n) = tok.strip_suffix("fr") {
+            if let Ok(f) = n.trim().parse::<f32>() {
+                out.push(Track::Fr(f.max(0.0)));
+            }
+        } else if let Some(l) = parse_len(tok) {
+            out.push(match l {
+                Len::Px(p) => Track::Px(p),
+                Len::Pct(p) => Track::Pct(p),
+            });
+        }
+        // unknown tokens (auto, named lines) are skipped
+    }
+    out
+}
+
+/// Index of the `)` matching the `(` at `open`.
+fn match_paren(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0u32;
+    for i in open..b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `16px`, `1.2em` (relative to current size), `120%`, bare number (lenient px).
@@ -495,7 +778,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         i += 1;
                     }
                     val = Some(b[st..i].iter().collect::<String>().to_ascii_lowercase());
-                    if Some(b[i]) == quote {
+                    if i < b.len() && Some(b[i]) == quote {
                         i += 1;
                     }
                 }
@@ -637,7 +920,7 @@ fn media_single(q: &str, vw: f32) -> bool {
 /// Root font size for rem/em lengths in media queries (CSS spec: root font).
 const ROOT_PX: f32 = 16.0;
 
-fn parse_len(v: &str) -> Option<f32> {
+fn media_len(v: &str) -> Option<f32> {
     let v = v.trim();
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse().ok();
@@ -673,8 +956,8 @@ fn media_feature(part: &str, vw: f32) -> bool {
             "hover" => v == "hover",
             "pointer" => v == "fine",
             "orientation" => v == "landscape", // 1000x700 window
-            "min-width" => parse_len(v).map(|px| vw >= px).unwrap_or(false),
-            "max-width" => parse_len(v).map(|px| vw <= px).unwrap_or(false),
+            "min-width" => media_len(v).map(|px| vw >= px).unwrap_or(false),
+            "max-width" => media_len(v).map(|px| vw <= px).unwrap_or(false),
             _ => false,
         };
     }
@@ -684,7 +967,7 @@ fn media_feature(part: &str, vw: f32) -> bool {
         if let Some((l, r)) = inner.split_once(op) {
             let num = |s: &str| {
                 let s = s.trim();
-                if s == "width" { Some(vw) } else { parse_len(s) }
+                if s == "width" { Some(vw) } else { media_len(s) }
             };
             let (Some(a), Some(b)) = (num(l), num(r)) else {
                 return false;
@@ -968,6 +1251,72 @@ mod tests {
         assert_eq!(sheet.resolve(&dom, inputs[1], Style::new(), None).style.color, 0x222222);
         assert!(sheet.resolve(&dom, inputs[2], Style::new(), None).style.italic);
         assert!(!sheet.resolve(&dom, inputs[3], Style::new(), None).style.italic);
+    }
+
+    // ---- box properties (Track A) ----
+
+    #[test]
+    fn tracks_parse_fr_px_pct_and_repeat() {
+        assert_eq!(
+            parse_tracks("repeat(3, 1fr)"),
+            vec![Track::Fr(1.0), Track::Fr(1.0), Track::Fr(1.0)]
+        );
+        assert_eq!(
+            parse_tracks("200px 50% 1fr"),
+            vec![Track::Px(200.0), Track::Pct(50.0), Track::Fr(1.0)]
+        );
+        // minmax(0, 1fr) → take the max side
+        assert_eq!(parse_tracks("minmax(0, 1fr)"), vec![Track::Fr(1.0)]);
+        assert!(parse_tracks("none").is_empty());
+        // garbage tokens are skipped, valid ones survive
+        assert_eq!(parse_tracks("[line1] auto 2fr"), vec![Track::Fr(2.0)]);
+    }
+
+    #[test]
+    fn len_parses_px_pct_and_bare() {
+        assert_eq!(parse_len("12px"), Some(Len::Px(12.0)));
+        assert_eq!(parse_len("50%"), Some(Len::Pct(50.0)));
+        assert_eq!(parse_len("24"), Some(Len::Px(24.0)));
+        assert_eq!(parse_len("auto"), None);
+        assert_eq!(parse_len("2rem"), None); // shortcut: rem only in media queries
+    }
+
+    #[test]
+    fn box_props_cascade_into_boxstyle() {
+        let sheet = parse(
+            ".row { display: flex; flex-direction: column; gap: 8px 12px; justify-content: center; align-items: end }\
+             .grid { display: grid; grid-template-columns: repeat(2, 1fr); column-gap: 5px }\
+             .box { width: 300px; max-width: 50%; margin: 0 auto }\
+             .inl { display: inline }",
+        );
+        let dom = dom_of(
+            r#"<div class=row></div><div class=grid></div><div class=box></div><div class=inl></div><div class=nocls></div>"#,
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+
+        let row = bx("row");
+        assert_eq!(row.display, Display::Flex);
+        assert_eq!(row.dir, Dir::Column);
+        assert_eq!(row.gap_row, 8.0);
+        assert_eq!(row.gap_col, 12.0, "`gap: row col` splits");
+        assert_eq!(row.justify, Justify::Center);
+        assert_eq!(row.align, Align::End);
+
+        let grid = bx("grid");
+        assert_eq!(grid.display, Display::Grid);
+        assert_eq!(grid.cols, vec![Track::Fr(1.0), Track::Fr(1.0)]);
+        assert_eq!(grid.gap_col, 5.0);
+        assert_eq!(grid.gap_row, 0.0);
+
+        let k = bx("box");
+        assert_eq!(k.width, Some(Len::Px(300.0)));
+        assert_eq!(k.max_width, Some(Len::Pct(50.0)));
+        assert!(k.margin_x_auto, "`margin: 0 auto` → auto centering");
+
+        assert_eq!(bx("inl").display, Display::Inline);
+        // no declarations → Auto (follow the tag)
+        let plain = sheet.resolve(&dom, by_attr(&dom, "class", "nocls"), Style::new(), None);
+        assert_eq!(plain.bx.display, Display::Auto);
     }
 }
 
