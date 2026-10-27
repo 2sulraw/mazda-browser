@@ -1,0 +1,16 @@
+[package]
+name = "mazda"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minifb = "0.28"
+ureq = "2"
+windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_ProcessStatus"] }
+ab_glyph = "0.2.32"
+url = "2.5.8"
+encoding_rs = "0.8.42"
+
+[profile.release]
+opt-level = "s"
+lto = true
