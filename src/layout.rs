@@ -256,8 +256,10 @@ fn build_into(
                     continue;
                 }
                 let child_style = if tag == "body" { style } else { style_for(tag, style) };
-                // author CSS (rules + inline style) cascades over UA defaults
-                let outcome = sheet.resolve(dom, child, child_style, dom.attr(child, "style"));
+                // author CSS (rules + inline style) cascades over UA defaults;
+                // relative font-sizes compute against the TRUE parent (style),
+                // not the UA-bumped child_style (headings would compound 2x)
+                let outcome = sheet.resolve_with_parent(dom, child, child_style, dom.attr(child, "style"), style.size);
                 if outcome.display_none {
                     continue;
                 }

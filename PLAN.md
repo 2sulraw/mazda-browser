@@ -207,7 +207,22 @@ curve matters more than the baseline (near-flat as tabs grow).
   `clientpref-day`) drops `clientpref-night` dark vars → light; nextjs (no root theme)
   keeps its JS-era `.dark` values → dark; MDN (no root class) unchanged → dark.
   shortcut: only root-declared themes are modeled — a JS-activated theme is not a
-  contradiction, so it stays (matches this machine's system-dark render; in progress)**
+  contradiction, so it stays (matches this machine's system-dark render).
+  Verified: Wikipedia light, nextjs dark, MDN unchanged, HN + rust-lang no-op;
+  115 tests; `241757d`)**
+- [x] **font-size cascade: replace-against-parent** — ~~Wikipedia "Welcome to
+  Wikipedia" `<h1>` rendered ~395px (each word overflowing the viewport)~~ **DONE:
+  `font-size` `%`/`em` now resolve against the true parent size and REPLACE the
+  cascade (spec) instead of multiplying into the running total; `inherit`/`unset`
+  restore the parent, `initial` → 16. The cascade had compounded `UA(2×) × 188% ×
+  1.8em × 1.8em` (a comma-rule whose two selectors both matched applied twice) and
+  `inherit` froze the inflated value. `resolve` is a thin wrapper delegating to
+  `resolve_with_parent(..., base.size)`; `build_into` passes `style.size` — the
+  pre-UA true parent — so an author rule replaces the UA heading default rather than
+  scaling it. Verified: Wikipedia heading ~32px + full featured page; rust-lang /
+  MDN / nextjs / HN identical (no regression); 117 tests)**
+  Known gap: a single comma-rule that matches twice still runs both selector arms
+  (harmless now that font-size replaces, but other properties still double-apply)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -255,6 +270,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | selector split + min-height fixes | nextjs.org | 42.0 MB (570 runs; hero NEXT floats above pill, footer no longer piled at top-left) |
 | 2026-10-29 | UA-white + cross-site fixes (inline-block/margin, clamp/vw, grid calc+named col, flex-wrap) | rust-lang.org | 27.2 MB (517 runs; full nav + yellow button) |
 | 2026-10-29 | UA-white + cross-site fixes | Wikipedia (Main_Page) | 34.4 MB (1326 runs; heading size fixed) |
+| 2026-10-29 | font-size replace-against-parent cascade | Wikipedia (Main_Page) | 34.5 MB (1326 runs; h1 ~32px, full featured page) |
+| 2026-10-29 | font-size replace-against-parent cascade | nextjs.org | 43.2 MB (570 runs; dark, no regression) |
 
 ### Phase 1c (Track A) findings
 

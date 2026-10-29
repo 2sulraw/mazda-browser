@@ -489,7 +489,24 @@ fn match_brace(b: &[u8], open: usize) -> Option<usize> {
 
 impl Sheet {
     /// Cascade every matching rule + the inline `style` attribute over `base`.
+    /// The parent font-size defaults to `base.size` (correct wherever `base` is
+    /// the true parent style); callers that pass a UA-adjusted base (headings)
+    /// use `resolve_with_parent` so relative font-sizes compute against the
+    /// real parent.
     pub fn resolve(&self, dom: &Dom, node: u32, base: Style, inline: Option<&str>) -> StyleOutcome {
+        self.resolve_with_parent(dom, node, base, inline, base.size)
+    }
+
+    /// `resolve`, but `%`/`em`/`inherit` in `font-size` resolve against
+    /// `parent_size` (the parent's true font-size) instead of `base.size`.
+    pub fn resolve_with_parent(
+        &self,
+        dom: &Dom,
+        node: u32,
+        base: Style,
+        inline: Option<&str>,
+        parent_size: f32,
+    ) -> StyleOutcome {
         let mut style = base;
         let mut bg = None;
         let mut display_none = false;
@@ -500,7 +517,7 @@ impl Sheet {
                 continue;
             }
             for d in &rule.decls {
-                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx) {
+                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size) {
                     display_none = true;
                 }
             }
@@ -508,7 +525,7 @@ impl Sheet {
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
-                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx) {
+                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size) {
                     display_none = true;
                 }
             }
@@ -623,7 +640,7 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
     out
 }
 
-fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxStyle) -> bool {
+fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxStyle, parent: f32) -> bool {
     match d.0.as_str() {
         "color" => {
             if let Some(c) = parse_color(&d.1) {
@@ -637,17 +654,14 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
             }
         }
         "font-size" => {
-            // `inherit`/`unset`/`initial`: the style we're cascading into
-            // already carries the parent's size, so inherit = keep it and
-            // initial = root size (16px)
+            // `%`/`em` resolve against the PARENT's font-size, and each declaration
+            // REPLACES the cascade (spec) — computing against the running style.size
+            // used to compound `188% × 1.8em × 1.8em` and freeze it under `inherit`.
             match d.1.trim() {
-                "inherit" | "unset" | "initial" => {
-                    if d.1.trim() == "initial" {
-                        style.size = 16.0;
-                    }
-                }
+                "inherit" | "unset" => style.size = parent, // restore the inherited size
+                "initial" => style.size = 16.0,
                 _ => {
-                    if let Some(px) = parse_size(&d.1, style.size) {
+                    if let Some(px) = parse_size(&d.1, parent) {
                         style.size = px.clamp(6.0, 400.0);
                     }
                 }
@@ -2049,6 +2063,41 @@ mod tests {
         // parent: 15 * 1.62 = 24.3; h1 inherit must keep exactly that
         assert!((parent.style.size - 24.3).abs() < 0.01, "parent {}", parent.style.size);
         assert_eq!(h1.style.size, parent.style.size, "inherit keeps parent size");
+    }
+
+    #[test]
+    fn font_size_cascades_against_parent_not_compounding() {
+        // Several matching font-size rules must each compute against the PARENT
+        // and replace (not compound); a top-specificity `inherit` restores it.
+        let sheet = parse(
+            "#w { font-size: 162% } \
+             h1 { font-size: 188% } \
+             .wrap h1 { font-size: 1.8em } \
+             .wrap h1 { font-size: 1.8em } \
+             #w h1 { font-size: inherit }",
+        );
+        let dom = dom_of("<div id=w class=wrap><h1>hi</h1></div>");
+        let parent = sheet.resolve(&dom, by_attr(&dom, "id", "w"), Style::new(), None);
+        // #w = 15 * 1.62 = 24.3
+        let h1 = sheet.resolve(&dom, by_tag(&dom, "h1"), parent.style, None);
+        assert_eq!(
+            h1.style.size, parent.style.size,
+            "inherit caps the h1 at the parent size (no compounding)"
+        );
+    }
+
+    #[test]
+    fn heading_author_fontsize_ignores_ua_default() {
+        // build_into passes a UA-bumped base (h1 = 2x parent) but the true parent
+        // size; an author `em`/`%` must compute against the PARENT, replacing the UA default.
+        let sheet = parse("h1 { font-size: 1.5em }");
+        let dom = dom_of("<h1>hi</h1>");
+        let mut parent = Style::new();
+        parent.size = 20.0;
+        let mut ua_bumped = parent; // what style_for produces for <h1>
+        ua_bumped.size = 40.0;
+        let h1 = sheet.resolve_with_parent(&dom, by_tag(&dom, "h1"), ua_bumped, None, 20.0);
+        assert_eq!(h1.style.size, 30.0, "1.5em of the parent (20), not of the UA base (40)");
     }
 
     #[test]
