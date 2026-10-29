@@ -4,6 +4,7 @@ mod css;
 mod html;
 mod image;
 mod layout;
+mod svg;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
 use layout::{Layout, Style};
@@ -11,9 +12,10 @@ use minifb::{Key, KeyRepeat, MouseButton, Window, WindowOptions};
 
 const PADDING: usize = 12;
 const BG: u32 = 0x00_1a_1a_1a;
-/// Total decoded image pixels per page (~4B/px RGBA, halved again by the
-/// post-layout downscale to display size). Images beyond the budget stay
-/// undecoded (declared width/height attrs still reserve space).
+/// Display pixels of decoded images kept in RAM per page (~4B/px RGBA).
+/// Charged at decode time against laid-out size (what's retained), not
+/// intrinsic size — over-budget images keep their probed dims (space
+/// reserved, nothing drawn).
 /// shortcut: first-come document-order cap, not LRU — pages rarely exceed it.
 const IMG_PIXEL_BUDGET: usize = 8_000_000;
 
@@ -197,15 +199,15 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32) -> Page {
     // fetch + probe every <img> header (disk-cached; no pixel decode yet —
     // layout only needs the intrinsic size to size the box)
     let mut img_budget = IMG_PIXEL_BUDGET;
-    let (n_img, skipped) = probe_images(&mut root_box, url, &mut img_budget);
+    let (n_img, skipped) = probe_images(&mut root_box, url);
     if n_img > 0 || skipped > 0 {
-        eprintln!("[img] {n_img} probed, {skipped} skipped (budget/format)");
+        eprintln!("[img] {n_img} probed, {skipped} skipped (format)");
     }
 
     let mut laid = layout::layout_tree(&mut root_box, max_w, &|s: &str, st: &Style| fonts.measure(s, st));
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
-    let n_px = decode_images(&mut root_box, url, &mut laid);
+    let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget);
     if n_px > 0 {
         eprintln!("[img] {n_px} decoded at display size");
     }
@@ -245,37 +247,30 @@ enum SheetSrc {
 }
 
 /// Walk the box tree fetching every `<img src>` and parsing only its header
-/// (disk-cached). Returns (probed, skipped); skipped = budget/format. Boxes
+/// (disk-cached). Returns (probed, skipped); skipped = bad URL/format. Boxes
 /// keep `Probed` (or `Pending` on failure) so declared sizes still reserve
-/// space even when the pixels will never decode.
-fn probe_images(n: &mut layout::BoxNode, base: &str, budget: &mut usize) -> (usize, usize) {
+/// space even when the pixels will never decode. No budget here: headers cost
+/// no pixels — the budget is charged at decode time against display size.
+fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
     let mut probed = 0usize;
     let mut skipped = 0usize;
     if let Some(layout::ImgSlot::Pending(src)) = &n.img {
         let src = src.to_string();
-        if *budget == 0 {
-            skipped += 1; // stays Pending: declared width/height still reserve space
-        } else if let Some(abs) = resolve(base, &src) {
+        if let Some(abs) = resolve(base, &src) {
             match fetch_image(&abs) {
-                Ok((bytes, _)) => match image::probe(&bytes) {
+                Ok((bytes, _)) => match image::probe(&bytes).or_else(|| svg::probe(&bytes)) {
                     Some((w, h)) => {
-                        let px = (w * h) as usize;
-                        if px <= *budget {
-                            *budget -= px;
-                            probed += 1;
-                            n.img = Some(layout::ImgSlot::Probed {
-                                src: std::rc::Rc::from(src.as_str()),
-                                w,
-                                h,
-                            });
-                        } else {
-                            skipped += 1; // beyond this page's pixel budget
-                        }
+                        probed += 1;
+                        n.img = Some(layout::ImgSlot::Probed {
+                            src: std::rc::Rc::from(src.as_str()),
+                            w,
+                            h,
+                        });
                     }
                     None => {
                         eprintln!("[img] no size from {abs} ({} bytes, starts {:?})",
                             bytes.len(), &bytes[..bytes.len().min(12)]);
-                        skipped += 1; // WebP/AVIF/SVG/corrupt
+                        skipped += 1; // WebP/AVIF/corrupt
                     }
                 },
                 Err(e) => {
@@ -288,7 +283,7 @@ fn probe_images(n: &mut layout::BoxNode, base: &str, budget: &mut usize) -> (usi
         }
     }
     for c in &mut n.children {
-        let (p, s) = probe_images(c, base, budget);
+        let (p, s) = probe_images(c, base);
         probed += p;
         skipped += s;
     }
@@ -297,8 +292,10 @@ fn probe_images(n: &mut layout::BoxNode, base: &str, budget: &mut usize) -> (usi
 
 /// Post-layout: decode each probed image (disk cache hit, no refetch),
 /// resample to its laid-out display size, and emit draw entries. One image's
-/// full-size buffer is alive at a time.
-fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout) -> usize {
+/// full-size buffer is alive at a time. `budget` caps the display pixels that
+/// stay in RAM — over-budget images keep their `Probed` dims (space reserved,
+/// nothing drawn).
+fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout, budget: &mut usize) -> usize {
     let mut count = 0usize;
     if let Some(layout::ImgSlot::Probed { src, .. }) = &n.img {
         let src = src.to_string();
@@ -307,21 +304,33 @@ fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout) -> usiz
             n.w.round().max(1.0) as u32,
             n.h.round().max(1.0) as u32,
         ) {
-            if let Ok((bytes, _)) = fetch_image(&abs) {
-                if let Some(full) = image::decode(&bytes) {
-                    let img = if full.w > dw || full.h > dh {
-                        std::rc::Rc::new(image::downscale(&full, dw, dh))
-                    } else {
-                        std::rc::Rc::new(full)
-                    };
-                    laid.images.push((n.x, n.y, n.w, n.h, img));
-                    count += 1;
+            let px = (dw as usize) * (dh as usize);
+            if px > *budget {
+                // over budget: keep dims, skip pixels
+            } else {
+                *budget -= px;
+                if let Ok((bytes, _)) = fetch_image(&abs) {
+                    // raster: decode then resample; svg: rasterize straight at
+                    // display size (vector, no full-size buffer ever exists)
+                    let img = image::decode(&bytes)
+                        .map(|full| {
+                            if full.w > dw || full.h > dh {
+                                image::downscale(&full, dw, dh)
+                            } else {
+                                full
+                            }
+                        })
+                        .or_else(|| svg::render(&bytes, dw, dh));
+                    if let Some(img) = img {
+                        laid.images.push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img)));
+                        count += 1;
+                    }
                 }
             }
         }
     }
     for c in &mut n.children {
-        count += decode_images(c, base, laid);
+        count += decode_images(c, base, laid, budget);
     }
     count
 }

@@ -75,13 +75,27 @@ curve matters more than the baseline (near-flat as tabs grow).
   (`png` + `jpeg-decoder`, both pure Rust), two-pass loading — header probe
   (IHDR/SOF) sizes the box pre-layout, pixel decode happens after layout and
   resamples straight to display size so full-resolution buffers never
-  accumulate (8M px/page budget, declared width/height attrs still reserve
+  accumulate (8M **display** px/page budget charged at decode time — what
+  stays in RAM, not intrinsic size; declared width/height attrs still reserve
   space when fetch/decode fails, aspect-ratio height, width attrs as
-  presentational hints; 73 tests; local test page: intrinsic/CSS-width/
-  attr-stretch/missing-file all correct, nextjs.org RSS 24.8 MB)**.
-  Known gaps: no WebP/AVIF/GIF/SVG (nextjs.org: 1/9 images decodes),
-  no srcset/art-direction, no lazy loading, no data: URIs,
+  presentational hints; content-negotiated Accept gets PNG/JPEG back from
+  image proxies; 73 tests; local test page: intrinsic/CSS-width/
+  attr-stretch/missing-file all correct)**.
+  Known gaps: no WebP/AVIF/GIF (nextjs.org: 8/9 images decode — remaining
+  skip is format), no srcset/art-direction, no lazy loading, no data: URIs,
   nearest-neighbour scale only
+- [x] **Phase 1f** — SVG rasterizer for logos/icons: ~~skip~~ **DONE
+  (`src/svg.rs`, hand-written — probe reads width/height/viewBox, render
+  rasterizes at display size so vectors are pixel-exact at any scale):
+  path (M/L/H/V/C/S/Q/T/A/Z abs+rel, arcs→cubics), rect/circle/ellipse/
+  polygon/polyline/line, g/transform stack (matrix/translate/scale/rotate/
+  skew), nonzero+evenodd scanline fill, stroke (quads + round joins),
+  presentation attrs + inline style inheritance, named/hex/rgb()/rgba()
+  colors, 2×2 supersampling, gradients collapsed to flat midpoint of stop
+  colors; 81 tests; nextjs.org 8/9 images (SVG logos visible, was 1/9)**.
+  Known gaps: no text/glyphs, no clip/mask/filter/pattern, no `use`/
+  `image`, no CSS <style> blocks, gradients flat (not interpolated),
+  no stroke-dash/miter/linecap variants
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -118,6 +132,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-27 | Phase 1d: box chrome (pad/margin/lh/radius/bg) | nextjs.org | 15.7 MB (572 runs) |
 | 2026-10-29 | Phase 1e: `<img>` PNG+JPEG (probe + display-size decode) | nextjs.org | **24.8 MB** (1 image decoded; naive full-decode was 50.0 MB) |
 | 2026-10-29 | Phase 1e: local image test page (3 PNGs) | 127.0.0.1 | 19.0 MB |
+| 2026-10-29 | Phase 1f: SVG rasterizer (8/9 images incl. logos) | nextjs.org | 45.1 MB (8 images at display size) |
 
 ### Phase 1c (Track A) findings
 
