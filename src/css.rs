@@ -302,8 +302,12 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         let decls = parse_decls(block);
         if !decls.is_empty() {
             // custom properties are collected for EVERY rule regardless of
-            // selector (including :root/:host, which we can't match) — they
-            // live in one page-wide map, so the selector doesn't matter
+            // selector — they live in one page-wide map. shortcut: theme-
+            // scoped definitions leak (Wikipedia's html.skin-theme-clientpref-
+            // night dark vars override its :root light ones → dark render).
+            // Correct fix = selector-aware scoping keyed on the root element's
+            // real classes, which needs the DOM at parse time; a JS-activated
+            // theme (nextjs .dark) is invisible to us either way.
             let real: Vec<Decl> = decls
                 .iter()
                 .filter_map(|d| {
@@ -1764,14 +1768,13 @@ mod tests {
     fn custom_properties_resolve_var() {
         // :root-style rules we can't match still populate the var map
         let sheet = parse(
-            ":root, :host { --ds-bg: #0a0a0a; --ds-mono: ui-monospace, Menlo, monospace } \
+            ":root, :host { --ds-bg: #0a0a0a; --ds-mono: ui-monospace, Menlo, monospace; --b: #00ff00; --a: var(--b) } \
              .pill { background: var(--ds-bg); font-family: var(--ds-mono) } \
              .fb { color: var(--missing, #ff0000) } \
-             .nest { color: var(--a) } \
-             .chain { --b: #00ff00; --a: var(--b) }",
+             .nest { color: var(--a) }",
         );
         let dom = dom_of(
-            "<div class=pill></div><div class=fb></div><div class=nest></div><div class=chain></div>",
+            "<div class=pill></div><div class=fb></div><div class=nest></div>",
         );
         let pill = sheet.resolve(&dom, by_attr(&dom, "class", "pill"), Style::new(), None);
         assert_eq!(pill.bg, Some(0x0a0a0a), "var in background-color");
@@ -1780,6 +1783,27 @@ mod tests {
         assert_eq!(fb.style.color, 0xff0000, "fallback used when var unknown");
         let nest = sheet.resolve(&dom, by_attr(&dom, "class", "nest"), Style::new(), None);
         assert_eq!(nest.style.color, 0x00ff00, "nested var chain resolves");
+    }
+
+    #[test]
+    fn vars_collected_from_any_selector() {
+        // Documented shortcut: the flat page-wide var map takes definitions
+        // from EVERY selector. It resolves nextjs (.dark block) and Wikipedia
+        // (:root light) alike — theme scoping is not modeled. See css.rs
+        // collect comment for the trade-off.
+        let sheet = parse(
+            ":root { --bg: #f8f9fa } \
+             html.skin-theme-clientpref-night { --bg: #202122 } \
+             body { background-color: var(--bg, #ffffff) }",
+        );
+        let dom = dom_of("<body class=skin-vector><p>x</p></body>");
+        let body = by_tag(&dom, "body");
+        // later rule wins in the flat map (source order)
+        assert_eq!(
+            sheet.resolve(&dom, body, Style::new(), None).bg,
+            Some(0x202122),
+            "flat var map: last definition wins regardless of selector"
+        );
     }
 
     #[test]

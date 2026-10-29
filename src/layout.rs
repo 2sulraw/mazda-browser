@@ -38,7 +38,7 @@ impl Style {
             size: 15.0,
             bold: false,
             italic: false,
-            color: 0x00_e8_e8_e8,
+            color: 0x00_00_00_00, // UA default = black (matches every browser)
             underline: false,
             fam: Fam::Sans,
             text_align: 0,
@@ -1991,7 +1991,7 @@ mod tests {
         n.children = vec![leaf("a")];
         let l = layout_tree(&mut n, 50.0, &m4);
         assert_eq!(l.rects.len(), 5, "bg + 4 strips: {:?}", l.rects);
-        assert_eq!(l.rects[1].4, 0xe8e8e8, "unspecified border = currentcolor");
+        assert_eq!(l.rects[1].4, 0x000000, "unspecified border = currentcolor");
         // rounded box with bg: ring = border-box fill + background inset over it
         let mut m2 = BoxNode::group(
             Style::new(),
@@ -2005,7 +2005,7 @@ mod tests {
         m2.children = vec![leaf("a")];
         let l2 = layout_tree(&mut m2, 50.0, &m4);
         assert_eq!(l2.rects.len(), 2, "ring = outer + inner: {:?}", l2.rects);
-        assert_eq!(l2.rects[0].4, 0xe8e8e8, "outer ring = currentcolor (text color)");
+        assert_eq!(l2.rects[0].4, 0x000000, "outer ring = currentcolor (text color)");
         assert!((l2.rects[1].2 - 46.0).abs() < 0.01, "inner w={}", l2.rects[1].2);
         assert!((l2.rects[1].5 - 4.0).abs() < 0.01, "inner radius={}", l2.rects[1].5);
     }
@@ -2061,7 +2061,7 @@ mod tests {
         );
         m2.children = vec![leaf("a")];
         let l2 = layout_tree(&mut m2, 200.0, &m4);
-        assert_eq!(l2.shadows[0].color, 0xff000000 | 0xe8e8e8, "currentcolor");
+        assert_eq!(l2.shadows[0].color, 0xff000000, "currentcolor (alpha-premultiplied)");
         assert!(l2.shadows[0].fixed, "fixed subtree");
     }
 

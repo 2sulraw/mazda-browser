@@ -11,7 +11,7 @@ use layout::{Fam, Layout, Style};
 use minifb::{Key, KeyRepeat, MouseButton, Window, WindowOptions};
 
 const PADDING: usize = 12;
-const BG: u32 = 0x00_1a_1a_1a;
+const BG: u32 = 0x00_ff_ff_ff; // UA default canvas = white (matches every browser)
 /// Display pixels of decoded images kept in RAM per page (~4B/px RGBA).
 /// Charged at decode time against laid-out size (what's retained), not
 /// intrinsic size — over-budget images keep their probed dims (space
@@ -188,8 +188,19 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
     );
 
     // cascade over the body element itself: page bg + initial inherited style
+    // (spec: the canvas background comes from <body> if it has one, else
+    // <html>'s — body wins per the HTML spec)
     let body = sheet.resolve(&dom, root, Style::new(), dom.attr(root, "style"));
-    let bg = body.bg.unwrap_or(BG);
+    let html_el = dom.nodes[0]
+        .children
+        .iter()
+        .copied()
+        .find(|&c| dom.tag(c) == "html")
+        .unwrap_or(0);
+    let bg = body
+        .bg
+        .or_else(|| sheet.resolve(&dom, html_el, Style::new(), dom.attr(html_el, "style")).bg)
+        .unwrap_or(BG);
 
     let mut root_box = layout::build(&dom, root, body.style, body.bx, &sheet);
     eprintln!(
