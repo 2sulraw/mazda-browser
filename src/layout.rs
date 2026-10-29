@@ -345,13 +345,15 @@ fn collect_paint(
         let bb = resolve_len(n.bx.border[2], n.w);
         let bl = resolve_len(n.bx.border[3], n.w);
         let has_b = bt > 0.0 || br > 0.0 || bb > 0.0 || bl > 0.0;
+        // currentcolor: unspecified border color = the element's text color
+        let bc = n.bx.bcolor.unwrap_or(n.style.color);
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
         let ring = has_b && r > 0.0 && n.bx.bg.is_some();
         if let Some(c) = n.bx.bg {
             if ring {
                 // rounded ring: fill the border-box with the border color,
                 // then the background inset over it (inner radius ≈ r − border)
-                out.push((n.x, n.y, n.w, n.h, n.bx.bcolor, r));
+                out.push((n.x, n.y, n.w, n.h, bc, r));
                 let inner = (r - bt.max(br).max(bb).max(bl)).max(0.0);
                 out.push((
                     n.x + bl,
@@ -369,16 +371,16 @@ fn collect_paint(
             // four side strips over the background (square corners on a
             // rounded backgroundless box — shortcut)
             if bt > 0.0 {
-                out.push((n.x, n.y, n.w, bt, n.bx.bcolor, 0.0));
+                out.push((n.x, n.y, n.w, bt, bc, 0.0));
             }
             if bb > 0.0 {
-                out.push((n.x, n.y + n.h - bb, n.w, bb, n.bx.bcolor, 0.0));
+                out.push((n.x, n.y + n.h - bb, n.w, bb, bc, 0.0));
             }
             if bl > 0.0 {
-                out.push((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0), n.bx.bcolor, 0.0));
+                out.push((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0), bc, 0.0));
             }
             if br > 0.0 {
-                out.push((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0), n.bx.bcolor, 0.0));
+                out.push((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0), bc, 0.0));
             }
         }
         if let Some(ImgSlot::Ready(d)) = &n.img {
@@ -1464,6 +1466,7 @@ mod tests {
         n.children = vec![leaf("a")];
         let l = layout_tree(&mut n, 50.0, &m4);
         assert_eq!(l.rects.len(), 5, "bg + 4 strips: {:?}", l.rects);
+        assert_eq!(l.rects[1].4, 0xe8e8e8, "unspecified border = currentcolor");
         // rounded box with bg: ring = border-box fill + background inset over it
         let mut m2 = BoxNode::group(
             Style::new(),
@@ -1477,7 +1480,7 @@ mod tests {
         m2.children = vec![leaf("a")];
         let l2 = layout_tree(&mut m2, 50.0, &m4);
         assert_eq!(l2.rects.len(), 2, "ring = outer + inner: {:?}", l2.rects);
-        assert_eq!(l2.rects[0].4, 0x000000, "outer = border color (black)");
+        assert_eq!(l2.rects[0].4, 0xe8e8e8, "outer ring = currentcolor (text color)");
         assert!((l2.rects[1].2 - 46.0).abs() < 0.01, "inner w={}", l2.rects[1].2);
         assert!((l2.rects[1].5 - 4.0).abs() < 0.01, "inner radius={}", l2.rects[1].5);
     }

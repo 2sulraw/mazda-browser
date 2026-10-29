@@ -98,7 +98,9 @@ curve matters more than the baseline (near-flat as tabs grow).
   no stroke-dash/miter/linecap variants
 - [x] **Phase 1g** — borders: ~~missing~~ **DONE (`border`/`border-width`/
   `border-color` shorthands + per-side `border-top/right/bottom/left`,
-  style words ignored = everything solid): border widths join the border-box
+  style words ignored = everything solid, unspecified color = currentcolor
+  resolved from the element's text color at paint time): border widths join
+  the border-box
   inset in layout (content starts inside borders, explicit width includes
   them, natural/wrap width grows by them), painted as 4 side strips over the
   background — or, when the box also has border-radius + background, as a

@@ -86,8 +86,9 @@ pub struct BoxStyle {
     pub radius: Len,
     /// border widths, top/right/bottom/left (% resolves against box width)
     pub border: [Len; 4],
-    /// one color for every side (per-side color: shortcut)
-    pub bcolor: u32,
+    /// border color; None = currentcolor (the element's own text color,
+    /// resolved at paint time — never a hardcoded default)
+    pub bcolor: Option<u32>,
 }
 
 impl Default for BoxStyle {
@@ -109,7 +110,7 @@ impl Default for BoxStyle {
             bg: None,
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
-            bcolor: 0, // spec: currentcolor; black is close enough
+            bcolor: None, // currentcolor
         }
     }
 }
@@ -544,9 +545,11 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 bx.radius = v;
             }
         }
-        // style words (solid/dashed/dotted) ignored — everything renders solid
+        // style words (solid/dashed/dotted) ignored — everything renders solid;
+        // the full shorthand resets color to currentcolor when unspecified
+        // (spec cascade), per-side shorthands only touch color when given
         "border" => {
-            let (w, c) = border_parts(&d.1, bx.bcolor);
+            let (w, c) = border_parts(&d.1);
             if let Some(w) = w {
                 bx.border = [w; 4];
             }
@@ -555,7 +558,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         "border-width" => bx.border = parse_sides(&d.1),
         "border-color" => {
             if let Some(c) = parse_color(&d.1) {
-                bx.bcolor = c;
+                bx.bcolor = Some(c);
             }
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
@@ -565,30 +568,33 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 "border-bottom" => 2,
                 _ => 3,
             };
-            let (w, c) = border_parts(&d.1, bx.bcolor);
+            let (w, c) = border_parts(&d.1);
             if let Some(w) = w {
                 bx.border[side] = w;
             }
-            bx.bcolor = c;
+            if c.is_some() {
+                bx.bcolor = c;
+            }
         }
         _ => {}
     }
     false
 }
 
-/// `border` shorthand value → (width, color). Style words (`solid`,
-/// `dashed`, …) are ignored — everything renders solid (shortcut);
-/// `none` resets the width to 0.
-fn border_parts(v: &str, cur: u32) -> (Option<Len>, u32) {
+/// `border` shorthand value → (width, color); `None` in either slot means
+/// "not specified" (color falls back to currentcolor at paint time).
+/// Style words (`solid`, `dashed`, …) are ignored — everything renders solid
+/// (shortcut); `none` resets the width to 0.
+fn border_parts(v: &str) -> (Option<Len>, Option<u32>) {
     let mut w = None;
-    let mut c = cur;
+    let mut c = None;
     for t in v.split_whitespace() {
         if t.eq_ignore_ascii_case("none") {
             w = Some(Len::Px(0.0));
         } else if let Some(l) = parse_len(t) {
             w = Some(l);
         } else if let Some(col) = parse_color(t) {
-            c = col;
+            c = Some(col);
         }
     }
     (w, c)
@@ -1528,21 +1534,26 @@ mod tests {
         let sheet = parse(
             ".b { border: 1px solid #eaeaea }\
              .t { border: 2px solid red; border-width: 0 0 3px }\
-             .n { border: none }",
+             .n { border: none }\
+             .k { color: #123456; border: 1px solid }",
         );
-        let dom = dom_of(r#"<div class=b></div><div class=t></div><div class=n></div>"#);
+        let dom = dom_of(r#"<div class=b></div><div class=t></div><div class=n></div><div class=k></div>"#);
         let b = sheet.resolve(&dom, by_attr(&dom, "class", "b"), Style::new(), None);
         assert_eq!(b.bx.border, [Len::Px(1.0); 4]);
-        assert_eq!(b.bx.bcolor, 0xeaeaea, "hex color");
+        assert_eq!(b.bx.bcolor, Some(0xeaeaea), "hex color");
         // later border-width overrides the shorthand's side list
         let t = sheet.resolve(&dom, by_attr(&dom, "class", "t"), Style::new(), None);
         assert_eq!(
             t.bx.border,
             [Len::Px(0.0), Len::Px(0.0), Len::Px(3.0), Len::Px(0.0)]
         );
-        assert_eq!(t.bx.bcolor, 0xff0000, "named color kept from shorthand");
+        assert_eq!(t.bx.bcolor, Some(0xff0000), "named color kept from shorthand");
         let n = sheet.resolve(&dom, by_attr(&dom, "class", "n"), Style::new(), None);
         assert_eq!(n.bx.border, [Len::Px(0.0); 4], "border: none resets widths");
+        assert_eq!(n.bx.bcolor, None, "border: none resets color to currentcolor");
+        let k = sheet.resolve(&dom, by_attr(&dom, "class", "k"), Style::new(), None);
+        assert_eq!(k.bx.bcolor, None, "unspecified color stays currentcolor");
+        assert_eq!(k.style.color, 0x123456, "…which is the element's text color");
     }
 }
 
