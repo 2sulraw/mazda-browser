@@ -256,7 +256,7 @@ fn probe_images(n: &mut layout::BoxNode, base: &str, budget: &mut usize) -> (usi
         if *budget == 0 {
             skipped += 1; // stays Pending: declared width/height still reserve space
         } else if let Some(abs) = resolve(base, &src) {
-            match fetch(&abs) {
+            match fetch_image(&abs) {
                 Ok((bytes, _)) => match image::probe(&bytes) {
                     Some((w, h)) => {
                         let px = (w * h) as usize;
@@ -272,7 +272,11 @@ fn probe_images(n: &mut layout::BoxNode, base: &str, budget: &mut usize) -> (usi
                             skipped += 1; // beyond this page's pixel budget
                         }
                     }
-                    None => skipped += 1, // WebP/AVIF/SVG/corrupt
+                    None => {
+                        eprintln!("[img] no size from {abs} ({} bytes, starts {:?})",
+                            bytes.len(), &bytes[..bytes.len().min(12)]);
+                        skipped += 1; // WebP/AVIF/SVG/corrupt
+                    }
                 },
                 Err(e) => {
                     eprintln!("[img] fetch failed {abs}: {e}");
@@ -303,7 +307,7 @@ fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout) -> usiz
             n.w.round().max(1.0) as u32,
             n.h.round().max(1.0) as u32,
         ) {
-            if let Ok((bytes, _)) = fetch(&abs) {
+            if let Ok((bytes, _)) = fetch_image(&abs) {
                 if let Some(full) = image::decode(&bytes) {
                     let img = if full.w > dw || full.h > dh {
                         std::rc::Rc::new(image::downscale(&full, dw, dh))
@@ -449,15 +453,30 @@ fn cache_write_in(
 }
 
 fn fetch(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    fetch_accept(url, None)
+}
+
+/// Fetch an image: content-negotiate for the formats we can decode.
+/// Image proxies (next/image et al.) serve WebP/AVIF when the client
+/// advertises support — omitting them gets the original PNG/JPEG back.
+fn fetch_image(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    fetch_accept(url, Some("image/png, image/jpeg;q=0.9"))
+}
+
+fn fetch_accept(
+    url: &str,
+    accept: Option<&str>,
+) -> Result<(Vec<u8>, Option<String>), String> {
     let dir = cache_dir();
     if let Some(hit) = cache_read_in(&dir, url, now_secs()) {
         eprintln!("[cache] hit {url}");
         return Ok(hit);
     }
-    let resp = ureq::get(url)
-        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)")
-        .call()
-        .map_err(|e| e.to_string())?;
+    let mut req = ureq::get(url).set("User-Agent", "Mazda/0.1 (minimal Rust browser)");
+    if let Some(a) = accept {
+        req = req.set("Accept", a);
+    }
+    let resp = req.call().map_err(|e| e.to_string())?;
     let content_type = resp.header("content-type").map(|s| s.to_string());
     // into_reader transparently gunzips (ureq gzip feature); cap at 20MB like a browser
     const CAP: usize = 20 * 1024 * 1024;
