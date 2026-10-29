@@ -260,6 +260,25 @@ curve matters more than the baseline (near-flat as tabs grow).
   still use generics until a Brotli+woff2 decoder chain lands; no bold/italic
   variants for installed aliases (regular file only); webfont face selection
   is a coarse (weight-range, italic) bucket — no synthesis
+- [x] **form-control chrome** — ~~`<select>` rendered as bare unboxed text and
+  `<input>` rendered nothing at all~~ **DONE: `control_chrome()` fills UA
+  border/background/padding/radius only where the cascade left them initial
+  (author CSS always wins), controls join the surrounding text line
+  (`BoxNode.inline` + line-continuation in `block()`, shrink-to-fit, vertical
+  centering), a closed `<select>` shows ONE line — the selected/first option
+  label + `▼` — options/optgroups never recurse into the flow, `<input>`
+  gets value/placeholder text (password → bullets, hidden skipped,
+  checkbox/radio → 14px box), `<textarea>` its default text, 170px default
+  width for empty text controls. Bonus: hidden option labels are never laid
+  out (rust-lang's language row no longer pulls in the CJK font → ~14 MB,
+  was ~28 MB). Also fixed: `font-family: inherit` (normalize.css ships it
+  on selects) keeps the parent stack instead of interning the word
+  "inherit" as a family. 147 tests; `f80f646` + `346de80`)**
+  Known gap: `multiple`/`size>1` selects and textarea `rows`/`cols` render
+  as the closed single-line control (no popup/listbox widget yet); the
+  arrow is the ▼ text glyph, not theme-drawn art; checkbox/radio have no
+  widget art; author `border:none` can't fully suppress UA chrome
+  (BoxStyle starts from `default()`, no declared-bit — css.rs follow-up)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -314,6 +333,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | font stacks + @font-face webfonts | rust-lang.org | 28.6 MB (517 runs; hero = Alfa Slab One via WOFF1, body Fira Sans; +44 KB webfonts) |
 | 2026-10-30 | font stacks + @font-face webfonts | hackernews | 12.9 MB (786 runs; Verdana via system alias) |
 | 2026-10-30 | font stacks + @font-face webfonts | Wikipedia (Main_Page) | 34.6 MB (1326 runs; pixel-unchanged) |
+| 2026-10-30 | form-control chrome | rust-lang.org | 14.0 MB (483 runs; select = one line, options never laid out → CJK font not pulled) |
 
 ### Phase 1c (Track A) findings
 
