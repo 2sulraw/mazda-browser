@@ -178,6 +178,12 @@ curve matters more than the baseline (near-flat as tabs grow).
   and backslash-escaped commas are literal; before the fix, `.prose :is(h1,h2,
   h3,h4)[id]{position:relative}` minted a bare `h4` rule that matched every
   `<h4>` on nextjs.org and yanked the footer columns to (0,0); 106 tests)**
+- [x] **min-height + flex-column justify** — ~~hero NEXT outline overlapped the
+  nav~~ **DONE (`BoxStyle.min_height` floors a box's content height in `place()`;
+  a flex column with `justify-content: flex-end|center` pushes its stack into the
+  freed space; nextjs.org hero `min-h-[560px] justify-end` now floats the NEXT
+  outline above the pill; 108 tests)**
+  Known gap: `%` min-height resolves against width, not container height
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -222,6 +228,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1k: flex-wrap | nextjs.org | 45.9 MB (572 runs) |
 | 2026-10-29 | Phase 1l: var() custom properties + hsl() | nextjs.org | 45.3 MB (572 runs; pill + themed colors render) |
 | 2026-10-29 | Phase 1m: inline `<svg>` | nextjs.org | 41.9 MB (572 runs; 24 images — hero NEXT + icons) |
+| 2026-10-29 | selector split + min-height fixes | nextjs.org | 42.0 MB (570 runs; hero NEXT floats above pill, footer no longer piled at top-left) |
 
 ### Phase 1c (Track A) findings
 

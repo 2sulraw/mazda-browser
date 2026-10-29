@@ -88,6 +88,9 @@ pub struct BoxStyle {
     pub max_width: Option<Len>,
     /// explicit height — shortcut: only consulted for replaced (`<img>`) boxes
     pub height: Option<Len>,
+    /// `min-height` — floor on the box's content height (hero sections use
+    /// `min-h-[560px]` + `justify-end` to push content to the bottom)
+    pub min_height: Option<Len>,
     pub margin_x_auto: bool,
     /// top, right, bottom, left (CSS shorthand order)
     pub pad: [Len; 4],
@@ -139,6 +142,7 @@ impl Default for BoxStyle {
             width: None,
             max_width: None,
             height: None,
+            min_height: None,
             margin_x_auto: false,
             pad: [Len::Px(0.0); 4],
             margin: [Len::Px(0.0); 4],
@@ -222,6 +226,7 @@ const KNOWN: &[&str] = &[
     "width",
     "max-width",
     "height",
+    "min-height",
     "padding",
     "padding-top",
     "padding-right",
@@ -663,6 +668,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         "grid-template-columns" => bx.cols = parse_tracks(&d.1),
         "width" => bx.width = parse_len(&d.1).filter(|_| d.1 != "auto"),
         "height" => bx.height = parse_len(&d.1).filter(|_| d.1 != "auto"),
+        "min-height" => bx.min_height = parse_len(&d.1).filter(|_| d.1 != "auto"),
         "max-width" => {
             bx.max_width = if d.1 == "none" {
                 None

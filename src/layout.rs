@@ -619,6 +619,33 @@ fn place(
             _ => block(n, measure, runs, uls), // Block / Auto(block tag)
         }
     }
+    // min-height: floor the content height. A flex column with vertical
+    // `justify` pushes its stack into the freed space (hero uses
+    // `min-h-[560px] justify-end` so the NEXT outline floats above the pill).
+    // shortcut: `%` min-height resolves against width, not the container
+    // height (real pages use px here).
+    if let Some(mh) = n.bx.min_height {
+        let min_px = resolve_len(mh, avail);
+        if n.h < min_px {
+            let dy = match (n.bx.display, n.bx.dir, n.bx.justify) {
+                (Display::Flex, Dir::Column, Justify::Center) => (min_px - n.h) * 0.5,
+                (Display::Flex, Dir::Column, Justify::End) => min_px - n.h,
+                _ => 0.0,
+            };
+            if dy != 0.0 {
+                for ch in &mut n.children {
+                    shift_tree(ch, 0.0, dy);
+                }
+                for r in &mut runs[run0..] {
+                    r.y += dy;
+                }
+                for u in &mut uls[ul0..] {
+                    u.1 += dy;
+                }
+            }
+            n.h = min_px;
+        }
+    }
     // restore border-box coords; height includes vertical padding + borders
     n.h += pt + pb + bt + bb;
     n.x = bx0;
@@ -1525,6 +1552,69 @@ mod tests {
         );
         n.children = children;
         n
+    }
+
+    fn flex_col(children: Vec<BoxNode>, bx: BoxStyle) -> BoxNode {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Column,
+                ..bx
+            },
+        );
+        n.children = children;
+        n
+    }
+
+    #[test]
+    fn min_height_flex_col_justify_end_pushes_content_down() {
+        // hero: `min-h-[560px] flex-col justify-end` — a short stack is pushed
+        // to the bottom of the 560px box (the NEXT outline floats above it)
+        let mut root = flex_col(
+            vec![leaf("pill")],
+            BoxStyle {
+                min_height: Some(Len::Px(560.0)),
+                justify: Justify::End,
+                ..BoxStyle::default()
+            },
+        );
+        let l = layout_tree(&mut root, 200.0, &m4);
+        assert_eq!(root.h, 560.0, "box floors to min-height");
+        assert_eq!(l.runs.len(), 1);
+        // text is pushed to the bottom of the 560px box (not left at the top)
+        assert!(l.runs[0].y > 500.0, "y={} should be near the bottom", l.runs[0].y);
+        assert!(l.runs[0].y < 560.0, "y={} within the box", l.runs[0].y);
+    }
+
+    #[test]
+    fn min_height_shorter_content_unchanged() {
+        // content already taller than min-height → no shift, height stays
+        // (boxed children: adjacent text leaves merge into one anonymous item)
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut root = flex_col(
+            vec![boxed("a"), boxed("b"), boxed("c")],
+            BoxStyle {
+                min_height: Some(Len::Px(20.0)),
+                justify: Justify::End,
+                ..BoxStyle::default()
+            },
+        );
+        let l = layout_tree(&mut root, 200.0, &m4);
+        // 3 lines at default 15px × 1.35 line-height
+        let content_h = 3.0 * 15.0 * 1.35;
+        assert!((root.h - content_h).abs() < 0.01, "h={} content={}", root.h, content_h);
+        assert_eq!(l.runs[0].y, 0.0, "first line stays at top");
     }
 
     #[test]
