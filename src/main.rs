@@ -7,7 +7,7 @@ mod layout;
 mod svg;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
-use layout::{Layout, Style};
+use layout::{Fam, Layout, Style};
 use minifb::{Key, KeyRepeat, MouseButton, Window, WindowOptions};
 
 const PADDING: usize = 12;
@@ -521,6 +521,8 @@ struct Fonts {
     bold: std::sync::OnceLock<FontVec>,
     italic: std::sync::OnceLock<FontVec>,
     mono: std::sync::OnceLock<FontVec>,
+    /// serif family (Georgia etc.); lazy — only when CSS asks for it
+    serif: std::sync::OnceLock<FontVec>,
     /// CJK (Chinese + kana) fallback; only loaded when a glyph is missing
     cjk: std::sync::OnceLock<Option<FontVec>>,
     /// Hangul fallback, same laziness
@@ -551,15 +553,21 @@ impl Fonts {
             bold: std::sync::OnceLock::new(),
             italic: std::sync::OnceLock::new(),
             mono: std::sync::OnceLock::new(),
+            serif: std::sync::OnceLock::new(),
             cjk: std::sync::OnceLock::new(),
             hangul: std::sync::OnceLock::new(),
         }
     }
 
     fn pick(&self, s: &Style) -> &FontVec {
-        if s.mono {
+        if s.fam == Fam::Mono {
             self.mono.get_or_init(|| {
                 load_font(&[r"C:\Windows\Fonts\consola.ttf", r"C:\Windows\Fonts\cour.ttf"])
+            })
+        } else if s.fam == Fam::Serif {
+            // Georgia ships regular/bold/italic/bold-italic on every Windows
+            self.serif.get_or_init(|| {
+                load_font(&[r"C:\Windows\Fonts\georgia.ttf", r"C:\Windows\Fonts\times.ttf"])
             })
         } else if s.bold && s.italic {
             &self.regular // no segoui-bi fallback; shortcut: faux-skip

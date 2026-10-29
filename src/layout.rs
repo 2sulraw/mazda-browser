@@ -6,6 +6,15 @@ use crate::css::{Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track}
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
 
+/// Resolved generic font family (CSS `font-family` stack → first known
+/// generic; unknown names are skipped, default = Sans).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Fam {
+    Sans,
+    Serif,
+    Mono,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct Style {
     pub size: f32,
@@ -13,7 +22,7 @@ pub struct Style {
     pub italic: bool,
     pub color: u32,
     pub underline: bool,
-    pub mono: bool,
+    pub fam: Fam,
     /// 0 = left, 1 = center, 2 = right (inherited, text-align)
     pub text_align: u8,
     /// line-height in px; 0 = default (size * 1.35) — inherited
@@ -28,7 +37,7 @@ impl Style {
             italic: false,
             color: 0x00_e8_e8_e8,
             underline: false,
-            mono: false,
+            fam: Fam::Sans,
             text_align: 0,
             lh: 0.0,
         }
@@ -83,7 +92,7 @@ fn style_for(tag: &str, base: Style) -> Style {
         "i" | "em" | "cite" | "var" => s.italic = true,
         "u" | "ins" => s.underline = true,
         "code" | "kbd" | "samp" | "pre" | "tt" => {
-            s.mono = true;
+            s.fam = Fam::Mono;
             s.size = base.size - 1.0;
         }
         "a" => {

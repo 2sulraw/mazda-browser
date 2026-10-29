@@ -130,6 +130,16 @@ curve matters more than the baseline (near-flat as tabs grow).
   renders with elevation shadows)**.
   Known gaps: `inset` (inner) shadows dropped, no shadow-per-side, blur is a
   smoothstep approximation of the gaussian (not separable-blurred)
+- [x] **Phase 1j** — font-family stack: ~~bool mono~~ **DONE (`Fam {Sans,
+  Serif, Mono}` on Style; `font-family` walks the comma stack, first
+  recognized generic wins — mono/courier/consol/menlo/monaco/code → Mono,
+  sans/arial/helvetica → Sans (checked before `serif` so `sans-serif`
+  doesn't misread), georgia/times/garamond/palatino/cambria/constantia →
+  Serif; lazy Georgia load in Fonts; unknown webfonts fall through to Sans;
+  96 tests)**.
+  Known gaps: no bold/italic serif faces (regular Georgia only), no per-stack
+  real-font matching (Arial/Verdana/Helvetica all → default sans), no
+  generic `ui-rounded`/`system-ui` distinction
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -170,6 +180,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1g: borders (strips/ring paint) | nextjs.org | 45.2 MB |
 | 2026-10-29 | Phase 1h: position relative/absolute/fixed | nextjs.org | 48.2 MB (572 runs; positioned nav/footer) |
 | 2026-10-29 | Phase 1i: box-shadow | nextjs.org | 45.6 MB (572 runs; 8 images) |
+| 2026-10-29 | Phase 1j: font-family stacks (serif) | nextjs.org/docs (redirect) | 78.2 MB (2698 runs; docs page, much larger than homepage) |
 
 ### Phase 1c (Track A) findings
 

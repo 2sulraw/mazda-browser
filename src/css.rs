@@ -7,7 +7,7 @@
 //! consumes it. Upgrade when the CSS engine grows (Phase 1c+).
 
 use crate::html::Dom;
-use crate::layout::Style;
+use crate::layout::{Fam, Style};
 
 pub type Decl = (String, String);
 
@@ -460,7 +460,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
             }
         }
         "font-style" => style.italic = matches!(d.1.as_str(), "italic" | "oblique"),
-        "font-family" => style.mono = d.1.contains("mono") || d.1.contains("courier"),
+        "font-family" => style.fam = parse_fam(&d.1),
         "text-decoration" => style.underline = d.1.contains("underline"),
         "line-height" => {
             // unitless = multiplier of font-size; px/rem/% absolute (of size)
@@ -860,6 +860,40 @@ fn parse_color(v: &str) -> Option<u32> {
         "pink" => Some(0xffc0cb),
         _ => None, // transparent, currentColor, var(), url() …
     }
+}
+
+/// `font-family` stack → first recognized generic family. Walks the list in
+/// order (CSS picks the first available font); unquoted multi-word names are
+/// matched by keyword. Unknown webfonts/sans stacks → Sans.
+fn parse_fam(v: &str) -> Fam {
+    for name in v.split(',') {
+        let n = name.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+        // mono before serif: "SFMono-Regular" etc. contain neither, but be safe
+        if n.contains("mono")
+            || n.contains("courier")
+            || n.contains("consol")
+            || n.contains("menlo")
+            || n.contains("monaco")
+            || n.contains("code")
+        {
+            return Fam::Mono;
+        }
+        // `sans-serif` also contains "serif" — check the negative first
+        if n.contains("sans") || n.contains("arial") || n.contains("helvetica") {
+            return Fam::Sans;
+        }
+        if n.contains("serif")
+            || n.contains("georgia")
+            || n.contains("times")
+            || n.contains("garamond")
+            || n.contains("palatino")
+            || n.contains("cambria")
+            || n.contains("constantia")
+        {
+            return Fam::Serif;
+        }
+    }
+    Fam::Sans
 }
 
 /// Like [`parse_color`] but keeps alpha — shadows need real opacity
@@ -1478,7 +1512,29 @@ mod tests {
         let dom = dom_of("<p></p>");
         let s = style_for_tag(&sheet, &dom, "p");
         assert_eq!(s.size, 30.0); // 2em of 15px default
-        assert!(s.bold && s.italic && s.mono && s.underline);
+        assert!(s.bold && s.italic && s.fam == Fam::Mono && s.underline);
+    }
+
+    #[test]
+    fn font_family_stack_resolves_to_generic() {
+        let sheet = parse(
+            ".a { font-family: Georgia, 'Times New Roman', serif } \
+             .b { font-family: 'Helvetica Neue', Arial, sans-serif } \
+             .c { font-family: 'Fira Code', Menlo, monospace } \
+             .d { font-family: Inter, system-ui, sans-serif }",
+        );
+        let dom = dom_of(
+            r#"<div class=a></div><div class=b></div><div class=c></div><div class=d></div>"#,
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        assert_eq!(get("a").fam, Fam::Serif, "georgia keyword");
+        assert_eq!(get("b").fam, Fam::Sans, "helvetica keyword");
+        assert_eq!(get("c").fam, Fam::Mono, "menlo keyword before generic");
+        assert_eq!(get("d").fam, Fam::Sans, "unknown webfonts fall through to sans");
+        // sans-serif must not be misread as serif
+        assert_eq!(parse_fam("sans-serif"), Fam::Sans);
+        assert_eq!(parse_fam("serif"), Fam::Serif);
+        assert_eq!(parse_fam("ui-monospace"), Fam::Mono);
     }
 
     #[test]
