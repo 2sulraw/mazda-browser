@@ -223,6 +223,25 @@ curve matters more than the baseline (near-flat as tabs grow).
   MDN / nextjs / HN identical (no regression); 117 tests)**
   Known gap: a single comma-rule that matches twice still runs both selector arms
   (harmless now that font-size replaces, but other properties still double-apply)
+- [x] **color-scheme + light-dark() + @supports** — ~~MDN rendered light while the
+  reference renders dark (its `color-scheme: light dark` + `light-dark()` colours
+  were dead)~~ **DONE: `PREFERS_DARK` global feeds `media_feature`
+  (`prefers-color-scheme: dark|light`), `used_scheme(declared, root_pol,
+  PREFERS_DARK)` resolves each element's scheme (own decl → inherited ancestor →
+  root theme → OS pref), and `light-dark(a,b)` picks the branch in colour-bearing
+  arms; `@supports` now evaluates for real (`supports_matches`: top-level
+  not/and/or, `property:value` knownness from `KNOWN`) so native branches are
+  entered and `@supports not` polyfills skipped. Follow-up fix: Wikipedia's
+  `@media(prefers-color-scheme:dark)` OS-palette vars (selector
+  `html…clientpref-os`, polarity-neutral) were winning the flat var map on its
+  day root — `scope_vars` now lets any definition whose selector *actually applies
+  to the real `<html>` element* outrank other scopes (gated on a root-declared
+  theme, so nextjs/MDN JS-era behaviour is unchanged). Verified: MDN dark =
+  reference, Wikipedia fully light, HN normal; 126 tests; `cc7db81`)**
+  Known gap: `light-dark()`/`color-scheme` only affect colour arms (border,
+  box-shadow included); `outline-color` unsupported entirely; `@supports`
+  `property:value` tests property knownness only (a value we can't parse is
+  still claimed supported — benign: those decls no-op)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -272,6 +291,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | UA-white + cross-site fixes | Wikipedia (Main_Page) | 34.4 MB (1326 runs; heading size fixed) |
 | 2026-10-29 | font-size replace-against-parent cascade | Wikipedia (Main_Page) | 34.5 MB (1326 runs; h1 ~32px, full featured page) |
 | 2026-10-29 | font-size replace-against-parent cascade | nextjs.org | 43.2 MB (570 runs; dark, no regression) |
+| 2026-10-30 | color-scheme + light-dark + @supports | MDN | 26.3 MB (623 runs; dark = reference) |
+| 2026-10-30 | color-scheme + light-dark + @supports (incl. scope_vars root-def fix) | Wikipedia (Main_Page) | 34.7 MB (1326 runs; fully light again) |
 
 ### Phase 1c (Track A) findings
 
