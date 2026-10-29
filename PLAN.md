@@ -162,6 +162,17 @@ curve matters more than the baseline (near-flat as tabs grow).
   Known gaps: flat page-wide var map (no per-element cascade/inheritance,
   `:root` vs `.dark` resolved by sheet order only), inline `style="--x:…"`
   custom props ignored, no `lab()`/`color()` colors
+- [x] **Phase 1m** — inline `<svg>`: ~~dropped (NON_RENDERED)~~ **DONE
+  (`svg` joins RAW_TEXT — parser keeps raw inner markup as a text child;
+  `build()` reassembles `<svg attrs>…</svg>`, substitutes `currentColor`
+  with the cascaded color, feeds it through the existing ImgSlot pipeline
+  (markup-as-src, no URL fetch); svg.rs `get_attr` case-insensitive since
+  the HTML parser lowercases attr keys; 103 tests)** — nextjs.org hero
+  NEXT outline + pill copy icon + nav logos now rasterize (24 images, up
+  from 8).
+  Known gaps: nested `<svg>` inside `<svg>` truncates at the first close
+  tag, `<foreignObject>` not skipped, `currentColor` substitution is
+  string-level (nested CSS custom props inside the SVG ignored)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -205,6 +216,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1j: font-family stacks (serif) | nextjs.org/docs (redirect) | 78.2 MB (2698 runs; docs page, much larger than homepage) |
 | 2026-10-29 | Phase 1k: flex-wrap | nextjs.org | 45.9 MB (572 runs) |
 | 2026-10-29 | Phase 1l: var() custom properties + hsl() | nextjs.org | 45.3 MB (572 runs; pill + themed colors render) |
+| 2026-10-29 | Phase 1m: inline `<svg>` | nextjs.org | 41.9 MB (572 runs; 24 images — hero NEXT + icons) |
 
 ### Phase 1c (Track A) findings
 

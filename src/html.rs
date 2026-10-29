@@ -21,7 +21,7 @@ const VOID: &[&str] = &[
 ];
 
 /// Elements whose content is raw text (no tags inside).
-const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title"];
+const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title", "svg"];
 
 /// Interned tag name: `u16` index into `Dom::tags` instead of a per-node String.
 #[derive(Copy, Clone, PartialEq, Eq)]

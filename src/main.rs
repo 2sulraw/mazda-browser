@@ -258,7 +258,20 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
     let mut skipped = 0usize;
     if let Some(layout::ImgSlot::Pending(src)) = &n.img {
         let src = src.to_string();
-        if let Some(abs) = resolve(base, &src) {
+        if src.starts_with('<') {
+            // inline <svg> markup (no fetch) — probe intrinsic size directly
+            match svg::probe(src.as_bytes()) {
+                Some((w, h)) => {
+                    probed += 1;
+                    n.img = Some(layout::ImgSlot::Probed {
+                        src: std::rc::Rc::from(src.as_str()),
+                        w,
+                        h,
+                    });
+                }
+                None => skipped += 1,
+            }
+        } else if let Some(abs) = resolve(base, &src) {
             match fetch_image(&abs) {
                 Ok((bytes, _)) => match image::probe(&bytes).or_else(|| svg::probe(&bytes)) {
                     Some((w, h)) => {
@@ -308,33 +321,34 @@ fn decode_images(
     let mut count = 0usize;
     if let Some(layout::ImgSlot::Probed { src, .. }) = &n.img {
         let src = src.to_string();
-        if let (Some(abs), dw, dh) = (
-            resolve(base, &src),
-            n.w.round().max(1.0) as u32,
-            n.h.round().max(1.0) as u32,
-        ) {
-            let px = (dw as usize) * (dh as usize);
-            if px > *budget {
-                // over budget: keep dims, skip pixels
+        let inline = src.starts_with('<'); // inline <svg> markup — no URL
+        let dw = n.w.round().max(1.0) as u32;
+        let dh = n.h.round().max(1.0) as u32;
+        let px = (dw as usize) * (dh as usize);
+        if px <= *budget {
+            let bytes = if inline {
+                Some(src.clone().into_bytes())
             } else {
+                resolve(base, &src)
+                    .and_then(|abs| fetch_image(&abs).ok().map(|(b, _)| b))
+            };
+            if let Some(bytes) = bytes {
                 *budget -= px;
-                if let Ok((bytes, _)) = fetch_image(&abs) {
-                    // raster: decode then resample; svg: rasterize straight at
-                    // display size (vector, no full-size buffer ever exists)
-                    let img = image::decode(&bytes)
-                        .map(|full| {
-                            if full.w > dw || full.h > dh {
-                                image::downscale(&full, dw, dh)
-                            } else {
-                                full
-                            }
-                        })
-                        .or_else(|| svg::render(&bytes, dw, dh));
-                    if let Some(img) = img {
-                        laid.images
-                            .push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img), fixed));
-                        count += 1;
-                    }
+                // raster: decode then resample; svg: rasterize straight at
+                // display size (vector, no full-size buffer ever exists)
+                let img = image::decode(&bytes)
+                    .map(|full| {
+                        if full.w > dw || full.h > dh {
+                            image::downscale(&full, dw, dh)
+                        } else {
+                            full
+                        }
+                    })
+                    .or_else(|| svg::render(&bytes, dw, dh));
+                if let Some(img) = img {
+                    laid.images
+                        .push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img), fixed));
+                    count += 1;
                 }
             }
         }

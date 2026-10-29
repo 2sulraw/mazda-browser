@@ -210,7 +210,7 @@ impl BoxNode {
 /// Elements whose content is never rendered (also covers `<style>`/`<script>`
 /// that appear inside body — head is already excluded by `body_root`).
 const NON_RENDERED: &[&str] = &[
-    "script", "style", "noscript", "template", "head", "title", "meta", "link", "svg",
+    "script", "style", "noscript", "template", "head", "title", "meta", "link",
 ];
 
 /// Build the box tree for `node`'s subtree. `style`/`bx` are the cascade
@@ -271,6 +271,41 @@ fn build_into(
                     if let Some(src) = dom.attr(child, "src").filter(|s| !s.is_empty()) {
                         g.img = Some(ImgSlot::Pending(std::rc::Rc::from(src)));
                     }
+                    out.push(g);
+                    continue;
+                }
+                if tag == "svg" {
+                    // inline <svg>: the parser kept the raw inner markup as a
+                    // text child (svg is RAW_TEXT). Reassemble the full
+                    // `<svg attrs>…</svg>` and hand it to the shared image
+                    // pipeline (ImgSlot::Pending holding markup, not a URL).
+                    let mut markup = String::from("<svg");
+                    if let NodeKind::Element(_, attrs) = &dom.nodes[child as usize].kind {
+                        for (k, v) in attrs.iter() {
+                            markup.push_str(&format!(" {k}=\"{}\"", v.replace('"', "&quot;")));
+                        }
+                    }
+                    markup.push('>');
+                    for &gc in &dom.nodes[child as usize].children {
+                        if let NodeKind::Text(t) = &dom.nodes[gc as usize].kind {
+                            markup.push_str(t);
+                        }
+                    }
+                    markup.push_str("</svg>");
+                    // currentColor = the element's cascaded color (class
+                    // rules like .text-next-blue already resolved via var())
+                    let hex = format!("#{:06x}", outcome.style.color & 0x00ff_ffff);
+                    let markup = markup
+                        .replace("currentColor", &hex)
+                        .replace("currentcolor", &hex);
+                    let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    if g.bx.width.is_none() {
+                        g.bx.width = dom.attr(child, "width").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
+                    }
+                    if g.bx.height.is_none() {
+                        g.bx.height = dom.attr(child, "height").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
+                    }
+                    g.img = Some(ImgSlot::Pending(std::rc::Rc::from(markup)));
                     out.push(g);
                     continue;
                 }
@@ -2036,6 +2071,31 @@ mod tests {
         });
         layout_tree(&mut n, 300.0, &m4);
         assert!((n.h - 80.0).abs() < 0.01, "h={}", n.h);
+    }
+
+    #[test]
+    fn inline_svg_becomes_img_box_with_raw_markup() {
+        // <svg> is RAW_TEXT in the parser; build() must reassemble the full
+        // markup into an ImgSlot so the image pipeline rasterizes it
+        let dom = crate::html::parse(
+            r#"<body><svg viewBox="0 0 10 20" width="10" height="20"><path d="M0 0h10"/></svg></body>"#,
+        );
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &crate::css::parse(""));
+        fn find_svg(n: &BoxNode) -> Option<&ImgSlot> {
+            if n.img.is_some() {
+                return n.img.as_ref();
+            }
+            n.children.iter().find_map(find_svg)
+        }
+        let Some(ImgSlot::Pending(src)) = find_svg(&root) else {
+            panic!("svg should produce a pending img slot");
+        };
+        assert!(src.starts_with("<svg"), "markup starts with root tag: {src:?}");
+        // the HTML parser lowercases attr keys; svg.rs get_attr is
+        // case-insensitive to match
+        assert!(src.contains("viewbox=\"0 0 10 20\""), "attrs kept: {src:?}");
+        assert!(src.contains("<path d=\"M0 0h10\"/>"), "inner markup kept: {src:?}");
+        assert!(src.ends_with("</svg>"), "closed: {src:?}");
     }
 
     #[test]

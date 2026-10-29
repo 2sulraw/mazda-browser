@@ -251,7 +251,7 @@ fn get_attr<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
                 (&after[..end], &after[end..])
             }
         };
-        if name == key {
+        if name.eq_ignore_ascii_case(key) {
             return Some(val);
         }
         rest = tail;
