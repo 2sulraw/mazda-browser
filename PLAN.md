@@ -173,6 +173,11 @@ curve matters more than the baseline (near-flat as tabs grow).
   Known gaps: nested `<svg>` inside `<svg>` truncates at the first close
   tag, `<foreignObject>` not skipped, `currentColor` substitution is
   string-level (nested CSS custom props inside the SVG ignored)
+- [x] **Selector-list split fix** — ~~footer/nav text piled at top-left~~ **DONE
+  (`split_selectors` replaces `sel_text.split(',')`: commas inside `(...)`/`[...]`
+  and backslash-escaped commas are literal; before the fix, `.prose :is(h1,h2,
+  h3,h4)[id]{position:relative}` minted a bare `h4` rule that matched every
+  `<h4>` on nextjs.org and yanked the footer columns to (0,0); 106 tests)**
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study

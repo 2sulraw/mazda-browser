@@ -313,7 +313,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                 i = cb + 1;
                 continue;
             }
-            for sel in sel_text.split(',') {
+            for sel in split_selectors(sel_text) {
                 if let Some(segs) = parse_selector(sel) {
                     let spec = spec_of(&segs);
                     rules.push(Rule {
@@ -367,6 +367,33 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
     } else {
         skip_at_rule(s, at)
     }
+}
+
+/// Split a selector list on top-level commas only: commas inside `(...)`
+/// (`:is(h1,h2)`) or preceded by a backslash (`\,` in escaped class names)
+/// are literal. shortcut: nesting depth beyond one level isn't tracked —
+/// real stylesheets don't nest deeper than `:is(:is(...))`.
+fn split_selectors(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0u32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1, // escaped char — next byte is literal
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
 }
 
 /// Index of the `}` matching the `{` at `open` (quote-aware); None if open.
@@ -1631,6 +1658,18 @@ mod tests {
     }
 
     #[test]
+    fn opacity_zero_drawer_is_hidden() {
+        // real nextjs.org mobile-menu drawer: fixed + opacity-0 via Tailwind
+        let sheet = parse(
+            ".fixed{position:fixed} .opacity-0{opacity:0} .inset-x-0{left:0;right:0} \
+             .top-16{top:4rem} .bottom-0{bottom:0} .z-40{z-index:40}",
+        );
+        let dom = dom_of(r#"<div class="fixed inset-x-0 top-16 bottom-0 z-40 opacity-0"></div>"#);
+        let out = sheet.resolve(&dom, by_attr(&dom, "class", "fixed inset-x-0 top-16 bottom-0 z-40 opacity-0"), Style::new(), None);
+        assert!(out.display_none, "opacity-0 drawer must be hidden");
+    }
+
+    #[test]
     fn visibility_hidden_hides_subtree() {
         // sites hide measurement clones with `visibility: invisible/hidden`
         // (Tailwind `.invisible`); shortcut: treated as display:none
@@ -1738,6 +1777,32 @@ mod tests {
         let sheet = parse(".btn.primary { color: #111111 }");
         let dom = dom_of(r#"<div class="btn big primary"></div>"#);
         assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0x111111);
+    }
+
+    #[test]
+    fn selector_list_commas_inside_functions_stay_unsplit() {
+        // Tailwind prose: splitting on every ',' minted a bare `h4` rule that
+        // matched every <h4> and fought over its `position`
+        let sheet = parse(
+            ".prose :is(h1,h2,h3,h4)[id]{position:relative} \
+             .\\[\\&_h4\\]\\:relative h4{position:absolute} \
+             .ok, .fine{color:red}",
+        );
+        let dom = dom_of(r#"<h4 class=other>x</h4><h4 id=q>x</h4><div class="ok fine">y</div><div class=ok>z</div><div class=fine>w</div>"#);
+        let plain = by_attr(&dom, "class", "other");
+        assert!(
+            sheet.resolve(&dom, plain, Style::new(), None).bx.pos == crate::css::Pos::Static,
+            "bare h4 must not inherit position from :is(h1,h2,h3,h4)"
+        );
+        // top-level comma split still works
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "class", "ok"), Style::new(), None).style.color,
+            0xff0000
+        );
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "class", "fine"), Style::new(), None).style.color,
+            0xff0000
+        );
     }
 
     #[test]
