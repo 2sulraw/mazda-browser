@@ -13,6 +13,9 @@ encoding_rs = "0.8.42"
 # image codecs (pure Rust; not engine code)
 png = "0.17"
 jpeg-decoder = { version = "0.3", default-features = false }
+# zlib inflate for WOFF1 font containers (pure Rust miniz_oxide backend;
+# already in the tree via png+ureq, so no new crates to build)
+flate2 = "1"
 
 [profile.release]
 opt-level = "s"

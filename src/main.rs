@@ -5,6 +5,7 @@ mod html;
 mod image;
 mod layout;
 mod svg;
+mod woff;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
 use layout::{Fam, Layout, Style};

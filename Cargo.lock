@@ -493,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "encoding_rs",
+ "flate2",
  "jpeg-decoder",
  "minifb",
  "png",
