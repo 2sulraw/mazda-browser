@@ -44,3 +44,7 @@ target\release\mazda.exe https://example.com/
 
 See [PLAN.md](PLAN.md) for the frozen architecture plan, phase status,
 measurements, and known gaps.
+
+## License
+
+[MIT](LICENSE)
