@@ -30,6 +30,9 @@ pub struct Style {
     /// `white-space: nowrap` — never wrap to a new line (truncate/ellipsis
     /// buttons, single-line labels)
     pub nowrap: bool,
+    /// interned id of the full `font-family` comma stack (0 = none → generic
+    /// pick); the names live in the shared table Fonts reads at pick time
+    pub fam_stack: u16,
 }
 
 impl Style {
@@ -44,6 +47,7 @@ impl Style {
             text_align: 0,
             lh: 0.0,
             nowrap: false,
+            fam_stack: 0,
         }
     }
 

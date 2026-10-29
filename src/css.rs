@@ -202,11 +202,144 @@ pub struct Sheet {
     /// `scope_vars` — fallback for elements with no declared `color-scheme`.
     /// None until `scope_vars` runs (then the system preference decides).
     root_pol: Option<bool>,
+    /// shared font-family stack interner (the loader injects its table via
+    /// `set_stacks` so the font picker reads the same Vec). None in tests →
+    /// `Style::fam_stack` stays 0 = generic pick, the pre-wiring behaviour.
+    stacks: Option<StackTable>,
+}
+
+/// Interned `font-family` comma stacks: the cascade assigns each distinct
+/// value a `Style::fam_stack` id as it resolves; the font picker reads the
+/// names back at measure/draw time. Rc: layout is single-threaded.
+pub type StackTable = std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>;
+
+/// One `@font-face` block. Family is lowercased (matching is case-insensitive);
+/// src URLs keep their original case (paths may be case-sensitive).
+pub struct FontFace {
+    pub family: String,
+    /// absolute URLs in declared order — first one we can fetch+decode wins
+    pub srcs: Vec<String>,
+    /// weight range (`400 700` variable faces); both 400 for a single weight
+    pub wmin: u16,
+    pub wmax: u16,
+    pub italic: bool,
+}
+
+/// Every `@font-face` definition in one stylesheet, with `src` URLs resolved
+/// against that sheet's own URL (`base`). The loader calls this per-sheet
+/// BEFORE concatenating text for `parse_for`, which would lose each base URL.
+/// The blocks themselves are still skipped by the main parse (no rules inside).
+pub fn collect_font_faces(text: &str, base: &str) -> Vec<FontFace> {
+    let s = strip_comments(text);
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(at) = s[i..].find("@font-face") {
+        let start = i + at;
+        let Some(ob) = s[start..].find('{') else { break };
+        let Some(cb) = match_brace(b, start + ob) else { break };
+        if let Some(f) = parse_font_face(&s[start + ob + 1..cb], base) {
+            out.push(f);
+        }
+        i = cb + 1;
+    }
+    out
+}
+
+/// Scan one `@font-face` block body (raw — NOT `parse_decls`, which lowercases
+/// values and src paths can be case-sensitive).
+fn parse_font_face(block: &str, base: &str) -> Option<FontFace> {
+    let mut family = String::new();
+    let mut srcs = Vec::new();
+    let (mut wmin, mut wmax) = (400u16, 400u16);
+    let mut italic = false;
+    for raw in block.split(';') {
+        let Some(colon) = raw.find(':') else { continue };
+        let prop = raw[..colon].trim().to_ascii_lowercase();
+        let val = raw[colon + 1..].trim();
+        match prop.as_str() {
+            "font-family" => {
+                family = val.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase()
+            }
+            "font-style" => italic = val.starts_with("italic") || val.starts_with("oblique"),
+            // single weight (`400`) or variable range (`100 900`)
+            "font-weight" => {
+                let mut it = val.split_whitespace().filter_map(|t| t.parse::<u16>().ok());
+                wmin = it.next()?;
+                wmax = it.next().unwrap_or(wmin);
+            }
+            // url(...) sources in declared order; local(...) skipped (we can't
+            // query installed-font names) — the URL fallbacks follow anyway
+            "src" => {
+                let mut rest = val;
+                while let Some(u) = rest.find("url(") {
+                    let after = &rest[u + 4..];
+                    let Some(end) = after.find(')') else { break };
+                    let target = after[..end].trim().trim_matches(|c| c == '"' || c == '\'');
+                    // join (not the page resolver): font assets may be
+                    // same-document/fragment-free absolute URLs already
+                    let abs = url::Url::parse(base)
+                        .and_then(|b| b.join(target))
+                        .map(|j| j.to_string())
+                        .unwrap_or_else(|_| target.to_string());
+                    srcs.push(abs);
+                    rest = &after[end + 1..];
+                }
+            }
+            _ => {}
+        }
+    }
+    if family.is_empty() || srcs.is_empty() {
+        return None;
+    }
+    Some(FontFace {
+        family,
+        srcs,
+        wmin,
+        wmax,
+        italic,
+    })
 }
 
 impl Sheet {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Wire the loader's shared stack table so `Style::fam_stack` ids resolved
+    /// during layout index the same Vec the font picker reads back.
+    pub fn set_stacks(&mut self, t: StackTable) {
+        self.stacks = Some(t);
+    }
+
+    /// Id of this font-family value's comma stack in the shared table
+    /// (0 = "no stack" → generic pick). Repeated values share one id.
+    fn intern_stack(&self, v: &str) -> u16 {
+        let Some(t) = &self.stacks else { return 0 };
+        let names: Vec<String> = v
+            .split(',')
+            .map(|n| n.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
+            .filter(|n| !n.is_empty())
+            .collect();
+        if names.is_empty() {
+            return 0;
+        }
+        let mut tab = t.borrow_mut();
+        if let Some(id) = tab.iter().position(|s| s == &names) {
+            return id as u16;
+        }
+        tab.push(names);
+        (tab.len() - 1) as u16
+    }
+
+    /// Interned stack id for one (var-substituted) declaration — only
+    /// `font-family` has one; everything else costs just the string compare.
+    fn fam_stack_of(&self, d: &Decl) -> u16 {
+        if d.0 == "font-family" {
+            self.intern_stack(&d.1)
+        } else {
+            0
+        }
     }
 
     /// Drop custom-property definitions whose selector asserts a theme state the
@@ -448,6 +581,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         vars,
         var_defs,
         root_pol: None,
+        stacks: None,
     }
 }
 
@@ -584,7 +718,9 @@ impl Sheet {
                 continue;
             }
             for d in &rule.decls {
-                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size, dark) {
+                let sd = self.subst(d);
+                let fs = self.fam_stack_of(&sd);
+                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, dark, fs) {
                     display_none = true;
                 }
             }
@@ -592,7 +728,9 @@ impl Sheet {
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
-                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size, dark) {
+                let sd = self.subst(d);
+                let fs = self.fam_stack_of(&sd);
+                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, dark, fs) {
                     display_none = true;
                 }
             }
@@ -793,6 +931,8 @@ fn apply_decl(
     bx: &mut BoxStyle,
     parent: f32,
     dark: bool,
+    // interned font-family stack id for this decl (from the shared table)
+    fam_stack: u16,
 ) -> bool {
     match d.0.as_str() {
         "color" => {
@@ -835,7 +975,10 @@ fn apply_decl(
             }
         }
         "font-style" => style.italic = matches!(d.1.as_str(), "italic" | "oblique"),
-        "font-family" => style.fam = parse_fam(&d.1),
+        "font-family" => {
+            style.fam = parse_fam(&d.1);
+            style.fam_stack = fam_stack;
+        }
         "text-decoration" => style.underline = d.1.contains("underline"),
         "line-height" => {
             // unitless = multiplier of font-size; px/rem/% absolute (of size)
@@ -2943,6 +3086,82 @@ mod tests {
         let sheet = parse("p { color: var(--missing, light-dark(#222222, #333333)) }");
         let dom = dom_of("<p></p>");
         assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0x333333);
+    }
+
+    #[test]
+    fn font_face_rules_are_collected() {
+        // shape of rust-lang's fonts.css: woff2 first, WOFF1 fallback after
+        let faces = collect_font_faces(
+            "@font-face { font-family: \"Alfa Slab One\"; \
+             src: url(/static/woff2/A.woff2) format(\"woff2\"), \
+             url(/static/woff/A.woff) format(\"woff\"); \
+             unicode-range: U+0000-00FF; font-weight: 400 }",
+            "https://x.org/static/styles/fonts.css",
+        );
+        assert_eq!(faces.len(), 1);
+        let f = &faces[0];
+        assert_eq!(f.family, "alfa slab one"); // lowercased for matching
+        assert_eq!(
+            f.srcs,
+            [
+                "https://x.org/static/woff2/A.woff2".to_string(),
+                "https://x.org/static/woff/A.woff".to_string()
+            ],
+            "src order preserved, resolved against the SHEET's URL"
+        );
+        assert_eq!((f.wmin, f.wmax, f.italic), (400, 400, false));
+    }
+
+    #[test]
+    fn font_face_src_urls_keep_case() {
+        // paths may be case-sensitive — never lowercased (unlike parse_decls)
+        let faces = collect_font_faces(
+            "@font-face{font-family:X;src:url(/MIXedCase/Font.WoFF)}",
+            "https://x.org/",
+        );
+        assert_eq!(faces[0].srcs, ["https://x.org/MIXedCase/Font.WoFF"]);
+    }
+
+    #[test]
+    fn font_face_variable_weight_range_and_italic() {
+        let faces = collect_font_faces(
+            "@font-face{font-family:Inter;src:url(a.woff2);font-weight:100 900;font-style:italic}",
+            "https://x.org/",
+        );
+        assert_eq!((faces[0].wmin, faces[0].wmax, faces[0].italic), (100, 900, true));
+    }
+
+    #[test]
+    fn font_face_needs_family_and_src() {
+        // a local()-only face (nextjs "Fallback") yields no URL to fetch → skipped
+        let faces = collect_font_faces(
+            "@font-face{font-family:X;src:local(Y)}",
+            "https://x.org/",
+        );
+        assert!(faces.is_empty());
+    }
+
+    #[test]
+    fn font_family_stack_is_interned() {
+        let mut sheet = parse(
+            "h1 { font-family: \"Alfa Slab One\", serif }\
+             p { font-family: \"ALFA SLAB ONE\", SERIF }",
+        );
+        let table: StackTable = std::rc::Rc::new(std::cell::RefCell::new(vec![Vec::new()]));
+        sheet.set_stacks(table.clone());
+        let dom = dom_of("<h1></h1><p></p>");
+        let h1 = style_for_tag(&sheet, &dom, "h1");
+        let p = style_for_tag(&sheet, &dom, "p");
+        assert_eq!(h1.fam, Fam::Serif, "generic fallback unchanged");
+        assert_eq!(h1.fam_stack, 1, "interned at first use");
+        assert_eq!(p.fam_stack, 1, "case-insensitive match shares one id");
+        assert_eq!(
+            table.borrow()[1],
+            ["alfa slab one".to_string(), "serif".to_string()]
+        );
+        // no stack table wired (tests using plain parse()) → id 0, old behaviour
+        let plain = parse("h1 { font-family: serif }");
+        assert_eq!(style_for_tag(&plain, &dom, "h1").fam_stack, 0);
     }
 }
 

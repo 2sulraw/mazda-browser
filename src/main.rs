@@ -33,13 +33,13 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "https://example.com".to_string());
 
-    let fonts = Fonts::load();
+    let mut fonts = Fonts::load();
     let width = 1000usize;
     let height = 700usize;
     let max_w = (width - 2 * PADDING) as f32;
     let page_h = height.saturating_sub(2 * PADDING) as f32;
 
-    let mut page = load_page(&start_url, &fonts, max_w, page_h);
+    let mut page = load_page(&start_url, &mut fonts, max_w, page_h);
     let mut back_stack: Vec<String> = Vec::new();
 
     let mut window = Window::new(
@@ -69,7 +69,7 @@ fn main() {
         if window.is_key_pressed(Key::Backspace, KeyRepeat::No) {
             eprintln!("[key] backspace (no-repeat)");
             if let Some(prev) = back_stack.pop() {
-                page = load_page(&prev, &fonts, max_w, page_h);
+                page = load_page(&prev, &mut fonts, max_w, page_h);
                 scroll = 0.0;
                 window.set_title(&format!("Mazda — {}", page.url));
             }
@@ -96,7 +96,7 @@ fn main() {
                     if let Some(next) = resolve(&page.url, &href) {
                         eprintln!("[nav] {} → {next}", page.url);
                         back_stack.push(page.url.clone());
-                        page = load_page(&next, &fonts, max_w, page_h);
+                        page = load_page(&next, &mut fonts, max_w, page_h);
                         scroll = 0.0;
                         window.set_title(&format!("Mazda — {}", page.url));
                     }
@@ -130,7 +130,7 @@ fn main() {
 }
 
 /// Fetch + parse + layout one page. `vh` = viewport height (fixed boxes).
-fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
+fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
     let source = match fetch(url) {
         Ok((bytes, ct)) => {
             let s = html::decode_html(&bytes, ct.as_deref());
@@ -158,9 +158,13 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
     collect_sheets(&dom, 0, &mut sources);
     let mut css_text = String::new();
     let mut ext_count = 0usize;
+    // `@font-face` defs collected per-sheet: the cascade concatenates sheets,
+    // which would lose each sheet's base URL for resolving relative src paths
+    let mut faces: Vec<css::FontFace> = Vec::new();
     for src in &sources {
         match src {
             SheetSrc::Inline(text) => {
+                faces.extend(css::collect_font_faces(text, url));
                 css_text.push_str(text);
                 css_text.push('\n');
             }
@@ -169,7 +173,9 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
                 match fetch(&abs) {
                     Ok((bytes, _)) => {
                         // CSS is UTF-8 in practice (spec @charset unsupported — shortcut)
-                        css_text.push_str(&String::from_utf8_lossy(&bytes));
+                        let text = String::from_utf8_lossy(&bytes);
+                        faces.extend(css::collect_font_faces(&text, &abs));
+                        css_text.push_str(&text);
                         css_text.push('\n');
                         ext_count += 1;
                     }
@@ -181,6 +187,8 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
     // media queries evaluate against the window's CSS pixel width
     let viewport = max_w + 2.0 * PADDING as f32;
     let mut sheet = css::parse_for(&css_text, viewport);
+    // cascade writes font-family stack ids into the font picker's own table
+    sheet.set_stacks(fonts.stacks.clone());
     eprintln!(
         "[css] {} bytes of style, {} rules ({} external sheets)",
         css_text.len(),
@@ -196,6 +204,7 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
         .find(|&c| dom.tag(c) == "html")
         .unwrap_or(0);
     sheet.scope_vars(&dom, html_el);
+    fonts.begin_page(faces);
 
     // cascade over the body element itself: page bg + initial inherited style
     // (spec: the canvas background comes from <body> if it has one, else
@@ -556,6 +565,63 @@ struct Fonts {
     cjk: std::sync::OnceLock<Option<FontVec>>,
     /// Hangul fallback, same laziness
     hangul: std::sync::OnceLock<Option<FontVec>>,
+    /// interned font-family stacks (shared with the cascade via Sheet)
+    stacks: css::StackTable,
+    /// `@font-face` faces declared by the CURRENT page (cleared on navigation)
+    faces: Vec<PageFace>,
+    /// one lazy slot per SYSTEM_FAMILIES entry
+    sys: Vec<std::sync::OnceLock<Option<FontVec>>>,
+}
+
+/// One page's `@font-face` definition with its lazily-fetched font.
+struct PageFace {
+    family: String, // lowercased, as parsed
+    wmin: u16,
+    wmax: u16,
+    italic: bool,
+    srcs: Vec<String>, // absolute URLs in declared order
+    font: std::sync::OnceLock<Option<FontVec>>,
+}
+
+/// Installed families sites commonly ask for by name → font files. One
+/// regular-weight file per family: bold/italic requests fall back to the
+/// generic pick's real bold/italic faces (shortcut: no per-family variants).
+/// Not exhaustive on purpose — lazily loaded only when a page actually asks.
+const SYSTEM_FAMILIES: &[(&str, &[&str])] = &[
+    ("verdana", &[r"C:\Windows\Fonts\verdana.ttf"]),
+    ("tahoma", &[r"C:\Windows\Fonts\tahoma.ttf"]),
+    ("trebuchet ms", &[r"C:\Windows\Fonts\trebuc.ttf"]),
+    ("times new roman", &[r"C:\Windows\Fonts\times.ttf"]),
+    ("georgia", &[r"C:\Windows\Fonts\georgia.ttf"]),
+    ("courier new", &[r"C:\Windows\Fonts\cour.ttf"]),
+    ("helvetica", &[r"C:\Windows\Fonts\arial.ttf"]),
+    ("arial", &[r"C:\Windows\Fonts\arial.ttf"]),
+    ("calibri", &[r"C:\Windows\Fonts\calibri.ttf"]),
+    ("cambria", &[r"C:\Windows\Fonts\cambria.ttc"]),
+    ("segoe ui", &[r"C:\Windows\Fonts\segoeui.ttf"]),
+    ("impact", &[r"C:\Windows\Fonts\impact.ttf"]),
+    ("comic sans ms", &[r"C:\Windows\Fonts\comic.ttf"]),
+    ("arial black", &[r"C:\Windows\Fonts\ariblk.ttf"]),
+];
+
+/// Generic keywords in a stack — the walk skips them; the derived `Fam`
+/// already picks the right system default for them.
+fn is_generic_family(n: &str) -> bool {
+    matches!(
+        n,
+        "serif"
+            | "sans-serif"
+            | "monospace"
+            | "cursive"
+            | "fantasy"
+            | "system-ui"
+            | "ui-serif"
+            | "ui-sans-serif"
+            | "ui-monospace"
+            | "ui-rounded"
+            | "math"
+            | "emoji"
+    )
 }
 
 /// Smallest full-coverage options first — raw bytes stay resident once loaded.
@@ -585,6 +651,34 @@ impl Fonts {
             serif: std::sync::OnceLock::new(),
             cjk: std::sync::OnceLock::new(),
             hangul: std::sync::OnceLock::new(),
+            stacks: std::rc::Rc::new(std::cell::RefCell::new(vec![Vec::new()])),
+            faces: Vec::new(),
+            sys: (0..SYSTEM_FAMILIES.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+        }
+    }
+
+    /// Page-scoped font state: drop the previous page's webfonts and stack
+    /// ids (RAM freed on navigation), register the new page's `@font-face`
+    /// defs — each font itself still loads lazily on first use.
+    fn begin_page(&mut self, faces: Vec<css::FontFace>) {
+        self.faces = faces
+            .into_iter()
+            .map(|f| PageFace {
+                family: f.family,
+                wmin: f.wmin,
+                wmax: f.wmax,
+                italic: f.italic,
+                srcs: f.srcs,
+                font: std::sync::OnceLock::new(),
+            })
+            .collect();
+        let mut t = self.stacks.borrow_mut();
+        t.clear();
+        t.push(Vec::new()); // id 0 = "no stack"
+        if !self.faces.is_empty() {
+            eprintln!("[font] {} @font-face defs for this page", self.faces.len());
         }
     }
 
@@ -619,12 +713,27 @@ impl Fonts {
         }
     }
 
-    /// Font that actually has a glyph for `ch`: primary style font, else the
-    /// lazily-loaded CJK/Hangul fallback, else primary (renders .notdef).
+    /// Font that actually has a glyph for `ch`: the element's `font-family`
+    /// stack in CSS order (webfonts + installed aliases), else the primary
+    /// style font, else the lazily-loaded CJK/Hangul fallback, else primary
+    /// (renders .notdef).
     /// Range-gated so Thai/Arabic/etc. (no fallback font for them) never pay
     /// the font-load cost just to learn there's no glyph.
     /// shortcut: fallback is always the *regular* weight — no bold/italic CJK.
     fn pick_font_for(&self, ch: char, style: &Style) -> &FontVec {
+        if style.fam_stack != 0 {
+            let table = self.stacks.borrow();
+            if let Some(names) = table.get(style.fam_stack as usize) {
+                for name in names {
+                    if is_generic_family(name) {
+                        continue; // the Fam-derived generic pick covers these
+                    }
+                    if let Some(f) = self.stack_font(name, style, ch) {
+                        return f;
+                    }
+                }
+            }
+        }
         let primary = self.pick(style);
         if primary.glyph_id(ch).0 != 0 {
             return primary;
@@ -646,6 +755,35 @@ impl Fonts {
         primary
     }
 
+    /// One family name from a stack: the page's `@font-face` webfont for it
+    /// (fetched+decoded once, disk-cached), else a known installed alias.
+    /// None → the caller continues to the next name in the stack.
+    fn stack_font(&self, name: &str, style: &Style, ch: char) -> Option<&FontVec> {
+        // best face for this weight/italic, else the family's regular face
+        let want: u16 = if style.bold { 700 } else { 400 };
+        let face = self
+            .faces
+            .iter()
+            .find(|f| {
+                f.family == name && f.italic == style.italic && f.wmin <= want && want <= f.wmax
+            })
+            .or_else(|| self.faces.iter().find(|f| f.family == name && !f.italic));
+        if let Some(def) = face {
+            if let Some(f) = def.font.get_or_init(|| load_webfont(&def.srcs)) {
+                if f.glyph_id(ch).0 != 0 {
+                    return Some(f);
+                }
+            }
+        }
+        let idx = SYSTEM_FAMILIES.iter().position(|(n, _)| *n == name)?;
+        if let Some(f) = self.sys[idx].get_or_init(|| try_load_font(SYSTEM_FAMILIES[idx].1)) {
+            if f.glyph_id(ch).0 != 0 {
+                return Some(f);
+            }
+        }
+        None
+    }
+
     fn measure(&self, text: &str, style: &Style) -> f32 {
         let scale = PxScale::from(style.size);
         text.chars()
@@ -659,6 +797,23 @@ impl Fonts {
 
 fn load_font(candidates: &[&str]) -> FontVec {
     try_load_font(candidates).unwrap_or_else(|| panic!("no system font found"))
+}
+
+/// Fetch + decode one webfont (`@font-face` src list, declared order).
+/// Disk-cached like any resource; containers: raw sfnt + WOFF1 via
+/// `woff::decode_font` (WOFF2 → None → try the next src / fall back).
+fn load_webfont(srcs: &[String]) -> Option<FontVec> {
+    for u in srcs {
+        let Ok((bytes, _)) = fetch(u) else { continue };
+        let Some(sfnt) = woff::decode_font(&bytes) else {
+            continue;
+        };
+        if let Ok(f) = FontVec::try_from_vec(sfnt.into_owned()) {
+            eprintln!("[font] loaded webfont {u} ({} KB)", bytes.len() / 1024);
+            return Some(f);
+        }
+    }
+    None
 }
 
 /// First candidate that parses; None if none do (used for optional fallbacks).
@@ -1034,6 +1189,70 @@ mod tests {
             std::ptr::eq(fonts.pick_font_for('ก', &Style::new()), primary),
             "Thai should stay on primary"
         );
+    }
+
+    #[test]
+    fn pick_font_for_honors_stack_order() {
+        let mut fonts = Fonts::load();
+        // unknown family + generic → walk continues to the generic fallback
+        fonts.stacks.borrow_mut().push(vec![
+            "definitely-not-a-font-x".to_string(),
+            "serif".to_string(),
+        ]);
+        let mut st = Style::new();
+        st.fam_stack = 1;
+        assert!(std::ptr::eq(fonts.pick_font_for('R', &st), fonts.pick(&st)));
+        // an installed alias in the stack beats the generic pick (HN: Verdana)
+        fonts.stacks.borrow_mut().push(vec!["verdana".to_string()]);
+        st.fam_stack = 2;
+        let f = fonts.pick_font_for('R', &st);
+        assert!(
+            !std::ptr::eq(f, fonts.pick(&st)),
+            "verdana should win over the generic primary"
+        );
+        assert!(f.glyph_id('R').0 != 0);
+    }
+
+    #[test]
+    fn webfont_face_wins_over_generic() {
+        let mut fonts = Fonts::load();
+        // simulate an already-declared face: the slot is pre-filled because
+        // loading goes through the network (decode path covered in woff tests)
+        let pre = try_load_font(&[r"C:\Windows\Fonts\segoeui.ttf"]).unwrap();
+        fonts.faces.push(PageFace {
+            family: "testface".to_string(),
+            wmin: 400,
+            wmax: 400,
+            italic: false,
+            srcs: vec![],
+            font: std::sync::OnceLock::from(Some(pre)),
+        });
+        fonts.stacks.borrow_mut().push(vec!["testface".to_string()]);
+        let mut st = Style::new();
+        st.fam = Fam::Serif; // generic pick would be Georgia
+        st.fam_stack = 1;
+        let f = fonts.pick_font_for('R', &st);
+        assert!(
+            std::ptr::eq(f, fonts.faces[0].font.get().unwrap().as_ref().unwrap()),
+            "the page's webfont wins over the generic"
+        );
+    }
+
+    #[test]
+    fn webfont_fetch_failure_falls_through_stack() {
+        let mut fonts = Fonts::load();
+        fonts.faces.push(PageFace {
+            family: "ghost".to_string(),
+            wmin: 400,
+            wmax: 400,
+            italic: false,
+            srcs: vec!["https://invalid.invalid/f.woff".to_string()],
+            font: std::sync::OnceLock::new(),
+        });
+        fonts.stacks.borrow_mut().push(vec!["ghost".to_string()]);
+        let st = Style::new();
+        // unreachable src → old behaviour: the primary generic pick
+        assert!(std::ptr::eq(fonts.pick_font_for('R', &st), fonts.pick(&st)));
     }
 
     #[test]
