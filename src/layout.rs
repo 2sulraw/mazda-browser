@@ -2,7 +2,7 @@
 //! shortcut: only inline/block split + word wrap (no float/flex/absolute);
 //! upgrade when a real CSS engine lands (Phase 1b+).
 
-use crate::css::{Align, BoxStyle, Dir, Display, Justify, Len, Sheet, Track};
+use crate::css::{Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track};
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
 
@@ -149,6 +149,11 @@ pub struct BoxNode {
     pub h: f32,
     /// last line still has content (block flow paragraph-gap bookkeeping)
     pub open: bool,
+    /// range of `runs` this subtree emitted during place() — phase-2
+    /// repositioning shifts exactly it (nested ranges compose)
+    pub run_range: (u32, u32),
+    /// same for `underline_rects`
+    pub ul_range: (u32, u32),
 }
 
 impl BoxNode {
@@ -167,6 +172,8 @@ impl BoxNode {
             w: 0.0,
             h: 0.0,
             open: false,
+            run_range: (0, 0),
+            ul_range: (0, 0),
         }
     }
 
@@ -185,6 +192,8 @@ impl BoxNode {
             w: 0.0,
             h: 0.0,
             open: false,
+            run_range: (0, 0),
+            ul_range: (0, 0),
         }
     }
 }
@@ -291,36 +300,61 @@ pub struct PositionedRun {
     pub style: Style,
     pub width: f32,
     pub link: Option<std::rc::Rc<str>>,
+    /// inside a `position: fixed` subtree — drawn in viewport coordinates
+    /// (no scroll offset), on top of scrolled content
+    pub fixed: bool,
 }
 
 pub struct Layout {
     pub runs: Vec<PositionedRun>,
     pub height: f32,
-    /// x, y, w, h, color (matches the run's text color)
-    pub underline_rects: Vec<(f32, f32, f32, f32, u32)>,
-    /// filled box backgrounds (x, y, w, h, color, radius) — drawn under text
-    pub rects: Vec<(f32, f32, f32, f32, u32, f32)>,
-    /// decoded `<img>` boxes (x, y, w, h, pixels) — drawn under text
-    pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>)>,
+    /// x, y, w, h, color (matches the run's text color), fixed
+    pub underline_rects: Vec<(f32, f32, f32, f32, u32, bool)>,
+    /// filled box backgrounds (x, y, w, h, color, radius, fixed) — drawn under text
+    pub rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    /// decoded `<img>` boxes (x, y, w, h, pixels, fixed) — drawn under text
+    pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
     /// true if the last line still has content on it (no trailing <br>) —
     /// block flow uses this to decide whether to add the paragraph gap
     pub open_line: bool,
 }
 
-/// Lay out the box tree at (0, 0) within `max_width`. Groups get x/y/w/h;
-/// text leaves are laid as line segments by their container (block) or as
-/// individual items (flex/grid).
+/// Default viewport height for [`layout_tree`] — matches the fixed window in
+/// main(); production passes the real one through [`layout_in`] (tests don't
+/// depend on it).
+#[cfg(test)]
+const VIEWPORT_H: f32 = 676.0;
+
+/// Lay out the box tree at (0, 0) within `max_width`, viewport height
+/// [`VIEWPORT_H`] (see [`layout_in`] for the real one).
+#[cfg(test)]
 pub fn layout_tree(
     root: &mut BoxNode,
     max_width: f32,
     measure: &dyn Fn(&str, &Style) -> f32,
 ) -> Layout {
+    layout_in(root, max_width, VIEWPORT_H, measure)
+}
+
+/// Like [`layout_tree`] but with the real viewport height — `position: fixed`
+/// boxes resolve `bottom`/`right` insets against (0, 0, max_width, vh).
+pub fn layout_in(
+    root: &mut BoxNode,
+    max_width: f32,
+    viewport_h: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> Layout {
     let mut runs = Vec::new();
     let mut uls = Vec::new();
+    // initial containing block = viewport (0, 0, max_width, vh)
+    let cb = (0.0f32, 0.0f32, max_width, viewport_h);
     place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls);
+    // phase 2: resolve relative/absolute/fixed against their containing
+    // blocks now that every in-flow position is final (root flow box = cb)
+    position_all(root, cb, cb, cb, false, measure, &mut runs, &mut uls);
     let mut rects = Vec::new();
     let mut images = Vec::new();
-    collect_paint(root, &mut rects, &mut images);
+    collect_paint(root, false, &mut rects, &mut images);
     Layout {
         runs,
         height: root.h,
@@ -333,13 +367,16 @@ pub fn layout_tree(
 
 /// Post-layout walk: every box with a background-color emits a filled rect;
 /// every decoded `<img>` emits its pixels (parent-first, so children paint
-/// over their parent's fill).
+/// over their parent's fill). `fixed` inherits down — a `position: fixed`
+/// subtree paints in viewport coordinates.
 fn collect_paint(
     n: &BoxNode,
-    out: &mut Vec<(f32, f32, f32, f32, u32, f32)>,
-    imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>)>,
+    fixed: bool,
+    out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
 ) {
     if !n.is_text {
+        let fixed = fixed || n.bx.pos == Pos::Fixed;
         let bt = resolve_len(n.bx.border[0], n.w);
         let br = resolve_len(n.bx.border[1], n.w);
         let bb = resolve_len(n.bx.border[2], n.w);
@@ -353,7 +390,7 @@ fn collect_paint(
             if ring {
                 // rounded ring: fill the border-box with the border color,
                 // then the background inset over it (inner radius ≈ r − border)
-                out.push((n.x, n.y, n.w, n.h, bc, r));
+                out.push((n.x, n.y, n.w, n.h, bc, r, fixed));
                 let inner = (r - bt.max(br).max(bb).max(bl)).max(0.0);
                 out.push((
                     n.x + bl,
@@ -362,34 +399,35 @@ fn collect_paint(
                     (n.h - bt - bb).max(0.0),
                     c,
                     inner,
+                    fixed,
                 ));
             } else {
-                out.push((n.x, n.y, n.w, n.h, c, r));
+                out.push((n.x, n.y, n.w, n.h, c, r, fixed));
             }
         }
         if has_b && !ring {
             // four side strips over the background (square corners on a
             // rounded backgroundless box — shortcut)
             if bt > 0.0 {
-                out.push((n.x, n.y, n.w, bt, bc, 0.0));
+                out.push((n.x, n.y, n.w, bt, bc, 0.0, fixed));
             }
             if bb > 0.0 {
-                out.push((n.x, n.y + n.h - bb, n.w, bb, bc, 0.0));
+                out.push((n.x, n.y + n.h - bb, n.w, bb, bc, 0.0, fixed));
             }
             if bl > 0.0 {
-                out.push((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0), bc, 0.0));
+                out.push((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0), bc, 0.0, fixed));
             }
             if br > 0.0 {
-                out.push((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0), bc, 0.0));
+                out.push((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0), bc, 0.0, fixed));
             }
         }
         if let Some(ImgSlot::Ready(d)) = &n.img {
             if n.w > 0.0 && n.h > 0.0 {
-                imgs.push((n.x, n.y, n.w, n.h, d.clone()));
+                imgs.push((n.x, n.y, n.w, n.h, d.clone(), fixed));
             }
         }
         for ch in &n.children {
-            collect_paint(ch, out, imgs);
+            collect_paint(ch, fixed, out, imgs);
         }
     }
 }
@@ -421,6 +459,10 @@ fn shift_tree(n: &mut BoxNode, dx: f32, dy: f32) {
     }
 }
 
+/// Containing block (x, y, w, h) — the nearest positioned ancestor's padding
+/// box, or the viewport for `position: fixed`.
+type CB = (f32, f32, f32, f32);
+
 /// Place one node. `avail` = containing block's content width.
 /// Returns the outer vertical advance (margin-top + border-box height +
 /// margin-bottom) so block flow can stack siblings without overlap.
@@ -433,6 +475,10 @@ fn place(
     runs: &mut Vec<PositionedRun>,
     uls: &mut Vec<UR>,
 ) -> f32 {
+    // every run/underline this subtree emits lands in [run0..]/[ul0..] —
+    // stored on the node so phase-2 repositioning can shift exactly that
+    // range (nested shifts compose; appends never move existing entries)
+    let (run0, ul0) = (runs.len(), uls.len());
     n.x = x;
     n.y = y;
     debug_assert!(!n.is_text, "text leaves are batched by their container");
@@ -496,10 +542,143 @@ fn place(
     n.x = bx0;
     n.y = by0;
     n.w = w;
+    n.run_range = (run0 as u32, runs.len() as u32);
+    n.ul_range = (ul0 as u32, uls.len() as u32);
     mt + n.h + mb
 }
 
-type UR = (f32, f32, f32, f32, u32);
+/// Phase-2 walk — resolve non-static boxes once every in-flow position is
+/// final (parent-first so nested relative/absolute shifts compose).
+/// `cb` = nearest positioned ancestor's padding box (abs), `flow` = parent's
+/// content box (relative % insets), `vcb` = viewport (fixed), `fixed` =
+/// inside a `position: fixed` subtree (paints without scroll offset).
+fn position_all(
+    n: &mut BoxNode,
+    cb: CB,
+    flow: CB,
+    vcb: CB,
+    fixed: bool,
+    measure: &dyn Fn(&str, &Style) -> f32,
+    runs: &mut Vec<PositionedRun>,
+    uls: &mut Vec<UR>,
+) {
+    let pos = n.bx.pos;
+    let fixed = fixed || pos == Pos::Fixed;
+    let inset = n.bx.inset; // [Option<Len>; 4] is Copy — avoid borrow conflicts
+    match pos {
+        // in flow already (also the root, laid by layout_in)
+        Pos::Static => {}
+        // stays in flow, just shifts — dx = left (wins) else −right
+        Pos::Relative => {
+            let dx = match (inset[3], inset[1]) {
+                (Some(l), _) => resolve_len(l, flow.2),
+                (_, Some(r)) => -resolve_len(r, flow.2),
+                _ => 0.0,
+            };
+            let dy = match (inset[0], inset[2]) {
+                (Some(t), _) => resolve_len(t, flow.3),
+                (_, Some(b)) => -resolve_len(b, flow.3),
+                _ => 0.0,
+            };
+            if dx != 0.0 || dy != 0.0 {
+                shift_tree(n, dx, dy);
+                let (a, b) = n.run_range;
+                for r in &mut runs[a as usize..b as usize] {
+                    r.x += dx;
+                    r.y += dy;
+                }
+                let (a, b) = n.ul_range;
+                for u in &mut uls[a as usize..b as usize] {
+                    u.0 += dx;
+                    u.1 += dy;
+                }
+            }
+        }
+        // left flow during place() — lay it out now against its containing
+        // block, then shift to satisfy the insets
+        Pos::Absolute | Pos::Fixed => {
+            let c = if pos == Pos::Fixed { vcb } else { cb };
+            // pre-size: both horizontal insets → stretch; else shrink-to-fit
+            // (max-content clamped to the CB — shortcut: no min-content floor)
+            // (img keeps its intrinsic width from place())
+            if n.bx.width.is_none() && n.img.is_none() {
+                n.bx.width = match (inset[3], inset[1]) {
+                    (Some(l), Some(r)) => Some(Len::Px(
+                        (c.2 - resolve_len(l, c.2) - resolve_len(r, c.2)).max(0.0),
+                    )),
+                    _ => Some(Len::Px(natural_w(n, c.2, measure).min(c.2))),
+                };
+            }
+            // provisional = CB origin (shortcut: real static position was
+            // skipped by the flow); insets resolve % against the CB axis
+            place(n, c.0, c.1, c.2, measure, runs, uls);
+            let ml = resolve_len(n.bx.margin[3], c.2);
+            let mr = resolve_len(n.bx.margin[1], c.2);
+            let mt = resolve_len(n.bx.margin[0], c.2);
+            let mb = resolve_len(n.bx.margin[2], c.2);
+            // over-constrained → top/left wins (ltr)
+            let dx = match (inset[3], inset[1]) {
+                (Some(l), _) => c.0 + resolve_len(l, c.2) + ml - n.x,
+                (_, Some(r)) => c.0 + c.2 - resolve_len(r, c.2) - mr - n.w - n.x,
+                _ => 0.0,
+            };
+            let dy = match (inset[0], inset[2]) {
+                (Some(t), _) => c.1 + resolve_len(t, c.3) + mt - n.y,
+                (_, Some(b)) => c.1 + c.3 - resolve_len(b, c.3) - mb - n.h - n.y,
+                _ => 0.0,
+            };
+            if dx != 0.0 || dy != 0.0 {
+                shift_tree(n, dx, dy);
+                let (a, b) = n.run_range;
+                for r in &mut runs[a as usize..b as usize] {
+                    r.x += dx;
+                    r.y += dy;
+                }
+                let (a, b) = n.ul_range;
+                for u in &mut uls[a as usize..b as usize] {
+                    u.0 += dx;
+                    u.1 += dy;
+                }
+            }
+            if fixed {
+                let (a, b) = n.run_range;
+                for r in &mut runs[a as usize..b as usize] {
+                    r.fixed = true;
+                }
+                let (a, b) = n.ul_range;
+                for u in &mut uls[a as usize..b as usize] {
+                    u.5 = true;
+                }
+            }
+        }
+    }
+    // CB for descendants: positioned boxes expose their padding box; everyone
+    // else forwards theirs. The flow box (relative %) = own content box.
+    let kid_cb = if pos == Pos::Static {
+        cb
+    } else {
+        let bl = resolve_len(n.bx.border[3], n.w);
+        let br = resolve_len(n.bx.border[1], n.w);
+        let bt = resolve_len(n.bx.border[0], n.w);
+        let bb = resolve_len(n.bx.border[2], n.w);
+        (n.x + bl, n.y + bt, (n.w - bl - br).max(0.0), (n.h - bt - bb).max(0.0))
+    };
+    let pl = resolve_len(n.bx.pad[3], n.w);
+    let pr = resolve_len(n.bx.pad[1], n.w);
+    let pt = resolve_len(n.bx.pad[0], n.w);
+    let pb = resolve_len(n.bx.pad[2], n.w);
+    let kid_flow = (
+        kid_cb.0 + pl,
+        kid_cb.1 + pt,
+        (kid_cb.2 - pl - pr).max(0.0),
+        (kid_cb.3 - pt - pb).max(0.0),
+    );
+    for ch in &mut n.children {
+        position_all(ch, kid_cb, kid_flow, vcb, fixed, measure, runs, uls);
+    }
+}
+
+type UR = (f32, f32, f32, f32, u32, bool); // x, y, w, h, color, fixed
 
 fn push_runs(mut src: Vec<PositionedRun>, dx: f32, dy: f32, dst: &mut Vec<PositionedRun>) {
     for r in &mut src {
@@ -535,6 +714,8 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
                 i += 1;
             }
             out.push(Item::Text(start, i));
+        } else if matches!(children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
+            i += 1; // out of flow: placed in phase 2 (position_all)
         } else {
             out.push(Item::Grp(i));
             i += 1;
@@ -583,6 +764,7 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
         (Display::Flex, Dir::Column) => n
             .children
             .iter()
+            .filter(|c| !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed))
             .map(|c| natural_w(c, avail, measure))
             .fold(0.0f32, f32::max),
         (Display::Grid, _) => {
@@ -597,6 +779,9 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
             let mut m = 0.0f32;
             let mut run = 0.0f32;
             for c in &n.children {
+                if matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
+                    continue; // out of flow: no contribution to shrink-to-fit
+                }
                 if c.is_text {
                     run += natural_w(c, avail, measure);
                 } else {
@@ -707,6 +892,10 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             y += h;
             open = o;
         } else {
+            if matches!(n.children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
+                i += 1; // out of flow: sized/placed by position_all (phase 2)
+                continue;
+            }
             if open {
                 y += n.style.size * 0.6; // leading break before child box
                 open = false;
@@ -1023,9 +1212,10 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
             style: w.style,
             width: ww,
             link: w.link.clone(),
+            fixed: false,
         });
         if w.style.underline {
-            underline_rects.push((x, y + lh - 2.0, ww, 1.0, w.style.color));
+            underline_rects.push((x, y + lh - 2.0, ww, 1.0, w.style.color, false));
         }
         x += ww;
         line_height = line_height.max(lh);
@@ -1553,7 +1743,8 @@ mod tests {
         n.children = vec![leaf("hi")];
         let l = layout_tree(&mut n, 100.0, &m4);
         assert_eq!(l.rects.len(), 1);
-        let &(x, y, w, h, color, rad) = &l.rects[0];
+        let &(x, y, w, h, color, rad, fixed) = &l.rects[0];
+        assert!(!fixed, "static box is not fixed");
         assert_eq!(color, 0x112233);
         assert!((x - 0.0).abs() < 0.01 && (y - 0.0).abs() < 0.01);
         assert!((w - 100.0).abs() < 0.01, "w={}", w);
@@ -1645,5 +1836,126 @@ mod tests {
         let line = 15.0 * 1.35;
         let gap = 15.0 * 0.6;
         assert!((l.images[0].1 - (line + gap)).abs() < 0.01, "img y={}", l.images[0].1);
+    }
+
+    // ---- position (relative / absolute / fixed) ----
+
+    /// group with `position` + insets, one text child.
+    fn pos_box(pos: Pos, inset: [Option<Len>; 4], children: Vec<BoxNode>) -> BoxNode {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                pos,
+                inset,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = children;
+        n
+    }
+
+    #[test]
+    fn absolute_leaves_flow_and_honors_insets() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let flow = pos_box(Pos::Static, [None; 4], vec![leaf("flowtxt")]);
+        // top: 10, left: 20 against the root's padding box (= viewport here)
+        let abs = pos_box(Pos::Absolute, [Some(Len::Px(10.0)), None, None, Some(Len::Px(20.0))], vec![leaf("abs")]);
+        root.children = vec![flow, abs];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // out-of-flow: contributes nothing to the parent's height
+        // (flow line + trailing paragraph gap after the child's open line)
+        let flow_h = 15.0 * 1.35 + 15.0 * 0.6;
+        assert!((root.h - flow_h).abs() < 0.01, "root.h={} (flow only)", root.h);
+        let abs_run = l.runs.iter().find(|r| r.text == "abs").expect("abs run");
+        let flow_run = l.runs.iter().find(|r| r.text == "flowtxt").expect("flow run");
+        assert!((abs_run.x - 20.0).abs() < 0.01, "x={}", abs_run.x);
+        assert!((abs_run.y - 10.0).abs() < 0.01, "y={}", abs_run.y);
+        assert!(!abs_run.fixed);
+        // flow run untouched by the absolute sibling
+        assert!((flow_run.y - flow_h).abs() < 0.01 || flow_run.y == 0.0, "y={}", flow_run.y);
+    }
+
+    #[test]
+    fn absolute_shrink_to_fit_and_right_bottom_insets() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        // right: 10, bottom: 10, no width → shrink-to-fit (4 chars × 4px)
+        let abs = pos_box(
+            Pos::Absolute,
+            [None, Some(Len::Px(10.0)), Some(Len::Px(10.0)), None],
+            vec![leaf("abcd")],
+        );
+        root.children = vec![abs];
+        // layout_in with a 200×100 viewport
+        let l = layout_in(&mut root, 300.0, 100.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "abcd").expect("run");
+        let bw = 16.0; // 4 chars × 4px
+        let bh = 15.0 * 1.35;
+        assert!((run.x - (300.0 - 10.0 - bw)).abs() < 0.01, "x={}", run.x);
+        assert!((run.y - (100.0 - 10.0 - bh)).abs() < 0.01, "y={}", run.y);
+        let abs_n = &root.children[0];
+        assert!((abs_n.w - bw).abs() < 0.01, "shrink w={}", abs_n.w);
+    }
+
+    #[test]
+    fn relative_shifts_subtree_and_runs() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut inner = pos_box(Pos::Static, [None; 4], vec![leaf("deep")]);
+        inner.children = vec![leaf("deep")];
+        let rel = pos_box(Pos::Relative, [Some(Len::Px(5.0)), None, None, Some(Len::Px(7.0))], vec![leaf("moved")]);
+        root.children = vec![rel, inner];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // relative stays in flow: the sibling still starts at flow position
+        // (two lines + a trailing paragraph gap after each open child line)
+        let line = 15.0 * 1.35;
+        let h = line * 2.0 + 15.0 * 0.6 * 2.0;
+        assert!((root.h - h).abs() < 0.01, "h={} = two lines + gaps", root.h);
+        let moved = l.runs.iter().find(|r| r.text == "moved").expect("run");
+        assert!((moved.x - 7.0).abs() < 0.01, "x={}", moved.x);
+        assert!((moved.y - 5.0).abs() < 0.01, "y={}", moved.y);
+    }
+
+    #[test]
+    fn fixed_marks_paint_and_uses_viewport() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        // bottom bar: bottom: 0 against the viewport (layout_in vh = 100)
+        let bar = pos_box(Pos::Fixed, [None, None, Some(Len::Px(0.0)), None], vec![leaf("bar")]);
+        root.children = vec![bar];
+        let l = layout_in(&mut root, 300.0, 100.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "bar").expect("run");
+        assert!(run.fixed, "run inside fixed subtree is marked fixed");
+        let bh = 15.0 * 1.35;
+        assert!((run.y - (100.0 - bh)).abs() < 0.01, "y={} = vh - h", run.y);
+    }
+
+    #[test]
+    fn fixed_stretches_to_viewport_and_rect_marked_fixed() {
+        // fixed with left+right insets stretches to the viewport width,
+        // not the parent's — parent is a narrow positioned box
+        let mut root = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                pos: Pos::Absolute,
+                width: Some(Len::Px(150.0)),
+                inset: [Some(Len::Px(50.0)), None, None, Some(Len::Px(50.0))],
+                ..BoxStyle::default()
+            },
+        );
+        root.children = vec![pos_box(
+            Pos::Fixed,
+            [Some(Len::Px(0.0)), Some(Len::Px(0.0)), None, Some(Len::Px(0.0))],
+            vec![],
+        )];
+        root.children[0].bx.bg = Some(0x334455);
+        let l = layout_in(&mut root, 300.0, 100.0, &m4);
+        assert_eq!(l.rects.len(), 1, "bg → one rect: {:?}", l.rects);
+        assert!(l.rects[0].6, "fixed box's rect carries the fixed flag");
+        let fixed_box = &root.children[0];
+        // parent: width 150 shifted to x=50; fixed ignores it — viewport CB
+        assert!((root.w - 150.0).abs() < 0.01, "root w={}", root.w);
+        assert!((root.x - 50.0).abs() < 0.01, "root x={}", root.x);
+        assert!((fixed_box.w - 300.0).abs() < 0.01, "fixed w={} = viewport", fixed_box.w);
+        assert!((fixed_box.x - 0.0).abs() < 0.01, "fixed x={} = viewport", fixed_box.x);
     }
 }

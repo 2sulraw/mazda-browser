@@ -109,6 +109,19 @@ curve matters more than the baseline (near-flat as tabs grow).
   Known gaps: one color for all sides (no per-side color), dashed/dotted
   render solid, no box-shadow, square border corners on rounded
   backgroundless boxes
+- [x] **Phase 1h** — positioning: ~~missing~~ **DONE (`position: relative/
+  absolute/fixed` + `top/right/bottom/left` + `inset` shorthand, sticky →
+  relative shortcut): absolute/fixed leave normal flow (skipped by
+  block/flex/grid, shrink-to-fit natural width, stretch when both horizontal
+  insets), phase-2 `position_all` walk resolves insets against the nearest
+  positioned ancestor's padding box (fixed: the viewport) after flow is
+  final; relative shifts its subtree + stored run/underline ranges in place;
+  fixed subtrees paint flagged (render double-pass: scrolled content first,
+  fixed overlays on top in viewport coords, hit-test scroll-aware); 91 tests;
+  nextjs.org renders with positioned elements)**.
+  Known gaps: static position approximated by the containing-block origin for
+  no-inset absolute boxes, no vertical auto-stretch (top+bottom+auto height),
+  no z-index (paint order = DOM order), sticky has no scroll threshold
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -147,6 +160,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1e: local image test page (3 PNGs) | 127.0.0.1 | 19.0 MB |
 | 2026-10-29 | Phase 1f: SVG rasterizer (8/9 images incl. logos) | nextjs.org | 45.1 MB (8 images at display size) |
 | 2026-10-29 | Phase 1g: borders (strips/ring paint) | nextjs.org | 45.2 MB |
+| 2026-10-29 | Phase 1h: position relative/absolute/fixed | nextjs.org | 48.2 MB (572 runs; positioned nav/footer) |
 
 ### Phase 1c (Track A) findings
 

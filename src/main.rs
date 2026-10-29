@@ -36,8 +36,9 @@ fn main() {
     let width = 1000usize;
     let height = 700usize;
     let max_w = (width - 2 * PADDING) as f32;
+    let page_h = height.saturating_sub(2 * PADDING) as f32;
 
-    let mut page = load_page(&start_url, &fonts, max_w);
+    let mut page = load_page(&start_url, &fonts, max_w, page_h);
     let mut back_stack: Vec<String> = Vec::new();
 
     let mut window = Window::new(
@@ -53,7 +54,6 @@ fn main() {
     let mut was_down = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        let page_h = height.saturating_sub(2 * PADDING) as f32;
         let max_scroll = (page.laid.height - page_h).max(0.0);
         if window.is_key_pressed(Key::Down, KeyRepeat::Yes) {
             scroll = (scroll + 40.0).min(max_scroll);
@@ -68,7 +68,7 @@ fn main() {
         if window.is_key_pressed(Key::Backspace, KeyRepeat::No) {
             eprintln!("[key] backspace (no-repeat)");
             if let Some(prev) = back_stack.pop() {
-                page = load_page(&prev, &fonts, max_w);
+                page = load_page(&prev, &fonts, max_w, page_h);
                 scroll = 0.0;
                 window.set_title(&format!("Mazda — {}", page.url));
             }
@@ -79,8 +79,10 @@ fn main() {
         if down && !was_down {
             if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Pass) {
                 let rx = mx - PADDING as f32;
-                let ry = my - PADDING as f32 + scroll;
+                let my_doc = my - PADDING as f32; // viewport y in page space
                 let hit = page.laid.runs.iter().find(|r| {
+                    // fixed runs don't scroll: compare in viewport coords
+                    let ry = if r.fixed { my_doc } else { my_doc + scroll };
                     r.link.is_some()
                         && rx >= r.x
                         && rx <= r.x + r.width
@@ -93,7 +95,7 @@ fn main() {
                     if let Some(next) = resolve(&page.url, &href) {
                         eprintln!("[nav] {} → {next}", page.url);
                         back_stack.push(page.url.clone());
-                        page = load_page(&next, &fonts, max_w);
+                        page = load_page(&next, &fonts, max_w, page_h);
                         scroll = 0.0;
                         window.set_title(&format!("Mazda — {}", page.url));
                     }
@@ -126,8 +128,8 @@ fn main() {
     println!("final RSS: {:.1} MB", working_set_mb());
 }
 
-/// Fetch + parse + layout one page.
-fn load_page(url: &str, fonts: &Fonts, max_w: f32) -> Page {
+/// Fetch + parse + layout one page. `vh` = viewport height (fixed boxes).
+fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
     let source = match fetch(url) {
         Ok((bytes, ct)) => {
             let s = html::decode_html(&bytes, ct.as_deref());
@@ -204,10 +206,10 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32) -> Page {
         eprintln!("[img] {n_img} probed, {skipped} skipped (format)");
     }
 
-    let mut laid = layout::layout_tree(&mut root_box, max_w, &|s: &str, st: &Style| fonts.measure(s, st));
+    let mut laid = layout::layout_in(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st));
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
-    let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget);
+    let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget, false);
     if n_px > 0 {
         eprintln!("[img] {n_px} decoded at display size");
     }
@@ -295,7 +297,14 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
 /// full-size buffer is alive at a time. `budget` caps the display pixels that
 /// stay in RAM — over-budget images keep their `Probed` dims (space reserved,
 /// nothing drawn).
-fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout, budget: &mut usize) -> usize {
+fn decode_images(
+    n: &mut layout::BoxNode,
+    base: &str,
+    laid: &mut Layout,
+    budget: &mut usize,
+    fixed: bool,
+) -> usize {
+    let fixed = fixed || n.bx.pos == css::Pos::Fixed;
     let mut count = 0usize;
     if let Some(layout::ImgSlot::Probed { src, .. }) = &n.img {
         let src = src.to_string();
@@ -322,7 +331,8 @@ fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout, budget:
                         })
                         .or_else(|| svg::render(&bytes, dw, dh));
                     if let Some(img) = img {
-                        laid.images.push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img)));
+                        laid.images
+                            .push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img), fixed));
                         count += 1;
                     }
                 }
@@ -330,7 +340,7 @@ fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout, budget:
         }
     }
     for c in &mut n.children {
-        count += decode_images(c, base, laid, budget);
+        count += decode_images(c, base, laid, budget, fixed);
     }
     count
 }
@@ -647,96 +657,112 @@ fn render(
     scroll: f32,
     page: f32,
 ) {
-    // box backgrounds first (parent-before-child), then text on top
-    for &(x, y, w, h, color, rad) in &laid.rects {
-        let y = y - scroll;
-        if y + h < 0.0 || y > page {
-            continue;
-        }
-        let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + y).max(0.0));
-        let r = rad.min(w * 0.5).min(h * 0.5);
-        for dy in 0..h.max(0.0) as usize {
-            let py = (sy as usize) + dy;
-            if py >= height {
-                break;
-            }
-            let ly = dy as f32; // y relative to rect top
-            for dx in 0..w.max(0.0) as usize {
-                let px = sx as usize + dx;
-                if px >= width {
-                    break;
-                }
-                // rounded corners: cull pixels outside the corner circles
-                if r > 0.5 {
-                    let lx = dx as f32;
-                    let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
-                    let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
-                    let (ex, ey) = (lx - cx, ly - cy);
-                    if ex * ex + ey * ey > r * r {
-                        continue;
-                    }
-                }
-                buf[py * width + px] = color;
-            }
-        }
-    }
-    // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
-    for (x, y, w, h, img) in &laid.images {
-        let y0 = y - scroll;
-        if y0 + h < 0.0 || y0 > page {
-            continue;
-        }
-        let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y0);
-        for dy in 0..h.max(0.0) as usize {
-            let py = sy as i32 + dy as i32;
-            if py < 0 || py >= height as i32 {
+    // two passes: normal content (scrolled) first, then fixed overlays on
+    // top in viewport coordinates (no scroll offset)
+    for want_fixed in [false, true] {
+        // box backgrounds first (parent-before-child), then text on top
+        for &(x, y, w, h, color, rad, fixed) in &laid.rects {
+            if fixed != want_fixed {
                 continue;
             }
-            let v = (dy as f32 * img.h as f32 / h) as u32;
-            for dx in 0..w.max(0.0) as usize {
-                let px = sx as i32 + dx as i32;
-                if px < 0 || px >= width as i32 {
-                    continue;
+            let y = if fixed { y } else { y - scroll };
+            if y + h < 0.0 || y > page {
+                continue;
+            }
+            let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + y).max(0.0));
+            let r = rad.min(w * 0.5).min(h * 0.5);
+            for dy in 0..h.max(0.0) as usize {
+                let py = (sy as usize) + dy;
+                if py >= height {
+                    break;
                 }
-                let u = (dx as f32 * img.w as f32 / w) as u32;
-                let c = img.px[(v * img.w + u) as usize];
-                let a = (c >> 24) as u8;
-                let idx = py as usize * width + px as usize;
-                if a == 255 {
-                    buf[idx] = c & 0x00ff_ffff;
-                } else if a > 0 {
-                    blend(&mut buf[idx], c, a);
+                let ly = dy as f32; // y relative to rect top
+                for dx in 0..w.max(0.0) as usize {
+                    let px = sx as usize + dx;
+                    if px >= width {
+                        break;
+                    }
+                    // rounded corners: cull pixels outside the corner circles
+                    if r > 0.5 {
+                        let lx = dx as f32;
+                        let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
+                        let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
+                        let (ex, ey) = (lx - cx, ly - cy);
+                        if ex * ex + ey * ey > r * r {
+                            continue;
+                        }
+                    }
+                    buf[py * width + px] = color;
                 }
             }
         }
-    }
-    for run in &laid.runs {
-        let y = run.y - scroll;
-        if y < -run.style.size * 2.0 || y > page + run.style.size {
-            continue;
+        // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
+        for (x, y, w, h, img, fixed) in &laid.images {
+            if *fixed != want_fixed {
+                continue;
+            }
+            let y0 = if *fixed { *y } else { y - scroll };
+            if y0 + h < 0.0 || y0 > page {
+                continue;
+            }
+            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y0);
+            for dy in 0..h.max(0.0) as usize {
+                let py = sy as i32 + dy as i32;
+                if py < 0 || py >= height as i32 {
+                    continue;
+                }
+                let v = (dy as f32 * img.h as f32 / h) as u32;
+                for dx in 0..w.max(0.0) as usize {
+                    let px = sx as i32 + dx as i32;
+                    if px < 0 || px >= width as i32 {
+                        continue;
+                    }
+                    let u = (dx as f32 * img.w as f32 / w) as u32;
+                    let c = img.px[(v * img.w + u) as usize];
+                    let a = (c >> 24) as u8;
+                    let idx = py as usize * width + px as usize;
+                    if a == 255 {
+                        buf[idx] = c & 0x00ff_ffff;
+                    } else if a > 0 {
+                        blend(&mut buf[idx], c, a);
+                    }
+                }
+            }
         }
-        draw_text(
-            buf,
-            width,
-            PADDING as f32 + run.x,
-            PADDING as f32 + y,
-            &run.text,
-            fonts,
-            &run.style,
-        );
-    }
-    for &(x, y, w, h, color) in &laid.underline_rects {
-        let y = y - scroll;
-        if y < 0.0 || y > page {
-            continue;
+        for run in &laid.runs {
+            if run.fixed != want_fixed {
+                continue;
+            }
+            let y = if run.fixed { run.y } else { run.y - scroll };
+            if y < -run.style.size * 2.0 || y > page + run.style.size {
+                continue;
+            }
+            draw_text(
+                buf,
+                width,
+                PADDING as f32 + run.x,
+                PADDING as f32 + y,
+                &run.text,
+                fonts,
+                &run.style,
+            );
         }
-        let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y);
-        for dy in 0..h.max(1.0) as usize {
-            for dx in 0..w as usize {
-                let px = sx as usize + dx;
-                let py = (sy as usize) + dy;
-                if px < width && py * width + px < buf.len() {
-                    buf[py * width + px] = color;
+        for &(x, y, w, h, color, fixed) in &laid.underline_rects {
+            if fixed != want_fixed {
+                continue;
+            }
+            let y = if fixed { y } else { y - scroll };
+            if y < 0.0 || y > page {
+                continue;
+            }
+            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y);
+            for dy in 0..h.max(1.0) as usize {
+                for dx in 0..w as usize {
+                    let px = sx as usize + dx;
+                    let py = (sy as usize) + dy;
+                    if px < width && py * width + px < buf.len() {
+                        buf[py * width + px] = color;
+                    }
                 }
             }
         }

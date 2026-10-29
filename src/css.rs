@@ -60,6 +60,16 @@ pub enum Align {
     Stretch,
 }
 
+/// CSS `position`. `sticky` maps to `Relative` (shortcut: no scroll
+/// threshold — it just offsets in flow).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Pos {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
 /// Per-element box layout properties — the non-inherited half of CSS.
 /// Default = plain block flow (matches pre-flex rendering).
 #[derive(Clone, PartialEq, Debug)]
@@ -89,6 +99,11 @@ pub struct BoxStyle {
     /// border color; None = currentcolor (the element's own text color,
     /// resolved at paint time — never a hardcoded default)
     pub bcolor: Option<u32>,
+    /// CSS position (non-static boxes leave normal flow)
+    pub pos: Pos,
+    /// top, right, bottom, left — None = unspecified (absolute keeps its
+    /// provisional position, relative doesn't shift on that axis)
+    pub inset: [Option<Len>; 4],
 }
 
 impl Default for BoxStyle {
@@ -111,6 +126,8 @@ impl Default for BoxStyle {
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
+            pos: Pos::Static,
+            inset: [None; 4],
         }
     }
 }
@@ -200,6 +217,12 @@ const KNOWN: &[&str] = &[
     "border-right",
     "border-bottom",
     "border-left",
+    "position",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "inset",
 ];
 
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
@@ -575,6 +598,32 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
             if c.is_some() {
                 bx.bcolor = c;
             }
+        }
+        "position" => {
+            bx.pos = match d.1.trim() {
+                "relative" | "sticky" => Pos::Relative, // sticky: shortcut = relative
+                "absolute" => Pos::Absolute,
+                "fixed" => Pos::Fixed,
+                _ => Pos::Static, // static / bogus
+            }
+        }
+        // insets — `auto`/bogus parse to None (absolute keeps its provisional
+        // position on that edge, relative doesn't shift along it)
+        "top" => bx.inset[0] = parse_len(&d.1),
+        "right" => bx.inset[1] = parse_len(&d.1),
+        "bottom" => bx.inset[2] = parse_len(&d.1),
+        "left" => bx.inset[3] = parse_len(&d.1),
+        // inset shorthand: 1–4 values, `auto` slots stay None (unlike
+        // margin/padding where 0 is the fallback — None means "unset edge")
+        "inset" => {
+            let vals: Vec<Option<Len>> = d.1.split_whitespace().map(parse_len).collect();
+            bx.inset = match vals.len() {
+                1 => [vals[0]; 4],
+                2 => [vals[0], vals[1], vals[0], vals[1]],
+                3 => [vals[0], vals[1], vals[2], vals[1]],
+                4 => [vals[0], vals[1], vals[2], vals[3]],
+                _ => [None; 4],
+            };
         }
         _ => {}
     }
@@ -1554,6 +1603,55 @@ mod tests {
         let k = sheet.resolve(&dom, by_attr(&dom, "class", "k"), Style::new(), None);
         assert_eq!(k.bx.bcolor, None, "unspecified color stays currentcolor");
         assert_eq!(k.style.color, 0x123456, "…which is the element's text color");
+    }
+
+    #[test]
+    fn position_and_insets_parse() {
+        let sheet = parse(
+            ".a { position: absolute; top: 10px; left: 20% }\
+             .r { position: relative; bottom: 5px }\
+             .f { position: fixed; right: 1em }\
+             .s { position: sticky; top: 0 }\
+             .d { position: static }\
+             .u { position: bogus; top: auto }",
+        );
+        let dom = dom_of(
+            r#"<div class=a></div><div class=r></div><div class=f></div><div class=s></div><div class=d></div><div class=u></div>"#,
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let a = get("a");
+        assert_eq!(a.bx.pos, Pos::Absolute);
+        assert_eq!(a.bx.inset[0], Some(Len::Px(10.0)), "top");
+        assert_eq!(a.bx.inset[3], Some(Len::Pct(20.0)), "left %");
+        assert_eq!(a.bx.inset[1], None, "right unspecified");
+        let r = get("r");
+        assert_eq!(r.bx.pos, Pos::Relative);
+        assert_eq!(r.bx.inset[2], Some(Len::Px(5.0)), "bottom");
+        let f = get("f");
+        assert_eq!(f.bx.pos, Pos::Fixed);
+        assert_eq!(f.bx.inset[1], Some(Len::Px(16.0)), "right 1em");
+        // sticky → relative (shortcut: no scroll threshold)
+        assert_eq!(get("s").bx.pos, Pos::Relative);
+        assert_eq!(get("d").bx.pos, Pos::Static);
+        // unknown keyword and unparseable `auto` → static/None
+        let u = get("u");
+        assert_eq!(u.bx.pos, Pos::Static, "bogus keyword ignored");
+        assert_eq!(u.bx.inset[0], None, "auto → None");
+    }
+
+    #[test]
+    fn inset_shorthand() {
+        let sheet = parse(".a { inset: 0 } .b { inset: 1px 2px } .c { inset: 1px auto }");
+        let dom = dom_of(r#"<div class=a></div><div class=b></div><div class=c></div>"#);
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        assert_eq!(get("a").bx.inset, [Some(Len::Px(0.0)); 4], "one value → all sides");
+        assert_eq!(
+            get("b").bx.inset,
+            [Some(Len::Px(1.0)), Some(Len::Px(2.0)), Some(Len::Px(1.0)), Some(Len::Px(2.0))],
+            "two values → tb lr"
+        );
+        assert_eq!(get("c").bx.inset[1], None, "auto slot stays None");
+        assert_eq!(get("c").bx.inset[0], Some(Len::Px(1.0)));
     }
 }
 
