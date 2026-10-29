@@ -230,6 +230,7 @@ const KNOWN: &[&str] = &[
     "margin-top",
     "margin-bottom",
     "line-height",
+    "visibility",
     "margin",
     "margin-left",
     "margin-right",
@@ -578,6 +579,10 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         // fully transparent = invisible; shortcut: partial opacity ignored
         // (rasterizer has no alpha compositing), so only 0 hides the subtree
         "opacity" => return d.1.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false),
+        // shortcut: hidden/collapse treated as display:none (real CSS keeps
+        // the box in flow — usually fine, sites use it on off-screen
+        // measurement clones)
+        "visibility" => return matches!(d.1.as_str(), "hidden" | "collapse"),
         "text-align" => {
             style.text_align = match d.1.as_str() {
                 "center" => 1,
@@ -1623,6 +1628,16 @@ mod tests {
         assert!(sheet.resolve(&dom, node, Style::new(), None).display_none);
         let sheet2 = parse("p { display: block }");
         assert!(!sheet2.resolve(&dom, node, Style::new(), None).display_none);
+    }
+
+    #[test]
+    fn visibility_hidden_hides_subtree() {
+        // sites hide measurement clones with `visibility: invisible/hidden`
+        // (Tailwind `.invisible`); shortcut: treated as display:none
+        let sheet = parse(".a { visibility: hidden } .b { visibility: visible }");
+        let dom = dom_of("<div class=a></div><div class=b></div>");
+        assert!(sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).display_none);
+        assert!(!sheet.resolve(&dom, by_attr(&dom, "class", "b"), Style::new(), None).display_none);
     }
 
     #[test]
