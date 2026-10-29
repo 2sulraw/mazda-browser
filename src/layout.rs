@@ -293,6 +293,22 @@ fn build_into(
     }
 }
 
+/// One painted `box-shadow` — resolved to px at layout. `color` already
+/// carries alpha (0xAARRGGBB); drawn as a blurred rounded rect.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ShadowRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub radius: f32,
+    /// blur radius (0 = hard edge)
+    pub blur: f32,
+    /// packed alpha × color
+    pub color: u32,
+    pub fixed: bool,
+}
+
 pub struct PositionedRun {
     pub x: f32,
     pub y: f32,
@@ -314,6 +330,8 @@ pub struct Layout {
     pub rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     /// decoded `<img>` boxes (x, y, w, h, pixels, fixed) — drawn under text
     pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
+    /// box-shadows (under backgrounds), paint order = list order
+    pub shadows: Vec<ShadowRect>,
     /// true if the last line still has content on it (no trailing <br>) —
     /// block flow uses this to decide whether to add the paragraph gap
     pub open_line: bool,
@@ -354,13 +372,15 @@ pub fn layout_in(
     position_all(root, cb, cb, cb, false, measure, &mut runs, &mut uls);
     let mut rects = Vec::new();
     let mut images = Vec::new();
-    collect_paint(root, false, &mut rects, &mut images);
+    let mut shadows = Vec::new();
+    collect_paint(root, false, &mut rects, &mut images, &mut shadows);
     Layout {
         runs,
         height: root.h,
         underline_rects: uls,
         rects,
         images,
+        shadows,
         open_line: root.open,
     }
 }
@@ -374,6 +394,7 @@ fn collect_paint(
     fixed: bool,
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
+    shadows: &mut Vec<ShadowRect>,
 ) {
     if !n.is_text {
         let fixed = fixed || n.bx.pos == Pos::Fixed;
@@ -386,6 +407,23 @@ fn collect_paint(
         let bc = n.bx.bcolor.unwrap_or(n.style.color);
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
         let ring = has_b && r > 0.0 && n.bx.bg.is_some();
+        // box-shadows: spread grows the rect, blur softens it; color
+        // resolves to currentcolor when unspecified, alpha from the color
+        for s in &n.bx.shadows {
+            let sp = s.spread;
+            let c = s.color.unwrap_or(n.style.color);
+            let a = s.alpha as u32;
+            shadows.push(ShadowRect {
+                x: n.x + s.dx - sp,
+                y: n.y + s.dy - sp,
+                w: (n.w + sp * 2.0).max(0.0),
+                h: (n.h + sp * 2.0).max(0.0),
+                radius: r,
+                blur: s.blur,
+                color: (a << 24) | c,
+                fixed,
+            });
+        }
         if let Some(c) = n.bx.bg {
             if ring {
                 // rounded ring: fill the border-box with the border color,
@@ -427,7 +465,7 @@ fn collect_paint(
             }
         }
         for ch in &n.children {
-            collect_paint(ch, fixed, out, imgs);
+            collect_paint(ch, fixed, out, imgs, shadows);
         }
     }
 }
@@ -1259,6 +1297,7 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
         underline_rects,
         rects: Vec::new(),
         images: Vec::new(),
+        shadows: Vec::new(),
         open_line: x > 0.0,
     }
 }
@@ -1673,6 +1712,61 @@ mod tests {
         assert_eq!(l2.rects[0].4, 0xe8e8e8, "outer ring = currentcolor (text color)");
         assert!((l2.rects[1].2 - 46.0).abs() < 0.01, "inner w={}", l2.rects[1].2);
         assert!((l2.rects[1].5 - 4.0).abs() < 0.01, "inner radius={}", l2.rects[1].5);
+    }
+
+    #[test]
+    fn shadow_emitted_offset_spread_alpha_fixed() {
+        use crate::css::Shadow;
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                bg: Some(0xffffff),
+                width: Some(Len::Px(100.0)),
+                shadows: vec![Shadow {
+                    dx: 0.0,
+                    dy: 4.0,
+                    blur: 10.0,
+                    spread: 2.0,
+                    color: Some(0x000000),
+                    alpha: 128,
+                }],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("a")];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        assert_eq!(l.shadows.len(), 1, "one shadow rect");
+        let s = &l.shadows[0];
+        // spread grows the rect by 2px each side, offset down 4px
+        assert!((s.x - -2.0).abs() < 0.01, "x={}", s.x);
+        assert!((s.y - 2.0).abs() < 0.01, "y={}", s.y);
+        assert!((s.w - 104.0).abs() < 0.01, "w={}", s.w);
+        // plain blocks size to content (declared height only applies to
+        // replaced elements) — compare against the emitted bg rect
+        assert!((s.h - (l.rects[0].3 + 4.0)).abs() < 0.01, "h={}", s.h);
+        assert_eq!(s.blur, 10.0);
+        assert_eq!(s.color, (128u32 << 24) | 0x000000, "alpha packed in");
+        assert!(!s.fixed, "in-flow box");
+        // currentcolor: no shadow color → the element's text color
+        let mut m2 = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                shadows: vec![Shadow {
+                    dx: 1.0,
+                    dy: 1.0,
+                    blur: 0.0,
+                    spread: 0.0,
+                    color: None,
+                    alpha: 255,
+                }],
+                pos: Pos::Fixed,
+                ..BoxStyle::default()
+            },
+        );
+        m2.children = vec![leaf("a")];
+        let l2 = layout_tree(&mut m2, 200.0, &m4);
+        assert_eq!(l2.shadows[0].color, 0xff000000 | 0xe8e8e8, "currentcolor");
+        assert!(l2.shadows[0].fixed, "fixed subtree");
     }
 
     #[test]

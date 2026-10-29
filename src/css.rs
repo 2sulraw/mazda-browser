@@ -104,6 +104,22 @@ pub struct BoxStyle {
     /// top, right, bottom, left — None = unspecified (absolute keeps its
     /// provisional position, relative doesn't shift on that axis)
     pub inset: [Option<Len>; 4],
+    /// `box-shadow` list, first = topmost (paint order reversed)
+    pub shadows: Vec<Shadow>,
+}
+
+/// One outer `box-shadow`: offset, blur, spread, color. `color: None` =
+/// currentcolor (the element's text color, resolved at paint time).
+/// shortcut: `inset` shadows are dropped (no inner-shadow rendering).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Shadow {
+    pub dx: f32,
+    pub dy: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Option<u32>,
+    /// shadow opacity 0-255 (CSS shadows carry their own alpha)
+    pub alpha: u8,
 }
 
 impl Default for BoxStyle {
@@ -128,6 +144,7 @@ impl Default for BoxStyle {
             bcolor: None, // currentcolor
             pos: Pos::Static,
             inset: [None; 4],
+            shadows: Vec::new(),
         }
     }
 }
@@ -223,6 +240,7 @@ const KNOWN: &[&str] = &[
     "bottom",
     "left",
     "inset",
+    "box-shadow",
 ];
 
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
@@ -470,6 +488,9 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
             "inline" | "inline-block" | "inline-flex" | "inline-grid" => bx.display = Display::Inline,
             _ => {}
         },
+        // shadows carry their own alpha (rgba() is the common case) and may
+        // stack — parse the whole list, first shadow paints on top
+        "box-shadow" => bx.shadows = parse_box_shadows(&d.1),
         // fully transparent = invisible; shortcut: partial opacity ignored
         // (rasterizer has no alpha compositing), so only 0 hides the subtree
         "opacity" => return d.1.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false),
@@ -839,6 +860,131 @@ fn parse_color(v: &str) -> Option<u32> {
         "pink" => Some(0xffc0cb),
         _ => None, // transparent, currentColor, var(), url() …
     }
+}
+
+/// Like [`parse_color`] but keeps alpha — shadows need real opacity
+/// (an `rgba(0,0,0,0.4)` shadow at full opacity looks like a sticker).
+/// Returns (rgb, alpha 0-255); None = unparseable.
+fn parse_color_alpha(v: &str) -> Option<(u32, u8)> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        let hex = hex.trim();
+        let digits = u32::from_str_radix(hex, 16).ok()?;
+        return match hex.len() {
+            3 => parse_color(v).map(|c| (c, 255)),
+            4 => {
+                let (r, g, b, a) = (
+                    (digits >> 8) & 0xf,
+                    (digits >> 4) & 0xf,
+                    digits & 0xf,
+                    (digits >> 12) & 0xf,
+                );
+                let f = |n: u32| (n << 4 | n) as u8;
+                Some(((f(r) as u32) << 16 | (f(g) as u32) << 8 | f(b) as u32, f(a)))
+            }
+            6 => Some((digits, 255)),
+            8 => Some((digits >> 8, (digits & 0xff) as u8)),
+            _ => None,
+        };
+    }
+    let is_rgba = v.starts_with("rgba(");
+    let inner = v
+        .strip_prefix("rgba(")
+        .or_else(|| v.strip_prefix("rgb("))
+        .and_then(|s| s.strip_suffix(')'));
+    if let Some(inner) = inner {
+        let mut parts = inner.split(',');
+        let r = parts.next()?.trim().parse::<u32>().ok()?;
+        let g = parts.next()?.trim().parse::<u32>().ok()?;
+        let b = parts.next()?.trim().parse::<u32>().ok()?;
+        if r > 255 || g > 255 || b > 255 {
+            return None;
+        }
+        let a = if is_rgba {
+            (parts.next().and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 1.0)
+                * 255.0)
+                .round() as u8
+        } else {
+            255
+        };
+        return Some((r << 16 | g << 8 | b, a));
+    }
+    parse_color(v).map(|c| (c, 255))
+}
+
+/// `box-shadow` value → list, first = topmost (paint order). `none`, empty
+/// and unparseable → empty list. `inset` shadows are dropped (shortcut: no
+/// inner-shadow rendering).
+fn parse_box_shadows(v: &str) -> Vec<Shadow> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    // split on top-level commas (rgba() has its own, inside parens)
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for c in v.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    parts.push(cur);
+    parts.iter().filter_map(|p| parse_shadow(p)).collect()
+}
+
+/// One comma-separated shadow: `dx dy [blur] [spread] [color]` in any
+/// token order (color first or last, as sites write it).
+fn parse_shadow(v: &str) -> Option<Shadow> {
+    let mut lens = [0.0f32; 4];
+    let mut n_lens = 0usize;
+    let mut color = None;
+    // re-join whitespace-split tokens that sit inside `rgba(...)` parens
+    let mut toks: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    for t in v.split_whitespace() {
+        if !toks.is_empty() && depth > 0 {
+            toks.last_mut().unwrap().push_str(t);
+        } else {
+            toks.push(t.to_string());
+        }
+        depth += t.matches('(').count();
+        depth = depth.saturating_sub(t.matches(')').count());
+    }
+    for t in toks {
+        if t.eq_ignore_ascii_case("inset") {
+            return None; // inner shadow: dropped (shortcut)
+        }
+        if let Some(l) = parse_len(&t) {
+            if n_lens < 4 {
+                lens[n_lens] = match l {
+                    Len::Px(p) => p,
+                    Len::Pct(_) => 0.0, // % of what? no resolved width here — ignore
+                };
+                n_lens += 1;
+            }
+        } else if color.is_none() {
+            color = parse_color_alpha(&t);
+        }
+    }
+    if n_lens < 2 {
+        return None; // need at least the two offsets
+    }
+    Some(Shadow {
+        dx: lens[0],
+        dy: lens[1],
+        blur: lens[2].max(0.0),
+        spread: lens[3],
+        color: color.map(|c| c.0),
+        alpha: color.map(|c| c.1).unwrap_or(255),
+    })
 }
 
 // ---------- selector parsing (once per sheet) ----------
@@ -1652,6 +1798,52 @@ mod tests {
         );
         assert_eq!(get("c").bx.inset[1], None, "auto slot stays None");
         assert_eq!(get("c").bx.inset[0], Some(Len::Px(1.0)));
+    }
+
+    #[test]
+    fn box_shadow_parse() {
+        let sheet = parse(".a { box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25) }");
+        let dom = dom_of("<div class=a></div>");
+        let s = sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None);
+        let sh = &s.bx.shadows;
+        assert_eq!(sh.len(), 1);
+        assert_eq!((sh[0].dx, sh[0].dy, sh[0].blur, sh[0].spread), (0.0, 4.0, 12.0, 0.0));
+        assert_eq!(sh[0].color, Some(0x000000), "rgba color");
+        assert_eq!(sh[0].alpha, 64, "0.25 × 255 ≈ 64");
+    }
+
+    #[test]
+    fn box_shadow_color_anywhere_and_defaults() {
+        // color before the lengths (sites write both orders); no color →
+        // currentcolor (None), default alpha 255
+        let sheet = parse(".a { box-shadow: #ff0000 1px 2px 3px 4px } .b { box-shadow: 1px 2px }");
+        let dom = dom_of("<div class=a></div><div class=b></div>");
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let a = &get("a").bx.shadows[0];
+        assert_eq!(a.color, Some(0xff0000));
+        assert_eq!((a.dx, a.dy, a.blur, a.spread), (1.0, 2.0, 3.0, 4.0));
+        assert_eq!(a.alpha, 255);
+        let b = &get("b").bx.shadows[0];
+        assert_eq!(b.color, None, "no color → currentcolor");
+        assert_eq!((b.dx, b.dy, b.blur, b.spread), (1.0, 2.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn box_shadow_multi_inset_none() {
+        // first shadow paints on top; `inset` shadows are dropped (shortcut);
+        // `none` and empty → no shadows
+        let sheet = parse(
+            ".a { box-shadow: 0 1px #111111, 0 2px 4px #222222, inset 0 3px #333333 } \
+             .b { box-shadow: none } .c { }",
+        );
+        let dom = dom_of("<div class=a></div><div class=b></div><div class=c></div>");
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let a = &get("a").bx.shadows;
+        assert_eq!(a.len(), 2, "inset dropped");
+        assert_eq!(a[0].color, Some(0x111111), "first = topmost");
+        assert_eq!(a[1].color, Some(0x222222));
+        assert!(get("b").bx.shadows.is_empty(), "none");
+        assert!(get("c").bx.shadows.is_empty(), "absent");
     }
 }
 

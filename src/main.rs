@@ -660,6 +660,52 @@ fn render(
     // two passes: normal content (scrolled) first, then fixed overlays on
     // top in viewport coordinates (no scroll offset)
     for want_fixed in [false, true] {
+        // box-shadows under everything else in this pass — blurred rounded
+        // rects, per-pixel distance falloff over blur/2
+        for s in &laid.shadows {
+            if s.fixed != want_fixed {
+                continue;
+            }
+            let y0 = if s.fixed { s.y } else { s.y - scroll };
+            // grow the paint area by the blur so the falloff isn't clipped
+            let pad = s.blur;
+            if y0 + s.h + pad < 0.0 || y0 - pad > page {
+                continue;
+            }
+            let (sx, sy) = (PADDING as f32 + s.x - pad, PADDING as f32 + y0 - pad);
+            let (bw, bh) = (s.w + pad * 2.0, s.h + pad * 2.0);
+            let a = (s.color >> 24) as u8;
+            let half = (s.blur * 0.5).max(0.01);
+            let (cx, cy) = (s.w * 0.5 + pad, s.h * 0.5 + pad);
+            for dy in 0..bh.max(0.0) as usize {
+                let py = sy as i32 + dy as i32;
+                if py < 0 || py >= height as i32 {
+                    continue;
+                }
+                for dx in 0..bw.max(0.0) as usize {
+                    let px = sx as i32 + dx as i32;
+                    if px < 0 || px >= width as i32 {
+                        continue;
+                    }
+                    // signed distance to the (rounded) rect, then smoothstep
+                    let lx = dx as f32 + pad;
+                    let ly = dy as f32 + pad;
+                    let qx = (lx - cx).abs().max(0.0) - s.w * 0.5 + s.radius;
+                    let qy = (ly - cy).abs().max(0.0) - s.h * 0.5 + s.radius;
+                    let dist = {
+                        let (ax, ay) = (qx.max(0.0), qy.max(0.0));
+                        (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - s.radius
+                    };
+                    if dist >= half {
+                        continue;
+                    }
+                    let t = ((half - dist) / (2.0 * half)).clamp(0.0, 1.0);
+                    let f = t * t * (3.0 - 2.0 * t); // smoothstep
+                    let idx = py as usize * width + px as usize;
+                    blend(&mut buf[idx], s.color, (a as f32 * f) as u8);
+                }
+            }
+        }
         // box backgrounds first (parent-before-child), then text on top
         for &(x, y, w, h, color, rad, fixed) in &laid.rects {
             if fixed != want_fixed {

@@ -122,6 +122,14 @@ curve matters more than the baseline (near-flat as tabs grow).
   Known gaps: static position approximated by the containing-block origin for
   no-inset absolute boxes, no vertical auto-stretch (top+bottom+auto height),
   no z-index (paint order = DOM order), sticky has no scroll threshold
+- [x] **Phase 1i** — box-shadow: ~~missing~~ **DONE (outer `box-shadow` list,
+  any token order, rgba/8-digit-hex alpha, spread, multi-shadow, currentcolor
+  default; layout emits `ShadowRect`s under backgrounds, render paints a
+  blurred rounded rect per shadow with smoothstep falloff over blur/2 in the
+  fixed/scrolled double-pass; `inset` shadows dropped; 95 tests; nextjs.org
+  renders with elevation shadows)**.
+  Known gaps: `inset` (inner) shadows dropped, no shadow-per-side, blur is a
+  smoothstep approximation of the gaussian (not separable-blurred)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -161,6 +169,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1f: SVG rasterizer (8/9 images incl. logos) | nextjs.org | 45.1 MB (8 images at display size) |
 | 2026-10-29 | Phase 1g: borders (strips/ring paint) | nextjs.org | 45.2 MB |
 | 2026-10-29 | Phase 1h: position relative/absolute/fixed | nextjs.org | 48.2 MB (572 runs; positioned nav/footer) |
+| 2026-10-29 | Phase 1i: box-shadow | nextjs.org | 45.6 MB (572 runs; 8 images) |
 
 ### Phase 1c (Track A) findings
 
