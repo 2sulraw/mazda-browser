@@ -184,6 +184,30 @@ curve matters more than the baseline (near-flat as tabs grow).
   freed space; nextjs.org hero `min-h-[560px] justify-end` now floats the NEXT
   outline above the pill; 108 tests)**
   Known gap: `%` min-height resolves against width, not container height
+- [x] **UA defaults + cross-site parity fixes** — ~~Wikipedia/nextjs/rust-lang/MDN/HN
+  each broke a different way~~ **DONE. UA `BG` → white `0x00ffffff`, default text →
+  black, `load_page` bg = body → `<html>` → BG (body wins per HTML spec); `display:
+  inline-block|inline-flex|inline-grid` → real box (buttons/badges paint); inline
+  horizontal margins emit one separator space (HN `.hnname` gap); `font-size`
+  honours `inherit/unset/initial` + `clamp()`/`vw`/`vh`; `parse_tracks` is paren-aware
+  (skips whole unresolvable `calc(`/`max(`/`min(` groups — no phantom 720px track)
+  and records `[line-name]` boundaries; named `grid-column: <name>` placement
+  (`BoxStyle.col_lines`+`grid_col`, `grid()` resolves named spans); whitespace-only
+  runs no longer become grid/flex items; wrapping flex rows fit available width
+  (`natural_w_inner` caps at `avail`). Verified: HN header gap, MDN wide hero,
+  rust-lang full nav + yellow button + black title, Wikipedia heading size — all
+  match the reference browser; 113 tests; `f057898`)**
+  Known gap: inline-block boxes stack as blocks instead of sitting mid-line; inline
+  margins approximate to one space (not pixel-exact)
+- [x] **var() theme scoping** — ~~Wikipedia rendered dark with invisible text
+  (night-scoped vars leaked past the `clientpref-day` root)~~ **DONE: `Sheet.var_defs`
+  records every custom-prop definition with its selector; `scope_vars(&Dom, html)` rewrites
+  the flat `vars` map after the DOM is built, dropping only definitions whose selector
+  asserts a theme state the real `<html>` root class list contradicts. Wikipedia (root
+  `clientpref-day`) drops `clientpref-night` dark vars → light; nextjs (no root theme)
+  keeps its JS-era `.dark` values → dark; MDN (no root class) unchanged → dark.
+  shortcut: only root-declared themes are modeled — a JS-activated theme is not a
+  contradiction, so it stays (matches this machine's system-dark render; in progress)**
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -229,6 +253,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1l: var() custom properties + hsl() | nextjs.org | 45.3 MB (572 runs; pill + themed colors render) |
 | 2026-10-29 | Phase 1m: inline `<svg>` | nextjs.org | 41.9 MB (572 runs; 24 images — hero NEXT + icons) |
 | 2026-10-29 | selector split + min-height fixes | nextjs.org | 42.0 MB (570 runs; hero NEXT floats above pill, footer no longer piled at top-left) |
+| 2026-10-29 | UA-white + cross-site fixes (inline-block/margin, clamp/vw, grid calc+named col, flex-wrap) | rust-lang.org | 27.2 MB (517 runs; full nav + yellow button) |
+| 2026-10-29 | UA-white + cross-site fixes | Wikipedia (Main_Page) | 34.4 MB (1326 runs; heading size fixed) |
 
 ### Phase 1c (Track A) findings
 

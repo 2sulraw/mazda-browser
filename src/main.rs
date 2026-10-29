@@ -179,24 +179,27 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32, vh: f32) -> Page {
     }
     // media queries evaluate against the window's CSS pixel width
     let viewport = max_w + 2.0 * PADDING as f32;
-    let sheet = css::parse_for(&css_text, viewport);
+    let mut sheet = css::parse_for(&css_text, viewport);
     eprintln!(
         "[css] {} bytes of style, {} rules ({} external sheets)",
         css_text.len(),
         sheet.rule_count(),
         ext_count
     );
-
-    // cascade over the body element itself: page bg + initial inherited style
-    // (spec: the canvas background comes from <body> if it has one, else
-    // <html>'s — body wins per the HTML spec)
-    let body = sheet.resolve(&dom, root, Style::new(), dom.attr(root, "style"));
+    // the real <html> element scopes custom-property themes (below) and is the
+    // canvas-background fallback
     let html_el = dom.nodes[0]
         .children
         .iter()
         .copied()
         .find(|&c| dom.tag(c) == "html")
         .unwrap_or(0);
+    sheet.scope_vars(&dom, html_el);
+
+    // cascade over the body element itself: page bg + initial inherited style
+    // (spec: the canvas background comes from <body> if it has one, else
+    // <html>'s — body wins per the HTML spec)
+    let body = sheet.resolve(&dom, root, Style::new(), dom.attr(root, "style"));
     let bg = body
         .bg
         .or_else(|| sheet.resolve(&dom, html_el, Style::new(), dom.attr(html_el, "style")).bg)

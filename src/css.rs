@@ -186,16 +186,48 @@ struct Rule {
 pub struct Sheet {
     /// sorted by (spec, order) at parse time; cascade = apply matches in order
     rules: Vec<Rule>,
-    /// custom properties (--name → value) collected from every rule in
-    /// document order (later rules override earlier, so `.dark` beats
-    /// `:root` when it comes later in the sheet). shortcut: no per-element
-    /// cascade/inheritance for custom props — a flat page-wide map.
+    /// effective custom properties (--name → value) consumed by `resolve`.
+    /// Starts as the flat last-definition-wins map (parse time); `scope_vars`
+    /// rewrites it once the real <html> element is known.
     vars: std::collections::HashMap<String, String>,
+    /// every custom-property definition as (selector, value) in document
+    /// order — what `scope_vars` filters by against the <html> root's theme.
+    var_defs: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 impl Sheet {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Drop custom-property definitions whose selector asserts a theme state the
+    /// real `<html>` element contradicts (Wikipedia's root declares
+    /// `clientpref-day`, so its `clientpref-night` dark vars must not override the
+    /// `:root` light ones). Runs once after the DOM is built; before it, `vars`
+    /// is the flat last-definition-wins map.
+    /// shortcut: only a theme declared on the <html> root is modeled. A JS-
+    /// activated theme (nextjs `.dark`, absent from server HTML) is NOT a
+    /// contradiction, so its dark values are kept — matching a system-dark render.
+    pub fn scope_vars(&mut self, dom: &Dom, html: u32) {
+        let root_pol = dom.attr(html, "class").and_then(theme_polarity);
+        self.vars.clear();
+        for (name, defs) in &self.var_defs {
+            let mut chosen: Option<&str> = None;
+            for (sel, val) in defs {
+                let sel_pol = selector_polarity(sel);
+                // both known and opposite => the definition contradicts the root
+                let contradicts = matches!(
+                    (root_pol, sel_pol),
+                    (Some(false), Some(true)) | (Some(true), Some(false))
+                );
+                if !contradicts {
+                    chosen = Some(val); // last non-contradicting definition wins
+                }
+            }
+            if let Some(v) = chosen {
+                self.vars.insert(name.clone(), v.to_string());
+            }
+        }
     }
 }
 
@@ -285,6 +317,8 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     let b = s.as_bytes();
     let mut rules: Vec<Rule> = Vec::new();
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut var_defs: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
     let mut order = 0u32;
     let mut i = 0usize;
 
@@ -311,17 +345,22 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         let decls = parse_decls(block);
         if !decls.is_empty() {
             // custom properties are collected for EVERY rule regardless of
-            // selector — they live in one page-wide map. shortcut: theme-
-            // scoped definitions leak (Wikipedia's html.skin-theme-clientpref-
-            // night dark vars override its :root light ones → dark render).
-            // Correct fix = selector-aware scoping keyed on the root element's
-            // real classes, which needs the DOM at parse time; a JS-activated
-            // theme (nextjs .dark) is invisible to us either way.
+            // selector — they live in one page-wide map. Each definition is
+            // also kept with its selector text so `scope_vars` can later drop
+            // the ones whose selector contradicts the real <html> root's theme
+            // (Wikipedia's html.skin-theme-clientpref-night dark vars vs its
+            // clientpref-day root). shortcut: only a theme declared on the
+            // root element is modeled — a JS-activated theme (nextjs .dark,
+            // absent from server HTML) can't contradict anything.
             let real: Vec<Decl> = decls
                 .iter()
                 .filter_map(|d| {
                     if d.0.starts_with("--") {
                         vars.insert(d.0.clone(), d.1.clone());
+                        var_defs
+                            .entry(d.0.clone())
+                            .or_default()
+                            .push((sel_text.trim().to_string(), d.1.clone()));
                         None
                     } else {
                         Some(d.clone())
@@ -351,7 +390,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     }
 
     rules.sort_by_key(|r| (r.spec, r.order));
-    Sheet { rules, vars }
+    Sheet { rules, vars, var_defs }
 }
 
 /// Position just past an at-rule. `@media`/`@layer` blocks whose condition
@@ -535,6 +574,29 @@ fn subst_vars(v: &str, vars: &std::collections::HashMap<String, String>, depth: 
     }
     out.push_str(rest);
     out
+}
+
+/// Theme polarity of ONE token, split into alphanumeric segments so
+/// `highlight`/`today` don't match `light`/`day`. Some(true)=dark, Some(false)=light.
+fn token_polarity(tok: &str) -> Option<bool> {
+    for seg in tok.split(|c: char| !c.is_ascii_alphanumeric()) {
+        match seg {
+            "dark" | "night" | "invert" => return Some(true),
+            "light" | "day" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// First class token on the root with a clean theme polarity (root's declared theme).
+fn theme_polarity(class_attr: &str) -> Option<bool> {
+    class_attr.split_whitespace().find_map(token_polarity)
+}
+
+/// Polarity a selector asserts (dark-scoped `.night`/`.dark` vs light-scoped). Neutral selectors (`:root`, `html`, `body`) → None.
+fn selector_polarity(sel: &str) -> Option<bool> {
+    token_polarity(sel)
 }
 
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
@@ -1884,6 +1946,43 @@ mod tests {
             sheet.resolve(&dom, body, Style::new(), None).bg,
             Some(0x202122),
             "flat var map: last definition wins regardless of selector"
+        );
+    }
+
+    #[test]
+    fn scope_vars_drops_root_contradicting_theme_defs() {
+        let mut sheet = parse(
+            ":root { --bg: #f8f9fa } \
+             html.skin-theme-clientpref-night { --bg: #202122 } \
+             body { background-color: var(--bg, #ffffff) }",
+        );
+        // the real root declares the DAY (light) theme
+        let dom = dom_of("<html class=\"skin-theme-clientpref-day\"><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        sheet.scope_vars(&dom, html);
+        let body = by_tag(&dom, "body");
+        assert_eq!(
+            sheet.resolve(&dom, body, Style::new(), None).bg,
+            Some(0xf8f9fa),
+            "night dark vars dropped when root declares day"
+        );
+    }
+
+    #[test]
+    fn scope_vars_keeps_dark_when_root_declares_no_theme() {
+        let mut sheet = parse(
+            ":root { --bg: #f8f9fa } .dark { --bg: #202122 } \
+             body { background-color: var(--bg, #ffffff) }",
+        );
+        // root has no theme class (nextjs server HTML) — dark def must survive
+        let dom = dom_of("<html><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        sheet.scope_vars(&dom, html);
+        let body = by_tag(&dom, "body");
+        assert_eq!(
+            sheet.resolve(&dom, body, Style::new(), None).bg,
+            Some(0x202122),
+            "no root theme => no contradiction => dark kept"
         );
     }
 
