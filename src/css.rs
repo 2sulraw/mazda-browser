@@ -334,8 +334,11 @@ impl Sheet {
 
     /// Interned stack id for one (var-substituted) declaration — only
     /// `font-family` has one; everything else costs just the string compare.
+    /// inherit/unset/initial never name a family (see the apply_decl arm).
     fn fam_stack_of(&self, d: &Decl) -> u16 {
-        if d.0 == "font-family" {
+        if d.0 == "font-family"
+            && !matches!(d.1.trim(), "inherit" | "unset" | "initial")
+        {
             self.intern_stack(&d.1)
         } else {
             0
@@ -975,10 +978,20 @@ fn apply_decl(
             }
         }
         "font-style" => style.italic = matches!(d.1.as_str(), "italic" | "oblique"),
-        "font-family" => {
-            style.fam = parse_fam(&d.1);
-            style.fam_stack = fam_stack;
-        }
+        "font-family" => match d.1.trim() {
+            // inherited property: inherit/unset must KEEP the parent's family
+            // (normalize.css ships `select, input, textarea { font-family:
+            // inherit }` — the base style already IS the parent's)
+            "inherit" | "unset" => {}
+            "initial" => {
+                style.fam = Fam::Sans;
+                style.fam_stack = 0;
+            }
+            v => {
+                style.fam = parse_fam(v);
+                style.fam_stack = fam_stack;
+            }
+        },
         "text-decoration" => style.underline = d.1.contains("underline"),
         "line-height" => {
             // unitless = multiplier of font-size; px/rem/% absolute (of size)
@@ -3162,6 +3175,33 @@ mod tests {
         // no stack table wired (tests using plain parse()) → id 0, old behaviour
         let plain = parse("h1 { font-family: serif }");
         assert_eq!(style_for_tag(&plain, &dom, "h1").fam_stack, 0);
+    }
+
+    #[test]
+    fn font_family_inherit_keeps_parent_stack() {
+        // normalize.css ships `select, input, textarea { font-family: inherit }`
+        // — "inherit" must keep the parent's stack, not become a family name
+        let mut sheet = parse(
+            "body { font-family: Verdana, sans-serif }\
+             select { font-family: inherit }",
+        );
+        let table: StackTable = std::rc::Rc::new(std::cell::RefCell::new(vec![Vec::new()]));
+        sheet.set_stacks(table.clone());
+        let dom = dom_of("<body><select></select></body>");
+        let body = by_tag(&dom, "body");
+        let base = sheet.resolve(&dom, body, Style::new(), None).style;
+        assert_eq!(base.fam_stack, 1, "body's stack interned");
+        let sel = by_tag(&dom, "select");
+        let st = sheet.resolve(&dom, sel, base, dom.attr(sel, "style")).style;
+        assert_eq!(
+            st.fam_stack, 1,
+            "font-family:inherit keeps the parent's stack untouched"
+        );
+        assert_eq!(
+            table.borrow().iter().find(|s| s.iter().any(|n| n == "inherit")),
+            None,
+            "the word 'inherit' never becomes a stack entry"
+        );
     }
 }
 
