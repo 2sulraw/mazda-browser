@@ -340,9 +340,46 @@ fn collect_paint(
     imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>)>,
 ) {
     if !n.is_text {
+        let bt = resolve_len(n.bx.border[0], n.w);
+        let br = resolve_len(n.bx.border[1], n.w);
+        let bb = resolve_len(n.bx.border[2], n.w);
+        let bl = resolve_len(n.bx.border[3], n.w);
+        let has_b = bt > 0.0 || br > 0.0 || bb > 0.0 || bl > 0.0;
+        let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
+        let ring = has_b && r > 0.0 && n.bx.bg.is_some();
         if let Some(c) = n.bx.bg {
-            let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
-            out.push((n.x, n.y, n.w, n.h, c, r));
+            if ring {
+                // rounded ring: fill the border-box with the border color,
+                // then the background inset over it (inner radius ≈ r − border)
+                out.push((n.x, n.y, n.w, n.h, n.bx.bcolor, r));
+                let inner = (r - bt.max(br).max(bb).max(bl)).max(0.0);
+                out.push((
+                    n.x + bl,
+                    n.y + bt,
+                    (n.w - bl - br).max(0.0),
+                    (n.h - bt - bb).max(0.0),
+                    c,
+                    inner,
+                ));
+            } else {
+                out.push((n.x, n.y, n.w, n.h, c, r));
+            }
+        }
+        if has_b && !ring {
+            // four side strips over the background (square corners on a
+            // rounded backgroundless box — shortcut)
+            if bt > 0.0 {
+                out.push((n.x, n.y, n.w, bt, n.bx.bcolor, 0.0));
+            }
+            if bb > 0.0 {
+                out.push((n.x, n.y + n.h - bb, n.w, bb, n.bx.bcolor, 0.0));
+            }
+            if bl > 0.0 {
+                out.push((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0), n.bx.bcolor, 0.0));
+            }
+            if br > 0.0 {
+                out.push((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0), n.bx.bcolor, 0.0));
+            }
         }
         if let Some(ImgSlot::Ready(d)) = &n.img {
             if n.w > 0.0 && n.h > 0.0 {
@@ -421,16 +458,21 @@ fn place(
     if n.bx.margin_x_auto {
         n.x = x + (avail - w).max(0.0) * 0.5;
     }
-    // content box = border box inset by padding (shortcut: border-box model —
-    // an explicit `width` includes padding, matching most modern sites)
+    // content box = border box inset by borders + padding (shortcut:
+    // border-box model — an explicit `width` includes both, matching most
+    // modern sites)
     let pl = resolve_len(n.bx.pad[3], w);
     let pr = resolve_len(n.bx.pad[1], w);
     let pt = resolve_len(n.bx.pad[0], w);
     let pb = resolve_len(n.bx.pad[2], w);
+    let bl = resolve_len(n.bx.border[3], w);
+    let br = resolve_len(n.bx.border[1], w);
+    let bt = resolve_len(n.bx.border[0], w);
+    let bb = resolve_len(n.bx.border[2], w);
     let (bx0, by0) = (n.x, n.y);
-    n.x += pl;
-    n.y += pt;
-    n.w = (w - pl - pr).max(0.0);
+    n.x += pl + bl;
+    n.y += pt + bt;
+    n.w = (w - pl - pr - bl - br).max(0.0);
     if n.img.is_some() {
         // replaced element: no children — height from declared height,
         // else aspect ratio of the content width (no size known: 0 → invisible)
@@ -447,8 +489,8 @@ fn place(
             _ => block(n, measure, runs, uls), // Block / Auto(block tag)
         }
     }
-    // restore border-box coords; height includes vertical padding
-    n.h += pt + pb;
+    // restore border-box coords; height includes vertical padding + borders
+    n.h += pt + pb + bt + bb;
     n.x = bx0;
     n.y = by0;
     n.w = w;
@@ -505,7 +547,11 @@ fn natural_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> 
     if n.is_text {
         return content;
     }
-    content + resolve_len(n.bx.pad[3], avail) + resolve_len(n.bx.pad[1], avail)
+    content
+        + resolve_len(n.bx.pad[3], avail)
+        + resolve_len(n.bx.pad[1], avail)
+        + resolve_len(n.bx.border[3], avail)
+        + resolve_len(n.bx.border[1], avail)
 }
 
 fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
@@ -1385,6 +1431,55 @@ mod tests {
         for r in &l.runs {
             assert!(r.x <= 75.0 + 0.001, "run escapes right padding: {:?}", r.text);
         }
+    }
+
+    #[test]
+    fn border_insets_content_and_grows_box() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                border: [Len::Px(2.0), Len::Px(4.0), Len::Px(2.0), Len::Px(4.0)],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("ab")];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        assert!((l.runs[0].x - 4.0).abs() < 0.01, "x={}", l.runs[0].x);
+        assert!((l.runs[0].y - 2.0).abs() < 0.01, "y={}", l.runs[0].y);
+        assert!((n.h - (15.0 * 1.35 + 4.0)).abs() < 0.01, "h={}", n.h);
+        assert!((n.w - 100.0).abs() < 0.01, "border-box width unchanged");
+    }
+
+    #[test]
+    fn border_paints_strips_or_ring() {
+        // square box with bg: background + 4 side strips
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                border: [Len::Px(1.0); 4],
+                bg: Some(0x123456),
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("a")];
+        let l = layout_tree(&mut n, 50.0, &m4);
+        assert_eq!(l.rects.len(), 5, "bg + 4 strips: {:?}", l.rects);
+        // rounded box with bg: ring = border-box fill + background inset over it
+        let mut m2 = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                border: [Len::Px(2.0); 4],
+                radius: Len::Px(6.0),
+                bg: Some(0x123456),
+                ..BoxStyle::default()
+            },
+        );
+        m2.children = vec![leaf("a")];
+        let l2 = layout_tree(&mut m2, 50.0, &m4);
+        assert_eq!(l2.rects.len(), 2, "ring = outer + inner: {:?}", l2.rects);
+        assert_eq!(l2.rects[0].4, 0x000000, "outer = border color (black)");
+        assert!((l2.rects[1].2 - 46.0).abs() < 0.01, "inner w={}", l2.rects[1].2);
+        assert!((l2.rects[1].5 - 4.0).abs() < 0.01, "inner radius={}", l2.rects[1].5);
     }
 
     #[test]

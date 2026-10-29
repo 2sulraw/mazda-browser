@@ -69,8 +69,8 @@ curve matters more than the baseline (near-flat as tabs grow).
   background-color → filled rects drawn under text (collected parent-first),
   border-radius (all corners, px/% vs width), rgba() colors (alpha 0 =
   transparent, >0 opaque — no compositing; 65 tests; nextjs.org hero spacing +
-  terminal bg visible, RSS 15.7 MB)**. Known gaps: no borders/box-shadow,
-  no per-corner radius, no background-image, no alpha blending
+  terminal bg visible, RSS 15.7 MB)**. Known gaps:
+  no box-shadow, no per-corner radius, no background-image, no alpha blending
 - [x] **Phase 1e** — `<img>` rendering: ~~invisible~~ **DONE: PNG+JPEG decode
   (`png` + `jpeg-decoder`, both pure Rust), two-pass loading — header probe
   (IHDR/SOF) sizes the box pre-layout, pixel decode happens after layout and
@@ -96,6 +96,17 @@ curve matters more than the baseline (near-flat as tabs grow).
   Known gaps: no text/glyphs, no clip/mask/filter/pattern, no `use`/
   `image`, no CSS <style> blocks, gradients flat (not interpolated),
   no stroke-dash/miter/linecap variants
+- [x] **Phase 1g** — borders: ~~missing~~ **DONE (`border`/`border-width`/
+  `border-color` shorthands + per-side `border-top/right/bottom/left`,
+  style words ignored = everything solid): border widths join the border-box
+  inset in layout (content starts inside borders, explicit width includes
+  them, natural/wrap width grows by them), painted as 4 side strips over the
+  background — or, when the box also has border-radius + background, as a
+  ring (border-box fill with border color, background inset over it, inner
+  radius ≈ r − border); 84 tests; nextjs.org terminal box border visible)**.
+  Known gaps: one color for all sides (no per-side color), dashed/dotted
+  render solid, no box-shadow, square border corners on rounded
+  backgroundless boxes
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -133,6 +144,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1e: `<img>` PNG+JPEG (probe + display-size decode) | nextjs.org | **24.8 MB** (1 image decoded; naive full-decode was 50.0 MB) |
 | 2026-10-29 | Phase 1e: local image test page (3 PNGs) | 127.0.0.1 | 19.0 MB |
 | 2026-10-29 | Phase 1f: SVG rasterizer (8/9 images incl. logos) | nextjs.org | 45.1 MB (8 images at display size) |
+| 2026-10-29 | Phase 1g: borders (strips/ring paint) | nextjs.org | 45.2 MB |
 
 ### Phase 1c (Track A) findings
 

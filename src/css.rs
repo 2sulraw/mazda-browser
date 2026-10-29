@@ -84,6 +84,10 @@ pub struct BoxStyle {
     pub bg: Option<u32>,
     /// border-radius (all corners; % resolves against box width at layout)
     pub radius: Len,
+    /// border widths, top/right/bottom/left (% resolves against box width)
+    pub border: [Len; 4],
+    /// one color for every side (per-side color: shortcut)
+    pub bcolor: u32,
 }
 
 impl Default for BoxStyle {
@@ -104,6 +108,8 @@ impl Default for BoxStyle {
             margin: [Len::Px(0.0); 4],
             bg: None,
             radius: Len::Px(0.0),
+            border: [Len::Px(0.0); 4],
+            bcolor: 0, // spec: currentcolor; black is close enough
         }
     }
 }
@@ -186,6 +192,13 @@ const KNOWN: &[&str] = &[
     "margin-inline-start",
     "margin-inline-end",
     "border-radius",
+    "border",
+    "border-width",
+    "border-color",
+    "border-top",
+    "border-right",
+    "border-bottom",
+    "border-left",
 ];
 
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
@@ -531,9 +544,54 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 bx.radius = v;
             }
         }
+        // style words (solid/dashed/dotted) ignored — everything renders solid
+        "border" => {
+            let (w, c) = border_parts(&d.1, bx.bcolor);
+            if let Some(w) = w {
+                bx.border = [w; 4];
+            }
+            bx.bcolor = c;
+        }
+        "border-width" => bx.border = parse_sides(&d.1),
+        "border-color" => {
+            if let Some(c) = parse_color(&d.1) {
+                bx.bcolor = c;
+            }
+        }
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let side = match d.0.as_str() {
+                "border-top" => 0,
+                "border-right" => 1,
+                "border-bottom" => 2,
+                _ => 3,
+            };
+            let (w, c) = border_parts(&d.1, bx.bcolor);
+            if let Some(w) = w {
+                bx.border[side] = w;
+            }
+            bx.bcolor = c;
+        }
         _ => {}
     }
     false
+}
+
+/// `border` shorthand value → (width, color). Style words (`solid`,
+/// `dashed`, …) are ignored — everything renders solid (shortcut);
+/// `none` resets the width to 0.
+fn border_parts(v: &str, cur: u32) -> (Option<Len>, u32) {
+    let mut w = None;
+    let mut c = cur;
+    for t in v.split_whitespace() {
+        if t.eq_ignore_ascii_case("none") {
+            w = Some(Len::Px(0.0));
+        } else if let Some(l) = parse_len(t) {
+            w = Some(l);
+        } else if let Some(col) = parse_color(t) {
+            c = col;
+        }
+    }
+    (w, c)
 }
 
 /// CSS side shorthand (`margin`/`padding`: 1–4 whitespace-separated values)
@@ -1463,6 +1521,28 @@ mod tests {
         assert_eq!(c.bx.bg, Some(0xff0000), "rgba alpha>0 renders opaque");
         let t = sheet.resolve(&dom, by_attr(&dom, "class", "t"), Style::new(), None);
         assert_eq!(t.bx.bg, None, "rgba(…,0) = transparent = no fill");
+    }
+
+    #[test]
+    fn border_shorthand_and_per_side() {
+        let sheet = parse(
+            ".b { border: 1px solid #eaeaea }\
+             .t { border: 2px solid red; border-width: 0 0 3px }\
+             .n { border: none }",
+        );
+        let dom = dom_of(r#"<div class=b></div><div class=t></div><div class=n></div>"#);
+        let b = sheet.resolve(&dom, by_attr(&dom, "class", "b"), Style::new(), None);
+        assert_eq!(b.bx.border, [Len::Px(1.0); 4]);
+        assert_eq!(b.bx.bcolor, 0xeaeaea, "hex color");
+        // later border-width overrides the shorthand's side list
+        let t = sheet.resolve(&dom, by_attr(&dom, "class", "t"), Style::new(), None);
+        assert_eq!(
+            t.bx.border,
+            [Len::Px(0.0), Len::Px(0.0), Len::Px(3.0), Len::Px(0.0)]
+        );
+        assert_eq!(t.bx.bcolor, 0xff0000, "named color kept from shorthand");
+        let n = sheet.resolve(&dom, by_attr(&dom, "class", "n"), Style::new(), None);
+        assert_eq!(n.bx.border, [Len::Px(0.0); 4], "border: none resets widths");
     }
 }
 
