@@ -2,6 +2,7 @@
 //! Phase 2: link hit-testing, click navigation, back history.
 mod css;
 mod html;
+mod image;
 mod layout;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
@@ -10,6 +11,11 @@ use minifb::{Key, KeyRepeat, MouseButton, Window, WindowOptions};
 
 const PADDING: usize = 12;
 const BG: u32 = 0x00_1a_1a_1a;
+/// Total decoded image pixels per page (~4B/px RGBA, halved again by the
+/// post-layout downscale to display size). Images beyond the budget stay
+/// undecoded (declared width/height attrs still reserve space).
+/// shortcut: first-come document-order cap, not LRU — pages rarely exceed it.
+const IMG_PIXEL_BUDGET: usize = 8_000_000;
 
 /// A rendered page: enough to draw it and hit-test its links.
 struct Page {
@@ -188,7 +194,21 @@ fn load_page(url: &str, fonts: &Fonts, max_w: f32) -> Page {
         layout::count_boxes(&root_box)
     );
 
-    let laid = layout::layout_tree(&mut root_box, max_w, &|s: &str, st: &Style| fonts.measure(s, st));
+    // fetch + probe every <img> header (disk-cached; no pixel decode yet —
+    // layout only needs the intrinsic size to size the box)
+    let mut img_budget = IMG_PIXEL_BUDGET;
+    let (n_img, skipped) = probe_images(&mut root_box, url, &mut img_budget);
+    if n_img > 0 || skipped > 0 {
+        eprintln!("[img] {n_img} probed, {skipped} skipped (budget/format)");
+    }
+
+    let mut laid = layout::layout_tree(&mut root_box, max_w, &|s: &str, st: &Style| fonts.measure(s, st));
+    // decode pixels only now, one image at a time, resampled straight to the
+    // laid-out display size — full-resolution buffers never accumulate
+    let n_px = decode_images(&mut root_box, url, &mut laid);
+    if n_px > 0 {
+        eprintln!("[img] {n_px} decoded at display size");
+    }
     eprintln!(
         "[mem] after layout: {:.1} MB ({} runs)",
         working_set_mb(),
@@ -222,6 +242,84 @@ enum SheetSrc {
     Inline(String),
     /// href of a `<link rel=stylesheet>`, unresolved
     Link(String),
+}
+
+/// Walk the box tree fetching every `<img src>` and parsing only its header
+/// (disk-cached). Returns (probed, skipped); skipped = budget/format. Boxes
+/// keep `Probed` (or `Pending` on failure) so declared sizes still reserve
+/// space even when the pixels will never decode.
+fn probe_images(n: &mut layout::BoxNode, base: &str, budget: &mut usize) -> (usize, usize) {
+    let mut probed = 0usize;
+    let mut skipped = 0usize;
+    if let Some(layout::ImgSlot::Pending(src)) = &n.img {
+        let src = src.to_string();
+        if *budget == 0 {
+            skipped += 1; // stays Pending: declared width/height still reserve space
+        } else if let Some(abs) = resolve(base, &src) {
+            match fetch(&abs) {
+                Ok((bytes, _)) => match image::probe(&bytes) {
+                    Some((w, h)) => {
+                        let px = (w * h) as usize;
+                        if px <= *budget {
+                            *budget -= px;
+                            probed += 1;
+                            n.img = Some(layout::ImgSlot::Probed {
+                                src: std::rc::Rc::from(src.as_str()),
+                                w,
+                                h,
+                            });
+                        } else {
+                            skipped += 1; // beyond this page's pixel budget
+                        }
+                    }
+                    None => skipped += 1, // WebP/AVIF/SVG/corrupt
+                },
+                Err(e) => {
+                    eprintln!("[img] fetch failed {abs}: {e}");
+                    skipped += 1;
+                }
+            }
+        } else {
+            skipped += 1; // non-navigable scheme (data:, javascript: …)
+        }
+    }
+    for c in &mut n.children {
+        let (p, s) = probe_images(c, base, budget);
+        probed += p;
+        skipped += s;
+    }
+    (probed, skipped)
+}
+
+/// Post-layout: decode each probed image (disk cache hit, no refetch),
+/// resample to its laid-out display size, and emit draw entries. One image's
+/// full-size buffer is alive at a time.
+fn decode_images(n: &mut layout::BoxNode, base: &str, laid: &mut Layout) -> usize {
+    let mut count = 0usize;
+    if let Some(layout::ImgSlot::Probed { src, .. }) = &n.img {
+        let src = src.to_string();
+        if let (Some(abs), dw, dh) = (
+            resolve(base, &src),
+            n.w.round().max(1.0) as u32,
+            n.h.round().max(1.0) as u32,
+        ) {
+            if let Ok((bytes, _)) = fetch(&abs) {
+                if let Some(full) = image::decode(&bytes) {
+                    let img = if full.w > dw || full.h > dh {
+                        std::rc::Rc::new(image::downscale(&full, dw, dh))
+                    } else {
+                        std::rc::Rc::new(full)
+                    };
+                    laid.images.push((n.x, n.y, n.w, n.h, img));
+                    count += 1;
+                }
+            }
+        }
+    }
+    for c in &mut n.children {
+        count += decode_images(c, base, laid);
+    }
+    count
 }
 
 /// Collect every stylesheet in the subtree, in document order (external
@@ -551,6 +649,36 @@ fn render(
                     }
                 }
                 buf[py * width + px] = color;
+            }
+        }
+    }
+    // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
+    for (x, y, w, h, img) in &laid.images {
+        let y0 = y - scroll;
+        if y0 + h < 0.0 || y0 > page {
+            continue;
+        }
+        let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y0);
+        for dy in 0..h.max(0.0) as usize {
+            let py = sy as i32 + dy as i32;
+            if py < 0 || py >= height as i32 {
+                continue;
+            }
+            let v = (dy as f32 * img.h as f32 / h) as u32;
+            for dx in 0..w.max(0.0) as usize {
+                let px = sx as i32 + dx as i32;
+                if px < 0 || px >= width as i32 {
+                    continue;
+                }
+                let u = (dx as f32 * img.w as f32 / w) as u32;
+                let c = img.px[(v * img.w + u) as usize];
+                let a = (c >> 24) as u8;
+                let idx = py as usize * width + px as usize;
+                if a == 255 {
+                    buf[idx] = c & 0x00ff_ffff;
+                } else if a > 0 {
+                    blend(&mut buf[idx], c, a);
+                }
             }
         }
     }

@@ -51,7 +51,8 @@ curve matters more than the baseline (near-flat as tabs grow).
   order alongside `<style>` (nextjs.org: 4 sheets → 260 rules)**,
   ~~HTTP disk cache~~ **DONE: `%LOCALAPPDATA%\mazda-cache`, FNV key, 5min TTL,
   oldest-mtime eviction at 300 files, 5MB body cap (Wikipedia reload = 3 hits, no network)**,
-  images with LRU decode cap
+  ~~images with LRU decode cap~~ **DONE in Phase 1e (PNG+JPEG, probe-then-decode,
+  8M px/page budget)**
 - [x] **Phase 1c (Track A)** — box tree + flex/grid layout: ~~flat atom flow~~ **DONE:
   `BoxNode` tree (block/flex/grid groups + text leaves), `BoxStyle` cascades from CSS
   (display/gap/justify/align/width/margin-auto/text-align), block flow with legacy
@@ -70,6 +71,17 @@ curve matters more than the baseline (near-flat as tabs grow).
   transparent, >0 opaque — no compositing; 65 tests; nextjs.org hero spacing +
   terminal bg visible, RSS 15.7 MB)**. Known gaps: no borders/box-shadow,
   no per-corner radius, no background-image, no alpha blending
+- [x] **Phase 1e** — `<img>` rendering: ~~invisible~~ **DONE: PNG+JPEG decode
+  (`png` + `jpeg-decoder`, both pure Rust), two-pass loading — header probe
+  (IHDR/SOF) sizes the box pre-layout, pixel decode happens after layout and
+  resamples straight to display size so full-resolution buffers never
+  accumulate (8M px/page budget, declared width/height attrs still reserve
+  space when fetch/decode fails, aspect-ratio height, width attrs as
+  presentational hints; 73 tests; local test page: intrinsic/CSS-width/
+  attr-stretch/missing-file all correct, nextjs.org RSS 24.8 MB)**.
+  Known gaps: no WebP/AVIF/GIF/SVG (nextjs.org: 1/9 images decodes),
+  no srcset/art-direction, no lazy loading, no data: URIs,
+  nearest-neighbour scale only
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -104,6 +116,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-27 | Phase 2: HTTP disk cache (3 hits, cold RSS) | Wikipedia | 35.7 MB |
 | 2026-10-27 | Phase 1c: box tree + flex/grid | nextjs.org | **16.9 MB** (was 19.2 MB; box tree = 356 nodes vs 1061 DOM nodes) |
 | 2026-10-27 | Phase 1d: box chrome (pad/margin/lh/radius/bg) | nextjs.org | 15.7 MB (572 runs) |
+| 2026-10-29 | Phase 1e: `<img>` PNG+JPEG (probe + display-size decode) | nextjs.org | **24.8 MB** (1 image decoded; naive full-decode was 50.0 MB) |
+| 2026-10-29 | Phase 1e: local image test page (3 PNGs) | 127.0.0.1 | 19.0 MB |
 
 ### Phase 1c (Track A) findings
 

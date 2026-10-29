@@ -602,7 +602,7 @@ mod tests {
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(i, n)| match &n.kind {
+            .filter_map(|(_i, n)| match &n.kind {
                 NodeKind::Element(t, _) => Some(t.0),
                 _ => None,
             })

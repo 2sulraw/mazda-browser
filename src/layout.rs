@@ -4,6 +4,7 @@
 
 use crate::css::{Align, BoxStyle, Dir, Display, Justify, Len, Sheet, Track};
 use crate::html::{Dom, NodeKind};
+use crate::image::ImageData;
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Style {
@@ -106,6 +107,28 @@ fn is_block(tag: &str) -> bool {
     )
 }
 
+/// Replaced-element payload for `<img>`: src before fetch, intrinsic size
+/// after the header probe, pixels only after layout (downscaled to display
+/// size — RAM rule). Failed/unsupported stay dim-only → box reserves space,
+/// nothing draws.
+pub enum ImgSlot {
+    Pending(std::rc::Rc<str>),
+    /// fetched, header parsed: intrinsic size known, pixels not decoded
+    Probed { src: std::rc::Rc<str>, w: u32, h: u32 },
+    Ready(std::rc::Rc<ImageData>),
+}
+
+impl ImgSlot {
+    /// intrinsic (w, h) if known
+    pub fn dims(&self) -> Option<(u32, u32)> {
+        match self {
+            ImgSlot::Pending(_) => None,
+            ImgSlot::Probed { w, h, .. } => Some((*w, *h)),
+            ImgSlot::Ready(d) => Some((d.w, d.h)),
+        }
+    }
+}
+
 /// Box tree node: a text run (leaf) or an element box (block/flex/grid).
 pub struct BoxNode {
     pub is_text: bool,
@@ -116,6 +139,8 @@ pub struct BoxNode {
     pub hard_break: bool,
     /// raw href of the enclosing <a>, resolved against base URL only on click
     pub link: Option<std::rc::Rc<str>>,
+    /// `<img>` replacement data (None for every other box)
+    pub img: Option<ImgSlot>,
     pub children: Vec<BoxNode>,
     // layout output (absolute CSS px)
     pub x: f32,
@@ -135,6 +160,7 @@ impl BoxNode {
             text: String::new(),
             hard_break: false,
             link: None,
+            img: None,
             children: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -152,6 +178,7 @@ impl BoxNode {
             text,
             hard_break,
             link,
+            img: None,
             children: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -212,6 +239,23 @@ fn build_into(
                 if outcome.display_none {
                     continue;
                 }
+                if tag == "img" {
+                    // replaced element: box now, pixels when main fetches the src.
+                    // width/height attributes are presentational hints (CSS wins:
+                    // outcome.bx already holds declared width/height).
+                    let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    if g.bx.width.is_none() {
+                        g.bx.width = dom.attr(child, "width").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
+                    }
+                    if g.bx.height.is_none() {
+                        g.bx.height = dom.attr(child, "height").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
+                    }
+                    if let Some(src) = dom.attr(child, "src").filter(|s| !s.is_empty()) {
+                        g.img = Some(ImgSlot::Pending(std::rc::Rc::from(src)));
+                    }
+                    out.push(g);
+                    continue;
+                }
                 // <a href> opens a link scope; nested <a> is invalid HTML so inherit-or-replace is enough
                 let child_link = if tag == "a" {
                     dom.attr(child, "href")
@@ -256,6 +300,8 @@ pub struct Layout {
     pub underline_rects: Vec<(f32, f32, f32, f32, u32)>,
     /// filled box backgrounds (x, y, w, h, color, radius) — drawn under text
     pub rects: Vec<(f32, f32, f32, f32, u32, f32)>,
+    /// decoded `<img>` boxes (x, y, w, h, pixels) — drawn under text
+    pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>)>,
     /// true if the last line still has content on it (no trailing <br>) —
     /// block flow uses this to decide whether to add the paragraph gap
     pub open_line: bool,
@@ -273,26 +319,38 @@ pub fn layout_tree(
     let mut uls = Vec::new();
     place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls);
     let mut rects = Vec::new();
-    collect_bgs(root, &mut rects);
+    let mut images = Vec::new();
+    collect_paint(root, &mut rects, &mut images);
     Layout {
         runs,
         height: root.h,
         underline_rects: uls,
         rects,
+        images,
         open_line: root.open,
     }
 }
 
-/// Post-layout walk: every box with a background-color emits a filled rect
-/// (parent-first, so children paint over their parent's fill).
-fn collect_bgs(n: &BoxNode, out: &mut Vec<(f32, f32, f32, f32, u32, f32)>) {
+/// Post-layout walk: every box with a background-color emits a filled rect;
+/// every decoded `<img>` emits its pixels (parent-first, so children paint
+/// over their parent's fill).
+fn collect_paint(
+    n: &BoxNode,
+    out: &mut Vec<(f32, f32, f32, f32, u32, f32)>,
+    imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>)>,
+) {
     if !n.is_text {
         if let Some(c) = n.bx.bg {
             let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
             out.push((n.x, n.y, n.w, n.h, c, r));
         }
+        if let Some(ImgSlot::Ready(d)) = &n.img {
+            if n.w > 0.0 && n.h > 0.0 {
+                imgs.push((n.x, n.y, n.w, n.h, d.clone()));
+            }
+        }
         for ch in &n.children {
-            collect_bgs(ch, out);
+            collect_paint(ch, out, imgs);
         }
     }
 }
@@ -354,6 +412,12 @@ fn place(
     if let Some(m) = n.bx.max_width {
         w = w.min(resolve_len(m, avail));
     }
+    // replaced element with known intrinsic size: width unless overridden
+    if n.img.is_some() && n.bx.width.is_none() {
+        if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
+            w = (iw as f32).min(avail);
+        }
+    }
     if n.bx.margin_x_auto {
         n.x = x + (avail - w).max(0.0) * 0.5;
     }
@@ -367,11 +431,21 @@ fn place(
     n.x += pl;
     n.y += pt;
     n.w = (w - pl - pr).max(0.0);
-    match (n.bx.display, n.bx.dir) {
-        (Display::Flex, Dir::Row) => flex_row(n, measure, runs, uls),
-        (Display::Flex, Dir::Column) => flex_col(n, measure, runs, uls),
-        (Display::Grid, _) => grid(n, measure, runs, uls),
-        _ => block(n, measure, runs, uls), // Block / Auto(block tag)
+    if n.img.is_some() {
+        // replaced element: no children — height from declared height,
+        // else aspect ratio of the content width (no size known: 0 → invisible)
+        n.h = match (n.bx.height, n.img.as_ref().and_then(ImgSlot::dims)) {
+            (Some(l), _) => resolve_len(l, avail),
+            (None, Some((iw, ih))) => n.w * ih as f32 / (iw as f32).max(1.0),
+            (None, None) => 0.0,
+        };
+    } else {
+        match (n.bx.display, n.bx.dir) {
+            (Display::Flex, Dir::Row) => flex_row(n, measure, runs, uls),
+            (Display::Flex, Dir::Column) => flex_col(n, measure, runs, uls),
+            (Display::Grid, _) => grid(n, measure, runs, uls),
+            _ => block(n, measure, runs, uls), // Block / Auto(block tag)
+        }
     }
     // restore border-box coords; height includes vertical padding
     n.h += pt + pb;
@@ -444,6 +518,9 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
     }
     if let Some(l) = n.bx.width {
         return resolve_len(l, avail);
+    }
+    if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
+        return iw as f32; // intrinsic (padding added by the wrapper)
     }
     match (n.bx.display, n.bx.dir) {
         (Display::Flex, Dir::Row) => {
@@ -943,6 +1020,7 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
         height: y,
         underline_rects,
         rects: Vec::new(),
+        images: Vec::new(),
         open_line: x > 0.0,
     }
 }
@@ -1383,5 +1461,91 @@ mod tests {
         assert!((w - 100.0).abs() < 0.01, "w={}", w);
         assert!((h - (15.0 * 1.35 + 10.0)).abs() < 0.01, "h={}", h);
         assert!((rad - 8.0).abs() < 0.01, "radius={}", rad);
+    }
+
+    // ---- replaced elements (<img>) ----
+
+    /// group box carrying a decoded 100×50 image.
+    fn img_box(bx: BoxStyle) -> BoxNode {
+        let mut n = BoxNode::group(Style::new(), bx);
+        n.img = Some(ImgSlot::Ready(std::rc::Rc::new(crate::image::ImageData {
+            w: 100,
+            h: 50,
+            px: vec![0; 100 * 50],
+        })));
+        n
+    }
+
+    #[test]
+    fn img_uses_intrinsic_size_clamped_to_avail() {
+        let mut n = img_box(BoxStyle::default());
+        let l = layout_tree(&mut n, 300.0, &m4);
+        assert!((n.w - 100.0).abs() < 0.01, "w={}", n.w);
+        assert!((n.h - 50.0).abs() < 0.01, "h={}", n.h);
+        assert_eq!(l.images.len(), 1);
+        assert!((l.images[0].3 - 50.0).abs() < 0.01);
+
+        let mut narrow = img_box(BoxStyle::default());
+        layout_tree(&mut narrow, 60.0, &m4);
+        assert!((narrow.w - 60.0).abs() < 0.01, "clamped w={}", narrow.w);
+        assert!((narrow.h - 30.0).abs() < 0.01, "aspect h={}", narrow.h);
+    }
+
+    #[test]
+    fn img_width_declared_height_keeps_aspect() {
+        let mut n = img_box(BoxStyle {
+            width: Some(Len::Px(50.0)),
+            ..BoxStyle::default()
+        });
+        layout_tree(&mut n, 300.0, &m4);
+        assert!((n.w - 50.0).abs() < 0.01, "w={}", n.w);
+        assert!((n.h - 25.0).abs() < 0.01, "h={}", n.h);
+    }
+
+    #[test]
+    fn img_declared_height_wins_over_aspect() {
+        let mut n = img_box(BoxStyle {
+            height: Some(Len::Px(80.0)),
+            ..BoxStyle::default()
+        });
+        layout_tree(&mut n, 300.0, &m4);
+        assert!((n.h - 80.0).abs() < 0.01, "h={}", n.h);
+    }
+
+    #[test]
+    fn undecoded_img_with_declared_size_reserves_space() {
+        // fetch/decode failed but width/height attributes were parsed → box still there
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                width: Some(Len::Px(40.0)),
+                height: Some(Len::Px(20.0)),
+                ..BoxStyle::default()
+            },
+        );
+        n.img = Some(ImgSlot::Pending(std::rc::Rc::from("x.png")));
+        let l = layout_tree(&mut n, 300.0, &m4);
+        assert!((n.w - 40.0).abs() < 0.01);
+        assert!((n.h - 20.0).abs() < 0.01, "declared h={}", n.h);
+        assert!(l.images.is_empty(), "no pixels → nothing drawn");
+    }
+
+    #[test]
+    fn img_advances_block_flow() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut first = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        first.children = vec![leaf("ab")];
+        let second = img_box(BoxStyle::default());
+        root.children = vec![first, second];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let line = 15.0 * 1.35;
+        let gap = 15.0 * 0.6;
+        assert!((l.images[0].1 - (line + gap)).abs() < 0.01, "img y={}", l.images[0].1);
     }
 }

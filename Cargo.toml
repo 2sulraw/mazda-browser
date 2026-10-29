@@ -10,6 +10,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_S
 ab_glyph = "0.2.32"
 url = "2.5.8"
 encoding_rs = "0.8.42"
+# image codecs (pure Rust; not engine code)
+png = "0.17"
+jpeg-decoder = { version = "0.3", default-features = false }
 
 [profile.release]
 opt-level = "s"
