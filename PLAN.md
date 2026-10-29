@@ -242,6 +242,24 @@ curve matters more than the baseline (near-flat as tabs grow).
   box-shadow included); `outline-color` unsupported entirely; `@supports`
   `property:value` tests property knownness only (a value we can't parse is
   still claimed supported — benign: those decls no-op)
+- [x] **font-family stacks + `@font-face` webfonts** — ~~hero rendered Georgia
+  instead of Alfa Slab One; `parse_fam` threw family names away; `@font-face`
+  skipped whole~~ **DONE: `Sheet` interns every distinct `font-family` comma
+  stack into a table shared with `Fonts` (`Rc<RefCell>`; `Style.fam_stack:
+  u16` id, cascade interns the var-substituted value at resolve time — inline
+  styles included), `collect_font_faces` parses each sheet's `@font-face`
+  blocks against that sheet's own base URL (raw-slice scanner, NOT
+  `parse_decls` — src paths must keep case), and `pick_font_for` walks the
+  stack in CSS order before the generic pick: page webfonts (lazy
+  `fetch` + `woff::decode_font`, disk-cached, per-face `OnceLock`, cleared on
+  navigation) then installed-family aliases (verdana/tahoma/calibri/…, lazy
+  one-slot-per-family). WOFF1 via `src/woff.rs` (`8f0e0b8`). Verified:
+  rust-lang hero = Alfa Slab One (21 KB woff), body Fira Sans, HN Verdana,
+  Wikipedia pixel-unchanged; 140 tests; `74eb2f3`)**
+  Known gap: WOFF2 (`wOF2`) decodes to None → MDN (Inter) and nextjs (Geist)
+  still use generics until a Brotli+woff2 decoder chain lands; no bold/italic
+  variants for installed aliases (regular file only); webfont face selection
+  is a coarse (weight-range, italic) bucket — no synthesis
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -293,6 +311,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | font-size replace-against-parent cascade | nextjs.org | 43.2 MB (570 runs; dark, no regression) |
 | 2026-10-30 | color-scheme + light-dark + @supports | MDN | 26.3 MB (623 runs; dark = reference) |
 | 2026-10-30 | color-scheme + light-dark + @supports (incl. scope_vars root-def fix) | Wikipedia (Main_Page) | 34.7 MB (1326 runs; fully light again) |
+| 2026-10-30 | font stacks + @font-face webfonts | rust-lang.org | 28.6 MB (517 runs; hero = Alfa Slab One via WOFF1, body Fira Sans; +44 KB webfonts) |
+| 2026-10-30 | font stacks + @font-face webfonts | hackernews | 12.9 MB (786 runs; Verdana via system alias) |
+| 2026-10-30 | font stacks + @font-face webfonts | Wikipedia (Main_Page) | 34.6 MB (1326 runs; pixel-unchanged) |
 
 ### Phase 1c (Track A) findings
 
