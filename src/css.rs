@@ -78,6 +78,9 @@ pub struct BoxStyle {
     pub dir: Dir,
     pub justify: Justify,
     pub align: Align,
+    /// `flex-wrap: wrap` — items that don't fit start a new line (nowrap =
+    /// shrink-to-fit, the old behavior)
+    pub wrap: bool,
     pub gap_row: f32,
     pub gap_col: f32,
     pub cols: Vec<Track>,
@@ -129,6 +132,7 @@ impl Default for BoxStyle {
             dir: Dir::Row,
             justify: Justify::Start,
             align: Align::Stretch,
+            wrap: false,
             gap_row: 0.0,
             gap_col: 0.0,
             cols: Vec::new(),
@@ -170,6 +174,11 @@ struct Rule {
 pub struct Sheet {
     /// sorted by (spec, order) at parse time; cascade = apply matches in order
     rules: Vec<Rule>,
+    /// custom properties (--name → value) collected from every rule in
+    /// document order (later rules override earlier, so `.dark` beats
+    /// `:root` when it comes later in the sheet). shortcut: no per-element
+    /// cascade/inheritance for custom props — a flat page-wide map.
+    vars: std::collections::HashMap<String, String>,
 }
 
 impl Sheet {
@@ -205,6 +214,7 @@ const KNOWN: &[&str] = &[
     "flex-direction",
     "justify-content",
     "align-items",
+    "flex-wrap",
     "gap",
     "row-gap",
     "column-gap",
@@ -258,6 +268,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     let s = strip_comments(text);
     let b = s.as_bytes();
     let mut rules: Vec<Rule> = Vec::new();
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut order = 0u32;
     let mut i = 0usize;
 
@@ -283,12 +294,30 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         let block = &s[i + ob + 1..cb];
         let decls = parse_decls(block);
         if !decls.is_empty() {
+            // custom properties are collected for EVERY rule regardless of
+            // selector (including :root/:host, which we can't match) — they
+            // live in one page-wide map, so the selector doesn't matter
+            let real: Vec<Decl> = decls
+                .iter()
+                .filter_map(|d| {
+                    if d.0.starts_with("--") {
+                        vars.insert(d.0.clone(), d.1.clone());
+                        None
+                    } else {
+                        Some(d.clone())
+                    }
+                })
+                .collect();
+            if real.is_empty() {
+                i = cb + 1;
+                continue;
+            }
             for sel in sel_text.split(',') {
                 if let Some(segs) = parse_selector(sel) {
                     let spec = spec_of(&segs);
                     rules.push(Rule {
                         segs,
-                        decls: decls.clone(),
+                        decls: real.clone(),
                         spec,
                         order,
                     });
@@ -302,7 +331,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     }
 
     rules.sort_by_key(|r| (r.spec, r.order));
-    Sheet { rules }
+    Sheet { rules, vars }
 }
 
 /// Position just past an at-rule. `@media`/`@layer` blocks whose condition
@@ -385,7 +414,7 @@ impl Sheet {
                 continue;
             }
             for d in &rule.decls {
-                if apply_decl(d, &mut style, &mut bg, &mut bx) {
+                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx) {
                     display_none = true;
                 }
             }
@@ -393,7 +422,7 @@ impl Sheet {
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
-                if apply_decl(d, &mut style, &mut bg, &mut bx) {
+                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx) {
                     display_none = true;
                 }
             }
@@ -405,6 +434,60 @@ impl Sheet {
             bx,
         }
     }
+
+    /// Substitute `var(--name[, fallback])` references in a decl value.
+    /// No-op (no allocation path beyond the check) when there's no `var(`.
+    fn subst(&self, d: &Decl) -> Decl {
+        if !d.1.contains("var(") {
+            return d.clone();
+        }
+        (d.0.clone(), subst_vars(&d.1, &self.vars, 0))
+    }
+}
+
+/// Replace every `var(--name[, fallback])` in `v` from the custom-property
+/// map; unknown names fall back, unresolvable → empty string. Depth-capped
+/// recursion handles nested vars (`--a: var(--b)`).
+fn subst_vars(v: &str, vars: &std::collections::HashMap<String, String>, depth: u8) -> String {
+    if depth > 5 {
+        return String::new(); // cycle guard
+    }
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find("var(") {
+        out.push_str(&rest[..i]);
+        // find the matching close paren (values may nest: var(--a, var(--b)))
+        let body_start = i + 4;
+        let mut dep = 1u32;
+        let mut j = body_start;
+        let bytes = rest.as_bytes();
+        while j < bytes.len() && dep > 0 {
+            match bytes[j] {
+                b'(' => dep += 1,
+                b')' => dep -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        if dep != 0 {
+            // unterminated var( — emit the rest literally
+            out.push_str(&rest[body_start..]);
+            return out;
+        }
+        let body = &rest[body_start..j - 1];
+        let (name, fallback) = match body.find(',') {
+            Some(c) => (body[..c].trim(), body[c + 1..].trim()),
+            None => (body.trim(), ""),
+        };
+        let val = match vars.get(name) {
+            Some(v) => subst_vars(v, vars, depth + 1),
+            None => subst_vars(fallback, vars, depth + 1),
+        };
+        out.push_str(&val);
+        rest = &rest[j..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
@@ -415,7 +498,8 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
             continue;
         };
         let p = p.trim().to_ascii_lowercase();
-        if !KNOWN.contains(&p.as_str()) {
+        // custom properties (--x) always survive: var() resolution needs them
+        if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
             continue;
         }
         let mut v = v.trim().to_ascii_lowercase();
@@ -520,6 +604,8 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 _ => Align::Start, // flex-start/baseline/default
             }
         }
+        // wrap | wrap-reverse both wrap (reverse axis ignored for now)
+        "flex-wrap" => bx.wrap = d.1.split(|c: char| c.is_whitespace() || c == '-').any(|t| t == "wrap"),
         "gap" => {
             let mut it = d.1.split_whitespace();
             if let (Some(a), b) = (it.next(), it.next()) {
@@ -822,6 +908,9 @@ fn parse_color(v: &str) -> Option<u32> {
     }
     // rgb()/rgba() — alpha 0 = transparent (dropped), alpha > 0 renders
     // opaque (the rasterizer has no compositing; documented shortcut)
+    if v.starts_with("hsl(") || v.starts_with("hsla(") {
+        return parse_hsl(v).map(|(c, _)| c);
+    }
     let inner = v
         .strip_prefix("rgba(")
         .or_else(|| v.strip_prefix("rgb("))
@@ -896,11 +985,52 @@ fn parse_fam(v: &str) -> Fam {
     Fam::Sans
 }
 
+/// `hsl(h, s%, l%[, a])` → (rgb, alpha 0-255). Accepts `%`-less s/l too
+/// (the site emits `hsla(var(--ds-x-value), 1)` with values like `0, 0%, 10%`).
+fn parse_hsl(v: &str) -> Option<(u32, u8)> {
+    let is_hsla = v.starts_with("hsla(");
+    let inner = v
+        .strip_prefix("hsla(")
+        .or_else(|| v.strip_prefix("hsl("))
+        .and_then(|s| s.strip_suffix(')'))?;
+    let mut parts = inner.split(',').map(|p| p.trim());
+    let h = parts.next()?.trim_end_matches("deg").parse::<f32>().ok()?;
+    let s = parts.next()?.trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+    let l = parts.next()?.trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+    let a = if is_hsla {
+        parts.next().and_then(|p| p.parse::<f32>().ok()).unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    if !(0.0..=1.0).contains(&s) || !(0.0..=1.0).contains(&l) {
+        return None;
+    }
+    // hsl → rgb (standard piecewise conversion)
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let q = |t: f32| ((t + m).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let rgb = q(r1) << 16 | q(g1) << 8 | q(b1);
+    Some((rgb, (a.clamp(0.0, 1.0) * 255.0).round() as u8))
+}
+
 /// Like [`parse_color`] but keeps alpha — shadows need real opacity
 /// (an `rgba(0,0,0,0.4)` shadow at full opacity looks like a sticker).
 /// Returns (rgb, alpha 0-255); None = unparseable.
 fn parse_color_alpha(v: &str) -> Option<(u32, u8)> {
     let v = v.trim();
+    if v.starts_with("hsl(") || v.starts_with("hsla(") {
+        return parse_hsl(v);
+    }
     if let Some(hex) = v.strip_prefix('#') {
         let hex = hex.trim();
         let digits = u32::from_str_radix(hex, 16).ok()?;
@@ -1538,6 +1668,17 @@ mod tests {
     }
 
     #[test]
+    fn flex_wrap_parses() {
+        let sheet = parse(".a { flex-wrap: wrap } .b { flex-wrap: wrap-reverse } .c { flex-wrap: nowrap } .d { }");
+        let dom = dom_of("<div class=a></div><div class=b></div><div class=c></div><div class=d></div>");
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).bx;
+        assert!(get("a").wrap);
+        assert!(get("b").wrap, "wrap-reverse wraps (reverse ignored)");
+        assert!(!get("c").wrap, "nowrap stays single-line");
+        assert!(!get("d").wrap, "default nowrap");
+    }
+
+    #[test]
     fn color_parsing() {
         assert_eq!(parse_color("#abc"), Some(0xaabbcc));
         assert_eq!(parse_color("#ff0000"), Some(0xff0000));
@@ -1545,6 +1686,36 @@ mod tests {
         assert_eq!(parse_color("white"), Some(0xffffff));
         assert_eq!(parse_color("transparent"), None);
         assert_eq!(parse_color("var(--x)"), None);
+        assert_eq!(parse_color("hsl(0, 100%, 50%)"), Some(0xff0000));
+        assert_eq!(parse_color("hsl(120, 100%, 25%)"), Some(0x008000));
+    }
+
+    #[test]
+    fn hsl_alpha_parses() {
+        assert_eq!(parse_color_alpha("hsla(0, 0%, 10%, 1)"), Some((0x1a1a1a, 255)));
+        assert_eq!(parse_color_alpha("hsla(210, 50%, 40%, 0.5)"), Some((0x336699, 128)));
+    }
+
+    #[test]
+    fn custom_properties_resolve_var() {
+        // :root-style rules we can't match still populate the var map
+        let sheet = parse(
+            ":root, :host { --ds-bg: #0a0a0a; --ds-mono: ui-monospace, Menlo, monospace } \
+             .pill { background: var(--ds-bg); font-family: var(--ds-mono) } \
+             .fb { color: var(--missing, #ff0000) } \
+             .nest { color: var(--a) } \
+             .chain { --b: #00ff00; --a: var(--b) }",
+        );
+        let dom = dom_of(
+            "<div class=pill></div><div class=fb></div><div class=nest></div><div class=chain></div>",
+        );
+        let pill = sheet.resolve(&dom, by_attr(&dom, "class", "pill"), Style::new(), None);
+        assert_eq!(pill.bg, Some(0x0a0a0a), "var in background-color");
+        assert_eq!(pill.style.fam, Fam::Mono, "var in font-family");
+        let fb = sheet.resolve(&dom, by_attr(&dom, "class", "fb"), Style::new(), None);
+        assert_eq!(fb.style.color, 0xff0000, "fallback used when var unknown");
+        let nest = sheet.resolve(&dom, by_attr(&dom, "class", "nest"), Style::new(), None);
+        assert_eq!(nest.style.color, 0x00ff00, "nested var chain resolves");
     }
 
     #[test]

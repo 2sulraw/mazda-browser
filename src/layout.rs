@@ -975,13 +975,62 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     let mut widths: Vec<f32> = items.iter().map(|it| item_natural(n, it, n.w, measure)).collect();
     let natural_sum: f32 = widths.iter().sum();
     let gaps = gap * (k as f32 - 1.0).max(0.0);
-    if natural_sum + gaps > n.w && natural_sum > 0.0 {
+    // nowrap shrinks to fit; wrap keeps natural widths and breaks lines
+    if !n.bx.wrap && natural_sum + gaps > n.w && natural_sum > 0.0 {
         let scale = ((n.w - gaps).max(0.0)) / natural_sum;
         for w in &mut widths {
             *w *= scale;
         }
     }
-    let used: f32 = widths.iter().sum::<f32>() + gaps;
+    // wrap: greedily split items into lines that fit the content width
+    let lines: Vec<std::ops::Range<usize>> = if n.bx.wrap {
+        let mut out = Vec::new();
+        let (mut start, mut used) = (0usize, 0.0f32);
+        for i in 0..k {
+            let need = widths[i] + if i > start { gap } else { 0.0 };
+            if i > start && used + need > n.w {
+                out.push(start..i);
+                start = i;
+                used = 0.0;
+            }
+            used += need;
+        }
+        out.push(start..k);
+        out
+    } else {
+        vec![0..k]
+    };
+    let mut y = n.y;
+    let mut total_h = 0.0f32;
+    let mut last_open = false;
+    for (li, line) in lines.iter().enumerate() {
+        if li > 0 {
+            y += n.bx.gap_row; // row-gap between wrapped lines
+        }
+        let lh = flex_line(n, &items, &widths, line.clone(), y, gap, measure, runs, uls, &mut last_open);
+        y += lh;
+        total_h += lh + if li > 0 { n.bx.gap_row } else { 0.0 };
+    }
+    n.h = total_h;
+    n.open = last_open;
+}
+
+/// Place one flex line (justify + cross-axis align); returns the line height.
+#[allow(clippy::too_many_arguments)]
+fn flex_line(
+    n: &mut BoxNode,
+    items: &[Item],
+    widths: &[f32],
+    line: std::ops::Range<usize>,
+    y: f32,
+    gap: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+    runs: &mut Vec<PositionedRun>,
+    uls: &mut Vec<UR>,
+    last_open: &mut bool,
+) -> f32 {
+    let k = line.len();
+    let used: f32 = line.clone().map(|i| widths[i]).sum::<f32>() + gap * (k as f32 - 1.0).max(0.0);
     let free = (n.w - used).max(0.0);
     let (x_off, extra) = match n.bx.justify {
         Justify::Center => (free * 0.5, 0.0),
@@ -990,36 +1039,35 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         _ => (0.0, 0.0), // Start
     };
     let mut row_h = 0.0f32;
-    let mut last_open = false;
     let mut x = n.x + x_off;
-    let mut marks: Vec<(usize, usize, f32, bool)> = Vec::with_capacity(k); // run_start, ul_start, h, open
-    for (idx, it) in items.iter().enumerate() {
+    let mut marks: Vec<(usize, usize, f32)> = Vec::with_capacity(k); // run_start, ul_start, h
+    for idx in line.clone() {
         let w = widths[idx];
         let rs = runs.len();
         let us = uls.len();
-        let (ih, io) = match it {
+        let (ih, io) = match items[idx] {
             Item::Text(a, b) => {
                 let mut atoms = Vec::new();
-                for c in &n.children[*a..*b] {
+                for c in &n.children[a..b] {
                     atoms.push(leaf_atom(c));
                 }
                 let l = layout(&atoms, w, measure);
-                push_runs(l.runs, x, n.y, runs);
-                push_uls(l.underline_rects, x, n.y, uls);
+                push_runs(l.runs, x, y, runs);
+                push_uls(l.underline_rects, x, y, uls);
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                let adv = place(&mut n.children[*i], x, n.y, w, measure, runs, uls);
-                (adv, n.children[*i].open) // cross-size = margin box
+                let adv = place(&mut n.children[i], x, y, w, measure, runs, uls);
+                (adv, n.children[i].open) // cross-size = margin box
             }
         };
-        marks.push((rs, us, ih, io));
+        marks.push((rs, us, ih));
         row_h = row_h.max(ih);
-        last_open = io;
+        *last_open = io;
         x += w + gap + extra;
     }
     // cross-axis align: shift each item (runs slice + box coords) into row_h
-    for (idx, &(rs, us, h, _)) in marks.iter().enumerate() {
+    for (idx, &(rs, us, h)) in marks.iter().enumerate() {
         let dy = match n.bx.align {
             Align::Center => (row_h - h) * 0.5,
             Align::End => row_h - h,
@@ -1036,12 +1084,11 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         for u in &mut uls[us..uend] {
             u.1 += dy;
         }
-        if let Item::Grp(i) = items[idx] {
+        if let Item::Grp(i) = items[line.start + idx] {
             shift_tree(&mut n.children[i], 0.0, dy);
         }
     }
-    n.h = row_h;
-    n.open = last_open;
+    row_h
 }
 
 /// Flex column: stack items with row-gap. shortcut: justify is a no-op (no
@@ -1204,12 +1251,17 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
             continue;
         }
         // split on any whitespace, remembering which had a trailing space
+        // (empty split pieces at the boundaries ARE meaningful: they mean
+        // this atom starts/ends with whitespace that must separate it from
+        // the neighboring inline element's text)
         let mut first = true;
+        let mut pending_ws = false;
         for w in a.text.split(|c: char| c.is_whitespace()) {
             if w.is_empty() {
+                pending_ws = true;
                 continue;
             }
-            if !first {
+            if !first || pending_ws {
                 words.push(Atom {
                     text: " ".into(),
                     style: a.style,
@@ -1218,8 +1270,20 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
                 });
             }
             first = false;
+            pending_ws = false;
             words.push(Atom {
                 text: w.to_string(),
+                style: a.style,
+                hard_break: false,
+                link: a.link.clone(),
+            });
+        }
+        // atom ends with whitespace → separator before the next atom's text
+        // (a space atom at line start is a no-op: the draw loop only
+        // advances x when x > 0)
+        if pending_ws {
+            words.push(Atom {
+                text: " ".into(),
                 style: a.style,
                 hard_break: false,
                 link: a.link.clone(),
@@ -1335,6 +1399,29 @@ mod tests {
         for r in &l.runs {
             assert!(r.x + r.width <= 20.0 + 0.001, "run overflows: {:?}", r.text);
         }
+    }
+
+    #[test]
+    fn inline_boundary_spaces_survive() {
+        // "create " + <strong>"high-quality"</strong> + " with ..." — trailing/
+        // leading whitespace at atom edges must become space atoms (regression:
+        // rendered as "createhigh-quality ... applicationswith")
+        let atoms = vec![
+            mk_atom("to create ", false),
+            mk_atom("high-quality", false),
+            mk_atom(" with power", false),
+        ];
+        let l = layout(&atoms, 500.0, &|s, _| s.len() as f32 * 4.0);
+        let texts: Vec<&str> = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["to", "create", "high-quality", "with", "power"]);
+        // "create" and "high-quality" are separated by actual x space
+        let create = l.runs.iter().find(|r| r.text == "create").unwrap();
+        let hq = l.runs.iter().find(|r| r.text == "high-quality").unwrap();
+        assert!(hq.x >= create.x + create.width, "no gap before strong");
+        // whitespace-only atom (between two inline elements) also separates
+        let l2 = layout(&[mk_atom("a", false), mk_atom(" ", false), mk_atom("b", false)], 500.0, &|s, _| s.len() as f32 * 4.0);
+        assert_eq!(l2.runs.len(), 2);
+        assert!(l2.runs[1].x > l2.runs[0].x + l2.runs[0].width, "ws-only atom separates");
     }
 
     #[test]
@@ -1462,6 +1549,53 @@ mod tests {
         let l = layout_tree(&mut root, 60.0, &m4);
         assert!(l.runs.iter().all(|r| r.x + r.width <= 60.0 + 0.001), "overflowed");
         assert_eq!(l.runs.len(), 2);
+    }
+
+    #[test]
+    fn flex_row_wrap_breaks_lines() {
+        // two 40px boxes in a 60px box with wrap: no shrink, second item
+        // starts a new line (natural widths preserved); boxes, not leaves —
+        // adjacent text leaves merge into one anonymous item
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut root = flex_row(
+            vec![boxed("aaaaaaaaaa"), boxed("bbbbbbbbbb")],
+            BoxStyle {
+                wrap: true,
+                gap_row: 5.0,
+                ..BoxStyle::default()
+            },
+        );
+        let l = layout_tree(&mut root, 60.0, &m4);
+        assert_eq!(l.runs.len(), 2);
+        assert_eq!(l.runs[0].width, 40.0, "natural width kept");
+        assert_eq!(l.runs[0].y, l.runs[1].y - 15.0 * 1.35 - 5.0, "second line + gap");
+        assert_eq!(l.runs[1].x, 0.0, "wrapped item starts at line start");
+    }
+
+    #[test]
+    fn flex_row_wrap_keeps_fitting_items_together() {
+        // three 20px items, 60px box: all fit one line (no wrap taken)
+        let mut root = flex_row(
+            vec![leaf("aaaaa"), leaf("bbbbb"), leaf("ccccc")],
+            BoxStyle {
+                wrap: true,
+                ..BoxStyle::default()
+            },
+        );
+        let l = layout_tree(&mut root, 60.0, &m4);
+        let ys: std::collections::HashSet<i32> = l.runs.iter().map(|r| r.y as i32).collect();
+        assert_eq!(ys.len(), 1, "single line when everything fits");
+        assert!(l.runs.iter().all(|r| r.width == 20.0), "no shrink with wrap");
     }
 
     #[test]

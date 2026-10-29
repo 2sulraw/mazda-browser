@@ -140,6 +140,28 @@ curve matters more than the baseline (near-flat as tabs grow).
   Known gaps: no bold/italic serif faces (regular Georgia only), no per-stack
   real-font matching (Arial/Verdana/Helvetica all → default sans), no
   generic `ui-rounded`/`system-ui` distinction
+- [x] **Phase 1k** — flex-wrap: ~~missing~~ **DONE (`BoxStyle.wrap`,
+  `flex-wrap: wrap|wrap-reverse` parses, `nowrap`/default = old
+  shrink-to-fit; greedy line breaking at natural widths, per-line
+  justify + cross-axis align + row-gap, `flex_row` refactored into
+  `flex_line` per line; 99 tests)**.
+  Known gaps: `wrap-reverse` wraps but doesn't reverse the cross axis, no
+  per-line `align-content`, items never shrink on a wrap line (CSS `flex-shrink`
+  inside wrapping lines ignored)
+- [x] **Inline-boundary spaces** — text split across inline elements (`create `
+  + `<strong>high-quality</strong>`) lost its separating spaces (empty split
+  pieces at atom edges were skipped). Fixed: boundary/whitespace-only atoms
+  emit space atoms (no-op at line start); regression test.
+- [x] **Phase 1l** — CSS custom properties (`var()`): ~~none~~ **DONE
+  (`--name` decls survive `parse_decls`, collected into one page-wide
+  `Sheet.vars` map in document order; `resolve()` substitutes
+  `var(--name[, fallback])` recursively (depth-capped cycle guard) before
+  `apply_decl`; `hsl()`/`hsla()` color parsing for the `--ds-*` theme
+  values; 102 tests)** — nextjs.org pill/backgrounds/borders now render
+  via `var(--ds-*)`.
+  Known gaps: flat page-wide var map (no per-element cascade/inheritance,
+  `:root` vs `.dark` resolved by sheet order only), inline `style="--x:…"`
+  custom props ignored, no `lab()`/`color()` colors
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -181,6 +203,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-29 | Phase 1h: position relative/absolute/fixed | nextjs.org | 48.2 MB (572 runs; positioned nav/footer) |
 | 2026-10-29 | Phase 1i: box-shadow | nextjs.org | 45.6 MB (572 runs; 8 images) |
 | 2026-10-29 | Phase 1j: font-family stacks (serif) | nextjs.org/docs (redirect) | 78.2 MB (2698 runs; docs page, much larger than homepage) |
+| 2026-10-29 | Phase 1k: flex-wrap | nextjs.org | 45.9 MB (572 runs) |
+| 2026-10-29 | Phase 1l: var() custom properties + hsl() | nextjs.org | 45.3 MB (572 runs; pill + themed colors render) |
 
 ### Phase 1c (Track A) findings
 
