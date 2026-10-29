@@ -114,6 +114,75 @@ fn style_for(tag: &str, base: Style) -> Style {
     s
 }
 
+/// Box-chrome defaults for form controls (`<select>`/`<input>`/
+/// `<textarea>`): the bordered, filled, padded box a desktop browser
+/// draws around them. Applied AFTER the author cascade, but only to
+/// properties still at their initial value — a declared author `border`/
+/// `background`/`padding`/`min-height`/`width` wins, the same override
+/// rule UA heading defaults get from `style_for`'s base style.
+/// shortcut: css.rs cascades from `BoxStyle::default()` and exposes no
+/// "declared" bit, so an author RESET to the initial value (`border:none`,
+/// `padding:0`, `background:none`) is indistinguishable from "not
+/// declared" and cannot suppress the UA chrome (and a color-less declared
+/// `border:1px solid` gets the UA gray instead of currentcolor) — a real
+/// fix needs css.rs to cascade over a UA base BoxStyle (owned elsewhere).
+fn control_chrome(bx: &mut BoxStyle, min_h: f32, default_w: Option<f32>) {
+    if bx.border == [Len::Px(0.0); 4] {
+        bx.border = [Len::Px(1.0); 4];
+    }
+    if bx.bcolor.is_none() {
+        bx.bcolor = Some(0x00_76_76_76); // UA control-border gray
+    }
+    if bx.bg.is_none() {
+        bx.bg = Some(0x00_f4_f4_f4); // light control fill
+    }
+    if bx.pad == [Len::Px(0.0); 4] {
+        bx.pad = [Len::Px(0.0), Len::Px(3.0), Len::Px(0.0), Len::Px(3.0)];
+    }
+    if bx.radius == Len::Px(0.0) {
+        bx.radius = Len::Px(2.0);
+    }
+    if bx.min_height.is_none() {
+        bx.min_height = Some(Len::Px(min_h));
+    }
+    if bx.width.is_none() {
+        bx.width = default_w.map(Len::Px);
+    }
+}
+
+/// Text contained by `node`, NOT descending into nested `<option>`s: the
+/// soup parser nests an unclosed `<option>` inside the previous one, and
+/// each option's label belongs to it alone. (Textareas are raw text, so
+/// their default value comes out whole.)
+fn contained_text(dom: &Dom, node: u32) -> String {
+    let mut s = String::new();
+    for &c in &dom.nodes[node as usize].children {
+        match &dom.nodes[c as usize].kind {
+            NodeKind::Text(t) => s.push_str(t),
+            NodeKind::Element(..) => {
+                if dom.tag(c) != "option" {
+                    s.push_str(&contained_text(dom, c));
+                }
+            }
+        }
+    }
+    s.trim().to_string()
+}
+
+/// Labels of every `<option>` under `node` in document order, as
+/// (text, selected). Recurses through `<optgroup>` and into soup-nested
+/// options so `<option>a<option>b` still yields two entries.
+fn option_labels(dom: &Dom, node: u32, out: &mut Vec<(String, bool)>) {
+    for &c in &dom.nodes[node as usize].children {
+        if matches!(&dom.nodes[c as usize].kind, NodeKind::Element(..)) {
+            if dom.tag(c) == "option" {
+                out.push((contained_text(dom, c), dom.attr(c, "selected").is_some()));
+            }
+            option_labels(dom, c, out);
+        }
+    }
+}
+
 fn is_block(tag: &str) -> bool {
     matches!(
         tag,
@@ -158,6 +227,11 @@ pub struct BoxNode {
     pub link: Option<std::rc::Rc<str>>,
     /// `<img>` replacement data (None for every other box)
     pub img: Option<ImgSlot>,
+    /// inline-block placement: the box sits on the surrounding text line
+    /// (shrink-to-fit, vertically centered) instead of opening its own
+    /// block line — UA form-control chrome (`<select>`/`<input>`/
+    /// `<textarea>`) sets it; `block()` is the only flow that reads it
+    pub inline: bool,
     pub children: Vec<BoxNode>,
     // layout output (absolute CSS px)
     pub x: f32,
@@ -183,6 +257,7 @@ impl BoxNode {
             hard_break: false,
             link: None,
             img: None,
+            inline: false,
             children: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -203,6 +278,7 @@ impl BoxNode {
             hard_break,
             link,
             img: None,
+            inline: false,
             children: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -327,6 +403,90 @@ fn build_into(
                 } else {
                     link.clone()
                 };
+                // form controls: one inline box with UA chrome, content
+                // collapsed to a single text run (the selected/first
+                // <option> label, the input value, the textarea default).
+                // Options are never recursed into here — a closed <select>
+                // shows ONE line, never stacked labels.
+                if tag == "select" || tag == "input" || tag == "textarea" {
+                    // shortcut: multiple/size>1 selects and textarea
+                    // rows/cols render like the closed single-line control —
+                    // there is no popup/listbox/scrolling widget yet
+                    let (text, min_h, def_w): (Option<String>, f32, Option<f32>) = match tag {
+                        "select" => {
+                            let mut opts: Vec<(String, bool)> = Vec::new();
+                            option_labels(dom, child, &mut opts);
+                            let label = opts
+                                .iter()
+                                .find(|(_, s)| *s)
+                                .or_else(|| opts.first())
+                                .map(|(l, _)| l.clone());
+                            // dropdown arrow appended to the one visible
+                            // line — shortcut: a text glyph, not a
+                            // rasterizer-drawn triangle. ▼ (U+25BC) not ▾:
+                            // the small triangle U+25BE is absent from the
+                            // whole system-font fallback chain (verified via
+                            // ab_glyph glyph_id), ▼ is in every one of them
+                            // no options → empty box (no text, no arrow), no crash
+                            (label.map(|l| format!("{l} \u{25bc}")), 20.0, None)
+                        }
+                        "textarea" => {
+                            let t = contained_text(dom, child);
+                            (if t.is_empty() { None } else { Some(t) }, 20.0, Some(170.0))
+                        }
+                        _ => {
+                            // input (VOID: value comes from the attribute)
+                            let ty = dom.attr(child, "type").unwrap_or("").trim().to_ascii_lowercase();
+                            if ty == "hidden" {
+                                continue; // never rendered, by spec
+                            }
+                            let val = dom
+                                .attr(child, "value")
+                                // no value → the placeholder shows as static text
+                                .or_else(|| dom.attr(child, "placeholder"))
+                                .unwrap_or("");
+                            // shortcut: checkbox/radio/range/color/image
+                            // render as a generic chrome box — no widget art
+                            let body = match ty.as_str() {
+                                "checkbox" | "radio" => String::new(),
+                                "password" => "\u{2022}".repeat(val.chars().count()),
+                                _ => val.to_string(),
+                            };
+                            let text = if body.is_empty() { None } else { Some(body) };
+                            let (min_h, def_w) = match ty.as_str() {
+                                "checkbox" | "radio" => (14.0, Some(14.0)),
+                                // empty sized inputs get the classic ~170px
+                                // default width; a value keeps its natural
+                                // width so it stays on one line (nothing
+                                // clips text in this engine)
+                                _ if text.is_some() => (20.0, None),
+                                "" | "text" | "search" | "email" | "url" | "tel"
+                                | "password" | "number" => (20.0, Some(170.0)),
+                                _ => (20.0, None),
+                            };
+                            (text, min_h, def_w)
+                        }
+                    };
+                    let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    control_chrome(&mut g.bx, min_h, def_w);
+                    // UA default (no author `display` declared) = the control
+                    // joins the surrounding text line; a declared
+                    // `display:block/flex/grid` opts out and stacks.
+                    // shortcut: css.rs maps an author `inline-block` to Block,
+                    // so a DECLARED inline-block select stacks exactly like
+                    // buttons do (same engine-wide shortcut)
+                    g.inline = g.bx.display == Display::Auto;
+                    if let Some(t) = text {
+                        g.children.push(BoxNode::leaf(
+                            outcome.style,
+                            t,
+                            false,
+                            child_link.clone(),
+                        ));
+                    }
+                    out.push(g);
+                    continue;
+                }
                 // which elements get a box: flex/grid/block always; inline
                 // tags only when CSS says so; Auto follows the tag
                 let boxed = match outcome.bx.display {
@@ -1004,53 +1164,135 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Batch consecutive text leaves starting at `i`, lay them as one wrapped
-/// segment at (n.x, y). Returns (height, open_line), advances `i`.
-fn lay_text_run(
-    n: &mut BoxNode,
-    i: &mut usize,
-    y: f32,
-    measure: &dyn Fn(&str, &Style) -> f32,
-    runs: &mut Vec<PositionedRun>,
-    uls: &mut Vec<UR>,
-) -> (f32, bool) {
-    let mut atoms = Vec::new();
-    while *i < n.children.len() && n.children[*i].is_text {
-        atoms.push(leaf_atom(&n.children[*i]));
-        *i += 1;
-    }
-    let l = layout(&atoms, n.w, measure);
-    push_runs(l.runs, n.x, y, runs);
-    push_uls(l.underline_rects, n.x, y, uls);
-    (l.height, l.open_line)
-}
-
 /// Block flow: consecutive text leaves become wrapped line segments; child
 /// boxes are placed at the running y. The 0.6*size paragraph gap is added at
 /// block boundaries (matches the legacy hard_break semantics: gap only after
 /// content, never between empty breaks).
+///
+/// Boxes with `inline` set (the `<select>`/`<input>`/`<textarea>` chrome)
+/// join the current text line instead of opening their own: shrink-to-fit
+/// width, vertically centered against what is already on the line, and the
+/// text after them continues on that same line.
 fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<PositionedRun>, uls: &mut Vec<UR>) {
-    let mut y = n.y; // absolute — matches place()/push_runs
-    let mut open = false;
+    // y = bottom of the last closed content. While `cont` is Some, the
+    // current line is still open: (line_top, line_h, cursor x relative to
+    // n.x); y mirrors line_top + line_h.
+    let mut y = n.y;
+    let mut cont: Option<(f32, f32, f32)> = None;
     let mut i = 0;
     while i < n.children.len() {
         if n.children[i].is_text {
-            // text run after an open line: leading break of an anonymous
-            // block, style = this block's style
-            if open {
-                y += n.style.size * 0.6;
+            let (x0, seg_top) = match cont {
+                Some((top, _, x)) => (x, top),
+                None => (0.0, y),
+            };
+            let mut atoms = Vec::new();
+            while i < n.children.len() && n.children[i].is_text {
+                atoms.push(leaf_atom(&n.children[i]));
+                i += 1;
             }
-            let (h, o) = lay_text_run(n, &mut i, y, measure, runs, uls);
-            y += h;
-            open = o;
+            let (mut l, end_x) = layout_from(&atoms, x0, n.w, measure);
+            // this batch's first-line height + last-line top (original run
+            // coords, before the continuation shifts below)
+            let f = l
+                .runs
+                .iter()
+                .filter(|r| r.y == 0.0)
+                .map(|r| r.style.line_height())
+                .fold(0.0f32, f32::max);
+            let last_orig = l.runs.last().map(|r| r.y);
+            // continuing a line taller than this batch's first line (an
+            // inline box leads it): center the first line's text in the
+            // leftover, push wrapped lines down to the real line height
+            let extra = match cont {
+                Some((_, lh, _)) => (lh - f).max(0.0),
+                None => 0.0,
+            };
+            if extra > 0.0 {
+                let dy = extra * 0.5;
+                for r in &mut l.runs {
+                    r.y += if r.y == 0.0 { dy } else { extra };
+                }
+                for u in &mut l.underline_rects {
+                    u.1 += if u.1 < f { dy } else { extra };
+                }
+            }
+            let bottom = seg_top + l.height + extra;
+            push_runs(l.runs, n.x, seg_top, runs);
+            push_uls(l.underline_rects, n.x, seg_top, uls);
+            if l.open_line {
+                if let Some(lt0) = last_orig {
+                    // open line top (shifted with the wrapped lines when the
+                    // first line grew to the inline box's height)
+                    let lt = lt0 + if lt0 > 0.0 { extra } else { 0.0 };
+                    cont = Some((seg_top + lt, l.height + extra - lt, end_x));
+                } else if let Some((top, lh, _)) = cont {
+                    // whitespace-only continuation: line geometry unchanged,
+                    // only the cursor moves
+                    cont = Some((top, lh, end_x));
+                }
+                y = bottom;
+            } else {
+                cont = None;
+                y = bottom;
+            }
+        } else if matches!(n.children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
+            // out of flow: sized/placed by position_all (phase 2).
+            // shortcut: closes an open line first — keeps the legacy
+            // paragraph gap for text interrupted by an absolute box
+            if let Some((top, h, _)) = cont.take() {
+                y = top + h + n.style.size * 0.6;
+            }
+            i += 1;
+        } else if n.children[i].inline {
+            // form-control box: shrink-to-fit, joins the current line
+            let (mut line_top, mut line_h, mut cx) = cont.unwrap_or((y, 0.0, 0.0));
+            let mut avail = (n.w - cx).max(0.0);
+            let mut bw = natural_w(&n.children[i], avail, measure);
+            let mut ml = resolve_len(n.children[i].bx.margin[3], avail);
+            let mut mr = resolve_len(n.children[i].bx.margin[1], avail);
+            if cx > 0.0 && cx + ml + bw + mr > n.w {
+                // no room left on this line → wrap to a fresh one
+                y = line_top + line_h;
+                line_top = y;
+                line_h = 0.0;
+                cx = 0.0;
+                avail = n.w;
+                bw = natural_w(&n.children[i], avail, measure);
+                ml = resolve_len(n.children[i].bx.margin[3], avail);
+                mr = resolve_len(n.children[i].bx.margin[1], avail);
+            }
+            // place() derives the border box from the width it is handed
+            // (px widths — incl. the UA 170px input default — land exactly;
+            // shortcut: a %-width on an inline control resolves against the
+            // line's remainder instead of the parent width)
+            let outer = bw + ml + mr;
+            ml = resolve_len(n.children[i].bx.margin[3], outer);
+            mr = resolve_len(n.children[i].bx.margin[1], outer);
+            let adv = place(&mut n.children[i], n.x + cx, line_top, outer, measure, runs, uls);
+            if line_h > 0.0 && adv < line_h {
+                // vertically centered against what is already on the line
+                let dy = (line_h - adv) * 0.5;
+                shift_tree(&mut n.children[i], 0.0, dy);
+                let (a, b) = n.children[i].run_range;
+                for r in &mut runs[a as usize..b as usize] {
+                    r.y += dy;
+                }
+                let (a, b) = n.children[i].ul_range;
+                for u in &mut uls[a as usize..b as usize] {
+                    u.1 += dy;
+                }
+            } else {
+                line_h = line_h.max(adv);
+            }
+            cx += ml + n.children[i].w + mr;
+            y = line_top + line_h;
+            cont = Some((line_top, line_h, cx));
+            i += 1;
         } else {
-            if matches!(n.children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
-                i += 1; // out of flow: sized/placed by position_all (phase 2)
-                continue;
-            }
-            if open {
-                y += n.style.size * 0.6; // leading break before child box
-                open = false;
+            // regular child box: close the open line + paragraph gap first
+            if let Some((top, h, _)) = cont.take() {
+                y = top + h + n.style.size * 0.6;
             }
             let adv = place(&mut n.children[i], n.x, y, n.w, measure, runs, uls);
             y += adv;
@@ -1061,8 +1303,11 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             i += 1;
         }
     }
+    if let Some((top, h, _)) = cont {
+        y = top + h;
+    }
     n.h = y - n.y;
-    n.open = open;
+    n.open = cont.is_some();
 }
 
 /// Flex row: max-content sizing with proportional shrink on overflow,
@@ -1388,10 +1633,22 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     n.open = last_open;
 }
 pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> f32) -> Layout {
+    layout_from(atoms, 0.0, max_width, measure).0
+}
+
+/// [`layout`], but the first line starts at `x0` — text continuing on a
+/// line that already holds an inline box. Returns the layout plus the
+/// line's end x (the continuation cursor for the next inline content).
+fn layout_from(
+    atoms: &[Atom],
+    x0: f32,
+    max_width: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> (Layout, f32) {
     let mut runs = Vec::new();
     let mut underline_rects = Vec::new();
     let mut y = 0.0f32;
-    let mut x = 0.0f32;
+    let mut x = x0;
     let mut line_height = 0.0f32;
 
     // split text into word atoms first so wrapping is per-word
@@ -1520,15 +1777,18 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
         i = j;
     }
 
-    Layout {
-        runs,
-        height: y,
-        underline_rects,
-        rects: Vec::new(),
-        images: Vec::new(),
-        shadows: Vec::new(),
-        open_line: x > 0.0,
-    }
+    (
+        Layout {
+            runs,
+            height: y,
+            underline_rects,
+            rects: Vec::new(),
+            images: Vec::new(),
+            shadows: Vec::new(),
+            open_line: x > 0.0,
+        },
+        x,
+    )
 }
 
 #[cfg(test)]
@@ -2462,5 +2722,182 @@ mod tests {
         assert!((root.x - 50.0).abs() < 0.01, "root x={}", root.x);
         assert!((fixed_box.w - 300.0).abs() < 0.01, "fixed w={} = viewport", fixed_box.w);
         assert!((fixed_box.x - 0.0).abs() < 0.01, "fixed x={} = viewport", fixed_box.x);
+    }
+
+    // ---- form controls (UA chrome: <select>/<input>/<textarea>) ----
+
+    /// box tree from markup: parse + build over an empty sheet (UA chrome
+    /// only — no author rules in the way).
+    fn tree_of(markup: &str) -> BoxNode {
+        let dom = crate::html::parse(markup);
+        build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            BoxStyle::default(),
+            &crate::css::parse(""),
+        )
+    }
+
+    /// every inline form-control box in tree order
+    fn controls(n: &BoxNode) -> Vec<&BoxNode> {
+        fn walk<'a>(n: &'a BoxNode, out: &mut Vec<&'a BoxNode>) {
+            if n.inline {
+                out.push(n);
+            }
+            for c in &n.children {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(n, &mut out);
+        out
+    }
+
+    #[test]
+    fn select_renders_one_line_with_selected_option() {
+        let mut root = tree_of(
+            r#"<p>Lang <select><option>English</option><option selected>Français</option><option>Deutsch</option></select></p>"#,
+        );
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 1, "select renders as exactly one box");
+            let sel = cs[0];
+            // one text leaf — the selected option — not three stacked labels
+            assert_eq!(sel.children.len(), 1, "single text leaf, not one per option");
+            assert!(sel.children[0].is_text);
+            let t = &sel.children[0].text;
+            assert!(t.contains("Français"), "selected label shown: {t:?}");
+            assert!(
+                !t.contains("English") && !t.contains("Deutsch"),
+                "only the selected option: {t:?}"
+            );
+            assert!(t.contains('\u{25bc}'), "dropdown arrow on the line: {t:?}");
+            // the box carries the UA chrome
+            assert!(sel.bx.border[0] == Len::Px(1.0), "UA border");
+            assert!(sel.bx.bg.is_some(), "UA background");
+            // one line: the box does not stack the paragraph into 3+ lines
+            let line = 15.0 * 1.35;
+            assert!(
+                root.h < line * 2.0,
+                "h={} stays a single line",
+                root.h
+            );
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert!(!l.runs.is_empty());
+        let ys: Vec<f32> = l.runs.iter().map(|r| r.y).collect();
+        let spread = ys.iter().cloned().fold(f32::MIN, f32::max)
+            - ys.iter().cloned().fold(f32::MAX, f32::min);
+        // inline on the same line (≤2px = the control's border/centering slack)
+        assert!(spread <= 2.0, "runs share one line, y spread={spread}");
+    }
+
+    #[test]
+    fn select_box_is_inline_and_shrinks_to_content() {
+        let mut root =
+            tree_of(r#"<div>Language <select><option>English</option></select> ok</div>"#);
+        let sel;
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 1, "one control box");
+            sel = cs[0];
+            // structure: a real box (not flattened into the parent flow),
+            // UA default display = joins the line, chrome filled in
+            assert!(!sel.is_text, "boxed, not bare text");
+            assert!(sel.bx.display == Display::Auto, "no author display → Auto");
+            assert!(sel.inline, "inline-block placement");
+            assert!(sel.bx.border[0] == Len::Px(1.0), "UA border");
+            assert!(sel.bx.bg.is_some(), "UA background");
+            assert!(sel.children.len() == 1 && sel.children[0].is_text);
+            // first option (none marked selected) becomes the label
+            assert!(sel.children[0].text.contains("English"), "first option");
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        // sits ON the surrounding line: after "Language " (9 chars × 4px),
+        // not on a stacked block line of its own
+        let cs = controls(&root);
+        let sel = cs[0];
+        assert!((sel.x - 36.0).abs() < 0.01, "x={} = after \"Language \"", sel.x);
+        assert!(sel.w > 0.0 && sel.w < 500.0, "shrink-to-fit w={}", sel.w);
+        let lang = l.runs.iter().find(|r| r.text == "Language").expect("run");
+        let eng = l.runs.iter().find(|r| r.text == "English").expect("label run");
+        let ok = l.runs.iter().find(|r| r.text == "ok").expect("trailing run");
+        assert!((eng.y - lang.y).abs() <= 2.0, "select on the text line");
+        assert!((ok.y - lang.y).abs() <= 2.0, "text continues on that line");
+        assert!(eng.x > lang.x + lang.width, "label starts inside the box");
+    }
+
+    #[test]
+    fn empty_select_renders_empty_box_without_crash() {
+        let mut root = tree_of("<div><select></select></div>");
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 1, "empty select still gets its box");
+            assert!(cs[0].children.is_empty(), "no options → no text, no arrow");
+        }
+        let l = layout_tree(&mut root, 200.0, &m4);
+        assert!(l.runs.is_empty(), "nothing to draw");
+        // and it flows inline between text without panicking
+        let mut root2 = tree_of("<div>x<select></select>y</div>");
+        let l2 = layout_tree(&mut root2, 200.0, &m4);
+        let texts: Vec<&str> = l2.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn option_outside_select_still_renders_as_text() {
+        let root = tree_of("<div><option>Bare</option></div>");
+        assert!(controls(&root).is_empty(), "no box for a stray <option>");
+        let div = &root.children[0];
+        assert!(
+            div.children.iter().any(|c| c.is_text && c.text == "Bare"),
+            "its text still flows into the parent"
+        );
+    }
+
+    #[test]
+    fn author_css_overrides_ua_control_chrome() {
+        let dom = crate::html::parse(r#"<div><select id="s"><option>X</option></select></div>"#);
+        let sheet = crate::css::parse(
+            r#"select { background: #112233; border: 3px solid #445566; padding: 5px; }"#,
+        );
+        let root = build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            BoxStyle::default(),
+            &sheet,
+        );
+        let cs = controls(&root);
+        let sel = cs[0];
+        assert_eq!(sel.bx.bg, Some(0x00_11_22_33), "author background wins");
+        assert!(sel.bx.border == [Len::Px(3.0); 4], "author border wins");
+        assert_eq!(sel.bx.bcolor, Some(0x00_44_55_66), "author border color");
+        assert!(sel.bx.pad == [Len::Px(5.0); 4], "author padding wins");
+        // undeclared properties keep the UA defaults
+        assert!(sel.bx.radius == Len::Px(2.0), "UA radius survives");
+        assert!(sel.inline, "still inline");
+    }
+
+    #[test]
+    fn input_and_textarea_render_value_boxes_hidden_skipped() {
+        let root = tree_of(
+            r#"<div><input type="hidden" value="secret"><input value="Hi"><textarea>Hello World</textarea></div>"#,
+        );
+        let cs = controls(&root);
+        assert_eq!(cs.len(), 2, "hidden input skipped, visible ones boxed");
+        assert_eq!(cs[0].children[0].text, "Hi", "input shows its value");
+        assert!(
+            cs[1].children[0].text.contains("Hello World"),
+            "textarea shows its default value: {:?}",
+            cs[1].children[0].text
+        );
+        // all three tags share the UA chrome
+        for c in &cs {
+            assert!(c.bx.border[0] == Len::Px(1.0) && c.bx.bg.is_some());
+        }
+        // no hidden value leaks into rendering
+        assert!(controls(&root).iter().all(|c| !c.children.iter().any(|t| t.text.contains("secret"))));
     }
 }
