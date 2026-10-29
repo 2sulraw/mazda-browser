@@ -333,8 +333,28 @@ fn build_into(
                     build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
                     out.push(g);
                 } else {
-                    // inline element: no box, children flatten into parent flow
+                    // inline element: no box, children flatten into parent
+                    // flow. shortcut: horizontal margins (e.g. HN's
+                    // `.hnname{margin-right:5px}`) can't shift inline text, so
+                    // they emit one separator space — visually equivalent
+                    let has_margin = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
+                    if has_margin(outcome.bx.margin[3]) {
+                        out.push(BoxNode::leaf(
+                            outcome.style,
+                            " ".into(),
+                            false,
+                            child_link.clone(),
+                        ));
+                    }
                     build_into(dom, child, outcome.style, sheet, child_link, out);
+                    if has_margin(outcome.bx.margin[1]) {
+                        out.push(BoxNode::leaf(
+                            outcome.style,
+                            " ".into(),
+                            false,
+                            None,
+                        ));
+                    }
                 }
             }
         }
@@ -826,6 +846,11 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
             while i < children.len() && children[i].is_text {
                 i += 1;
             }
+            // whitespace-only runs are not items (spec: anonymous item
+            // creation skips whitespace) — they used to eat a grid track
+            if children[start..i].iter().all(|c| c.text.trim().is_empty()) {
+                continue;
+            }
             out.push(Item::Text(start, i));
         } else if matches!(children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
             i += 1; // out of flow: placed in phase 2 (position_all)
@@ -872,7 +897,15 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
             for it in &items {
                 sum += item_natural(n, it, avail, measure);
             }
-            sum + n.bx.gap_col * (k as f32 - 1.0).max(0.0)
+            let w = sum + n.bx.gap_col * (k as f32 - 1.0).max(0.0);
+            // a wrapping row fits the available width (fit-content) — sizing
+            // it to the unwrapped sum made rust-lang.org's nav overflow and
+            // clip its last items, wrap branch never engaging
+            if n.bx.wrap && avail > 0.0 {
+                w.min(avail)
+            } else {
+                w
+            }
         }
         (Display::Flex, Dir::Column) => n
             .children
@@ -1212,9 +1245,11 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     n.open = last_open;
 }
 
-/// Grid: row-major cells over resolved tracks; row height = tallest cell,
-/// row-gap between rows. shortcut: empty cols = single implicit column,
-/// no spanning, no implicit rows beyond item count.
+/// Grid: cells over resolved tracks; row height = tallest cell, row-gap
+/// between rows. Items with `grid-column: <name>` place into the
+/// [name-start]…[name-end] column span (stacking in successive rows);
+/// auto items flow row-major. shortcut: named and auto items can share a
+/// row index (overlap) — real grids resolve full placement sparsely.
 fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<PositionedRun>, uls: &mut Vec<UR>) {
     let items = items_of(&n.children);
     if items.is_empty() {
@@ -1228,22 +1263,72 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         resolve_tracks(&n.bx.cols, n.w, n.bx.gap_col)
     };
     let nc = cols.len();
-    let nrows = (items.len() + nc - 1) / nc;
+    // x offset + width of columns [c0, c1)
+    let span_xw = |c0: usize, c1: usize| {
+        let x: f32 = cols[..c0].iter().sum::<f32>() + n.bx.gap_col * c0 as f32;
+        let w: f32 = cols[c0..c1].iter().sum::<f32>() + n.bx.gap_col * (c1 - c0 - 1) as f32;
+        (x, w)
+    };
+    // resolve each item's (row, c0, c1)
+    let resolve_col = |name: &str| -> Option<(usize, usize)> {
+        let line = |suffix: &str| {
+            n.bx
+                .col_lines
+                .iter()
+                .find(|(l, _)| l == name || l == &format!("{name}{suffix}"))
+                .map(|(_, i)| *i)
+        };
+        let s = line("-start")?;
+        let e = line("-end").filter(|&e| e > s).unwrap_or(s + 1);
+        Some((s, e.min(nc)))
+    };
+    let mut col_row = vec![0usize; nc]; // next free row per column (named)
+    let mut ar = 0usize; // auto cursor row
+    let mut ac = 0usize; // auto cursor col
+    let mut spots: Vec<(usize, usize, usize)> = Vec::with_capacity(items.len());
+    for it in &items {
+        let named = match it {
+            Item::Grp(i) => n.children[*i]
+                .bx
+                .grid_col
+                .as_deref()
+                .and_then(resolve_col),
+            Item::Text(..) => None,
+        };
+        spots.push(match named {
+            Some((s, e)) => {
+                let r = (s..e).map(|c| col_row[c]).max().unwrap_or(0);
+                for c in s..e {
+                    col_row[c] = r + 1;
+                }
+                (r, s, e)
+            }
+            None => {
+                let sp = (ar, ac, (ac + 1).min(nc));
+                ac += 1;
+                if ac >= nc {
+                    ac = 0;
+                    ar += 1;
+                }
+                sp
+            }
+        });
+    }
+    let nrows = spots.iter().map(|s| s.0).max().unwrap_or(0) + 1;
     let mut y = n.y;
     let mut last_open = false;
     for r in 0..nrows {
         let mut row_h = 0.0f32;
         let mut marks: Vec<(usize, usize, f32)> = Vec::with_capacity(nc); // run_start, ul_start, h
+        let mut row_items: Vec<usize> = (0..items.len()).filter(|&i| spots[i].0 == r).collect();
+        row_items.sort_by_key(|&i| spots[i].1);
         let mut cell_ios: Vec<bool> = Vec::with_capacity(nc);
-        let mut x = n.x;
-        for c in 0..nc {
-            let idx = r * nc + c;
-            if idx >= items.len() {
-                break;
-            }
+        for &idx in &row_items {
+            let (_, c0, c1) = spots[idx];
+            let (dx, w) = span_xw(c0, c1);
+            let x = n.x + dx;
             let rs = runs.len();
             let us = uls.len();
-            let w = cols[c];
             let (ih, io) = match items[idx] {
                 Item::Text(a, b) => {
                     let mut atoms = Vec::new();
@@ -1263,7 +1348,6 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             marks.push((rs, us, ih));
             cell_ios.push(io);
             row_h = row_h.max(ih);
-            x += w + n.bx.gap_col;
         }
         // cross-axis align within the row (ranges are safe: the next row
         // hasn't been laid yet)
@@ -1284,7 +1368,7 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             for u in &mut uls[us..uend] {
                 u.1 += dy;
             }
-            if let Item::Grp(i) = items[r * nc + ci] {
+            if let Item::Grp(i) = items[row_items[ci]] {
                 shift_tree(&mut n.children[i], 0.0, dy);
             }
         }

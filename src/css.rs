@@ -84,6 +84,12 @@ pub struct BoxStyle {
     pub gap_row: f32,
     pub gap_col: f32,
     pub cols: Vec<Track>,
+    /// `[line-name]` boundaries from `grid-template-columns`
+    /// (name → track index it precedes)
+    pub col_lines: Vec<(String, usize)>,
+    /// this grid item's `grid-column: <name>` — resolved against the
+    /// container's `col_lines` (`name-start`…`name-end`) at layout
+    pub grid_col: Option<String>,
     pub width: Option<Len>,
     pub max_width: Option<Len>,
     /// explicit height — shortcut: only consulted for replaced (`<img>`) boxes
@@ -139,6 +145,8 @@ impl Default for BoxStyle {
             gap_row: 0.0,
             gap_col: 0.0,
             cols: Vec::new(),
+            col_lines: Vec::new(),
+            grid_col: None,
             width: None,
             max_width: None,
             height: None,
@@ -223,6 +231,7 @@ const KNOWN: &[&str] = &[
     "row-gap",
     "column-gap",
     "grid-template-columns",
+    "grid-column",
     "width",
     "max-width",
     "height",
@@ -566,8 +575,20 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
             }
         }
         "font-size" => {
-            if let Some(px) = parse_size(&d.1, style.size) {
-                style.size = px.clamp(6.0, 400.0);
+            // `inherit`/`unset`/`initial`: the style we're cascading into
+            // already carries the parent's size, so inherit = keep it and
+            // initial = root size (16px)
+            match d.1.trim() {
+                "inherit" | "unset" | "initial" => {
+                    if d.1.trim() == "initial" {
+                        style.size = 16.0;
+                    }
+                }
+                _ => {
+                    if let Some(px) = parse_size(&d.1, style.size) {
+                        style.size = px.clamp(6.0, 400.0);
+                    }
+                }
             }
         }
         "font-weight" => {
@@ -607,7 +628,11 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
             "flex" => bx.display = Display::Flex,
             "grid" => bx.display = Display::Grid,
             "block" => bx.display = Display::Block,
-            "inline" | "inline-block" | "inline-flex" | "inline-grid" => bx.display = Display::Inline,
+            // inline-block/inline-flex/inline-grid get a real box so their
+            // background/border/paint (buttons, badges) actually renders —
+            // shortcut: they stack as blocks instead of sitting mid-line
+            "inline-block" | "inline-flex" | "inline-grid" => bx.display = Display::Block,
+            "inline" => bx.display = Display::Inline,
             _ => {}
         },
         // shadows carry their own alpha (rgba() is the common case) and may
@@ -673,7 +698,19 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 bx.gap_col = len_px(v, 0.0);
             }
         }
-        "grid-template-columns" => bx.cols = parse_tracks(&d.1),
+        "grid-template-columns" => {
+            let (cols, lines) = parse_tracks(&d.1);
+            bx.cols = cols;
+            bx.col_lines = lines;
+        }
+        // item placement into named lines: `grid-column: content` spans the
+        // [content-start]…[content-end] pair from the container's template
+        "grid-column" => {
+            let first = d.1.split('/').next().unwrap_or("").trim();
+            if !first.is_empty() && first != "auto" && !first.parse::<u32>().is_ok() {
+                bx.grid_col = Some(first.to_string());
+            }
+        }
         "width" => bx.width = parse_len(&d.1).filter(|_| d.1 != "auto"),
         "height" => bx.height = parse_len(&d.1).filter(|_| d.1 != "auto"),
         "min-height" => bx.min_height = parse_len(&d.1).filter(|_| d.1 != "auto"),
@@ -845,12 +882,15 @@ fn len_px(l: Len, container: f32) -> f32 {
 
 /// `grid-template-columns`: `1fr 1fr 1fr`, `repeat(3, 1fr)`,
 /// `minmax(0, 1fr)`, `200px 50%`. Empty = single implicit column.
-/// shortcut: `repeat(auto-fill, …)` and named lines are dropped.
-fn parse_tracks(v: &str) -> Vec<Track> {
+/// Returns the tracks plus line names (`[content-start]` → index of the
+/// track boundary it precedes) so items can place via `grid-column: name`.
+/// shortcut: `repeat(auto-fill, …)` and multi-token line names are dropped.
+fn parse_tracks(v: &str) -> (Vec<Track>, Vec<(String, usize)>) {
     let mut out = Vec::new();
+    let mut lines: Vec<(String, usize)> = Vec::new();
     let v = v.trim();
     if v.is_empty() || v == "none" {
-        return out;
+        return (out, lines);
     }
     // expand repeat(n, …) and minmax(a, b) first so tokens are space-free
     let mut s = String::new();
@@ -879,12 +919,27 @@ fn parse_tracks(v: &str) -> Vec<Track> {
                 s.push(' ');
             }
             i = close + 1;
+        } else if v[i..].starts_with("calc(") || v[i..].starts_with("max(") || v[i..].starts_with("min(") {
+            // unresolvable math (needs the viewport for vw) — skip the WHOLE
+            // paren group. Cutting inside it used to leak inner literals
+            // (e.g. `calc(50vw - 720px)` minted a phantom 720px track)
+            let open = v[i..].find('(').unwrap();
+            let Some(close) = match_paren(b, i + open) else { break };
+            s.push(' '); // keep neighbors separated
+            i = close + 1;
         } else {
             s.push(b[i] as char);
             i += 1;
         }
     }
     for tok in s.split_whitespace() {
+        // [line-name] → record the boundary index it precedes
+        if let Some(name) = tok.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+            if !name.contains(' ') {
+                lines.push((name.to_string(), out.len()));
+            }
+            continue;
+        }
         let tok = tok.trim_end_matches(',');
         if let Some(n) = tok.strip_suffix("fr") {
             if let Ok(f) = n.trim().parse::<f32>() {
@@ -896,9 +951,9 @@ fn parse_tracks(v: &str) -> Vec<Track> {
                 Len::Pct(p) => Track::Pct(p),
             });
         }
-        // unknown tokens (auto, named lines) are skipped
+        // unknown tokens (auto) are skipped
     }
-    out
+    (out, lines)
 }
 
 /// Index of the `)` matching the `(` at `open`.
@@ -921,6 +976,32 @@ fn match_paren(b: &[u8], open: usize) -> Option<usize> {
 
 /// `16px`, `1.2em` (relative to current size), `120%`, bare number (lenient px).
 fn parse_size(v: &str, current: f32) -> Option<f32> {
+    let v = v.trim();
+    // clamp(min, val, max) — common for responsive font sizes; resolve the
+    // inner values (px/rem/% only; vw needs the viewport, see parse_for note)
+    if let Some(inner) = v
+        .strip_prefix("clamp(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+        if parts.len() == 3 {
+            let (Some(lo), Some(hi)) = (parse_size(parts[0], current), parse_size(parts[2], current))
+            else {
+                return None;
+            };
+            let val = parse_size(parts[1], current).unwrap_or(lo);
+            return Some(val.clamp(lo, hi));
+        }
+        return None;
+    }
+    // vw/vh units: no viewport here (static parse) — treat vw as % of a
+    // 1000px window (our fixed width) so headings stay proportional
+    if let Some(n) = v.strip_suffix("vw") {
+        return n.trim().parse::<f32>().ok().map(|f| f / 100.0 * 1000.0);
+    }
+    if let Some(n) = v.strip_suffix("vh") {
+        return n.trim().parse::<f32>().ok().map(|f| f / 100.0 * 700.0);
+    }
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse().ok();
     }
@@ -1859,6 +1940,31 @@ mod tests {
     }
 
     #[test]
+    fn font_size_inherit_keeps_parent_size() {
+        // Wikipedia: #mp-welcome{font-size:162%} #mp-welcome h1{font-size:inherit}
+        // — without inherit support the h1 doubled to the UA 2x default
+        let sheet = parse("#w { font-size: 162% } #w h1 { font-size: inherit }");
+        let dom = dom_of("<div id=w><h1>x</h1></div>");
+        let parent = sheet.resolve(&dom, by_attr(&dom, "id", "w"), Style::new(), None);
+        let h1 = sheet.resolve(&dom, by_tag(&dom, "h1"), parent.style, None);
+        // parent: 15 * 1.62 = 24.3; h1 inherit must keep exactly that
+        assert!((parent.style.size - 24.3).abs() < 0.01, "parent {}", parent.style.size);
+        assert_eq!(h1.style.size, parent.style.size, "inherit keeps parent size");
+    }
+
+    #[test]
+    fn font_size_clamp_and_vw_parse() {
+        let sheet = parse(".a { font-size: clamp(16px, 2.5vw, 32px) } .b { font-size: 5vw }");
+        let dom = dom_of("<div class=a></div><div class=b></div>");
+        let a = sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None);
+        // 2.5vw = 25px, inside [16, 32]
+        assert!((a.style.size - 25.0).abs() < 0.01, "clamp {}", a.style.size);
+        let b = sheet.resolve(&dom, by_attr(&dom, "class", "b"), Style::new(), None);
+        // 5vw = 50px, clamped to the 400px cap only
+        assert!((b.style.size - 50.0).abs() < 0.01, "vw {}", b.style.size);
+    }
+
+    #[test]
     fn colon_inside_attribute_value_is_not_a_pseudo() {
         assert!(!has_pseudo(r#"a[href^="http:"]"#));
         assert!(!has_pseudo(r#".data-\:x"#));
@@ -1957,19 +2063,35 @@ mod tests {
 
     #[test]
     fn tracks_parse_fr_px_pct_and_repeat() {
+        let tracks = |v: &str| parse_tracks(v).0;
         assert_eq!(
-            parse_tracks("repeat(3, 1fr)"),
+            tracks("repeat(3, 1fr)"),
             vec![Track::Fr(1.0), Track::Fr(1.0), Track::Fr(1.0)]
         );
         assert_eq!(
-            parse_tracks("200px 50% 1fr"),
+            tracks("200px 50% 1fr"),
             vec![Track::Px(200.0), Track::Pct(50.0), Track::Fr(1.0)]
         );
         // minmax(0, 1fr) → take the max side
-        assert_eq!(parse_tracks("minmax(0, 1fr)"), vec![Track::Fr(1.0)]);
-        assert!(parse_tracks("none").is_empty());
+        assert_eq!(tracks("minmax(0, 1fr)"), vec![Track::Fr(1.0)]);
+        assert!(tracks("none").is_empty());
         // garbage tokens are skipped, valid ones survive
-        assert_eq!(parse_tracks("[line1] auto 2fr"), vec![Track::Fr(2.0)]);
+        assert_eq!(tracks("[line1] auto 2fr"), vec![Track::Fr(2.0)]);
+        // line names are recorded with the boundary index they precede
+        assert_eq!(
+            parse_tracks("[a] 1fr [b-start] 200px [b-end]").1,
+            vec![("a".to_string(), 0), ("b-start".to_string(), 1), ("b-end".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn calc_in_tracks_does_not_leak_phantom_lengths() {
+        // MDN: `max(1rem,calc(50vw - 720px + 1rem))` used to be cut inside
+        // the parens, minting a bogus 720px track that zeroed the 1fr tracks
+        let (cols, _) = parse_tracks(
+            "[s] max(1rem,calc(50vw - 720px + 1rem)) [c0] 1fr [c1] minmax(0,48rem) [c2] 1fr [e]",
+        );
+        assert_eq!(cols, vec![Track::Fr(1.0), Track::Px(768.0), Track::Fr(1.0)]);
     }
 
     #[test]
