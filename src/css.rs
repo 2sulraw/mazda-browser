@@ -166,6 +166,7 @@ impl Default for BoxStyle {
 }
 
 /// One compound step of a selector, e.g. `nav > a.current[href]`.
+#[derive(Clone)]
 struct Seg {
     tag: Option<String>,
     id: Option<String>,
@@ -186,6 +187,10 @@ struct Rule {
 pub struct Sheet {
     /// sorted by (spec, order) at parse time; cascade = apply matches in order
     rules: Vec<Rule>,
+    /// cascade-ordered `(selector, value)` pairs for `color-scheme` only.
+    /// The property is consulted for every element but declared on very few
+    /// rules, so `resolve` walks this tiny slice instead of the full rule list.
+    schemes: Vec<(Vec<Seg>, String)>,
     /// effective custom properties (--name → value) consumed by `resolve`.
     /// Starts as the flat last-definition-wins map (parse time); `scope_vars`
     /// rewrites it once the real <html> element is known.
@@ -193,6 +198,10 @@ pub struct Sheet {
     /// every custom-property definition as (selector, value) in document
     /// order — what `scope_vars` filters by against the <html> root's theme.
     var_defs: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// the `<html>` class-list theme polarity (Some(true)=dark) captured by
+    /// `scope_vars` — fallback for elements with no declared `color-scheme`.
+    /// None until `scope_vars` runs (then the system preference decides).
+    root_pol: Option<bool>,
 }
 
 impl Sheet {
@@ -205,13 +214,23 @@ impl Sheet {
     /// `clientpref-day`, so its `clientpref-night` dark vars must not override the
     /// `:root` light ones). Runs once after the DOM is built; before it, `vars`
     /// is the flat last-definition-wins map.
+    /// Definitions from rules that really apply to the real `<html>` outrank
+    /// every other scope: `html.skin-theme-clientpref-os` vars (entered via
+    /// `@media (prefers-color-scheme:dark)`) never match a clientpref-day
+    /// root, so they must not beat the root's own `:root` palette.
     /// shortcut: only a theme declared on the <html> root is modeled. A JS-
     /// activated theme (nextjs `.dark`, absent from server HTML) is NOT a
     /// contradiction, so its dark values are kept — matching a system-dark render.
     pub fn scope_vars(&mut self, dom: &Dom, html: u32) {
         let root_pol = dom.attr(html, "class").and_then(theme_polarity);
+        self.root_pol = root_pol; // fallback theme for light-dark() below
         self.vars.clear();
         for (name, defs) in &self.var_defs {
+            // winner among definitions whose selector applies to the real
+            // <html> element — those ARE the root's custom properties
+            let mut on_root: Option<&str> = None;
+            // last non-contradicting definition otherwise (a JS-activated
+            // theme, absent from server HTML, can't contradict anything)
             let mut chosen: Option<&str> = None;
             for (sel, val) in defs {
                 let sel_pol = selector_polarity(sel);
@@ -220,11 +239,21 @@ impl Sheet {
                     (root_pol, sel_pol),
                     (Some(false), Some(true)) | (Some(true), Some(false))
                 );
-                if !contradicts {
-                    chosen = Some(val); // last non-contradicting definition wins
+                // a selector the DOM says matches <html> can't contradict it —
+                // the polarity tokens are a guess, the DOM is the truth (a list
+                // like `:root,.skin-invert,.notheme` reads dark by token but is
+                // the page's own light palette)
+                let applies = root_pol.is_some() && sel_applies_to_root(dom, html, sel);
+                if contradicts && !applies {
+                    continue;
+                }
+                if applies {
+                    on_root = Some(val); // last on-root definition wins
+                } else {
+                    chosen = Some(val); // fallback when no on-root def exists
                 }
             }
-            if let Some(v) = chosen {
+            if let Some(v) = on_root.or(chosen) {
                 self.vars.insert(name.clone(), v.to_string());
             }
         }
@@ -245,6 +274,7 @@ pub struct StyleOutcome {
 /// at parse time to keep the rule list small.
 const KNOWN: &[&str] = &[
     "color",
+    "color-scheme",
     "background",
     "background-color",
     "font-size",
@@ -300,6 +330,14 @@ const KNOWN: &[&str] = &[
     "inset",
     "box-shadow",
 ];
+
+/// The OS color-scheme preference this build renders for (`true` = the system
+/// prefers dark, as on this machine). shortcut: no live OS listener — one
+/// honest global read at parse/resolve time, so `@media
+/// (prefers-color-scheme:…)` and `light-dark()` always agree; a light-OS user
+/// sets it to `false` and the `light dark` branch of `light-dark()` becomes
+/// the light one, with `prefers-color-scheme: light` blocks applying instead.
+const PREFERS_DARK: bool = true;
 
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
 /// cascade-sorted rule list, assuming a 1000px desktop viewport.
@@ -390,7 +428,27 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     }
 
     rules.sort_by_key(|r| (r.spec, r.order));
-    Sheet { rules, vars, var_defs }
+    // color-scheme decides light-dark() for every element but is declared on
+    // very few rules — keep the (already cascade-ordered) slice so resolve can
+    // find a winning value without re-walking the full rule list. Last
+    // declaration within a rule wins (source order), like every property.
+    let schemes: Vec<(Vec<Seg>, String)> = rules
+        .iter()
+        .filter_map(|r| {
+            r.decls
+                .iter()
+                .rev()
+                .find(|d| d.0 == "color-scheme")
+                .map(|d| (r.segs.clone(), d.1.clone()))
+        })
+        .collect();
+    Sheet {
+        rules,
+        schemes,
+        vars,
+        var_defs,
+        root_pol: None,
+    }
 }
 
 /// Position just past an at-rule. `@media`/`@layer` blocks whose condition
@@ -416,6 +474,12 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
     }
     let transparent = match name {
         "media" => media_matches(&s[ne..pe], vw),
+        // feature queries: enter a branch only if we actually support what it
+        // tests for. Modern sites ship a native form and an `@supports not`
+        // polyfill of the same custom property; evaluating the query for real
+        // keeps the polyfill (whose logic we can't run) from shadowing the
+        // native values (MDN's `light-dark()` colours).
+        "supports" => supports_matches(&s[ne..pe]),
         // shortcut: layer order ≈ source order (cross-layer specificity off)
         "layer" => true,
         _ => false,
@@ -511,13 +575,16 @@ impl Sheet {
         let mut bg = None;
         let mut display_none = false;
         let mut bx = BoxStyle::default();
+        // used color scheme for THIS element (own declaration, else the
+        // nearest ancestor's — the property inherits) — decides light-dark()
+        let dark = self.used_dark(dom, node, inline);
 
         for rule in &self.rules {
             if !matches(dom, node, &rule.segs) {
                 continue;
             }
             for d in &rule.decls {
-                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size) {
+                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size, dark) {
                     display_none = true;
                 }
             }
@@ -525,7 +592,7 @@ impl Sheet {
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
-                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size) {
+                if apply_decl(&self.subst(d), &mut style, &mut bg, &mut bx, parent_size, dark) {
                     display_none = true;
                 }
             }
@@ -545,6 +612,50 @@ impl Sheet {
             return d.clone();
         }
         (d.0.clone(), subst_vars(&d.1, &self.vars, 0))
+    }
+
+    /// The cascaded `color-scheme` value for `node`: matched rules in cascade
+    /// order (last wins), then the inline `style` (applied last → wins).
+    fn own_scheme(&self, dom: &Dom, node: u32, inline: Option<&str>) -> Option<String> {
+        let mut val: Option<String> = None;
+        for (segs, v) in &self.schemes {
+            if matches(dom, node, segs) {
+                // same var() substitution resolve applies to every declaration
+                val = Some(if v.contains("var(") {
+                    subst_vars(v, &self.vars, 0)
+                } else {
+                    v.clone()
+                });
+            }
+        }
+        if let Some(inline) = inline {
+            for d in &parse_decls(inline) {
+                if d.0 == "color-scheme" {
+                    val = Some(self.subst(d).1);
+                }
+            }
+        }
+        val
+    }
+
+    /// Used color scheme for `node` (true = dark): the nearest declared
+    /// `color-scheme` up the DOM parent chain (the property inherits, so a
+    /// root `color-scheme: light` reaches descendants that don't override
+    /// it), else the root's theme polarity, else the system preference.
+    fn used_dark(&self, dom: &Dom, node: u32, inline: Option<&str>) -> bool {
+        let mut n = node;
+        loop {
+            let here = if n == node { inline } else { dom.attr(n, "style") };
+            if let Some(v) = self.own_scheme(dom, n, here) {
+                return used_scheme(Some(&v), self.root_pol, PREFERS_DARK);
+            }
+            let parent = dom.nodes[n as usize].parent;
+            if parent == n {
+                break; // document root (its parent is itself)
+            }
+            n = parent;
+        }
+        used_scheme(None, self.root_pol, PREFERS_DARK)
     }
 }
 
@@ -616,6 +727,39 @@ fn selector_polarity(sel: &str) -> Option<bool> {
     token_polarity(sel)
 }
 
+/// Does this definition's selector apply to the real `<html>` element?
+/// [`Sheet::scope_vars`] uses it to prefer the root's own custom properties
+/// over ones scoped to a different theme state (`html.skin-theme-clientpref-os`
+/// vars on a clientpref-day page never apply in a real browser). `:root`
+/// counts even though pseudo-classes don't parse — it IS the root by definition.
+fn sel_applies_to_root(dom: &Dom, html: u32, sel: &str) -> bool {
+    if split_selectors(sel).iter().any(|p| p.trim() == ":root") {
+        return true;
+    }
+    parse_selector(sel)
+        .map(|segs| matches(dom, html, &segs))
+        .unwrap_or(false)
+}
+
+/// Used color scheme for one element (true = dark) from its declared
+/// `color-scheme` value: an explicit `dark`/`light` (with or without `only`)
+/// pins it, `light dark` = "either is fine" follows the system preference
+/// (`pref_dark`, a `PREFERS_DARK` bool at the call sites); no usable
+/// declaration falls back to the root's theme polarity, else the preference.
+fn used_scheme(declared: Option<&str>, root_polarity: Option<bool>, pref_dark: bool) -> bool {
+    let Some(v) = declared else {
+        return root_polarity.unwrap_or(pref_dark);
+    };
+    let has = |w: &str| v.split_whitespace().any(|t| t == w);
+    match (has("light"), has("dark")) {
+        (true, true) => pref_dark, // `light dark` / `dark light` → preference
+        (_, true) => true,         // `dark`, `only dark`
+        (true, false) => false,    // `light`, `only light`
+        // `normal`, unknown keywords, empty → root theme, else preference
+        (false, false) => root_polarity.unwrap_or(pref_dark),
+    }
+}
+
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
 pub fn parse_decls(block: &str) -> Vec<Decl> {
     let mut out = Vec::new();
@@ -640,19 +784,31 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
     out
 }
 
-fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxStyle, parent: f32) -> bool {
+/// `dark` = the element's used color scheme — picks the `light-dark()` branch
+/// on color-bearing values before they reach `parse_color`.
+fn apply_decl(
+    d: &Decl,
+    style: &mut Style,
+    bg: &mut Option<u32>,
+    bx: &mut BoxStyle,
+    parent: f32,
+    dark: bool,
+) -> bool {
     match d.0.as_str() {
         "color" => {
-            if let Some(c) = parse_color(&d.1) {
+            if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 style.color = c;
             }
         }
         "background" | "background-color" => {
-            if let Some(c) = parse_color(&d.1) {
+            if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 *bg = Some(c);
                 bx.bg = Some(c); // per-box fill (cards, nav bars)
             }
         }
+        // consumed before the cascade in `resolve_with_parent` (the used
+        // value decides `light-dark()`) — nothing to do per declaration here
+        "color-scheme" => {}
         "font-size" => {
             // `%`/`em` resolve against the PARENT's font-size, and each declaration
             // REPLACES the cascade (spec) — computing against the running style.size
@@ -713,7 +869,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         },
         // shadows carry their own alpha (rgba() is the common case) and may
         // stack — parse the whole list, first shadow paints on top
-        "box-shadow" => bx.shadows = parse_box_shadows(&d.1),
+        "box-shadow" => bx.shadows = parse_box_shadows(&d.1, dark),
         // fully transparent = invisible; shortcut: partial opacity ignored
         // (rasterizer has no alpha compositing), so only 0 hides the subtree
         "opacity" => return d.1.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false),
@@ -838,7 +994,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         // the full shorthand resets color to currentcolor when unspecified
         // (spec cascade), per-side shorthands only touch color when given
         "border" => {
-            let (w, c) = border_parts(&d.1);
+            let (w, c) = border_parts(&d.1, dark);
             if let Some(w) = w {
                 bx.border = [w; 4];
             }
@@ -846,7 +1002,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
         }
         "border-width" => bx.border = parse_sides(&d.1),
         "border-color" => {
-            if let Some(c) = parse_color(&d.1) {
+            if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 bx.bcolor = Some(c);
             }
         }
@@ -857,7 +1013,7 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 "border-bottom" => 2,
                 _ => 3,
             };
-            let (w, c) = border_parts(&d.1);
+            let (w, c) = border_parts(&d.1, dark);
             if let Some(w) = w {
                 bx.border[side] = w;
             }
@@ -899,16 +1055,17 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
 /// `border` shorthand value → (width, color); `None` in either slot means
 /// "not specified" (color falls back to currentcolor at paint time).
 /// Style words (`solid`, `dashed`, …) are ignored — everything renders solid
-/// (shortcut); `none` resets the width to 0.
-fn border_parts(v: &str) -> (Option<Len>, Option<u32>) {
+/// (shortcut); `none` resets the width to 0. Color tokens may be
+/// `light-dark(a, b)` — picked against the used scheme (`dark`).
+fn border_parts(v: &str, dark: bool) -> (Option<Len>, Option<u32>) {
     let mut w = None;
     let mut c = None;
-    for t in v.split_whitespace() {
+    for t in joined_tokens(v) {
         if t.eq_ignore_ascii_case("none") {
             w = Some(Len::Px(0.0));
-        } else if let Some(l) = parse_len(t) {
+        } else if let Some(l) = parse_len(&t) {
             w = Some(l);
-        } else if let Some(col) = parse_color(t) {
+        } else if let Some(col) = parse_color(pick_light_dark(&t, dark)) {
             c = Some(col);
         }
     }
@@ -1091,6 +1248,43 @@ fn parse_size(v: &str, current: f32) -> Option<f32> {
         return n.trim().parse::<f32>().ok().map(|f| f / 100.0 * current);
     }
     v.trim().parse().ok()
+}
+
+/// `light-dark(light, dark)` → the branch for the used scheme (`dark`),
+/// splitting the top-level comma (arguments nest: `light-dark(var(--a),
+/// rgb(1, 2, 3))`). Returns `v` untouched unless the WHOLE value is one
+/// `light-dark(…)` call, so plain colors — and every site that never uses
+/// the function — flow through unchanged. Runs AFTER var() substitution, so
+/// `var(--x, light-dark(a, b))` and `light-dark(var(--l), var(--d))` are
+/// already plain values by the time we split.
+fn pick_light_dark(v: &str, dark: bool) -> &str {
+    let t = v.trim();
+    let Some(inner) = t.strip_prefix("light-dark(").and_then(|s| s.strip_suffix(')')) else {
+        return v;
+    };
+    let mut depth = 0i32;
+    let mut comma = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return v; // suffix wasn't our closing paren — leave it alone
+                }
+            }
+            ',' if depth == 0 => {
+                comma = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(comma) = comma else {
+        return v; // not two arguments — unparseable, same as before
+    };
+    let branch = if dark { &inner[comma + 1..] } else { &inner[..comma] };
+    branch.trim()
 }
 
 /// `#rgb`, `#rrggbb`, `rgb(r,g,b)`, a few names. None = unparseable/transparent.
@@ -1281,8 +1475,9 @@ fn parse_color_alpha(v: &str) -> Option<(u32, u8)> {
 
 /// `box-shadow` value → list, first = topmost (paint order). `none`, empty
 /// and unparseable → empty list. `inset` shadows are dropped (shortcut: no
-/// inner-shadow rendering).
-fn parse_box_shadows(v: &str) -> Vec<Shadow> {
+/// inner-shadow rendering). Color tokens may be `light-dark(a, b)` — picked
+/// against the used scheme (`dark`).
+fn parse_box_shadows(v: &str, dark: bool) -> Vec<Shadow> {
     let v = v.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return Vec::new();
@@ -1304,16 +1499,13 @@ fn parse_box_shadows(v: &str) -> Vec<Shadow> {
         cur.push(c);
     }
     parts.push(cur);
-    parts.iter().filter_map(|p| parse_shadow(p)).collect()
+    parts.iter().filter_map(|p| parse_shadow(p, dark)).collect()
 }
 
-/// One comma-separated shadow: `dx dy [blur] [spread] [color]` in any
-/// token order (color first or last, as sites write it).
-fn parse_shadow(v: &str) -> Option<Shadow> {
-    let mut lens = [0.0f32; 4];
-    let mut n_lens = 0usize;
-    let mut color = None;
-    // re-join whitespace-split tokens that sit inside `rgba(...)` parens
+/// Whitespace-split value tokens with `(...)` groups re-joined: function
+/// arguments (`rgba(0, 0, 0, 0.4)`, `light-dark(#111, #222)`) span several
+/// whitespace chunks and must stay whole for per-token parsing.
+fn joined_tokens(v: &str) -> Vec<String> {
     let mut toks: Vec<String> = Vec::new();
     let mut depth = 0usize;
     for t in v.split_whitespace() {
@@ -1325,7 +1517,16 @@ fn parse_shadow(v: &str) -> Option<Shadow> {
         depth += t.matches('(').count();
         depth = depth.saturating_sub(t.matches(')').count());
     }
-    for t in toks {
+    toks
+}
+
+/// One comma-separated shadow: `dx dy [blur] [spread] [color]` in any
+/// token order (color first or last, as sites write it).
+fn parse_shadow(v: &str, dark: bool) -> Option<Shadow> {
+    let mut lens = [0.0f32; 4];
+    let mut n_lens = 0usize;
+    let mut color = None;
+    for t in joined_tokens(v) {
         if t.eq_ignore_ascii_case("inset") {
             return None; // inner shadow: dropped (shortcut)
         }
@@ -1338,7 +1539,7 @@ fn parse_shadow(v: &str) -> Option<Shadow> {
                 n_lens += 1;
             }
         } else if color.is_none() {
-            color = parse_color_alpha(&t);
+            color = parse_color_alpha(pick_light_dark(&t, dark));
         }
     }
     if n_lens < 2 {
@@ -1620,6 +1821,107 @@ fn strip_comments(s: &str) -> String {
     out
 }
 
+// ---------- @supports feature queries (evaluated once, at parse time) ----------
+
+/// One `@supports` condition. We answer honestly from the feature set Mazda
+/// actually implements, so a site's native branch is entered and its
+/// `@supports not (…)` polyfill (whose runtime logic we can't execute) is
+/// skipped rather than shadowing working CSS.
+/// shortcut: only `property: value` plain tests (plus `not`/`and`/`or`) are
+/// parsed; an unparseable condition is treated as unsupported (`false`), the
+/// safe direction — we never enter a branch whose syntax we don't understand.
+fn supports_matches(prelude: &str) -> bool {
+    supports_condition(prelude.trim())
+}
+
+fn supports_condition(q: &str) -> bool {
+    let q = q.trim();
+    // top-level `or` (lowest precedence) — any side true => true
+    if let Some((l, r)) = split_top_level(q, " or ") {
+        return supports_condition(l) || supports_condition(r);
+    }
+    // top-level `and` — every conjunct must hold
+    if let Some(parts) = split_all_top_level(q, " and ") {
+        return parts.iter().all(|p| supports_condition(p));
+    }
+    if let Some(inner) = q.strip_prefix("not ").map(str::trim) {
+        return !supports_condition(inner);
+    }
+    // plain `property: value` test (parens already stripped by caller path)
+    let inner = q
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(q)
+        .trim();
+    supports_feature(inner)
+}
+
+/// Do we support this `property: value` pair? Answered from `KNOWN` — the set
+/// of properties the cascade actually implements — which makes
+/// `(color: light-dark(…))` true (color values incl. light-dark parse) and
+/// unknown-feature tests false.
+/// shortcut: property-level known-ness only; a value we can't parse
+/// (`color: oklch(…)`) is still claimed supported. The failure mode is
+/// entering a branch whose decls then no-op — safer than skipping a branch
+/// whose property we do handle.
+fn supports_feature(test: &str) -> bool {
+    let Some((prop, _value)) = test.split_once(':') else {
+        return false; // bare `(color)` form — needs a value to test
+    };
+    KNOWN.contains(&prop.trim())
+}
+
+/// Split `s` on the FIRST top-level occurrence of `sep`, returning both halves
+/// (paren/bracket depth ignored inside). None if `sep` isn't present.
+fn split_top_level<'a>(s: &'a str, sep: &str) -> Option<(&'a str, &'a str)> {
+    let b = s.as_bytes();
+    let sb = sep.as_bytes();
+    let mut depth = 0u32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && b[i..].starts_with(sb) {
+            return Some((s[..i].trim(), s[i + sb.len()..].trim()));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split `s` on EVERY top-level occurrence of `sep`; returns None if fewer
+/// than two parts (so the caller knows there was no separator).
+fn split_all_top_level<'a>(s: &'a str, sep: &str) -> Option<Vec<&'a str>> {
+    let b = s.as_bytes();
+    let sb = sep.as_bytes();
+    let mut depth = 0u32;
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && b[i..].starts_with(sb) {
+            parts.push(s[start..i].trim());
+            i += sb.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if parts.is_empty() {
+        return None; // no separator found
+    }
+    parts.push(s[start..].trim());
+    Some(parts)
+}
+
 // ---------- media queries (evaluated once, at parse time) ----------
 
 /// Comma-separated query list = OR. Used for `@media` preludes.
@@ -1684,8 +1986,19 @@ fn media_feature(part: &str, vw: f32) -> bool {
             "orientation" => v == "landscape", // 1000x700 window
             "min-width" => media_len(v).map(|px| vw >= px).unwrap_or(false),
             "max-width" => media_len(v).map(|px| vw <= px).unwrap_or(false),
+            // the OS preference — one honest global (see PREFERS_DARK)
+            "prefers-color-scheme" => match v {
+                "dark" => PREFERS_DARK,
+                "light" => !PREFERS_DARK,
+                // no-preference/bogus: we always model a definite preference
+                _ => false,
+            },
             _ => false,
         };
+    }
+    // boolean form `(prefers-color-scheme)` = "does the system prefer dark"
+    if inner == "prefers-color-scheme" {
+        return PREFERS_DARK;
     }
     // range syntax (Media Queries L4 / Tailwind v4): (width >= 48rem),
     // (640px > width), (48rem <= width)
@@ -2001,6 +2314,72 @@ mod tests {
     }
 
     #[test]
+    fn scope_vars_prefers_on_root_defs_over_other_theme_scopes() {
+        // Wikipedia shape: `@media (prefers-color-scheme:dark)` matches here,
+        // so the OS-theme block parses — but its html.skin-theme-clientpref-os
+        // selector never applies to the clientpref-day root, and its later
+        // dark defs must not outrank the page's own `:root` palette in the
+        // flat last-wins map
+        let mut sheet = parse(
+            ":root { --bg: #ffffff } \
+             @media screen and (prefers-color-scheme:dark) { \
+               html.skin-theme-clientpref-os { --bg: #101418 } \
+             } \
+             body { background-color: var(--bg, #f0f0f0) }",
+        );
+        let dom = dom_of("<html class=\"skin-theme-clientpref-day\"><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        sheet.scope_vars(&dom, html);
+        let body = by_tag(&dom, "body");
+        assert_eq!(
+            sheet.resolve(&dom, body, Style::new(), None).bg,
+            Some(0xffffff),
+            "os-scoped vars lose to the root's own defs on a day-declaring root"
+        );
+    }
+
+    #[test]
+    fn scope_vars_keeps_root_matching_selector_lists_despite_polarity_tokens() {
+        // the light palette ships as `:root,.skin-invert,.notheme` — the
+        // `invert` token reads dark, but the list really applies to the root
+        // (ground truth beats the token guess), so it must not be dropped
+        let mut sheet = parse(
+            ":root,.skin-invert,.notheme { --bg: #f8f9fa } \
+             html.skin-theme-clientpref-night { --bg: #101418 } \
+             body { background-color: var(--bg, #ffffff) }",
+        );
+        let dom = dom_of("<html class=\"skin-theme-clientpref-day\"><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        sheet.scope_vars(&dom, html);
+        let body = by_tag(&dom, "body");
+        assert_eq!(
+            sheet.resolve(&dom, body, Style::new(), None).bg,
+            Some(0xf8f9fa),
+            "a selector list containing :root applies to the root regardless of tokens"
+        );
+    }
+
+    #[test]
+    fn scope_vars_uses_other_theme_scopes_only_as_fallback() {
+        // a name defined nowhere else still resolves from the os block — the
+        // flat map has no per-element scoping; the value only loses when the
+        // root itself defines the name
+        let mut sheet = parse(
+            "html.skin-theme-clientpref-os { --only: #202122 } \
+             body { background-color: var(--only, #ffffff) }",
+        );
+        let dom = dom_of("<html class=\"skin-theme-clientpref-day\"><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        sheet.scope_vars(&dom, html);
+        let body = by_tag(&dom, "body");
+        assert_eq!(
+            sheet.resolve(&dom, body, Style::new(), None).bg,
+            Some(0x202122),
+            "non-root theme scopes still supply names the root doesn't define"
+        );
+    }
+
+    #[test]
     fn class_matching_is_whitespace_split() {
         let sheet = parse(".btn.primary { color: #111111 }");
         let dom = dom_of(r#"<div class="btn big primary"></div>"#);
@@ -2147,6 +2526,55 @@ mod tests {
         let after = "@media (max-width: 640px) { p { display: none } } q { color: #222222 }";
         let q = dom_of("<q></q>");
         assert_eq!(style_for_tag(&parse(after), &q, "q").color, 0x222222);
+    }
+
+    #[test]
+    fn supports_light_dark_enters_native_branch_skips_polyfill() {
+        // A site ships a native branch and an `@supports not(...)` polyfill of
+        // the SAME custom property. We support light-dark(), so the native
+        // branch must win and the polyfill must be skipped — otherwise the
+        // polyfill's fallback logic shadows the dark values.
+        let sheet = parse(
+            "@supports (color: light-dark(#fff, #fff)) { \
+               :root { --bg: #202122 } } \
+             @supports not (color: light-dark(#fff, #fff)) { \
+               :root { --bg: #ffffff } } \
+             p { background-color: var(--bg, #ffffff) }",
+        );
+        let dom = dom_of("<html><body><p>x</p></body></html>");
+        assert_eq!(
+            sheet.resolve(&dom, by_tag(&dom, "p"), Style::new(), None).bg,
+            Some(0x202122),
+            "native branch entered, polyfill skipped"
+        );
+        // sanity: the polyfill branch alone (native absent) would give white
+        let poly = parse(
+            "@supports not (color: light-dark(#fff, #fff)) { \
+               :root { --bg: #ffffff } } \
+             p { background-color: var(--bg, #abcdef) }",
+        );
+        assert_eq!(
+            poly.resolve(&dom, by_tag(&dom, "p"), Style::new(), None).bg,
+            Some(0xabcdef),
+            "polyfill skipped => fallback colour used"
+        );
+    }
+
+    #[test]
+    fn supports_and_or_not_and_unknown_conditions() {
+        // `and` conjuncts: both hold => enter
+        let both = "@supports (color: light-dark(#fff, #fff)) and (display: block) { p { color: #111111 } }";
+        // second conjunct is a property we don't implement => skip
+        let drop = "@supports (color: light-dark(#fff, #fff)) and (accent-color: red) { p { color: #111111 } }";
+        let dom = dom_of("<p></p>");
+        assert_eq!(style_for_tag(&parse(both), &dom, "p").color, 0x111111);
+        assert_eq!(parse(drop).rule_count(), 0, "unsupported conjunct skips");
+        // `or`: one side true => enter even if the other is unknown
+        let orq = "@supports (accent-color: red) or (color: light-dark(#fff, #fff)) { p { color: #222222 } }";
+        assert_eq!(style_for_tag(&parse(orq), &dom, "p").color, 0x222222);
+        // neither side supported => skip
+        let none = "@supports (accent-color: red) or (tab-size: 4) { p { color: #444444 } }";
+        assert_eq!(parse(none).rule_count(), 0);
     }
 
     #[test]
@@ -2455,6 +2883,66 @@ mod tests {
         assert_eq!(a[1].color, Some(0x222222));
         assert!(get("b").bx.shadows.is_empty(), "none");
         assert!(get("c").bx.shadows.is_empty(), "absent");
+    }
+
+    #[test]
+    fn light_dark_picks_dark_branch_when_scheme_dark() {
+        // the used color-scheme (here: each element's own declaration) picks
+        // the branch before the value reaches parse_color
+        let sheet = parse(
+            "div { color-scheme: dark; color: light-dark(#111111, #eeeeee) } \
+             span { color-scheme: light; color: light-dark(#111111, #eeeeee) }",
+        );
+        let dom = dom_of("<div></div><span></span>");
+        assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0xeeeeee, "dark → 2nd arg");
+        assert_eq!(style_for_tag(&sheet, &dom, "span").color, 0x111111, "light → 1st arg");
+    }
+
+    #[test]
+    fn color_scheme_light_dark_follows_pref() {
+        // `light dark` = "either is fine" → the system preference (dark)
+        let sheet = parse(
+            "html { color-scheme: light dark } p { color: light-dark(#000000, #ffffff) }",
+        );
+        let dom = dom_of("<html><p></p></html>");
+        assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0xffffff, "pref dark → 2nd arg");
+        // a fixed `light` on the root pins descendants that don't override it
+        let sheet2 = parse(
+            "html { color-scheme: light } p { color: light-dark(#000000, #ffffff) }",
+        );
+        assert_eq!(style_for_tag(&sheet2, &dom, "p").color, 0x000000, "declared light wins");
+        // the root's light THEME CLASS must not beat `light dark` — the
+        // preference decides between the two branches
+        let mut sheet3 = parse(
+            "html { color-scheme: light dark } p { color: light-dark(#000000, #ffffff) }",
+        );
+        let dom3 = dom_of("<html class=light><p></p></html>");
+        sheet3.scope_vars(&dom3, by_tag(&dom3, "html"));
+        assert_eq!(
+            style_for_tag(&sheet3, &dom3, "p").color,
+            0xffffff,
+            "light dark → pref, not root class"
+        );
+    }
+
+    #[test]
+    fn prefers_color_scheme_media_applies() {
+        // PREFERS_DARK = true: the dark block applies, the light one doesn't
+        let sheet = parse(
+            "@media (prefers-color-scheme: dark) { p { color: #ff0000 } } \
+             @media (prefers-color-scheme: light) { q { color: #00ff00 } }",
+        );
+        let dom = dom_of("<p></p><q></q>");
+        assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0xff0000, "dark block applies");
+        assert_eq!(style_for_tag(&sheet, &dom, "q").color, 0x000000, "light block skipped");
+    }
+
+    #[test]
+    fn light_dark_inside_var_fallback() {
+        // var() resolves first, then the light-dark() branch picks (pref dark)
+        let sheet = parse("p { color: var(--missing, light-dark(#222222, #333333)) }");
+        let dom = dom_of("<p></p>");
+        assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0x333333);
     }
 }
 
