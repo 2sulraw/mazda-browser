@@ -227,6 +227,7 @@ const KNOWN: &[&str] = &[
     "max-width",
     "height",
     "min-height",
+    "white-space",
     "padding",
     "padding-top",
     "padding-right",
@@ -621,6 +622,9 @@ fn apply_decl(d: &Decl, style: &mut Style, bg: &mut Option<u32>, bx: &mut BoxSty
                 "right" | "end" => 2,
                 _ => 0, // left/start; shortcut: justify renders as left
             }
+        }
+        "white-space" => {
+            style.nowrap = matches!(d.1.as_str(), "nowrap" | "pre" | "pre-line")
         }
         "flex-direction" => {
             bx.dir = if d.1.contains("column") { Dir::Column } else { Dir::Row }

@@ -27,6 +27,9 @@ pub struct Style {
     pub text_align: u8,
     /// line-height in px; 0 = default (size * 1.35) — inherited
     pub lh: f32,
+    /// `white-space: nowrap` — never wrap to a new line (truncate/ellipsis
+    /// buttons, single-line labels)
+    pub nowrap: bool,
 }
 
 impl Style {
@@ -40,6 +43,7 @@ impl Style {
             fam: Fam::Sans,
             text_align: 0,
             lh: 0.0,
+            nowrap: false,
         }
     }
 
@@ -1372,7 +1376,7 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
             continue;
         }
         let ww = measure(&w.text, &w.style);
-        if x > 0.0 && x + ww > max_width {
+        if x > 0.0 && x + ww > max_width && !w.style.nowrap {
             y += line_height;
             x = 0.0;
             line_height = 0.0;
@@ -1588,8 +1592,32 @@ mod tests {
     }
 
     #[test]
-    fn min_height_shorter_content_unchanged() {
-        // content already taller than min-height → no shift, height stays
+    fn nowrap_text_stays_on_one_line() {
+        // `truncate` class (white-space:nowrap) must not wrap — the Ask AI
+        // button stacked vertically without it
+        let a = Atom {
+            text: "Ask AI".into(),
+            style: Style {
+                nowrap: true,
+                ..Style::new()
+            },
+            hard_break: false,
+            link: None,
+        };
+        // width fits only ~2 chars → would wrap without nowrap
+        let l = layout(&[a], 10.0, &|s, st| s.len() as f32 * st.size * 0.5);
+        // words are separate runs; nowrap = they share one line (same y)
+        assert!(l.runs.len() >= 1);
+        let y0 = l.runs[0].y;
+        assert!(
+            l.runs.iter().all(|r| (r.y - y0).abs() < 0.01),
+            "all words on one line"
+        );
+        assert!(l.height <= l.runs[0].style.line_height() + 0.01, "single line");
+    }
+
+    #[test]
+    fn min_height_shorter_content_unchanged() {        // content already taller than min-height → no shift, height stays
         // (boxed children: adjacent text leaves merge into one anonymous item)
         let boxed = |t: &str| {
             let mut g = BoxNode::group(
