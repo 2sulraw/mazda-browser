@@ -1377,6 +1377,12 @@ fn parse_len(v: &str) -> Option<Len> {
     if let Some(n) = v.strip_suffix('%') {
         return n.trim().parse::<f32>().ok().map(Len::Pct);
     }
+    // `calc(<arith>)` — var() already substituted upstream; evaluate the
+    // arithmetic to px. `%`/`vw`/`vh` terms need a container/viewport that
+    // parse_len doesn't have, so they stay unresolvable (None → unset).
+    if let Some(inner) = v.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
+        return eval_calc(inner).map(Len::Px);
+    }
     if let Some(n) = v.strip_suffix("rem") {
         return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
     }
@@ -1387,6 +1393,95 @@ fn parse_len(v: &str) -> Option<Len> {
         return n.trim().parse::<f32>().ok().map(Len::Px);
     }
     v.parse::<f32>().ok().map(Len::Px)
+}
+
+/// Evaluate `calc()` arithmetic (already `var()`-substituted) to px.
+/// Grammar: `+ -` at the lowest precedence, then `* /`, then a signed factor
+/// (parenthesized sub-expression or a number with an optional px/em/rem unit;
+/// unitless numbers act as multipliers). `%`, `vw`, `vh`, and other units are
+/// unsupported here (they need a container/viewport) → None. shortcut: no
+/// nested `calc(` inside the expression.
+fn eval_calc(s: &str) -> Option<f32> {
+    fn skip_ws(b: &[u8], i: &mut usize) {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    }
+    fn factor(b: &[u8], s: &str, i: &mut usize) -> Option<f32> {
+        skip_ws(b, i);
+        let mut sign = 1.0f32;
+        while *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
+            if b[*i] == b'-' {
+                sign = -sign;
+            }
+            *i += 1;
+            skip_ws(b, i);
+        }
+        if *i < b.len() && b[*i] == b'(' {
+            *i += 1;
+            let v = additive(b, s, i)?;
+            skip_ws(b, i);
+            if *i < b.len() && b[*i] == b')' {
+                *i += 1;
+            }
+            return Some(sign * v);
+        }
+        let start = *i;
+        while *i < b.len() && (b[*i].is_ascii_digit() || b[*i] == b'.') {
+            *i += 1;
+        }
+        if start == *i {
+            return None; // not a number — unresolvable
+        }
+        let n: f32 = s[start..*i].parse().ok()?;
+        skip_ws(b, i);
+        let ustart = *i;
+        while *i < b.len() && b[*i].is_ascii_alphabetic() {
+            *i += 1;
+        }
+        let px = match &s[ustart..*i] {
+            "" | "px" => n, // unitless = multiplier; px = identity
+            "em" | "rem" => n * 16.0,
+            _ => return None, // %, vw, vh, … need a container
+        };
+        Some(sign * px)
+    }
+    fn multiplicative(b: &[u8], s: &str, i: &mut usize) -> Option<f32> {
+        let mut lhs = factor(b, s, i)?;
+        loop {
+            skip_ws(b, i);
+            if *i >= b.len() || (b[*i] != b'*' && b[*i] != b'/') {
+                break;
+            }
+            let op = b[*i];
+            *i += 1;
+            let rhs = factor(b, s, i)?;
+            lhs = if op == b'*' { lhs * rhs } else { lhs / rhs };
+        }
+        Some(lhs)
+    }
+    fn additive(b: &[u8], s: &str, i: &mut usize) -> Option<f32> {
+        let mut lhs = multiplicative(b, s, i)?;
+        loop {
+            skip_ws(b, i);
+            if *i >= b.len() || (b[*i] != b'+' && b[*i] != b'-') {
+                break;
+            }
+            let op = b[*i];
+            *i += 1;
+            let rhs = multiplicative(b, s, i)?;
+            lhs = if op == b'+' { lhs + rhs } else { lhs - rhs };
+        }
+        Some(lhs)
+    }
+    let b = s.as_bytes();
+    let mut i = 0;
+    let v = additive(b, s, &mut i)?;
+    skip_ws(b, &mut i);
+    if i != b.len() {
+        return None; // trailing junk → unresolvable
+    }
+    Some(v)
 }
 
 /// Symbolic length → px against a known container width (Pct resolves here).
@@ -2952,6 +3047,22 @@ mod tests {
             parse_tracks("[a] 1fr [b-start] 200px [b-end]").1,
             vec![("a".to_string(), 0), ("b-start".to_string(), 1), ("b-end".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn calc_evaluates_arithmetic_to_px() {
+        // var() is substituted upstream; parse_len only sees the arithmetic
+        assert_eq!(parse_len("calc(20em * -1)"), Some(Len::Px(-320.0)), "MDN a11y-menu off-screen top");
+        assert_eq!(parse_len("calc(100px + 20px)"), Some(Len::Px(120.0)));
+        assert_eq!(parse_len("calc(100px - 20px)"), Some(Len::Px(80.0)));
+        assert_eq!(parse_len("calc(4px * 3 + 2px)"), Some(Len::Px(14.0)), "* binds tighter than +");
+        assert_eq!(parse_len("calc(2rem + 10px)"), Some(Len::Px(42.0)), "rem = 16px each");
+        assert_eq!(parse_len("calc((10px + 2px) * 2)"), Some(Len::Px(24.0)), "parenthesized sub-expression");
+        // % / vw / vh need a container/viewport → stay unresolvable (unset)
+        assert_eq!(parse_len("calc(100% - 20px)"), None);
+        assert_eq!(parse_len("calc(50vw - 720px)"), None);
+        // trailing junk / malformed → unresolvable
+        assert_eq!(parse_len("calc(10px +)"), None);
     }
 
     #[test]
