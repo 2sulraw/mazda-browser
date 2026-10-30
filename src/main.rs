@@ -825,6 +825,8 @@ fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
     // media queries evaluate against the window's CSS pixel width
     let viewport = max_w + 2.0 * PADDING as f32;
     let mut sheet = css::parse_for(&css_text, viewport);
+    // viewport units (vh/vw/vmin/vmax) resolve against the real window size
+    sheet.set_viewport(viewport, vh);
     // cascade writes font-family stack ids into the font picker's own table
     sheet.set_stacks(fonts.stacks.clone());
     eprintln!(
