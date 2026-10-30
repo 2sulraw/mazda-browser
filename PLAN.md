@@ -172,7 +172,17 @@ curve matters more than the baseline (near-flat as tabs grow).
   from 8).
   Known gaps: nested `<svg>` inside `<svg>` truncates at the first close
   tag, `<foreignObject>` not skipped, `currentColor` substitution is
-  string-level (nested CSS custom props inside the SVG ignored)
+  string-level (nested CSS custom props inside the SVG ignored).
+  Follow-up DONE (SVG class-paint round): site CSS coloring an inline-SVG's
+  children by single-class rule (`.logo__letter { fill: … }`) now reaches the
+  rasterizer — `parse_decls` keeps the paint props (added to `KNOWN`),
+  `Sheet::class_paint` resolves last-in-cascade var()-substituted +
+  `light-dark()`-picked values, and `build()` injects them into each open tag's
+  inline `style` (which svg.rs prefers over presentation attributes). MDN's
+  logo went from solid black to blue letters + light wordmark. shortcut: simple
+  single-class selectors only (no descendant chains / tag / id / attr /
+  pseudo); SVGs with no matching rule pass through byte-identical (verified
+  nextjs + rust-lang unchanged)
 - [x] **Selector-list split fix** — ~~footer/nav text piled at top-left~~ **DONE
   (`split_selectors` replaces `sel_text.split(',')`: commas inside `(...)`/`[...]`
   and backslash-escaped commas are literal; before the fix, `.prose :is(h1,h2,
@@ -350,6 +360,11 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | form-control chrome | rust-lang.org | 14.0 MB (483 runs; select = one line, options never laid out → CJK font not pulled) |
 | 2026-10-30 | inline-block sits on the text line | nextjs.org | 43.0 MB (571 runs; no regression) |
 | 2026-10-30 | inline-block sits on the text line | rust-lang.org | 14.8 MB (483 runs; pixel-unchanged, same 2 webfonts) |
+| 2026-10-30 | min-content/max-content/auto grid tracks | Wikipedia (Main_Page) | 35.5 MB (1461 runs; sidebar in proper column, +135 runs from content tracks sizing to content) |
+| 2026-10-30 | min-content/max-content/auto grid tracks | nextjs.org | 43.0 MB (571 runs; byte-identical — no content tracks there) |
+| 2026-10-30 | SVG class-based fill (inline-SVG logo color) | MDN | 14.8 MB (630 runs; logo now blue letters + light wordmark, was solid black) |
+| 2026-10-30 | SVG class-based fill | rust-lang.org | 17.6 MB (483 runs; pixel-unchanged — gear logo not single-class-colored) |
+| 2026-10-30 | SVG class-based fill | nextjs.org | 43.0 MB (571 runs; byte-identical) |
 
 ### Phase 1c (Track A) findings
 

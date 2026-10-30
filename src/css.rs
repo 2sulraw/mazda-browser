@@ -494,6 +494,17 @@ const KNOWN: &[&str] = &[
     "left",
     "inset",
     "box-shadow",
+    // SVG paint properties — the rasterizer supports these; kept in decls so
+    // Sheet::class_paint can resolve class-colored inline-SVG children
+    // (fill/stroke/… on <path>/<rect>), which the text cascade never reaches
+    "fill",
+    "stroke",
+    "fill-opacity",
+    "stroke-opacity",
+    "fill-rule",
+    "stroke-width",
+    "stroke-linejoin",
+    "stroke-linecap",
 ];
 
 /// The OS color-scheme preference this build renders for (`true` = the system
@@ -826,6 +837,52 @@ impl Sheet {
             n = parent;
         }
         used_scheme(None, self.root_pol, PREFERS_DARK)
+    }
+
+    /// The used color-scheme polarity for `node` (true = dark) — what a
+    /// `fill: light-dark(…)` should branch on. Public so the SVG paint
+    /// injector picks the same branch the text cascade does.
+    pub fn is_dark(&self, dom: &Dom, node: u32) -> bool {
+        self.used_dark(dom, node, dom.attr(node, "style"))
+    }
+
+    /// Resolve an SVG paint property (`fill`/`stroke`/`opacity`/…) for an
+    /// element matched only by single-class rules — the common way sites color
+    /// inline-SVG children (`.logo__letter { fill: … }`). Returns the
+    /// last-in-cascade value (var()-substituted, `light-dark()` branch-picked)
+    /// or None when no such rule applies.
+    /// shortcut: simple single-class selectors only — no descendant chains,
+    /// tag/id/attr qualifiers, pseudo-classes, or `<style>` blocks in the SVG.
+    pub fn class_paint(&self, classes: &str, prop: &str, dark: bool) -> Option<String> {
+        let toks: Vec<&str> = classes.split_whitespace().collect();
+        let mut val: Option<String> = None;
+        for rule in &self.rules {
+            // a single compound segment with exactly one class, nothing else
+            if rule.segs.len() != 1 {
+                continue;
+            }
+            let seg = &rule.segs[0];
+            if seg.tag.is_some() || seg.id.is_some() || !seg.attrs.is_empty() || seg.child {
+                continue;
+            }
+            if seg.classes.len() != 1 || !toks.contains(&seg.classes[0].as_str()) {
+                continue;
+            }
+            for d in &rule.decls {
+                if d.0 == prop {
+                    let sd = self.subst(d);
+                    let picked = pick_light_dark(&sd.1, dark);
+                    // normalize a color value to canonical #rrggbb (a
+                    // light-dark() branch or var() may yield a named color);
+                    // non-color values (fill-rule, stroke-width) pass through
+                    val = Some(match parse_color(picked) {
+                        Some(c) => format!("#{:06x}", c & 0x00ff_ffff),
+                        None => picked.to_string(),
+                    });
+                }
+            }
+        }
+        val
     }
 }
 
@@ -3176,6 +3233,52 @@ mod tests {
             0xffffff,
             "light dark → pref, not root class"
         );
+    }
+
+    #[test]
+    fn class_paint_resolves_fill_from_single_class_rules() {
+        // inline-SVG children colored by class rule (the common way sites
+        // theme a logo) — the rasterizer has no cascade, so layout bakes the
+        // resolved value into an inline style
+        let mut sheet = parse(
+            ".logo__letter { fill: #0a5dbd } \
+             .logo__text { fill: var(--color-text-primary) } \
+             .logo__letter { stroke: light-dark(#111111, #eeeeee) } \
+             .nav > .logo__letter { fill: #ff0000 }",
+        );
+        let dom = dom_of("<div></div>");
+        // custom property for the var() test
+        sheet.vars.insert(
+            "--color-text-primary".to_string(),
+            "light-dark(black, white)".to_string(),
+        );
+        // single-class rule → its fill
+        assert_eq!(
+            sheet.class_paint("logo__letter", "fill", false),
+            Some("#0a5dbd".to_string()),
+            "single-class fill resolved"
+        );
+        // var() + light-dark() branches pick correctly
+        assert_eq!(
+            sheet.class_paint("logo__text", "fill", false),
+            Some("#000000".to_string()),
+            "light branch of light-dark"
+        );
+        assert_eq!(
+            sheet.class_paint("logo__text", "fill", true),
+            Some("#ffffff".to_string()),
+            "dark branch of light-dark"
+        );
+        // a descendant/child selector (.nav > .logo__letter) is NOT applied
+        // (documented shortcut: single-class only)
+        assert_eq!(
+            sheet.class_paint("logo__letter", "fill", false),
+            Some("#0a5dbd".to_string()),
+            "child combinator ignored — last single-class wins"
+        );
+        // no rule for this class/prop → None
+        assert_eq!(sheet.class_paint("nope", "fill", false), None);
+        assert_eq!(sheet.class_paint("logo__letter", "stroke-width", false), None);
     }
 
     #[test]
