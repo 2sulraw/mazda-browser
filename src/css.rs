@@ -1,12 +1,15 @@
 //! CSS subset (Phase 1b, PLAN Recommendations §2): stylesheet text is parsed
 //! ONCE into a rule list with precompiled selectors — never re-parsed per element.
-//! shortcut: no pseudo-classes, no @media/@import, no !important (stripped and
-//! ignored), shorthand `font:` unsupported; background-color is only honored
-//! for the page background (body/html), not per-box. Box layout properties
-//! (display:flex/grid, width, gap, …) cascade into `BoxStyle` — layout.rs
-//! consumes it. Upgrade when the CSS engine grows (Phase 1c+).
+//! shortcut: dynamic pseudo-classes (`:hover`, `:focus`, …) and pseudo-elements
+//! drop their whole selector (static ones — `:link`, `:visited`, `:root`,
+//! `:not(...)`, `:is(...)`, `:where(...)`, `:first-child`, `:last-child`,
+//! `:nth-child(...)` — participate in the cascade), no @import, no !important
+//! (stripped and ignored), shorthand `font:` unsupported; background-color is
+//! only honored for the page background (body/html), not per-box. Box layout
+//! properties (display:flex/grid, width, gap, …) cascade into `BoxStyle` —
+//! layout.rs consumes it. Upgrade when the CSS engine grows (Phase 1c+).
 
-use crate::html::Dom;
+use crate::html::{Dom, NodeKind};
 use crate::layout::{Fam, Style};
 
 pub type Decl = (String, String);
@@ -194,6 +197,33 @@ impl Default for BoxStyle {
     }
 }
 
+/// One static pseudo-class the cascade can evaluate without interaction
+/// state. Dynamic/state pseudo-classes (`:hover`, `:focus`, …) and
+/// pseudo-elements are NOT representable — a selector containing one is
+/// dropped at parse time (a `:hover` rule that always matched would paint
+/// hover styles permanently).
+#[derive(Clone)]
+enum Pseudo {
+    /// `:link` / `:visited` — an element carrying an `href` (the common case
+    /// `<a href>`). Visit history isn't modeled, so both states match the
+    /// same set: anchors with an href.
+    Link,
+    /// `:root` — a direct child of the document root (the `<html>` element).
+    Root,
+    /// `:first-child` — first ELEMENT child of its parent (text nodes don't
+    /// count, matching the CSS definition).
+    FirstChild,
+    /// `:last-child` — last element child of its parent.
+    LastChild,
+    /// `:nth-child(an+b)` — 1-based element-sibling index satisfies the
+    /// formula for some whole n >= 0.
+    NthChild(i32, i32),
+    /// `:is(...)`/`:where(...)` — the element may match ANY of the alternate
+    /// compound selectors. The flag is `counts`: `:is` contributes its most
+    /// specific argument's specificity, `:where` contributes none.
+    Is(Vec<Seg>, bool),
+}
+
 /// One compound step of a selector, e.g. `nav > a.current[href]`.
 #[derive(Clone)]
 struct Seg {
@@ -201,6 +231,11 @@ struct Seg {
     id: Option<String>,
     classes: Vec<String>,
     attrs: Vec<(String, Option<String>)>,
+    /// static pseudo-classes that must ALL hold for this segment
+    pseudos: Vec<Pseudo>,
+    /// `:not(...)` exclusions — the element must match NONE of these simple
+    /// selectors (each parsed by `parse_compound`)
+    nots: Vec<Seg>,
     /// joined to the left segment by `>` (else descendant)
     child: bool,
 }
@@ -596,7 +631,8 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                     });
                     order += 1;
                 }
-                // selectors we can't parse (pseudo-classes etc.) are dropped,
+                // selectors we can't parse (dynamic pseudo-classes,
+                // pseudo-elements, malformed syntax) are dropped,
                 // but the rule still applies via its other comma-separated parts
             }
         }
@@ -862,7 +898,13 @@ impl Sheet {
                 continue;
             }
             let seg = &rule.segs[0];
-            if seg.tag.is_some() || seg.id.is_some() || !seg.attrs.is_empty() || seg.child {
+            if seg.tag.is_some()
+                || seg.id.is_some()
+                || !seg.attrs.is_empty()
+                || !seg.pseudos.is_empty()
+                || !seg.nots.is_empty()
+                || seg.child
+            {
                 continue;
             }
             if seg.classes.len() != 1 || !toks.contains(&seg.classes[0].as_str()) {
@@ -958,14 +1000,13 @@ fn selector_polarity(sel: &str) -> Option<bool> {
 /// [`Sheet::scope_vars`] uses it to prefer the root's own custom properties
 /// over ones scoped to a different theme state (`html.skin-theme-clientpref-os`
 /// vars on a clientpref-day page never apply in a real browser). `:root`
-/// counts even though pseudo-classes don't parse — it IS the root by definition.
+/// parses like any other selector now and matches the root by parentage.
 fn sel_applies_to_root(dom: &Dom, html: u32, sel: &str) -> bool {
-    if split_selectors(sel).iter().any(|p| p.trim() == ":root") {
-        return true;
-    }
-    parse_selector(sel)
-        .map(|segs| matches(dom, html, &segs))
-        .unwrap_or(false)
+    split_selectors(sel).iter().any(|p| {
+        parse_selector(p)
+            .map(|segs| matches(dom, html, &segs))
+            .unwrap_or(false)
+    })
 }
 
 /// Used color scheme for one element (true = dark) from its declared
@@ -1947,41 +1988,88 @@ fn flush<'a>(tokens: &mut Vec<&'a str>, s: &'a str, start: usize, end: usize) {
     }
 }
 
-/// True if the selector contains a `:` that starts a pseudo-class/element:
-/// not a CSS escape (`\:`) and not inside `[...]` (attribute values may
-/// legally contain colons, e.g. `[href^="http:"]`). Escaped colons belong to
-/// class names like Tailwind's `.data-\[state\=closed\]\:hidden`.
-fn has_pseudo(s: &str) -> bool {
-    let mut esc = false;
-    let mut depth = 0u32;
-    for c in s.chars() {
-        if esc {
-            esc = false;
-            continue;
-        }
-        match c {
-            '\\' => esc = true,
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
-            ':' if depth == 0 => return true,
-            _ => {}
-        }
+/// True if `s` is a state/interaction pseudo-class the static cascade can
+/// never evaluate: no element is hovered/focused/checked during a style-only
+/// pass, so these never match — which makes their `:not(...)` negation
+/// vacuously true (skip links styled `:not(:focus)` keep working).
+fn is_dynamic_pseudo(s: &str) -> bool {
+    let Some(name) = s.strip_prefix(':') else {
+        return false;
+    };
+    if name.starts_with(':') {
+        return false; // pseudo-element, not a pseudo-class
     }
-    false
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "hover" | "focus" | "focus-within" | "focus-visible" | "active" | "checked"
+            | "target" | "enabled" | "disabled" | "default" | "required" | "optional"
+            | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
+            | "read-only" | "read-write" | "placeholder-shown"
+    )
+}
+
+/// Parse a `:nth-child()` argument into `(a, b)` for the `a*n + b` formula
+/// (1-based index). Accepts `odd`/`even`, plain integers (`3`), and the
+/// `an+b` forms (`2n`, `2n+1`, `-n+3`, `n+2`).
+fn parse_nth(expr: &str) -> Option<(i32, i32)> {
+    let e: String = expr
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    match e.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    if let Some(npos) = e.find('n') {
+        let (a_str, b_str) = e.split_at(npos);
+        let a = match a_str {
+            "" | "+" => 1,
+            "-" => -1,
+            s => s.parse::<i32>().ok()?,
+        };
+        // b_str starts at 'n'; the remainder is `+k`, `-k`, or empty
+        let b = match &b_str[1..] {
+            "" => 0,
+            rest => rest.parse::<i32>().ok()?,
+        };
+        Some((a, b))
+    } else {
+        e.parse::<i32>().ok().map(|b| (0, b))
+    }
 }
 
 fn parse_selector(s: &str) -> Option<Vec<Seg>> {
     let s = s.trim();
-    if s.is_empty() || has_pseudo(s) {
-        return None; // pseudo-classes/elements unsupported (comment in module docs)
+    if s.is_empty() {
+        return None;
     }
-    // tokenize on whitespace and '>'
+    // Tokenize on whitespace and '>' — but NOT inside `(...)` (pseudo-class
+    // args like `:is(h1, h2)` or `:nth-child(2n + 1)` may contain both) or
+    // `[...]` (attribute values like `[title="a b"]`).
+    // shortcut: paren/bracket depth isn't quote-aware — a `]` inside a
+    // quoted attribute value unbalances the count (real selectors rarely do
+    // this; split_selectors has the same shortcut).
     let mut tokens: Vec<&str> = Vec::new();
     let mut start = 0usize;
     let bytes = s.as_bytes();
     let mut i = 0usize;
+    let mut depth = 0u32;
     while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() || bytes[i] == b'>' {
+        match bytes[i] {
+            b'\\' => {
+                // escaped char — never a split point; clamp in case the
+                // selector ends with a lone backslash
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && (bytes[i].is_ascii_whitespace() || bytes[i] == b'>') {
             flush(&mut tokens, s, start, i);
             if bytes[i] == b'>' {
                 tokens.push(">");
@@ -2022,6 +2110,8 @@ fn parse_compound(s: &str) -> Option<Seg> {
         id: None,
         classes: Vec::new(),
         attrs: Vec::new(),
+        pseudos: Vec::new(),
+        nots: Vec::new(),
         child: false,
     };
     let b: Vec<char> = s.chars().collect();
@@ -2051,7 +2141,9 @@ fn parse_compound(s: &str) -> Option<Seg> {
                             name.push(b[i + 1]);
                             i += 2;
                         }
-                        '.' | '#' | '[' => break,
+                        // an UNESCAPED ':' starts a pseudo-class — the name
+                        // ends here (escaped ones were consumed just above)
+                        '.' | '#' | '[' | ':' => break,
                         c => {
                             name.push(c);
                             i += 1;
@@ -2101,7 +2193,87 @@ fn parse_compound(s: &str) -> Option<Seg> {
                 }
                 seg.attrs.push((name, val));
             }
-            _ => return None, // unexpected char (e.g. pseudo sneaking past the filter)
+            ':' => {
+                if i + 1 < b.len() && b[i + 1] == ':' {
+                    return None; // pseudo-element (::before) — unsupported, drop
+                }
+                i += 1;
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '-' || b[i] == '_')
+                {
+                    i += 1;
+                }
+                let name: String = b[st..i].iter().collect::<String>().to_ascii_lowercase();
+                // optional `(args)` with balanced-paren scan
+                let mut args: Option<String> = None;
+                if i < b.len() && b[i] == '(' {
+                    let mut pdepth = 0u32;
+                    let ast = i + 1;
+                    while i < b.len() {
+                        match b[i] {
+                            '(' => pdepth += 1,
+                            ')' => {
+                                pdepth -= 1;
+                                if pdepth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if pdepth != 0 {
+                        return None; // unbalanced parens
+                    }
+                    args = Some(b[ast..i].iter().collect::<String>());
+                    i += 1; // consume ')'
+                }
+                match (name.as_str(), args) {
+                    // static approximation: an element carrying an href
+                    // (`<a href>`). Visit history isn't modeled, so `:link`
+                    // and `:visited` match the same set.
+                    ("link" | "visited", None) => seg.pseudos.push(Pseudo::Link),
+                    // the root element: a direct child of the document root
+                    ("root", None) => seg.pseudos.push(Pseudo::Root),
+                    ("first-child", None) => seg.pseudos.push(Pseudo::FirstChild),
+                    ("last-child", None) => seg.pseudos.push(Pseudo::LastChild),
+                    ("nth-child", Some(a)) => {
+                        let (a_, b_) = parse_nth(&a)?;
+                        seg.pseudos.push(Pseudo::NthChild(a_, b_));
+                    }
+                    ("not", Some(a)) => {
+                        let a = a.trim();
+                        if is_dynamic_pseudo(a) {
+                            // `:not(:focus)` etc. — the state never holds in a
+                            // static pass, so the negation is vacuously true:
+                            // drop the constraint, keep the rest of the selector
+                        } else {
+                            // simple-selector argument only; anything more
+                            // complex (combinators, nested :is()) drops the
+                            // rule (shortcut: no complex :not() args)
+                            seg.nots.push(parse_compound(a)?);
+                        }
+                    }
+                    ("is" | "where", Some(a)) => {
+                        // each comma-separated alternate must match; :where()
+                        // contributes no specificity, :is() its best argument
+                        let counts = name == "is";
+                        let mut alts = Vec::new();
+                        for part in a.split(',') {
+                            // shortcut: compound args only — combinators or
+                            // nested comma lists inside :is()/:where() drop
+                            // the whole selector
+                            alts.push(parse_compound(part.trim())?);
+                        }
+                        seg.pseudos.push(Pseudo::Is(alts, counts));
+                    }
+                    // dynamic/state pseudo-classes (:hover, :focus, …) and
+                    // anything unknown: not statically evaluable — the whole
+                    // selector is dropped (module docs)
+                    _ => return None,
+                }
+            }
+            _ => return None, // unexpected char (space/combinator inside a compound)
         }
     }
     Some(seg)
@@ -2118,6 +2290,29 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
         cls += s.classes.len() as u16 + s.attrs.len() as u16;
         if s.tag.is_some() {
             tags += 1;
+        }
+        // pseudo-classes count like classes; :not() takes its argument's
+        // specificity; :is() its most specific alternate; :where() zero
+        for p in &s.pseudos {
+            match p {
+                Pseudo::Is(alts, counts) => {
+                    if *counts {
+                        let best = alts.iter().map(|a| spec_of(std::slice::from_ref(a))).max();
+                        if let Some((i, c, t)) = best {
+                            ids += i;
+                            cls += c;
+                            tags += t;
+                        }
+                    }
+                }
+                _ => cls += 1,
+            }
+        }
+        for n in &s.nots {
+            let (i, c, t) = spec_of(std::slice::from_ref(n));
+            ids += i;
+            cls += c;
+            tags += t;
         }
     }
     (ids, cls, tags)
@@ -2182,7 +2377,79 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg) -> bool {
             None => return false,
         }
     }
+    for p in &seg.pseudos {
+        if !pseudo_matches(dom, node, p) {
+            return false;
+        }
+    }
+    // `:not(X)` — the element must match NONE of the excluded selectors
+    for n in &seg.nots {
+        if seg_matches(dom, node, n) {
+            return false;
+        }
+    }
     true
+}
+
+fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo) -> bool {
+    match p {
+        // an element carrying an href; visit history isn't modeled
+        Pseudo::Link => dom.attr(node, "href").is_some(),
+        // a direct child of the document root (the `<html>` element)
+        Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
+        Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
+        Pseudo::LastChild => {
+            let Some((idx, elems)) = element_children(dom, node) else {
+                return false;
+            };
+            idx == elems
+        }
+        // 1-based position among element siblings satisfies a*n + b
+        Pseudo::NthChild(a, b) => {
+            let Some(idx) = element_sibling_index(dom, node) else {
+                return false;
+            };
+            let idx = idx as i32;
+            if *a == 0 {
+                idx == *b
+            } else {
+                let d = idx - *b;
+                d % *a == 0 && d / *a >= 0
+            }
+        }
+        // ANY alternate compound selector matches
+        Pseudo::Is(alts, _) => alts.iter().any(|alt| seg_matches(dom, node, alt)),
+    }
+}
+
+/// Element children of `node`'s parent: `(node's 1-based index, total count)`
+/// — the data `:first-child`/`:nth-child` need. Text nodes don't count.
+/// None if `node` has no element parent (document root / text node).
+fn element_children(dom: &Dom, node: u32) -> Option<(usize, usize)> {
+    let parent = dom.nodes[node as usize].parent;
+    if parent == node {
+        return None; // document root (its parent is itself)
+    }
+    let kids = &dom.nodes[parent as usize].children;
+    let mut idx = 0usize;
+    let mut total = 0usize;
+    for &c in kids {
+        if matches!(dom.nodes[c as usize].kind, NodeKind::Element(..)) {
+            total += 1;
+            if c == node {
+                idx = total;
+            }
+        }
+    }
+    if idx == 0 {
+        None // not found among element children (shouldn't happen)
+    } else {
+        Some((idx, total))
+    }
+}
+
+fn element_sibling_index(dom: &Dom, node: u32) -> Option<usize> {
+    element_children(dom, node).map(|(idx, _)| idx)
 }
 
 // ---------- helpers ----------
@@ -2501,8 +2768,132 @@ mod tests {
     #[test]
     fn pseudo_selectors_dropped_others_kept() {
         let sheet = parse("a:hover { color: #111111 } p { color: #222222 }");
-        let dom = dom_of("<p></p>");
+        let dom = dom_of("<p></p><a href=x></a>");
         assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0x222222);
+        // the dropped :hover rule must not paint its color on the anchor either
+        let a = by_tag(&dom, "a");
+        assert_ne!(sheet.resolve(&dom, a, Style::new(), None).style.color, 0x111111);
+    }
+
+    #[test]
+    fn a_link_color_applies_to_hrefs_only() {
+        let dom = dom_of("<a id=x href=page>one</a><a id=y>no href</a>");
+        let x = by_attr(&dom, "id", "x");
+        let y = by_attr(&dom, "id", "y");
+        // :link matches the href-carrying anchor…
+        let link = parse("a:link { color: #123456 }");
+        assert_eq!(link.resolve(&dom, x, Style::new(), None).style.color, 0x123456);
+        // …while an href-less <a> is a plain placeholder — no link styling
+        assert_ne!(link.resolve(&dom, y, Style::new(), None).style.color, 0x123456);
+        // :visited matches the same set (visit history isn't modeled)
+        let visited = parse("a:visited { color: #654321 }");
+        assert_eq!(visited.resolve(&dom, x, Style::new(), None).style.color, 0x654321);
+        assert_ne!(visited.resolve(&dom, y, Style::new(), None).style.color, 0x654321);
+    }
+
+    #[test]
+    fn a_link_text_decoration_none_kills_underline() {
+        // UA default for `a` underlines; the author rule must kill it
+        let sheet = parse("a:link { text-decoration: none }");
+        let dom = dom_of(r#"<a href=page>one</a>"#);
+        let node = by_tag(&dom, "a");
+        let mut base = Style::new();
+        base.underline = true; // UA default for anchors
+        assert!(!sheet.resolve(&dom, node, base, None).style.underline);
+    }
+
+    #[test]
+    fn not_pseudo_excludes_matching_elements() {
+        let sheet = parse(".x:not(.y) { color: #111111 }");
+        let dom = dom_of(r#"<div class="x"></div><div class="x y"></div>"#);
+        let only_x = by_attr(&dom, "class", "x");
+        let both = by_attr(&dom, "class", "x y");
+        assert_eq!(
+            sheet.resolve(&dom, only_x, Style::new(), None).style.color,
+            0x111111,
+            ".x without .y must match"
+        );
+        assert_ne!(
+            sheet.resolve(&dom, both, Style::new(), None).style.color,
+            0x111111,
+            ".x.y must be excluded by :not(.y)"
+        );
+    }
+
+    #[test]
+    fn not_specificity_beats_plain_class() {
+        // `.x:not(.y)` = (0, 2, 0) — the :not() argument counts — so it beats
+        // a later single-class rule despite source order
+        let sheet = parse(".x:not(.y) { color: #111111 } .x { color: #222222 }");
+        let dom = dom_of(r#"<div class="x"></div>"#);
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "class", "x"), Style::new(), None)
+                .style
+                .color,
+            0x111111
+        );
+    }
+
+    #[test]
+    fn nth_child_and_structural_pseudos_match() {
+        let sheet = parse(
+            "li:first-child { color: #111111 } li:last-child { color: #222222 } \
+             li:nth-child(2) { color: #333333 } li:nth-child(odd) { font-style: italic }",
+        );
+        let dom = dom_of("<ul><li id=a></li><li id=b></li><li id=c></li></ul>");
+        let a = by_attr(&dom, "id", "a");
+        let b = by_attr(&dom, "id", "b");
+        let c = by_attr(&dom, "id", "c");
+        assert_eq!(sheet.resolve(&dom, a, Style::new(), None).style.color, 0x111111);
+        assert_eq!(sheet.resolve(&dom, b, Style::new(), None).style.color, 0x333333);
+        assert_eq!(sheet.resolve(&dom, c, Style::new(), None).style.color, 0x222222);
+        // odd = 1st/3rd italic, 2nd not
+        assert!(sheet.resolve(&dom, a, Style::new(), None).style.italic);
+        assert!(!sheet.resolve(&dom, b, Style::new(), None).style.italic);
+        assert!(sheet.resolve(&dom, c, Style::new(), None).style.italic);
+    }
+
+    #[test]
+    fn root_pseudo_matches_html_element() {
+        let sheet = parse(":root { color: #123456 }");
+        let dom = dom_of("<html><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        let p = by_tag(&dom, "p");
+        assert_eq!(sheet.resolve(&dom, html, Style::new(), None).style.color, 0x123456);
+        assert_ne!(sheet.resolve(&dom, p, Style::new(), None).style.color, 0x123456);
+    }
+
+    #[test]
+    fn is_and_where_selectors_match_alternates() {
+        let sheet = parse("li:is(.a, .b) { color: #111111 } li:where(.c) { color: #222222 }");
+        let dom = dom_of(r#"<li class="a"></li><li class="b"></li><li class="c"></li><li></li>"#);
+        for id in ["a", "b", "c"] {
+            let node = by_attr(&dom, "class", id);
+            let want = if id == "c" { 0x222222 } else { 0x111111 };
+            assert_eq!(
+                sheet.resolve(&dom, node, Style::new(), None).style.color,
+                want,
+                "class {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_specificity_is_best_alternate_where_is_zero() {
+        // :is(.a, #b) takes the id from the best alternate…
+        let sheet = parse(":is(.a, #b) { color: #111111 } .a { color: #222222 }");
+        let dom = dom_of(r#"<div class="a"></div>"#);
+        let node = by_attr(&dom, "class", "a");
+        assert_eq!(
+            sheet.resolve(&dom, node, Style::new(), None).style.color,
+            0x111111
+        );
+        // …while :where() contributes zero: this later .a rule wins the tie
+        let w = parse(":where(.a) { color: #111111 } .a { color: #222222 }");
+        assert_eq!(
+            w.resolve(&dom, node, Style::new(), None).style.color,
+            0x222222
+        );
     }
 
     #[test]
@@ -2877,11 +3268,12 @@ mod tests {
 
     #[test]
     fn colon_inside_attribute_value_is_not_a_pseudo() {
-        assert!(!has_pseudo(r#"a[href^="http:"]"#));
-        assert!(!has_pseudo(r#".data-\:x"#));
-        assert!(has_pseudo("a:hover"));
-        assert!(has_pseudo("li::before"));
-        assert!(!has_pseudo(".plain .other"));
+        assert!(parse_selector(r#"a[href^="http:"]"#).is_some());
+        assert!(parse_selector(r#".data-\:x"#).is_some());
+        // dynamic pseudo-classes / pseudo-elements still drop the selector
+        assert!(parse_selector("a:hover").is_none());
+        assert!(parse_selector("li::before").is_none());
+        assert!(parse_selector(".plain .other").is_some());
     }
 
     #[test]
