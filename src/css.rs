@@ -114,6 +114,10 @@ pub struct BoxStyle {
     pub margin: [Len; 4],
     /// per-box background-color
     pub bg: Option<u32>,
+    /// `background-image: url(…)` — the raw target (unresolved; layout
+    /// hands it to the shared `<img>` pipeline, which resolves/fetches it
+    /// against the page URL)
+    pub bg_image: Option<std::rc::Rc<str>>,
     /// border-radius (all corners; % resolves against box width at layout)
     pub radius: Len,
     /// border widths, top/right/bottom/left (% resolves against box width)
@@ -186,6 +190,7 @@ impl Default for BoxStyle {
             pad: [Len::Px(0.0); 4],
             margin: [Len::Px(0.0); 4],
             bg: None,
+            bg_image: None,
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
@@ -477,6 +482,7 @@ const KNOWN: &[&str] = &[
     "color-scheme",
     "background",
     "background-color",
+    "background-image",
     "font-size",
     "font-weight",
     "font-style",
@@ -1040,8 +1046,19 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
             continue;
         }
-        let mut v = v.trim().to_ascii_lowercase();
-        if let Some(pos) = v.find("!important") {
+        // image URLs are case-sensitive on real servers — a value carrying
+        // a url() keeps its raw case (same reason the @font-face scanner
+        // bypasses this function); ascii lowercasing is 1:1 on bytes, so
+        // positions found in the lowered copy index the raw one too
+        let raw = v.trim();
+        let lower = raw.to_ascii_lowercase();
+        let imp = lower.find("!important");
+        let mut v = if lower.contains("url(") {
+            raw.to_string()
+        } else {
+            lower
+        };
+        if let Some(pos) = imp {
             v.truncate(pos); // shortcut: !important ignored entirely
         }
         let v = v.trim().to_string();
@@ -1070,11 +1087,28 @@ fn apply_decl(
                 style.color = c;
             }
         }
-        "background" | "background-color" => {
-            bx.declared |= decl::BG;
-            if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
-                *bg = Some(c);
-                bx.bg = Some(c); // per-box fill (cards, nav bars)
+        "background" | "background-color" | "background-image" => {
+            // the color half (the `background` shorthand declares a color
+            // even when it carries a url; the image longhand does not)
+            if d.0 != "background-image" {
+                bx.declared |= decl::BG;
+                if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
+                    *bg = Some(c);
+                    bx.bg = Some(c); // per-box fill (cards, nav bars)
+                }
+            }
+            // the image half: url(…) rides the shared <img> pipeline
+            // (probe_images resolves/fetches it against the page URL).
+            // Per spec the `background` shorthand resets the image — a
+            // later color-only `background:` clears an earlier url.
+            if d.0 == "background" {
+                bx.bg_image = parse_bg_url(&d.1);
+            } else if d.0 == "background-image" {
+                if d.1.trim() == "none" {
+                    bx.bg_image = None;
+                } else if let Some(u) = parse_bg_url(&d.1) {
+                    bx.bg_image = Some(u);
+                }
             }
         }
         // consumed before the cascade in `resolve_with_parent` (the used
@@ -1409,6 +1443,28 @@ fn parse_sides(v: &str) -> [Len; 4] {
         4 => [vals[0], vals[1], vals[2], vals[3]],
         _ => [z, z, z, z], // includes `auto` slots (handled separately)
     }
+}
+
+/// `url(…)` / `url("…")` / `url('…')` → the raw target (unresolved — the
+/// `<img>` pipeline joins it against the page URL). shortcut: the FIRST url
+/// in the value only; other layers and keywords (`no-repeat`, `50% 50%`,
+/// `cover`, …) are ignored — one background image per box, drawn at natural
+/// size, top-left, no repeat (the CSS initial values, which is what sites
+/// like the HN vote arrows rely on).
+fn parse_bg_url(v: &str) -> Option<std::rc::Rc<str>> {
+    // values may keep raw case (url() case-sensitivity) — match the
+    // function name case-insensitively via the lowered copy (1:1 bytes)
+    let start = v.to_ascii_lowercase().find("url(")? + 4;
+    let rest = v[start..].trim_start();
+    let target = if let Some(q) = rest.strip_prefix('"') {
+        q.split_once('"')?.0
+    } else if let Some(q) = rest.strip_prefix('\'') {
+        q.split_once('\'')?.0
+    } else {
+        &rest[..rest.find(')')?]
+    };
+    let target = target.trim();
+    (!target.is_empty()).then(|| std::rc::Rc::from(target))
 }
 
 /// `200px` / `50%` / `1.5rem` → [`Len`]. Bare numbers are lenient px

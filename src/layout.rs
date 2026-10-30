@@ -214,6 +214,11 @@ impl ImgSlot {
 /// Box tree node: a text run (leaf) or an element box (block/flex/grid).
 pub struct BoxNode {
     pub is_text: bool,
+    /// synthetic background-image placeholder (first child of the element
+    /// its `background-image` targets): carries an [`ImgSlot`] so the
+    /// shared `<img>` pipeline fetches/decodes it, paints at the parent's
+    /// padding-box top-left, reserves no flow space
+    pub is_bg: bool,
     pub style: Style,
     pub bx: BoxStyle,
     pub text: String,
@@ -248,6 +253,7 @@ impl BoxNode {
     fn group(style: Style, bx: BoxStyle) -> Self {
         BoxNode {
             is_text: false,
+            is_bg: false,
             style,
             bx,
             text: String::new(),
@@ -269,6 +275,7 @@ impl BoxNode {
     fn leaf(style: Style, text: String, hard_break: bool, link: Option<std::rc::Rc<str>>) -> Self {
         BoxNode {
             is_text: true,
+            is_bg: false,
             style,
             bx: BoxStyle::default(),
             text,
@@ -298,8 +305,46 @@ const NON_RENDERED: &[&str] = &[
 /// result for `node` itself (main resolves body before calling).
 pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) -> BoxNode {
     let mut root = BoxNode::group(style, bx);
+    // body's own background-image (root = body's box) — pushed before
+    // build_into appends, so it stays the first child (paints under)
+    if let Some(u) = root.bx.bg_image.clone() {
+        root.children.push(bg_placeholder(&u, style));
+    }
     build_into(dom, node, style, sheet, None, &mut root.children);
     root
+}
+
+/// Synthetic child for `background-image` — it rides the existing `<img>`
+/// pipeline: `probe_images` (main.rs) resolves the raw url against the page
+/// URL and probes the header, `decode_images` decodes at display size and
+/// appends the draw entry in tree order — child 0 means the background
+/// lands UNDER the element's content images, and all images draw under
+/// text. `place()` anchors it to the parent's padding-box top-left;
+/// `is_bg` keeps it out of every flow (block/flex/grid and shrink-to-fit
+/// width).
+/// shortcut: one image per box, natural size, top-left, no repeat /
+/// position / size / clip (the CSS initial values — what real sites'
+/// small icon backgrounds rely on).
+fn bg_placeholder(url: &str, style: Style) -> BoxNode {
+    let mut g = BoxNode::group(style, BoxStyle::default());
+    g.is_bg = true;
+    g.img = Some(ImgSlot::Pending(std::rc::Rc::from(url)));
+    g
+}
+
+/// `width="85%"` / `width="400"` presentational attribute → [`Len`] — the
+/// same `Len` the CSS `width` property produces, so the attribute behaves
+/// identically at layout.
+fn attr_len(v: &str) -> Option<Len> {
+    let v = v.trim();
+    if let Some(n) = v.strip_suffix('%') {
+        return n.trim().parse::<f32>().ok().map(Len::Pct);
+    }
+    v.trim_end_matches("px")
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .map(Len::Px)
 }
 
 /// Total node count (for the [mem] log).
@@ -504,6 +549,26 @@ fn build_into(
                 };
                 if boxed {
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    // table presentational hints (lower precedence than
+                    // author CSS): width="85%"/"400" behaves exactly like
+                    // the CSS property; align="center" centers the band
+                    // like `margin: auto`
+                    if tag == "table" {
+                        if g.bx.declared & decl::WIDTH == 0 {
+                            g.bx.width = dom.attr(child, "width").and_then(attr_len);
+                        }
+                        let center = dom
+                            .attr(child, "align")
+                            .map_or(false, |a| a.trim().eq_ignore_ascii_case("center"));
+                        if center && !g.bx.margin_x_auto && g.bx.margin == [Len::Px(0.0); 4] {
+                            g.bx.margin_x_auto = true;
+                        }
+                    }
+                    // background-image: placeholder rides the <img> pipeline
+                    // and paints under this box's content (first child)
+                    if let Some(u) = g.bx.bg_image.clone() {
+                        g.children.push(bg_placeholder(&u, outcome.style));
+                    }
                     // inline-block: a real box (background/border paint),
                     // but placed ON the surrounding text line by block()'s
                     // inline branch instead of stacking
@@ -519,6 +584,7 @@ fn build_into(
                     // button). Same placement path as author inline-block.
                     let nz = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
                     let paints = outcome.bx.bg.is_some()
+                        || outcome.bx.bg_image.is_some()
                         || !outcome.bx.shadows.is_empty()
                         || outcome.bx.border.iter().any(|&l| nz(l))
                         || nz(outcome.bx.pad[1])
@@ -526,6 +592,10 @@ fn build_into(
                     if paints {
                         let mut g = BoxNode::group(outcome.style, outcome.bx);
                         g.inline = true;
+                        // background-image placeholder (see above)
+                        if let Some(u) = g.bx.bg_image.clone() {
+                            g.children.push(bg_placeholder(&u, outcome.style));
+                        }
                         build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
                         out.push(g);
                     } else {
@@ -608,6 +678,33 @@ pub struct Layout {
 #[cfg(test)]
 const VIEWPORT_H: f32 = 676.0;
 
+/// Background-image decode budget (pixels), separate from and much smaller
+/// than the content `IMG_PIXEL_BUDGET` (64 MB, main.rs): backgrounds are
+/// decorative, so any placeholder whose probed intrinsic size doesn't fit
+/// the remaining budget loses its slot before layout (no decode, no draw).
+/// 256K px ≈ 1 MB RGBA — keeps the project's minimal-RAM metric.
+const BG_PIXEL_BUDGET: usize = 256 * 1024;
+
+/// Drop (de-slot) background-image placeholders whose probed intrinsic
+/// pixels don't fit the remaining [`BG_PIXEL_BUDGET`]. Content `<img>`
+/// boxes are never touched — they keep main's shared budget discipline.
+fn cap_bg_images(n: &mut BoxNode, budget: &mut usize) {
+    if n.is_bg {
+        if let Some(ImgSlot::Probed { w, h, .. }) = &n.img {
+            let px = (*w as usize).saturating_mul(*h as usize);
+            if px > *budget {
+                n.img = None;
+            } else {
+                *budget -= px;
+            }
+        }
+        return;
+    }
+    for c in &mut n.children {
+        cap_bg_images(c, budget);
+    }
+}
+
 /// Lay out the box tree at (0, 0) within `max_width`, viewport height
 /// [`VIEWPORT_H`] (see [`layout_in`] for the real one).
 #[cfg(test)]
@@ -629,6 +726,10 @@ pub fn layout_in(
 ) -> Layout {
     let mut runs = Vec::new();
     let mut uls = Vec::new();
+    // background-image budget: over-budget placeholders lose their slot
+    // before anything is sized or painted (probe already ran in main)
+    let mut bg_budget = BG_PIXEL_BUDGET;
+    cap_bg_images(root, &mut bg_budget);
     // initial containing block = viewport (0, 0, max_width, vh)
     let cb = (0.0f32, 0.0f32, max_width, viewport_h);
     place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls);
@@ -824,6 +925,22 @@ fn place(
     n.x += pl + bl;
     n.y += pt + bt;
     n.w = (w - pl - pr - bl - br).max(0.0);
+    // background-image placeholders: anchored to this box's padding-box
+    // top-left at intrinsic size (CSS initial position/size/repeat), out of
+    // flow — block/flex/grid skip them, so they take no space. An unprobed
+    // slot (fetch failed / unsupported format / over budget) stays 0×0 and
+    // never paints.
+    for ch in &mut n.children {
+        if !ch.is_bg {
+            continue;
+        }
+        ch.x = bx0 + bl;
+        ch.y = by0 + bt;
+        if let Some((iw, ih)) = ch.img.as_ref().and_then(ImgSlot::dims) {
+            ch.w = iw as f32;
+            ch.h = ih as f32;
+        }
+    }
     if n.img.is_some() {
         // replaced element: no children — height from declared height,
         // else aspect ratio of the content width (no size known: 0 → invisible)
@@ -1049,8 +1166,10 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
                 continue;
             }
             out.push(Item::Text(start, i));
-        } else if matches!(children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
-            i += 1; // out of flow: placed in phase 2 (position_all)
+        } else if children[i].is_bg
+            || matches!(children[i].bx.pos, Pos::Absolute | Pos::Fixed)
+        {
+            i += 1; // background placeholder / out of flow: not a layout item
         } else {
             out.push(Item::Grp(i));
             i += 1;
@@ -1107,7 +1226,9 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
         (Display::Flex, Dir::Column) => n
             .children
             .iter()
-            .filter(|c| !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed))
+            .filter(|c| {
+                !c.is_bg && !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed)
+            })
             .map(|c| natural_w(c, avail, measure))
             .fold(0.0f32, f32::max),
         (Display::Grid, _) => {
@@ -1122,7 +1243,7 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
             let mut m = 0.0f32;
             let mut run = 0.0f32;
             for c in &n.children {
-                if matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
+                if c.is_bg || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
                     continue; // out of flow: no contribution to shrink-to-fit
                 }
                 if c.is_text {
@@ -1453,6 +1574,9 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             if let Some((top, h, _)) = cont.take() {
                 y = top + h + n.style.size * 0.6;
             }
+            i += 1;
+        } else if n.children[i].is_bg {
+            // background-image placeholder: anchored by place(), no advance
             i += 1;
         } else if n.children[i].inline {
             // inline-level box (form control / author inline-block /
@@ -3473,5 +3597,158 @@ mod tests {
         }
         // no hidden value leaks into rendering
         assert!(controls(&root).iter().all(|c| !c.children.iter().any(|t| t.text.contains("secret"))));
+    }
+
+    // ---- background-image (url() painting) ----
+
+    /// html + stylesheet → laid root box tree (body box = root).
+    fn boxes_of(markup: &str, css: &str) -> BoxNode {
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse(css);
+        build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet)
+    }
+
+    #[test]
+    fn background_image_url_parsed_and_resolved() {
+        // inline style: url() lands on the box as a Pending slot inside a
+        // synthetic placeholder child (child 0 → paints under content)
+        let root = boxes_of(r#"<div style="background-image: url(img/tri.png)">x</div>"#, "");
+        let div = &root.children[0];
+        assert!(div.children[0].is_bg, "placeholder is the first child");
+        match &div.children[0].img {
+            Some(ImgSlot::Pending(src)) => assert_eq!(&**src, "img/tri.png"),
+            _ => panic!("Pending slot expected on the placeholder"),
+        }
+        // the shared <img> pipeline resolves that raw src against the page
+        // URL exactly like an <img src> (probe_images calls resolve first)
+        assert_eq!(
+            crate::resolve("http://host.test/p/page.html", "img/tri.png").as_deref(),
+            Some("http://host.test/p/img/tri.png"),
+            "raw url joins the page base to an absolute URL"
+        );
+    }
+
+    #[test]
+    fn background_shorthand_url_case_kept_and_reset() {
+        let root = boxes_of(
+            r#"<div class="a">x</div><div class="a b">y</div><div class="c">z</div>"#,
+            r#"
+                .a { background: url(/Assets/Icon.PNG) no-repeat }
+                .b { background: #fff }
+                .c { background: url(c.png); background-image: none }
+            "#,
+        );
+        let bg_pending = |i: usize| match &root.children[i].children[0].img {
+            Some(ImgSlot::Pending(s)) => Some(&**s),
+            _ => None,
+        };
+        // shorthand url survives keywords after it, raw case preserved
+        assert_eq!(bg_pending(0), Some("/Assets/Icon.PNG"));
+        // spec: a later color-only `background:` shorthand resets the image
+        assert_eq!(bg_pending(1), None, "color-only background: clears url");
+        // longhand `background-image: none` also clears it
+        assert_eq!(bg_pending(2), None, "background-image: none clears url");
+    }
+
+    #[test]
+    fn background_image_paints_under_content_at_natural_size() {
+        // a real 2×1 PNG written here; the pipeline would decode it in
+        // decode_images (main.rs) — slotting Ready directly proves the
+        // paint path: natural size, padding-box top-left, listed BEFORE the
+        // content <img> (render draws images in list order, all under text)
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, 2, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[255, 0, 0, 128, 0, 255, 0, 255]).unwrap();
+        }
+        let img = std::rc::Rc::new(crate::image::decode(&bytes).expect("png decodes"));
+        let mut root = boxes_of(
+            r#"<div style="background-image:url(t.png)"><img src="c.png">text</div>"#,
+            "",
+        );
+        let div = &mut root.children[0];
+        assert!(div.children[0].is_bg);
+        div.children[0].img = Some(ImgSlot::Ready(img.clone()));
+        let content = div
+            .children
+            .iter_mut()
+            .find(|c| !c.is_bg && c.img.is_some())
+            .expect("content <img> box");
+        content.img = Some(ImgSlot::Ready(img));
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.images.len(), 2, "bg + content img");
+        let (x, y, w, h, _, _) = l.images[0];
+        assert_eq!((x, y, w, h), (0.0, 0.0, 2.0, 1.0), "natural size at padding-box origin");
+        // z-order: the bg entry precedes the content image; text runs draw
+        // after ALL images in render(), so the text sits on top
+        assert!(!l.runs.is_empty(), "text content unaffected");
+    }
+
+    #[test]
+    fn background_image_fetch_failure_paints_nothing() {
+        // probe/fetch failed → the slot stays Pending → no decode, no draw
+        // entry, no panic, content unaffected
+        let mut root = boxes_of(r#"<div style="background-image:url(missing.png)">x</div>"#, "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert!(l.images.is_empty());
+        assert!(!l.runs.is_empty());
+    }
+
+    #[test]
+    fn oversized_background_image_dropped_by_budget() {
+        let mut root = boxes_of(r#"<div style="background-image:url(big.png)">x</div>"#, "");
+        // simulate a probed header over the separate bg budget (4M px > 256K)
+        root.children[0].children[0].img = Some(ImgSlot::Probed {
+            src: std::rc::Rc::from("big.png"),
+            w: 2000,
+            h: 2000,
+        });
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert!(l.images.is_empty(), "over-budget bg never decodes/draws");
+        assert_eq!(root.children[0].children[0].w, 0.0, "slot de-sized");
+    }
+
+    // ---- table percentage widths / presentational attributes ----
+
+    #[test]
+    fn table_width_attr_percent_matches_css() {
+        // <table width="85%"> behaves exactly like `table { width: 85% }`
+        let mut by_attr =
+            boxes_of(r#"<table width="85%"><tr><td>x</td></tr></table>"#, "");
+        let mut by_css =
+            boxes_of(r#"<table><tr><td>x</td></tr></table>"#, "table { width: 85% }");
+        let la = layout_tree(&mut by_attr, 1000.0, &m4);
+        let lc = layout_tree(&mut by_css, 1000.0, &m4);
+        assert_eq!(by_attr.children[0].w, 850.0, "85% of the 1000px container");
+        assert_eq!(by_css.children[0].w, 850.0, "CSS width resolves the same");
+        assert_eq!(la.height, lc.height, "same layout either way");
+        // px values too
+        let mut px = boxes_of(r#"<table width="400"><tr><td>x</td></tr></table>"#, "");
+        layout_tree(&mut px, 1000.0, &m4);
+        assert_eq!(px.children[0].w, 400.0, "width=\"400\" = 400px");
+    }
+
+    #[test]
+    fn table_align_center_centers_band_and_css_wins() {
+        let mut root = boxes_of(
+            r#"<table width="85%" align="center"><tr><td>x</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 1000.0, &m4);
+        let t = &root.children[0];
+        assert_eq!(t.w, 850.0);
+        assert_eq!(t.x, 75.0, "centered in the 1000px container");
+        // author CSS beats both hints (declared width + explicit margin)
+        let mut styled = boxes_of(
+            r#"<table width="85%" align="center"><tr><td>x</td></tr></table>"#,
+            "table { width: 400px; margin-left: 10px }",
+        );
+        layout_tree(&mut styled, 1000.0, &m4);
+        let t = &styled.children[0];
+        assert_eq!(t.w, 400.0, "author width wins over the attribute");
+        assert_eq!(t.x, 10.0, "author margin wins over align=center");
     }
 }
