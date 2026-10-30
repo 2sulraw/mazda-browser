@@ -514,7 +514,17 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 ## Non-goals v1
 
-JavaScript, GPU compositor, process sandbox, full CSS, media playback, extensions, DevTools.
+GPU compositor, process sandbox, full CSS, media playback, extensions, DevTools.
+
+JavaScript was originally a non-goal; **user decision 2026-10-30: Stage 1 JS support is
+now in scope** (from-scratch tree-walking interpreter, no third-party engine code).
+Roadmap: Stage 1 = interpreter core + `addEventListener`/DOM reads+writes/`fetch`/queue-
+only `setTimeout` — enough for vanilla-JS interactive sites (Wikipedia gadgets, small
+widgets, DuckDuckGo); RAM cost measured and logged at every step. Later stages (not
+committed): ES2015+ depth (promises/microtasks, classes), incremental re-layout on DOM
+mutation. Pixel-parity on heavyweight JS applications (google.com-class) explicitly NOT
+a near-term target: those need a Chrome-scale API surface + JIT; recorded honestly here
+so the goalposts don't drift.
 
 ## Environment notes
 
