@@ -2,8 +2,12 @@
 //! ONCE into a rule list with precompiled selectors — never re-parsed per element.
 //! shortcut: dynamic pseudo-classes (`:hover`, `:focus`, …) and pseudo-elements
 //! drop their whole selector (static ones — `:link`, `:visited`, `:root`,
-//! `:not(...)`, `:is(...)`, `:where(...)`, `:first-child`, `:last-child`,
-//! `:nth-child(...)` — participate in the cascade), no @import, no !important
+//! `:host(...)` (bound to the component whose `<style>` declared it), `:not(...)`
+//! incl. comma lists, `:is(...)`, `:where(...)`, `:first-child`, `:last-child`,
+//! `:nth-child(...)` — participate in the cascade). `slot[name=X]` also selects
+//! the light-DOM nodes projected into that slot (`[slot=X]`) — a flat-tree
+//! stand-in for shadow distribution, so hiding the slot hides its content.
+//! No @import, no !important
 //! (stripped and ignored), shorthand `font:` unsupported; background-color is
 //! only honored for the page background (body/html), not per-box. Box layout
 //! properties (display:flex/grid, width, gap, …) cascade into `BoxStyle` —
@@ -209,10 +213,17 @@ impl Default for BoxStyle {
 /// hover styles permanently).
 #[derive(Clone)]
 enum Pseudo {
-    /// `:link` / `:visited` — an element carrying an `href` (the common case
-    /// `<a href>`). Visit history isn't modeled, so both states match the
-    /// same set: anchors with an href.
+    /// `:link` — an element carrying an `href` (the common case `<a href>`).
     Link,
+    /// `:visited` — a link the user has actually visited. Visit history isn't
+    /// modeled, so a fresh render has NO visited links: this matches nothing.
+    /// (Treating it like `:link` would let `a:visited` outrank the base `a`
+    /// color and paint every unvisited link the visited color.)
+    Visited,
+    /// `:enabled` — a form control NOT carrying the `disabled` attribute.
+    Enabled,
+    /// `:disabled` — a form control carrying the `disabled` attribute.
+    Disabled,
     /// `:root` — a direct child of the document root (the `<html>` element).
     Root,
     /// `:first-child` — first ELEMENT child of its parent (text nodes don't
@@ -227,6 +238,10 @@ enum Pseudo {
     /// compound selectors. The flag is `counts`: `:is` contributes its most
     /// specific argument's specificity, `:where` contributes none.
     Is(Vec<Seg>, bool),
+    /// `:host(...)` — the host of the component whose `<style>` declared this
+    /// selector. Boxed argument = the compound inside the parens; the String
+    /// is the verbatim `:host(...)` source text, used to locate that style.
+    Host(Box<Seg>, String),
 }
 
 /// One compound step of a selector, e.g. `nav > a.current[href]`.
@@ -2045,9 +2060,12 @@ fn flush<'a>(tokens: &mut Vec<&'a str>, s: &'a str, start: usize, end: usize) {
 }
 
 /// True if `s` is a state/interaction pseudo-class the static cascade can
-/// never evaluate: no element is hovered/focused/checked during a style-only
-/// pass, so these never match — which makes their `:not(...)` negation
-/// vacuously true (skip links styled `:not(:focus)` keep working).
+/// never evaluate: no element is hovered/focused during a style-only pass, so
+/// these never match — which makes their `:not(...)` negation vacuously true
+/// (skip links styled `:not(:focus)` keep working).
+///
+/// Note: `:enabled`/`:disabled` are NOT here — they are markup state (the
+/// `disabled` attribute), which the static cascade evaluates directly.
 fn is_dynamic_pseudo(s: &str) -> bool {
     let Some(name) = s.strip_prefix(':') else {
         return false;
@@ -2058,7 +2076,7 @@ fn is_dynamic_pseudo(s: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "hover" | "focus" | "focus-within" | "focus-visible" | "active" | "checked"
-            | "target" | "enabled" | "disabled" | "default" | "required" | "optional"
+            | "target" | "default" | "required" | "optional"
             | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
             | "read-only" | "read-write" | "placeholder-shown"
     )
@@ -2253,6 +2271,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                 if i + 1 < b.len() && b[i + 1] == ':' {
                     return None; // pseudo-element (::before) — unsupported, drop
                 }
+                let pstart = i;
                 i += 1;
                 let st = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '-' || b[i] == '_')
@@ -2287,8 +2306,14 @@ fn parse_compound(s: &str) -> Option<Seg> {
                 match (name.as_str(), args) {
                     // static approximation: an element carrying an href
                     // (`<a href>`). Visit history isn't modeled, so `:link`
-                    // and `:visited` match the same set.
-                    ("link" | "visited", None) => seg.pseudos.push(Pseudo::Link),
+                    // matches every anchor; `:visited` matches none (a fresh
+                    // render has no visited links).
+                    ("link", None) => seg.pseudos.push(Pseudo::Link),
+                    ("visited", None) => seg.pseudos.push(Pseudo::Visited),
+                    // `:enabled`/`:disabled` are markup state (the `disabled`
+                    // attribute), not interaction state — statically evaluable.
+                    ("enabled", None) => seg.pseudos.push(Pseudo::Enabled),
+                    ("disabled", None) => seg.pseudos.push(Pseudo::Disabled),
                     // the root element: a direct child of the document root
                     ("root", None) => seg.pseudos.push(Pseudo::Root),
                     ("first-child", None) => seg.pseudos.push(Pseudo::FirstChild),
@@ -2298,18 +2323,42 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         seg.pseudos.push(Pseudo::NthChild(a_, b_));
                     }
                     ("not", Some(a)) => {
+                        // the argument may be a selector LIST — `:not(A, B)`
+                        // excludes a match against any member, so each member
+                        // becomes its own `nots` entry
                         let a = a.trim();
-                        if is_dynamic_pseudo(a) {
-                            // `:not(:focus)` etc. — the state never holds in a
-                            // static pass, so the negation is vacuously true:
-                            // drop the constraint, keep the rest of the selector
-                        } else {
-                            // simple-selector argument only; anything more
+                        for m in split_all_top_level(a, ",").unwrap_or_else(|| vec![a]) {
+                            let m = m.trim();
+                            if m.is_empty() {
+                                continue; // stray comma — nothing to exclude
+                            }
+                            if is_dynamic_pseudo(m) {
+                                // `:not(:focus)` etc. — the state never holds
+                                // in a static pass, so that member's negation
+                                // is vacuously true: drop it, keep the rest
+                                continue;
+                            }
+                            // simple-selector members only; anything more
                             // complex (combinators, nested :is()) drops the
                             // rule (shortcut: no complex :not() args)
-                            seg.nots.push(parse_compound(a)?);
+                            seg.nots.push(parse_compound(m)?);
                         }
                     }
+                    // `:host(arg)` — matches the element that declared the
+                    // shadow template this rule came from. Flat expansion
+                    // (html.rs) splices the component's own <style> in as a
+                    // child of the host, and the rule's selector text is a
+                    // verbatim slice of that style — so the host is found by
+                    // looking for a direct <style> child containing this exact
+                    // `:host(...)` text, which can't leak across components.
+                    // shortcut: bare `:host{…}` can't identify its owner and
+                    // drops — usually `display:contents`, a no-op here anyway
+                    ("host", Some(a)) => {
+                        let raw = b[pstart..i].iter().collect::<String>();
+                        seg.pseudos
+                            .push(Pseudo::Host(Box::new(parse_compound(a.trim())?), raw));
+                    }
+                    ("host", None) => return None,
                     ("is" | "where", Some(a)) => {
                         // each comma-separated alternate must match; :where()
                         // contributes no specificity, :is() its best argument
@@ -2361,6 +2410,14 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
                         }
                     }
                 }
+                // `:host()` counts as a pseudo-class plus its argument's
+                Pseudo::Host(arg, _) => {
+                    cls += 1;
+                    let (i, c, t) = spec_of(std::slice::from_ref(&**arg));
+                    ids += i;
+                    cls += c;
+                    tags += t;
+                }
                 _ => cls += 1,
             }
         }
@@ -2402,8 +2459,21 @@ fn matches(dom: &Dom, node: u32, segs: &[Seg]) -> bool {
 }
 
 fn seg_matches(dom: &Dom, node: u32, seg: &Seg) -> bool {
+    // `slot[name=X]` also matches the light-DOM nodes projected into that
+    // slot (elements carrying `slot="X"`): flat shadow expansion leaves the
+    // slotted children as siblings of the empty <slot>, so a rule styling
+    // the slot must reach the content that renders there (shortcut: the
+    // slot's whole rule applies to projected nodes, not just display:none —
+    // ::slotted() isn't modeled either)
+    let projected = seg.tag.as_deref() == Some("slot")
+        && dom.tag(node) != "slot"
+        && seg.attrs.iter().any(|(n, v)| {
+            n == "name"
+                && v.as_ref()
+                    .is_some_and(|w| dom.attr(node, "slot").is_some_and(|g| g.eq_ignore_ascii_case(w)))
+        });
     if let Some(t) = &seg.tag {
-        if dom.tag(node) != t {
+        if dom.tag(node) != t && !projected {
             return false;
         }
     }
@@ -2422,6 +2492,9 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg) -> bool {
         }
     }
     for (name, want) in &seg.attrs {
+        if projected && name == "name" {
+            continue; // `name` was matched against the node's `slot` attr
+        }
         match dom.attr(node, name) {
             Some(v) => {
                 if let Some(w) = want {
@@ -2449,8 +2522,15 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg) -> bool {
 
 fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo) -> bool {
     match p {
-        // an element carrying an href; visit history isn't modeled
+        // an element carrying an href
         Pseudo::Link => dom.attr(node, "href").is_some(),
+        // visit history isn't modeled — a fresh render has no visited links
+        Pseudo::Visited => false,
+        // `:enabled`/`:disabled` are markup state: the `disabled` attribute on
+        // a form control. (Fieldset-inherited disabling isn't walked — see the
+        // parse-time note.)
+        Pseudo::Disabled => is_form_control(dom, node) && dom.attr(node, "disabled").is_some(),
+        Pseudo::Enabled => is_form_control(dom, node) && dom.attr(node, "disabled").is_none(),
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
@@ -2475,7 +2555,34 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo) -> bool {
         }
         // ANY alternate compound selector matches
         Pseudo::Is(alts, _) => alts.iter().any(|alt| seg_matches(dom, node, alt)),
+        // the host of the component that declared this rule: an element with
+        // a direct <style> child whose text contains the exact `:host(...)`
+        // selector text (flat shadow expansion splices that style into the
+        // host), and matching the argument
+        Pseudo::Host(arg, raw) => {
+            let owns_style = dom.nodes[node as usize].children.iter().any(|&c| {
+                dom.tag(c) == "style"
+                    && dom.nodes[c as usize].children.iter().any(|&t| {
+                        matches!(
+                            &dom.nodes[t as usize].kind,
+                            NodeKind::Text(txt) if txt.contains(raw.as_str())
+                        )
+                    })
+            });
+            owns_style && seg_matches(dom, node, arg)
+        }
     }
+}
+
+/// True for the form-control elements that participate in `:enabled`/
+/// `:disabled`. `fieldset` inherits disabling from an ancestor fieldset, but
+/// that inheritance isn't walked here — only the element's own `disabled`
+/// attribute is consulted (shortcut: no fieldset-ancestor walk).
+fn is_form_control(dom: &Dom, node: u32) -> bool {
+    matches!(
+        dom.tag(node),
+        "input" | "button" | "select" | "textarea" | "fieldset" | "optgroup" | "option"
+    )
 }
 
 /// Element children of `node`'s parent: `(node's 1-based index, total count)`
@@ -2841,9 +2948,10 @@ mod tests {
         assert_eq!(link.resolve(&dom, x, Style::new(), None).style.color, 0x123456);
         // …while an href-less <a> is a plain placeholder — no link styling
         assert_ne!(link.resolve(&dom, y, Style::new(), None).style.color, 0x123456);
-        // :visited matches the same set (visit history isn't modeled)
+        // :visited matches nothing (visit history isn't modeled, so a fresh
+        // render has no visited links — every anchor keeps its unvisited look)
         let visited = parse("a:visited { color: #654321 }");
-        assert_eq!(visited.resolve(&dom, x, Style::new(), None).style.color, 0x654321);
+        assert_ne!(visited.resolve(&dom, x, Style::new(), None).style.color, 0x654321);
         assert_ne!(visited.resolve(&dom, y, Style::new(), None).style.color, 0x654321);
     }
 
@@ -2856,6 +2964,46 @@ mod tests {
         let mut base = Style::new();
         base.underline = true; // UA default for anchors
         assert!(!sheet.resolve(&dom, node, base, None).style.underline);
+    }
+
+    #[test]
+    fn visited_pseudo_matches_nothing_when_history_unmodeled() {
+        // Visit history isn't modeled, so a fresh session has NO visited
+        // links. `a:visited` must therefore not win over the base `a` color —
+        // otherwise every unvisited link renders the visited (purple) color.
+        let dom = dom_of(r#"<a href=page>link</a>"#);
+        let node = by_tag(&dom, "a");
+        let sheet = parse("a { color: #36c } a:visited { color: #6a60b0 }");
+        assert_eq!(
+            sheet.resolve(&dom, node, Style::new(), None).style.color,
+            0x3366cc,
+            "unvisited link must keep the base `a` color, not the `:visited` color"
+        );
+    }
+
+    #[test]
+    fn enabled_disabled_are_static_markup_state() {
+        // `:enabled`/`:disabled` are determined by the `disabled` attribute,
+        // not by interaction state — they must be statically evaluable, not
+        // dropped like `:hover`.
+        let dom = dom_of(r#"<input id=a><input id=b disabled><div id=c></div>"#);
+        let sheet = parse("input:enabled { color: #123456 } input:disabled { color: #654321 }");
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "id", "a"), Style::new(), None).style.color,
+            0x123456,
+            "input without [disabled] is :enabled"
+        );
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "id", "b"), Style::new(), None).style.color,
+            0x654321,
+            "input with [disabled] is :disabled"
+        );
+        // a non-form-control element is neither :enabled nor :disabled
+        assert_ne!(
+            sheet.resolve(&dom, by_attr(&dom, "id", "c"), Style::new(), None).style.color,
+            0x123456,
+            "div is not a form control, so input:enabled must not leak onto it"
+        );
     }
 
     #[test]
@@ -2992,6 +3140,65 @@ mod tests {
         let dom = dom_of("<div class=a></div><div class=b></div>");
         assert!(sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).display_none);
         assert!(!sheet.resolve(&dom, by_attr(&dom, "class", "b"), Style::new(), None).display_none);
+    }
+
+    #[test]
+    fn not_pseudo_accepts_comma_separated_list() {
+        // `:not(A, B)` excludes a match against ANY member; a dynamic member
+        // (`:focus-within`) can never hold in a static pass and drops out,
+        // the rest still exclude
+        let sheet = parse(".x:not(.a, :focus-within) { color: #123456 }");
+        let dom = dom_of("<div id=plain class=x></div><div id=ex class=\"x a\"></div>");
+        let plain = by_attr(&dom, "id", "plain");
+        let ex = by_attr(&dom, "id", "ex");
+        assert_eq!(sheet.resolve(&dom, plain, Style::new(), None).style.color, 0x123456);
+        assert_ne!(sheet.resolve(&dom, ex, Style::new(), None).style.color, 0x123456);
+    }
+
+    #[test]
+    fn slot_name_selector_reaches_projected_light_dom() {
+        // flat shadow expansion keeps the slotted children as siblings of the
+        // (empty) <slot>; a rule on `slot[name=X]` must style them too, since
+        // that's where the content renders in a real shadow tree
+        let sheet = parse("slot[name=title] { color: #123456 }");
+        let dom = dom_of("<x-card><slot name=title></slot><h3 slot=title>T</h3></x-card>");
+        let slot = by_tag(&dom, "slot");
+        let h3 = by_tag(&dom, "h3");
+        assert_eq!(sheet.resolve(&dom, slot, Style::new(), None).style.color, 0x123456);
+        assert_eq!(sheet.resolve(&dom, h3, Style::new(), None).style.color, 0x123456);
+    }
+
+    #[test]
+    fn host_selector_binds_to_the_component_that_declared_it() {
+        // mdn-style declarative shadow root, post-expansion: the component's
+        // own <style> and <slot>s are children of the host, the light-DOM
+        // content carries slot="…". The closed-state rule hides the projected
+        // panel unless the host carries [loaded].
+        let markup = |loaded: &str| {
+            format!(
+                "<mdn-dropdown{loaded}><style>:host(:not([loaded],:focus-within)) \
+                 slot[name=dropdown]{{display:none}}</style><slot name=button></slot>\
+                 <slot name=dropdown></slot><button slot=button>Open</button>\
+                 <div class=\"menu__panel\" slot=dropdown>Menu</div></mdn-dropdown>"
+            )
+        };
+        let sheet =
+            parse(":host(:not([loaded],:focus-within)) slot[name=dropdown] { display: none }");
+        // closed (no [loaded]): the projected panel is hidden
+        let dom = dom_of(&markup(""));
+        let panel = by_attr(&dom, "slot", "dropdown");
+        assert!(sheet.resolve(&dom, panel, Style::new(), None).display_none);
+        // the sibling button slot is untouched
+        let btn = by_attr(&dom, "slot", "button");
+        assert!(!sheet.resolve(&dom, btn, Style::new(), None).display_none);
+        // opened (host carries [loaded]): the rule's :not() fails — visible
+        let dom2 = dom_of(&markup(" loaded=\"\""));
+        let panel2 = by_attr(&dom2, "slot", "dropdown");
+        assert!(!sheet.resolve(&dom2, panel2, Style::new(), None).display_none);
+        // outside any component the :host() part can't match — visible
+        let dom3 = dom_of("<div slot=dropdown>elsewhere</div>");
+        let out = by_attr(&dom3, "slot", "dropdown");
+        assert!(!sheet.resolve(&dom3, out, Style::new(), None).display_none);
     }
 
     #[test]
