@@ -152,7 +152,64 @@ pub fn parse(html: &str) -> Dom {
             }
         }
     }
+    expand_declarative_shadow_roots(&mut dom);
     dom
+}
+
+/// `<template shadowroot=...>` / `<template shadowrootmode=...>` with value
+/// `open` or `closed` (ASCII case-insensitive) declares a shadow root.
+fn is_declarative_shadow_template(dom: &Dom, idx: u32) -> bool {
+    ["shadowroot", "shadowrootmode"].iter().any(|&a| {
+        dom.attr(idx, a)
+            .is_some_and(|v| v.eq_ignore_ascii_case("open") || v.eq_ignore_ascii_case("closed"))
+    })
+}
+
+/// Post-parse pass: expand declarative shadow DOM templates.
+/// shortcut: FLAT EXPANSION only — the template's children are spliced into
+/// the parent's child list at the template's position and the template is
+/// unlinked; no real shadow-root abstraction, no `<slot>` distribution, no
+/// `::slotted`/scoped-style isolation (backlog). `shadowroot="closed"` is
+/// treated identically to `"open"` since rendering ignores the mode.
+/// Plain `<template>` (no shadowroot attr) is untouched: its children stay
+/// under the template node, which layout's NON_RENDERED list skips — i.e.
+/// inert per spec.
+fn expand_declarative_shadow_roots(dom: &mut Dom) {
+    // Each node is queued at most once (the tree is acyclic), so shadow
+    // templates nested inside shadow templates terminate without looping.
+    let mut queue = vec![0u32];
+    while let Some(i) = queue.pop() {
+        let children = std::mem::take(&mut dom.nodes[i as usize].children);
+        let mut kept = Vec::with_capacity(children.len());
+        for c in children {
+            if dom.tag(c) == "template" && is_declarative_shadow_template(dom, c) {
+                hoist_shadow_children(dom, i, c, &mut kept, &mut queue);
+                // the unlinked template node remains in the arena but is
+                // unreachable from the root, so layout never sees it
+            } else {
+                kept.push(c);
+                queue.push(c);
+            }
+        }
+        dom.nodes[i as usize].children = kept;
+    }
+}
+
+/// Recursively splice `tmpl`'s children into `parent`'s child list (`out`).
+/// shortcut: a shadow template nested directly inside another one (e.g. DSD
+/// emitted by nested web components) is expanded inline into the same parent,
+/// recursing — the parent was already walked, so a queue pass can't catch it.
+fn hoist_shadow_children(dom: &mut Dom, parent: u32, tmpl: u32, out: &mut Vec<u32>, queue: &mut Vec<u32>) {
+    let grandkids = std::mem::take(&mut dom.nodes[tmpl as usize].children);
+    for g in grandkids {
+        if dom.tag(g) == "template" && is_declarative_shadow_template(dom, g) {
+            hoist_shadow_children(dom, parent, g, out, queue);
+        } else {
+            dom.nodes[g as usize].parent = parent;
+            out.push(g);
+            queue.push(g); // descendants may hold more DSD templates
+        }
+    }
 }
 
 /// Implicit end tags for `<p>a<p>b`, `<li>x<li>y`, headings, cells and rows.
@@ -616,6 +673,81 @@ mod tests {
         let dom = parse("<html><head><title>x</title></head><body><p>hi</p></body></html>");
         let root = dom.body_root();
         assert_eq!(dom.tag(root), "body");
+    }
+
+    /// children (by tag or text) of `parent` in the live tree, in order
+    fn child_tags(dom: &Dom, parent: u32) -> Vec<String> {
+        dom.nodes[parent as usize]
+            .children
+            .iter()
+            .map(|&c| dom.tag(c).to_string())
+            .collect()
+    }
+
+    fn find_tag(dom: &Dom, name: &str) -> u32 {
+        (0..dom.nodes.len())
+            .find(|&i| dom.tag(i as u32) == name)
+            .expect("element not found") as u32
+    }
+
+    #[test]
+    fn declarative_shadow_template_hoists_children() {
+        // (a) <template shadowroot="open"> children become div's children
+        let dom = parse(r#"<div><template shadowroot="open"><p>hi</p></template></div>"#);
+        let div = find_tag(&dom, "div");
+        assert_eq!(child_tags(&dom, div), ["p"], "p should be a live child of div");
+        // template must be unreachable from the root (it lingers in the arena)
+        let mut seen = vec![false; dom.nodes.len()];
+        let mut stack = vec![0u32];
+        while let Some(i) = stack.pop() {
+            seen[i as usize] = true;
+            stack.extend(dom.nodes[i as usize].children.iter().copied());
+        }
+        assert!(
+            (0..dom.nodes.len()).all(|i| dom.tag(i as u32) != "template" || !seen[i]),
+            "template must not be reachable from the document root"
+        );
+        let p = find_tag(&dom, "p");
+        assert_eq!(dom.nodes[p as usize].parent, div, "hoisted p reparents to div");
+        assert_eq!(text_of(&dom), "hi");
+    }
+
+    #[test]
+    fn declarative_shadow_attr_order_and_case() {
+        // (b) either attribute spelling works, in any order, value case-insensitive
+        let dom = parse(
+            r#"<div><template shadowrootmode="open" shadowroot="closed"><p>one</p></template><template shadowroot=OPEN><p>two</p></template></div>"#,
+        );
+        let div = find_tag(&dom, "div");
+        assert_eq!(child_tags(&dom, div), ["p", "p"], "both templates hoist");
+        assert_eq!(text_of(&dom), "one|two");
+    }
+
+    #[test]
+    fn plain_template_stays_inert() {
+        // (c) <template> without a shadowroot attr keeps its contents off the live tree
+        let dom = parse("<div><template><p>x</p></template></div>");
+        let div = find_tag(&dom, "div");
+        assert_eq!(child_tags(&dom, div), ["template"], "template stays, p is not hoisted");
+        let tmpl = find_tag(&dom, "template");
+        assert_eq!(child_tags(&dom, tmpl), ["p"], "p remains inert under the template");
+        // and a bogus shadowroot value is not declarative shadow DOM either
+        let dom = parse(r#"<div><template shadowroot="garbage"><p>y</p></template></div>"#);
+        let div = find_tag(&dom, "div");
+        assert_eq!(child_tags(&dom, div), ["template"]);
+    }
+
+    #[test]
+    fn nested_declarative_shadow_templates_terminate() {
+        // (d) DSD inside DSD: everything hoists outward, no infinite loop
+        let dom = parse(
+            r#"<div><template shadowroot="open"><p>a</p><template shadowrootmode="closed"><span>b</span></template></template><p>after</p></div>"#,
+        );
+        let div = find_tag(&dom, "div");
+        assert_eq!(child_tags(&dom, div), ["p", "span", "p"]);
+        assert_eq!(text_of(&dom), "a|b|after");
+        let span = find_tag(&dom, "span");
+        assert_eq!(dom.nodes[span as usize].parent, div, "inner hoist reaches div");
     }
 }
 
