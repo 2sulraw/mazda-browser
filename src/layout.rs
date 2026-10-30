@@ -2,7 +2,7 @@
 //! shortcut: only inline/block split + word wrap (no float/flex/absolute);
 //! upgrade when a real CSS engine lands (Phase 1b+).
 
-use crate::css::{Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track};
+use crate::css::{decl, Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track};
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
 
@@ -117,35 +117,31 @@ fn style_for(tag: &str, base: Style) -> Style {
 /// Box-chrome defaults for form controls (`<select>`/`<input>`/
 /// `<textarea>`): the bordered, filled, padded box a desktop browser
 /// draws around them. Applied AFTER the author cascade, but only to
-/// properties still at their initial value — a declared author `border`/
-/// `background`/`padding`/`min-height`/`width` wins, the same override
-/// rule UA heading defaults get from `style_for`'s base style.
-/// shortcut: css.rs cascades from `BoxStyle::default()` and exposes no
-/// "declared" bit, so an author RESET to the initial value (`border:none`,
-/// `padding:0`, `background:none`) is indistinguishable from "not
-/// declared" and cannot suppress the UA chrome (and a color-less declared
-/// `border:1px solid` gets the UA gray instead of currentcolor) — a real
-/// fix needs css.rs to cascade over a UA base BoxStyle (owned elsewhere).
+/// properties the author did NOT declare — css.rs sets a [`decl`] bit on
+/// every box property an author/inline rule touches, so a declared value
+/// (including a reset to initial: `border:none`, `padding:0`,
+/// `background:none`) always wins over the UA chrome, and a color-less
+/// `border:1px solid` renders currentcolor instead of the UA gray.
 fn control_chrome(bx: &mut BoxStyle, min_h: f32, default_w: Option<f32>) {
-    if bx.border == [Len::Px(0.0); 4] {
+    if bx.declared & decl::BORDER == 0 {
         bx.border = [Len::Px(1.0); 4];
     }
-    if bx.bcolor.is_none() {
+    if bx.declared & decl::BCOLOR == 0 {
         bx.bcolor = Some(0x00_76_76_76); // UA control-border gray
     }
-    if bx.bg.is_none() {
+    if bx.declared & decl::BG == 0 {
         bx.bg = Some(0x00_f4_f4_f4); // light control fill
     }
-    if bx.pad == [Len::Px(0.0); 4] {
+    if bx.declared & decl::PAD == 0 {
         bx.pad = [Len::Px(0.0), Len::Px(3.0), Len::Px(0.0), Len::Px(3.0)];
     }
-    if bx.radius == Len::Px(0.0) {
+    if bx.declared & decl::RADIUS == 0 {
         bx.radius = Len::Px(2.0);
     }
-    if bx.min_height.is_none() {
+    if bx.declared & decl::MIN_HEIGHT == 0 {
         bx.min_height = Some(Len::Px(min_h));
     }
-    if bx.width.is_none() {
+    if bx.declared & decl::WIDTH == 0 {
         bx.width = default_w.map(Len::Px);
     }
 }
@@ -2878,6 +2874,42 @@ mod tests {
         // undeclared properties keep the UA defaults
         assert!(sel.bx.radius == Len::Px(2.0), "UA radius survives");
         assert!(sel.inline, "still inline");
+    }
+
+    #[test]
+    fn author_border_none_suppresses_ua_chrome() {
+        // a RESET to initial must suppress the UA chrome (previously
+        // indistinguishable from "not declared")
+        let dom = crate::html::parse(r#"<div><select id="s"><option>X</option></select></div>"#);
+        let sheet = crate::css::parse(
+            r#"select { border: none; padding: 0; background: none; }"#,
+        );
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let sel = controls(&root)[0];
+        assert!(sel.bx.border == [Len::Px(0.0); 4], "border:none suppresses UA border");
+        assert!(sel.bx.pad == [Len::Px(0.0); 4], "padding:0 suppresses UA padding");
+        assert_eq!(sel.bx.bg, None, "background:none suppresses UA fill");
+    }
+
+    #[test]
+    fn author_colorless_border_uses_currentcolor_not_ua_gray() {
+        // `border:1px solid` (no color) = currentcolor per spec, not UA gray
+        let dom = crate::html::parse(r#"<div><input value="x"></div>"#);
+        let sheet = crate::css::parse(r#"input { border: 1px solid; }"#);
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let inp = controls(&root)[0];
+        assert!(inp.bx.border == [Len::Px(1.0); 4], "declared width kept");
+        assert_eq!(inp.bx.bcolor, None, "colorless border = currentcolor, not UA gray");
+    }
+
+    #[test]
+    fn author_explicit_border_color_wins_over_ua_gray() {
+        let dom = crate::html::parse(r#"<div><input value="x"></div>"#);
+        let sheet = crate::css::parse(r#"input { border-color: #ff0000; }"#);
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let inp = controls(&root)[0];
+        assert_eq!(inp.bx.bcolor, Some(0x00_ff_00_00), "author border-color wins");
+        assert!(inp.bx.border == [Len::Px(1.0); 4], "UA width survives a color-only decl");
     }
 
     #[test]

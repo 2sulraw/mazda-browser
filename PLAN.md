@@ -257,7 +257,11 @@ curve matters more than the baseline (near-flat as tabs grow).
   rust-lang hero = Alfa Slab One (21 KB woff), body Fira Sans, HN Verdana,
   Wikipedia pixel-unchanged; 140 tests; `74eb2f3`)**
   Known gap: WOFF2 (`wOF2`) decodes to None → MDN (Inter) and nextjs (Geist)
-  still use generics until a Brotli+woff2 decoder chain lands; no bold/italic
+  still use generics. WOFF2 stays unsupported (verified `a182f8f`): the one
+  pure-Rust WOFF2 decoder mandates `safer-bytes ^0.2.0`, whose only 0.2.x
+  returns a different error type than the decoder expects (never compiled;
+  can't be pinned into working), and the maintained alternative ships a
+  shaping engine duplicating the one we already use. No bold/italic
   variants for installed aliases (regular file only); webfont face selection
   is a coarse (weight-range, italic) bucket — no synthesis
 - [x] **form-control chrome** — ~~`<select>` rendered as bare unboxed text and
@@ -273,12 +277,18 @@ curve matters more than the baseline (near-flat as tabs grow).
   out (rust-lang's language row no longer pulls in the CJK font → ~14 MB,
   was ~28 MB). Also fixed: `font-family: inherit` (normalize.css ships it
   on selects) keeps the parent stack instead of interning the word
-  "inherit" as a family. 147 tests; `f80f646` + `346de80`)**
+  "inherit" as a family. Follow-up DONE: `BoxStyle` now carries a
+  `declared` bitmask ([`css::decl`] flags) set whenever an author/inline
+  rule touches border/border-color/background/padding/border-radius/
+  min-height/width, so `control_chrome()` fills only properties the author
+  did NOT declare — an author reset (`border:none`, `padding:0`,
+  `background:none`) now suppresses the UA chrome, and a color-less
+  `border:1px solid` renders currentcolor instead of the UA gray.
+  150 tests; `f80f646` + `346de80` + this)**
   Known gap: `multiple`/`size>1` selects and textarea `rows`/`cols` render
   as the closed single-line control (no popup/listbox widget yet); the
   arrow is the ▼ text glyph, not theme-drawn art; checkbox/radio have no
-  widget art; author `border:none` can't fully suppress UA chrome
-  (BoxStyle starts from `default()`, no declared-bit — css.rs follow-up)
+  widget art)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study

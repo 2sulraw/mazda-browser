@@ -118,6 +118,27 @@ pub struct BoxStyle {
     pub inset: [Option<Len>; 4],
     /// `box-shadow` list, first = topmost (paint order reversed)
     pub shadows: Vec<Shadow>,
+    /// Bitmask of [`decl`] flags: which box properties the author CSS
+    /// actually declared. Lets UA control chrome (`control_chrome` in
+    /// layout.rs) fill only the properties the author left initial, so an
+    /// author `border:none` / `padding:0` / `background:none` suppresses the
+    /// chrome and a color-less `border:1px solid` renders currentcolor
+    /// instead of the UA gray. Zero = nothing declared (plain default box).
+    pub declared: u32,
+}
+
+/// Bits for [`BoxStyle::declared`]: one per property UA control chrome fills.
+/// `BCOLOR` is separate from `BORDER` so the `border` shorthand (which always
+/// declares a color, defaulting to currentcolor) suppresses the UA gray even
+/// when no explicit color token is present.
+pub mod decl {
+    pub const BORDER: u32 = 1 << 0;
+    pub const BCOLOR: u32 = 1 << 1;
+    pub const BG: u32 = 1 << 2;
+    pub const PAD: u32 = 1 << 3;
+    pub const RADIUS: u32 = 1 << 4;
+    pub const MIN_HEIGHT: u32 = 1 << 5;
+    pub const WIDTH: u32 = 1 << 6;
 }
 
 /// One outer `box-shadow`: offset, blur, spread, color. `color: None` =
@@ -161,6 +182,7 @@ impl Default for BoxStyle {
             pos: Pos::Static,
             inset: [None; 4],
             shadows: Vec::new(),
+            declared: 0,
         }
     }
 }
@@ -944,6 +966,7 @@ fn apply_decl(
             }
         }
         "background" | "background-color" => {
+            bx.declared |= decl::BG;
             if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 *bg = Some(c);
                 bx.bg = Some(c); // per-box fill (cards, nav bars)
@@ -1099,9 +1122,19 @@ fn apply_decl(
                 bx.grid_col = Some(first.to_string());
             }
         }
-        "width" => bx.width = parse_len(&d.1).filter(|_| d.1 != "auto"),
+        "width" => {
+            if let Some(l) = parse_len(&d.1).filter(|_| d.1 != "auto") {
+                bx.width = Some(l);
+                bx.declared |= decl::WIDTH;
+            }
+        }
         "height" => bx.height = parse_len(&d.1).filter(|_| d.1 != "auto"),
-        "min-height" => bx.min_height = parse_len(&d.1).filter(|_| d.1 != "auto"),
+        "min-height" => {
+            if let Some(l) = parse_len(&d.1).filter(|_| d.1 != "auto") {
+                bx.min_height = Some(l);
+                bx.declared |= decl::MIN_HEIGHT;
+            }
+        }
         "max-width" => {
             bx.max_width = if d.1 == "none" {
                 None
@@ -1119,7 +1152,10 @@ fn apply_decl(
                 bx.margin_x_auto = true;
             }
         }
-        "padding" => bx.pad = parse_sides(&d.1),
+        "padding" => {
+            bx.pad = parse_sides(&d.1);
+            bx.declared |= decl::PAD;
+        }
         "margin-top" => bx.margin[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
         "margin-bottom" => bx.margin[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
         "margin-left" | "margin-inline" | "margin-inline-start" => {
@@ -1136,14 +1172,27 @@ fn apply_decl(
                 bx.margin[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
             }
         }
-        "padding-top" => bx.pad[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
-        "padding-right" => bx.pad[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
-        "padding-bottom" => bx.pad[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
-        "padding-left" => bx.pad[3] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "padding-top" => {
+            bx.pad[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "padding-right" => {
+            bx.pad[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "padding-bottom" => {
+            bx.pad[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "padding-left" => {
+            bx.pad[3] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
         // first value only (per-corner radii: shortcut)
         "border-radius" | "border-top-left-radius" => {
             if let Some(v) = d.1.split_whitespace().next().and_then(parse_len) {
                 bx.radius = v;
+                bx.declared |= decl::RADIUS;
             }
         }
         // style words (solid/dashed/dotted) ignored — everything renders solid;
@@ -1155,12 +1204,20 @@ fn apply_decl(
                 bx.border = [w; 4];
             }
             bx.bcolor = c;
+            // the shorthand always declares the border (width+color, color
+            // defaulting to currentcolor) — even `border:none` must suppress
+            // the UA chrome rather than read as "undeclared"
+            bx.declared |= decl::BORDER | decl::BCOLOR;
         }
-        "border-width" => bx.border = parse_sides(&d.1),
+        "border-width" => {
+            bx.border = parse_sides(&d.1);
+            bx.declared |= decl::BORDER;
+        }
         "border-color" => {
             if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 bx.bcolor = Some(c);
             }
+            bx.declared |= decl::BCOLOR;
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
             let side = match d.0.as_str() {
@@ -1175,6 +1232,10 @@ fn apply_decl(
             }
             if c.is_some() {
                 bx.bcolor = c;
+            }
+            bx.declared |= decl::BORDER;
+            if c.is_some() {
+                bx.declared |= decl::BCOLOR;
             }
         }
         "position" => {
