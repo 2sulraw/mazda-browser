@@ -825,14 +825,19 @@ impl Sheet {
         let mut display_none = false;
         let mut bx = BoxStyle::default();
         // used color scheme for THIS element (own declaration, else the
-        // nearest ancestor's — the property inherits) — decides light-dark()
-        let dark = self.used_dark(dom, node, inline);
+        // nearest ancestor's — the property inherits) — decides light-dark().
+        // Some(…) = a color-scheme declaration was actually found; needed
+        // below to tell a declared dark scheme from the preference fallback
+        let scheme = self.declared_dark(dom, node, inline);
+        let dark = scheme.unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK));
+        let mut color_declared = false;
 
         for rule in &self.rules {
             if !matches(dom, node, &rule.segs) {
                 continue;
             }
             for d in &rule.decls {
+                color_declared |= d.0 == "color";
                 let sd = self.subst(d);
                 let fs = self.fam_stack_of(&sd);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
@@ -843,12 +848,26 @@ impl Sheet {
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
+                color_declared |= d.0 == "color";
                 let sd = self.subst(d);
                 let fs = self.fam_stack_of(&sd);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
                 }
             }
+        }
+        // The UA default text color (Style::new's black) is scheme-blind, but
+        // per CSS UI the canvas-text default follows the USED color scheme:
+        // with a declared dark scheme an author-colored-nothing page must get
+        // light text, or every text paints black-on-#222 near-invisible
+        // (example.com: `color-scheme: light dark` + light-dark() canvas).
+        // Only a DECLARED scheme flips it — undeclared pages keep the
+        // light-canvas black default (real browsers don't dark-opt them in).
+        // shortcut: packed colors carry no declared-bit, so a literal black
+        // declared up-tree flips with the default (rare: explicit black text
+        // under a dark-scheme root).
+        if dark && scheme.is_some() && !color_declared && style.color == 0x00_00_00 {
+            style.color = 0xff_ff_ff;
         }
         StyleOutcome {
             style,
@@ -896,19 +915,27 @@ impl Sheet {
     /// root `color-scheme: light` reaches descendants that don't override
     /// it), else the root's theme polarity, else the system preference.
     fn used_dark(&self, dom: &Dom, node: u32, inline: Option<&str>) -> bool {
+        self.declared_dark(dom, node, inline)
+            .unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK))
+    }
+
+    /// Like [`used_dark`], but `None` when NO ancestor declared
+    /// `color-scheme` — callers that must tell a declared scheme apart from
+    /// the bare preference fallback (the default text color only follows a
+    /// scheme the page opted into) need the distinction.
+    fn declared_dark(&self, dom: &Dom, node: u32, inline: Option<&str>) -> Option<bool> {
         let mut n = node;
         loop {
             let here = if n == node { inline } else { dom.attr(n, "style") };
             if let Some(v) = self.own_scheme(dom, n, here) {
-                return used_scheme(Some(&v), self.root_pol, PREFERS_DARK);
+                return Some(used_scheme(Some(&v), self.root_pol, PREFERS_DARK));
             }
             let parent = dom.nodes[n as usize].parent;
             if parent == n {
-                break; // document root (its parent is itself)
+                return None; // document root (its parent is itself)
             }
             n = parent;
         }
-        used_scheme(None, self.root_pol, PREFERS_DARK)
     }
 
     /// The used color-scheme polarity for `node` (true = dark) — what a
@@ -4198,6 +4225,63 @@ mod tests {
         let sheet = parse("p { color: var(--missing, light-dark(#222222, #333333)) }");
         let dom = dom_of("<p></p>");
         assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0x333333);
+    }
+
+    #[test]
+    fn light_dark_arm_per_declared_scheme_keyword() {
+        // the declared keyword picks the light-dark() arm: `dark` pins the
+        // dark arm, `light` the light arm, `normal`/`unset` carry no usable
+        // keyword and fall to the system preference (dark: PREFERS_DARK)
+        let dom = dom_of("<html><p></p></html>");
+        for (scheme, expect) in [
+            ("dark", 0xeeeeee),
+            ("only dark", 0xeeeeee),
+            ("light", 0x111111),
+            ("only light", 0x111111),
+            ("normal", 0xeeeeee),
+            ("unset", 0xeeeeee),
+            ("light dark", 0xeeeeee),
+            ("dark light", 0xeeeeee),
+        ] {
+            let sheet = parse(&format!(
+                "html {{ color-scheme: {scheme} }} p {{ color: light-dark(#111111, #eeeeee) }}"
+            ));
+            assert_eq!(
+                style_for_tag(&sheet, &dom, "p").color,
+                expect,
+                "color-scheme: {scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_dark_scheme_flips_undeclared_text_color() {
+        // example.com's shape: `html { color-scheme: light dark; background:
+        // light-dark(#eee, #222) }` and NO `color` anywhere — the UA default
+        // text color follows the USED scheme (CSS UI: canvas-text), or every
+        // undeclared text paints black-on-#222, near-invisible. The heading
+        // and the paragraph carry no author color at all here.
+        let dom = dom_of("<html><body><h1>T</h1><p>T</p></body></html>");
+        let sheet = parse("html { color-scheme: light dark }");
+        assert_eq!(
+            style_for_tag(&sheet, &dom, "h1").color,
+            0xff_ff_ff,
+            "h1 default text light under declared dark scheme"
+        );
+        assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0xff_ff_ff);
+        // a pinned `dark` flips too; a pinned `light` keeps black
+        let dark_pin = parse("html { color-scheme: dark }");
+        assert_eq!(style_for_tag(&dark_pin, &dom, "h1").color, 0xff_ff_ff);
+        let light_pin = parse("html { color-scheme: light }");
+        assert_eq!(style_for_tag(&light_pin, &dom, "h1").color, 0x00_00_00);
+        // no color-scheme declaration anywhere → the light-canvas black
+        // default stays (a real browser keeps undeclared pages light even on
+        // a dark OS — only a declared scheme opts a page into dark)
+        let none = parse("p { font-size: 16px }");
+        assert_eq!(style_for_tag(&none, &dom, "p").color, 0x00_00_00);
+        // an author color always wins over the scheme default
+        let author = parse("html { color-scheme: dark } p { color: #123456 }");
+        assert_eq!(style_for_tag(&author, &dom, "p").color, 0x12_34_56);
     }
 
     #[test]
