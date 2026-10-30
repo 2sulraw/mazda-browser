@@ -223,10 +223,11 @@ pub struct BoxNode {
     pub link: Option<std::rc::Rc<str>>,
     /// `<img>` replacement data (None for every other box)
     pub img: Option<ImgSlot>,
-    /// inline-block placement: the box sits on the surrounding text line
+    /// inline-level placement: the box sits on the surrounding text line
     /// (shrink-to-fit, vertically centered) instead of opening its own
-    /// block line — UA form-control chrome (`<select>`/`<input>`/
-    /// `<textarea>`) sets it; `block()` is the only flow that reads it
+    /// block line — set for UA form-control chrome (`<select>`/`<input>`/
+    /// `<textarea>`) and for author `display: inline-block`; `block()` is
+    /// the only flow that reads it
     pub inline: bool,
     pub children: Vec<BoxNode>,
     // layout output (absolute CSS px)
@@ -353,6 +354,9 @@ fn build_into(
                     if let Some(src) = dom.attr(child, "src").filter(|s| !s.is_empty()) {
                         g.img = Some(ImgSlot::Pending(std::rc::Rc::from(src)));
                     }
+                    // author `inline-block` on a replaced box sits on the
+                    // text line like any other inline-block
+                    g.inline = g.bx.display == Display::InlineBlock;
                     out.push(g);
                     continue;
                 }
@@ -388,6 +392,7 @@ fn build_into(
                         g.bx.height = dom.attr(child, "height").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
                     }
                     g.img = Some(ImgSlot::Pending(std::rc::Rc::from(markup)));
+                    g.inline = g.bx.display == Display::InlineBlock;
                     out.push(g);
                     continue;
                 }
@@ -466,12 +471,11 @@ fn build_into(
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
                     control_chrome(&mut g.bx, min_h, def_w);
                     // UA default (no author `display` declared) = the control
-                    // joins the surrounding text line; a declared
-                    // `display:block/flex/grid` opts out and stacks.
-                    // shortcut: css.rs maps an author `inline-block` to Block,
-                    // so a DECLARED inline-block select stacks exactly like
-                    // buttons do (same engine-wide shortcut)
-                    g.inline = g.bx.display == Display::Auto;
+                    // joins the surrounding text line; an author
+                    // `display:inline-block` keeps that placement (inline-level
+                    // in real engines too); `display:block/flex/grid` opts out
+                    // and stacks.
+                    g.inline = matches!(g.bx.display, Display::Auto | Display::InlineBlock);
                     if let Some(t) = text {
                         g.children.push(BoxNode::leaf(
                             outcome.style,
@@ -483,8 +487,9 @@ fn build_into(
                     out.push(g);
                     continue;
                 }
-                // which elements get a box: flex/grid/block always; inline
-                // tags only when CSS says so; Auto follows the tag
+                // which elements get a box: flex/grid/block/inline-block
+                // always; inline tags only when CSS says so; Auto follows
+                // the tag
                 let boxed = match outcome.bx.display {
                     Display::Auto => is_block(tag),
                     Display::Inline => false,
@@ -492,6 +497,10 @@ fn build_into(
                 };
                 if boxed {
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    // inline-block: a real box (background/border paint),
+                    // but placed ON the surrounding text line by block()'s
+                    // inline branch instead of stacking
+                    g.inline = g.bx.display == Display::InlineBlock;
                     build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
                     out.push(g);
                 } else {
@@ -1165,10 +1174,14 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32) -> Vec<f32> {
 /// block boundaries (matches the legacy hard_break semantics: gap only after
 /// content, never between empty breaks).
 ///
-/// Boxes with `inline` set (the `<select>`/`<input>`/`<textarea>` chrome)
-/// join the current text line instead of opening their own: shrink-to-fit
-/// width, vertically centered against what is already on the line, and the
-/// text after them continues on that same line.
+/// Boxes with `inline` set (UA form-control chrome, author `display:
+/// inline-block`) join the current text line instead of opening their own:
+/// shrink-to-fit width, vertically centered against what is already on the
+/// line, and the text after them continues on that same line.
+/// shortcut: centering approximates baseline alignment (a real engine
+/// aligns the inline-block's text baseline to the line's), and a box
+/// wider than its container overflows instead of shrink-wrapping its
+/// content to fit (no min-content measure).
 fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<PositionedRun>, uls: &mut Vec<UR>) {
     // y = bottom of the last closed content. While `cont` is Some, the
     // current line is still open: (line_top, line_h, cursor x relative to
@@ -1241,7 +1254,8 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             }
             i += 1;
         } else if n.children[i].inline {
-            // form-control box: shrink-to-fit, joins the current line
+            // inline-level box (form control / author inline-block):
+            // shrink-to-fit, joins the current line
             let (mut line_top, mut line_h, mut cx) = cont.unwrap_or((y, 0.0, 0.0));
             let mut avail = (n.w - cx).max(0.0);
             let mut bw = natural_w(&n.children[i], avail, measure);
@@ -2822,6 +2836,81 @@ mod tests {
         assert!((eng.y - lang.y).abs() <= 2.0, "select on the text line");
         assert!((ok.y - lang.y).abs() <= 2.0, "text continues on that line");
         assert!(eng.x > lang.x + lang.width, "label starts inside the box");
+    }
+
+    #[test]
+    fn inline_block_sits_on_the_text_line() {
+        let dom = crate::html::parse(r#"<p>pre <span class="ib">mid</span> post</p>"#);
+        let sheet = crate::css::parse(
+            r#".ib { display: inline-block; background: #ff0000; border: 1px solid; padding: 2px; }"#,
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 1, "one inline-level box");
+            let ib = cs[0];
+            assert!(ib.bx.display == Display::InlineBlock, "display is InlineBlock");
+            assert!(ib.inline, "inline placement");
+            assert_eq!(ib.bx.bg, Some(0x00_ff_00_00), "background renders (real box)");
+            assert!(ib.bx.border[0] == Len::Px(1.0), "border renders (real box)");
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let pre = l.runs.iter().find(|r| r.text == "pre").expect("pre run");
+        let mid = l.runs.iter().find(|r| r.text == "mid").expect("mid run");
+        let post = l.runs.iter().find(|r| r.text == "post").expect("post run");
+        // all three on ONE line — the box's border+padding offset its inner
+        // text a few px, but far less than a stacked line height (~20px);
+        // the x-advancement below is the stronger same-line proof
+        assert!((mid.y - pre.y).abs() < 10.0, "box on the text line (dy={})", mid.y - pre.y);
+        assert!((post.y - pre.y).abs() < 10.0, "text continues after the box");
+        // x advances left-to-right: pre → mid (inside box) → post
+        assert!(pre.x < mid.x, "mid after pre: {} vs {}", mid.x, pre.x);
+        assert!(mid.x < post.x, "post after mid: {} vs {}", post.x, mid.x);
+    }
+
+    #[test]
+    fn two_inline_blocks_share_one_line() {
+        let dom = crate::html::parse(r#"<div><span class="ib">A</span><span class="ib">B</span></div>"#);
+        let sheet = crate::css::parse(r#".ib { display: inline-block; border: 1px solid; padding: 2px; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 2, "two inline-level boxes");
+            assert!(cs[0].inline && cs[1].inline, "both inline placement");
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let a = l.runs.iter().find(|r| r.text == "A").expect("A run");
+        let b = l.runs.iter().find(|r| r.text == "B").expect("B run");
+        // side by side on one line: same y, B to the right of A
+        assert!((b.y - a.y).abs() <= 2.0, "same line: A.y={} B.y={}", a.y, b.y);
+        assert!(b.x > a.x, "B right of A: {} vs {}", b.x, a.x);
+    }
+
+    #[test]
+    fn inline_block_wraps_when_it_does_not_fit() {
+        // "xx" opens the line; the wide inline-block doesn't fit after it in
+        // a 30px container, so it wraps to a fresh line below (not overflow)
+        let dom = crate::html::parse(r#"<div>xx<span class="ib">WWWWWWWWWW</span></div>"#);
+        let sheet = crate::css::parse(r#".ib { display: inline-block; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 30.0, &m4);
+        let xx = l.runs.iter().find(|r| r.text == "xx").expect("xx run");
+        let w = l.runs.iter().find(|r| r.text.starts_with('W')).expect("box run");
+        assert!(w.y > xx.y + 1.0, "wrapped below: xx.y={} box.y={}", xx.y, w.y);
+    }
+
+    #[test]
+    fn inline_flex_and_inline_grid_still_stack_as_blocks() {
+        // shortcut: inline-flex/inline-grid map to Block (no inline layout
+        // mode) — they stack rather than sit mid-line; asserted so the
+        // known gap is explicit
+        let dom = crate::html::parse(r#"<div><span class="ib">A</span><span class="ib">B</span></div>"#);
+        let sheet = crate::css::parse(r#".ib { display: inline-flex; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let a = l.runs.iter().find(|r| r.text == "A").expect("A run");
+        let b = l.runs.iter().find(|r| r.text == "B").expect("B run");
+        assert!(b.y > a.y + 1.0, "inline-flex stacks (documented shortcut)");
     }
 
     #[test]

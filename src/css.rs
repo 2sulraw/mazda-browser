@@ -33,6 +33,10 @@ pub enum Display {
     /// inline tag → flatten into the parent's text flow)
     Auto,
     Inline,
+    /// `display: inline-block` — a real box (background/border paint) that
+    /// sits ON the surrounding text line: shrink-to-fit, vertically
+    /// centered, text after it continues on that line
+    InlineBlock,
     Block,
     Flex,
     Grid,
@@ -1039,10 +1043,13 @@ fn apply_decl(
             "flex" => bx.display = Display::Flex,
             "grid" => bx.display = Display::Grid,
             "block" => bx.display = Display::Block,
-            // inline-block/inline-flex/inline-grid get a real box so their
-            // background/border/paint (buttons, badges) actually renders —
-            // shortcut: they stack as blocks instead of sitting mid-line
-            "inline-block" | "inline-flex" | "inline-grid" => bx.display = Display::Block,
+            // inline-block: a real box that still sits on the text line
+            // (layout.rs `block()` places `inline` boxes mid-line)
+            "inline-block" => bx.display = Display::InlineBlock,
+            // shortcut: inline-flex/inline-grid still stack as blocks — a
+            // real engine lays their flex/grid session out mid-line, which
+            // needs an inline layout mode this engine doesn't have yet
+            "inline-flex" | "inline-grid" => bx.display = Display::Block,
             "inline" => bx.display = Display::Inline,
             _ => {}
         },
@@ -2932,6 +2939,22 @@ mod tests {
         // no declarations → Auto (follow the tag)
         let plain = sheet.resolve(&dom, by_attr(&dom, "class", "nocls"), Style::new(), None);
         assert_eq!(plain.bx.display, Display::Auto);
+    }
+
+    #[test]
+    fn inline_block_maps_to_inlineblock_display() {
+        let sheet = parse(
+            ".ib { display: inline-block } .iflex { display: inline-flex } .igrid { display: inline-grid }",
+        );
+        let dom = dom_of(
+            r#"<div class=ib></div><div class=iflex></div><div class=igrid></div>"#,
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("ib").display, Display::InlineBlock);
+        // shortcut: inline-flex/inline-grid still collapse to Block (no
+        // inline layout mode yet)
+        assert_eq!(bx("iflex").display, Display::Block);
+        assert_eq!(bx("igrid").display, Display::Block);
     }
 
     #[test]

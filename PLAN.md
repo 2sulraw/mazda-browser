@@ -197,8 +197,12 @@ curve matters more than the baseline (near-flat as tabs grow).
   (`natural_w_inner` caps at `avail`). Verified: HN header gap, MDN wide hero,
   rust-lang full nav + yellow button + black title, Wikipedia heading size — all
   match the reference browser; 113 tests; `f057898`)**
-  Known gap: inline-block boxes stack as blocks instead of sitting mid-line; inline
-  margins approximate to one space (not pixel-exact)
+  Known gap: inline margins approximate to one space (not pixel-exact).
+  Follow-up DONE (inline-block round): author `display:inline-block`
+  now maps to `Display::InlineBlock` and sits ON the text line (shrink-to-fit,
+  `block()`'s inline branch), so buttons/badges paint AND flow inline; only
+  `inline-flex`/`inline-grid` still stack (honest `shortcut:` — no inline
+  flex/grid layout mode yet)
 - [x] **var() theme scoping** — ~~Wikipedia rendered dark with invisible text
   (night-scoped vars leaked past the `clientpref-day` root)~~ **DONE: `Sheet.var_defs`
   records every custom-prop definition with its selector; `scope_vars(&Dom, html)` rewrites
@@ -344,6 +348,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | font stacks + @font-face webfonts | hackernews | 12.9 MB (786 runs; Verdana via system alias) |
 | 2026-10-30 | font stacks + @font-face webfonts | Wikipedia (Main_Page) | 34.6 MB (1326 runs; pixel-unchanged) |
 | 2026-10-30 | form-control chrome | rust-lang.org | 14.0 MB (483 runs; select = one line, options never laid out → CJK font not pulled) |
+| 2026-10-30 | inline-block sits on the text line | nextjs.org | 43.0 MB (571 runs; no regression) |
+| 2026-10-30 | inline-block sits on the text line | rust-lang.org | 14.8 MB (483 runs; pixel-unchanged, same 2 webfonts) |
 
 ### Phase 1c (Track A) findings
 
