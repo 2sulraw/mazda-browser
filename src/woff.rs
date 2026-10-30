@@ -1,6 +1,6 @@
 //! Font container decoding: raw sfnt + WOFF1 (`wOFF`) → raw sfnt for ab_glyph.
 //! shortcut: no WOFF2 (`wOF2`, Brotli) — rejects to None, caller falls back
-//! to the site's stack/generic font (separate follow-up).
+//! to the site's stack/generic font (see PLAN.md for why it's blocked).
 
 use std::io::Read;
 
@@ -12,9 +12,10 @@ const MAX_FONT_BYTES: usize = 256 << 20;
 
 /// Decode font bytes in any container we support to a raw sfnt
 /// (`\0\x1\0\0`/OTTO/true) parseable by the font lib.
-/// `wOF2` (WOFF2/Brotli) → None for now — caller falls back to the
-/// site's stack/generic font. shortcut: no WOFF2 yet (needs a Brotli
-/// decoder; separate follow-up).
+/// `wOF2` (WOFF2/Brotli) → None — caller falls back to the next `src` URL
+/// or the site's generic font. shortcut: no WOFF2; see PLAN.md (the one
+/// pure-Rust crate that decodes it does not compile against its own pinned
+/// deps, and the alternative ships a shaping engine we don't need).
 pub fn decode_font(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     // four sfnt version magics: TrueType, CFF, True, type1
     if bytes.starts_with(&[0x00, 0x01, 0x00, 0x00])
@@ -218,8 +219,9 @@ mod tests {
 
     #[test]
     fn woff2_returns_none_honest_fallback() {
-        // shortcut: no WOFF2 yet (needs a Brotli decoder; separate follow-up)
+        // no WOFF2 decoder (see module doc) — reject rather than render wrong
         assert!(decode_font(b"wOF2\x00\x00\x00\x01brotli bytes here").is_none());
+        assert!(decode_font(b"wOF2").is_none()); // truncated header
     }
 
     #[test]
