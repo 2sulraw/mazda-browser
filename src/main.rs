@@ -3,6 +3,7 @@
 mod css;
 mod html;
 mod image;
+mod js;
 mod layout;
 mod svg;
 mod ui_chrome;
