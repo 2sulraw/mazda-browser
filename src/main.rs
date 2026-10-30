@@ -169,6 +169,9 @@ impl App {
                 images: Vec::new(),
                 shadows: Vec::new(),
                 open_line: false,
+                forms: Vec::new(),
+                focused: None,
+                form_values: Default::default(),
             },
             bg: BG,
         };
@@ -705,6 +708,10 @@ fn wire_to_page(w: PageWire) -> Page {
                 .collect(),
             shadows: w.shadows,
             open_line: false, // paint-only consumer; flow state not needed
+            // fresh load: no focused field / typed values survive a navigation
+            forms: Vec::new(),
+            focused: None,
+            form_values: Default::default(),
         },
     }
 }
@@ -2096,6 +2103,9 @@ mod tests {
                 fixed: false,
             }],
             open_line: true,
+            forms: Vec::new(),
+            focused: None,
+            form_values: Default::default(),
         };
         let page = Page {
             url: "https://example.com/".into(),
