@@ -469,8 +469,9 @@ mod tests {
 
     #[test]
     fn ellipsis_reserves_its_own_room() {
-        // 3 chars = 15 + 4 ell = 19 > 18 → keep 2 (10 + 4 = 14 ≤ 18)
-        assert_eq!(ellipsized_chars(&[5.0, 5.0, 5.0], 18.0, 4.0), 2);
+        // 15 > 14 → truncate, reserving the ellipsis: 5+4=9≤14, 10+4=14≤14 → keep 2
+        assert_eq!(ellipsized_chars(&[5.0, 5.0, 5.0], 14.0, 4.0), 2);
+        // total 15 fits in 19 → no ellipsis at all
         assert_eq!(ellipsized_chars(&[5.0, 5.0, 5.0], 19.0, 4.0), 3);
         // even one char cannot survive if char + ellipsis overflow
         assert_eq!(ellipsized_chars(&[5.0], 3.0, 4.0), 0);
