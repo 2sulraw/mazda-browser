@@ -5,6 +5,7 @@
 use crate::css::{decl, Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track};
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
+use std::collections::HashMap;
 
 /// Resolved generic font family (CSS `font-family` stack → first known
 /// generic; unknown names are skipped, default = Sans).
@@ -211,6 +212,86 @@ impl ImgSlot {
     }
 }
 
+/// What a form-control box does — decides hit-test semantics, focus
+/// painting and the value shown. Built from the element tag + `type`
+/// attribute during [`build`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FormKind {
+    /// text-ish `<input>` (text/search/email/url/tel/number/absent type)
+    /// and `<textarea>` — focusable, takes typed text, shows a caret
+    TextInput { password: bool },
+    /// `<input type=checkbox>` — small square, toggle on click
+    Checkbox,
+    /// `<input type=radio>` — small circle, select one in a group
+    Radio,
+    /// `<input type=submit|button|reset>` and the `<button>` element —
+    /// activation on click (shortcut: no form POST, the shell logs
+    /// `[form] submit name=value`)
+    Submit,
+    /// `<select>` — closed one-line display only (no popup yet; kept
+    /// working as before, but now hit-testable for a future popup)
+    Select,
+    /// other `<input>` types (range/color/date/file/…) — chrome box
+    /// shows the value attr, but no widget art and no interaction yet
+    Generic,
+}
+
+impl FormKind {
+    /// does a click "activate" this control (as opposed to focusing a
+    /// text field or opening a future popup)?
+    pub fn activates(&self) -> bool {
+        matches!(self, FormKind::Submit)
+    }
+    /// does this control accept typed text (focus + caret)?
+    pub fn takes_text(&self) -> bool {
+        matches!(self, FormKind::TextInput { .. })
+    }
+}
+
+/// Form-control identity carried from build into the laid output: which
+/// DOM node this box came from, what it does, and its initial raw value
+/// (seeded into [`Layout::form_values`]; password masking is display-
+/// only, storage always keeps the raw text).
+pub struct FormCtl {
+    /// DOM node index in the [`Dom`] — stable across re-layout, the key
+    /// the focus slot and value map are saved under
+    pub node: u32,
+    pub kind: FormKind,
+    /// initial raw value: `value` attribute / textarea content / the
+    /// selected option label / the button label (never masked)
+    pub value: String,
+}
+
+/// One laid-out form control: its border-box rect in document coords
+/// (scroll offset NOT applied) plus interaction metadata. Collected in
+/// tree order by [`layout_in`].
+#[derive(Clone, Copy, Debug)]
+pub struct FormBox {
+    /// DOM node index (see [`FormCtl::node`])
+    pub node: u32,
+    /// border-box rect: x, y, w, h in document coordinates
+    pub rect: (f32, f32, f32, f32),
+    pub kind: FormKind,
+    pub focused: bool,
+    /// inside a `position: fixed` subtree — `y` is viewport-relative
+    pub fixed: bool,
+}
+
+/// Focus + value state the shell carries across re-layouts. Both maps are
+/// keyed by DOM node id (NOT by [`FormBox`] index), so resizing the
+/// window or re-running layout keeps the same field focused and the same
+/// values shown. The SHELL owns the editable string — it edits on
+/// keystrokes via [`Layout::set_form_value`] and re-runs
+/// [`layout_in_forms`]; the engine only stores and displays.
+#[derive(Clone, Default)]
+pub struct FormState {
+    /// focused control's DOM node id (None = nothing focused)
+    pub focused: Option<u32>,
+    /// live values by DOM node id (raw text; password masking is display-
+    /// only)
+    pub values: HashMap<u32, String>,
+}
+
 /// Box tree node: a text run (leaf) or an element box (block/flex/grid).
 pub struct BoxNode {
     pub is_text: bool,
@@ -228,6 +309,9 @@ pub struct BoxNode {
     pub link: Option<std::rc::Rc<str>>,
     /// `<img>` replacement data (None for every other box)
     pub img: Option<ImgSlot>,
+    /// form-control identity (input/textarea/button/select): None for
+    /// every other box; carried into the laid output as a [`FormBox`]
+    pub form: Option<FormCtl>,
     /// inline-level placement: the box sits on the surrounding text line
     /// (shrink-to-fit, vertically centered) instead of opening its own
     /// block line — set for UA form-control chrome (`<select>`/`<input>`/
@@ -260,6 +344,7 @@ impl BoxNode {
             hard_break: false,
             link: None,
             img: None,
+            form: None,
             inline: false,
             children: Vec::new(),
             x: 0.0,
@@ -282,6 +367,7 @@ impl BoxNode {
             hard_break,
             link,
             img: None,
+            form: None,
             inline: false,
             children: Vec::new(),
             x: 0.0,
@@ -458,15 +544,29 @@ fn build_into(
                 };
                 // form controls: one inline box with UA chrome, content
                 // collapsed to a single text run (the selected/first
-                // <option> label, the input value, the textarea default).
-                // Options are never recursed into here — a closed <select>
-                // shows ONE line, never stacked labels.
-                if tag == "select" || tag == "input" || tag == "textarea" {
+                // <option> label, the input value, the textarea default,
+                // the <button> label). Options are never recursed into
+                // here — a closed <select> shows ONE line, never stacked
+                // labels. Every box carries its FormCtl so layout can
+                // collect FormBoxes for hit-testing/focus.
+                if tag == "select" || tag == "input" || tag == "textarea" || tag == "button"
+                {
                     // shortcut: multiple/size>1 selects and textarea
                     // rows/cols render like the closed single-line control —
                     // there is no popup/listbox/scrolling widget yet
-                    let (text, min_h, def_w): (Option<String>, f32, Option<f32>) = match tag {
+                    let mut kind = FormKind::Select;
+                    // raw stored value (never masked, never the arrow):
+                    // value attr / textarea content / option label / button
+                    // label — seeded into Layout::form_values at collect
+                    let mut raw = String::new();
+                    let (text, min_h, def_w, centered): (
+                        Option<String>,
+                        f32,
+                        Option<f32>,
+                        bool,
+                    ) = match tag {
                         "select" => {
+                            kind = FormKind::Select;
                             let mut opts: Vec<(String, bool)> = Vec::new();
                             option_labels(dom, child, &mut opts);
                             let label = opts
@@ -474,6 +574,7 @@ fn build_into(
                                 .find(|(_, s)| *s)
                                 .or_else(|| opts.first())
                                 .map(|(l, _)| l.clone());
+                            raw = label.clone().unwrap_or_default();
                             // dropdown arrow appended to the one visible
                             // line — shortcut: a text glyph, not a
                             // rasterizer-drawn triangle. ▼ (U+25BC) not ▾:
@@ -481,11 +582,22 @@ fn build_into(
                             // whole system-font fallback chain (verified via
                             // ab_glyph glyph_id), ▼ is in every one of them
                             // no options → empty box (no text, no arrow), no crash
-                            (label.map(|l| format!("{l} \u{25bc}")), 20.0, None)
+                            (label.map(|l| format!("{l} \u{25bc}")), 20.0, None, false)
                         }
                         "textarea" => {
+                            kind = FormKind::TextInput { password: false };
                             let t = contained_text(dom, child);
-                            (if t.is_empty() { None } else { Some(t) }, 20.0, Some(170.0))
+                            raw = t.clone();
+                            (if t.is_empty() { None } else { Some(t) }, 20.0, Some(170.0), false)
+                        }
+                        "button" => {
+                            // <button>: label = its text content; default
+                            // type is submit (activate on click). The label
+                            // is centered in the box like real UA buttons.
+                            kind = FormKind::Submit;
+                            let t = contained_text(dom, child);
+                            raw = t.clone();
+                            (if t.is_empty() { None } else { Some(t) }, 20.0, None, true)
                         }
                         _ => {
                             // input (VOID: value comes from the attribute)
@@ -493,6 +605,20 @@ fn build_into(
                             if ty == "hidden" {
                                 continue; // never rendered, by spec
                             }
+                            kind = match ty.as_str() {
+                                "checkbox" => FormKind::Checkbox,
+                                "radio" => FormKind::Radio,
+                                "submit" | "button" | "reset" | "image" => FormKind::Submit,
+                                "password" => FormKind::TextInput { password: true },
+                                // other typed inputs: chrome box, no widget
+                                // art and no interaction yet
+                                "range" | "color" | "date" | "time" | "month" | "week"
+                                | "datetime-local" | "file" => FormKind::Generic,
+                                _ => FormKind::TextInput { password: false },
+                            };
+                            // raw stored value = the value attribute only
+                            // (placeholder is display fallback, never a value)
+                            raw = dom.attr(child, "value").unwrap_or("").to_string();
                             let val = dom
                                 .attr(child, "value")
                                 // no value → the placeholder shows as static text
@@ -500,24 +626,37 @@ fn build_into(
                                 .unwrap_or("");
                             // shortcut: checkbox/radio/range/color/image
                             // render as a generic chrome box — no widget art
-                            let body = match ty.as_str() {
-                                "checkbox" | "radio" => String::new(),
-                                "password" => "\u{2022}".repeat(val.chars().count()),
-                                _ => val.to_string(),
+                            let body = match kind {
+                                FormKind::Checkbox | FormKind::Radio => String::new(),
+                                FormKind::TextInput { password: true } => {
+                                    "\u{2022}".repeat(val.chars().count())
+                                }
+                                FormKind::TextInput { password: false } => val.to_string(),
+                                // button-ish inputs show their value as the label
+                                FormKind::Submit => val.to_string(),
+                                FormKind::Select => String::new(),
+                                // range/color/date/… show the value attr as text
+                                FormKind::Generic => val.to_string(),
                             };
                             let text = if body.is_empty() { None } else { Some(body) };
-                            let (min_h, def_w) = match ty.as_str() {
-                                "checkbox" | "radio" => (14.0, Some(14.0)),
-                                // empty sized inputs get the classic ~170px
-                                // default width; a value keeps its natural
-                                // width so it stays on one line (nothing
-                                // clips text in this engine)
-                                _ if text.is_some() => (20.0, None),
-                                "" | "text" | "search" | "email" | "url" | "tel"
-                                | "password" | "number" => (20.0, Some(170.0)),
-                                _ => (20.0, None),
+                            let (min_h, def_w) = match kind {
+                                // 14x14 OUTER: min-height is content-box in
+                                // this engine (width is border-box), so the
+                                // UA 1px border (×2) must be subtracted
+                                FormKind::Checkbox | FormKind::Radio => (12.0, Some(14.0)),
+                                // text-ish inputs: the classic ~20ch (~170px)
+                                // default width whether empty or filled —
+                                // longer values are tail-clipped at the box
+                                // edge during layout (see layout_in_forms)
+                                FormKind::TextInput { .. } => (20.0, Some(170.0)),
+                                // button-ish inputs shrink to their label
+                                FormKind::Submit => (20.0, None),
+                                FormKind::Select => (20.0, None),
+                                // generic chrome box: shrink to its value text
+                                FormKind::Generic => (20.0, None),
                             };
-                            (text, min_h, def_w)
+                            let centered = matches!(kind, FormKind::Submit);
+                            (text, min_h, def_w, centered)
                         }
                     };
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
@@ -528,13 +667,14 @@ fn build_into(
                     // in real engines too); `display:block/flex/grid` opts out
                     // and stacks.
                     g.inline = matches!(g.bx.display, Display::Auto | Display::InlineBlock);
+                    g.form = Some(FormCtl { node: child, kind, value: raw });
                     if let Some(t) = text {
-                        g.children.push(BoxNode::leaf(
-                            outcome.style,
-                            t,
-                            false,
-                            child_link.clone(),
-                        ));
+                        let mut st = outcome.style;
+                        // button labels center in their box (UA default)
+                        if centered {
+                            st.text_align = 1;
+                        }
+                        g.children.push(BoxNode::leaf(st, t, false, child_link.clone()));
                     }
                     out.push(g);
                     continue;
@@ -670,6 +810,16 @@ pub struct Layout {
     /// true if the last line still has content on it (no trailing <br>) —
     /// block flow uses this to decide whether to add the paragraph gap
     pub open_line: bool,
+    /// laid form controls in tree order (see [`FormBox`]) — hit-test
+    /// targets for the shell
+    pub forms: Vec<FormBox>,
+    /// focus slot echoed from the [`FormState`] this layout was built
+    /// with (DOM node id; None = nothing focused)
+    pub focused: Option<u32>,
+    /// raw (unmasked) values by DOM node id — live value if the shell set
+    /// one via [`Layout::set_form_value`], else the initial value from
+    /// the markup
+    pub form_values: HashMap<u32, String>,
 }
 
 /// Default viewport height for [`layout_tree`] — matches the fixed window in
@@ -718,11 +868,50 @@ pub fn layout_tree(
 
 /// Like [`layout_tree`] but with the real viewport height — `position: fixed`
 /// boxes resolve `bottom`/`right` insets against (0, 0, max_width, vh).
+/// No form state (nothing focused, values = the markup defaults) — see
+/// [`layout_in_forms`] for the interactive entry point.
 pub fn layout_in(
     root: &mut BoxNode,
     max_width: f32,
     viewport_h: f32,
     measure: &dyn Fn(&str, &Style) -> f32,
+) -> Layout {
+    layout_in_forms(root, max_width, viewport_h, measure, &FormState::default())
+}
+
+/// [`layout_in`] plus form-control interaction state: `state.focused`
+/// paints the accent border + caret on the focused text field,
+/// `state.values` overrides what each control shows (password fields
+/// mask for display only), and the result carries every control's laid
+/// rect in [`Layout::forms`] for hit-testing.
+///
+/// Shell integration sketch (main.rs):
+/// ```ignore
+/// // Page { …, forms: FormState } — carried across re-layouts
+/// // click:
+/// if let Some(i) = lay.hit_test_form(mx, my, scroll_y) {
+///     let fb = lay.forms[i];
+///     if fb.kind.activates() {
+///         // shortcut: no form POST — log and move on
+///         println!("[form] submit {}={}", dom.attr(fb.node, "name").unwrap_or(""), lay.form_value(fb.node));
+///     } else if fb.kind.takes_text() {
+///         page.forms.focused = Some(fb.node); // DOM node id
+///     }
+/// } else { page.forms.focused = None; } // click on empty space blurs
+/// // key into the focused field:
+/// if let Some(n) = page.forms.focused {
+///     let mut v = lay.form_value(n).to_string(); v.push(ch);
+///     page.forms.values.insert(n, v);
+/// }
+/// // after any state change, re-lay out (fast — layout is cheap):
+/// lay = layout_in_forms(&mut root, max_w, vh, &measure, &page.forms);
+/// ```
+pub fn layout_in_forms(
+    root: &mut BoxNode,
+    max_width: f32,
+    viewport_h: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+    state: &FormState,
 ) -> Layout {
     let mut runs = Vec::new();
     let mut uls = Vec::new();
@@ -730,6 +919,9 @@ pub fn layout_in(
     // before anything is sized or painted (probe already ran in main)
     let mut bg_budget = BG_PIXEL_BUDGET;
     cap_bg_images(root, &mut bg_budget);
+    // apply the live form state to the control boxes BEFORE layout so the
+    // shown text (value override, password mask, tail clip) sizes lines
+    apply_form_state(root, state, measure);
     // initial containing block = viewport (0, 0, max_width, vh)
     let cb = (0.0f32, 0.0f32, max_width, viewport_h);
     place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls);
@@ -740,6 +932,10 @@ pub fn layout_in(
     let mut images = Vec::new();
     let mut shadows = Vec::new();
     collect_paint(root, false, &mut rects, &mut images, &mut shadows);
+    // form controls: laid rects + focus visuals (caret) + value seeding
+    let mut forms = Vec::new();
+    let mut form_values = HashMap::new();
+    collect_forms(root, false, state, &mut forms, &mut uls, &mut form_values, measure);
     Layout {
         runs,
         height: root.h,
@@ -748,6 +944,175 @@ pub fn layout_in(
         images,
         shadows,
         open_line: root.open,
+        forms,
+        focused: state.focused,
+        form_values,
+    }
+}
+
+/// UA accent blue — the focused text-field border/caret color (matches
+/// the window chrome's accent).
+const FORM_ACCENT: u32 = 0x00_6a_9c_ff;
+
+/// Pre-layout walk over the box tree: for every form control, show the
+/// live value from the state (password fields mask it for display only),
+/// tail-clip text that would overflow the box, and paint the focus
+/// border. Runs before [`place`] so line sizing sees the final text.
+fn apply_form_state(
+    n: &mut BoxNode,
+    state: &FormState,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) {
+    if let Some((node, kind)) = n.form.as_ref().map(|c| (c.node, c.kind)) {
+        let focused = state.focused == Some(node);
+        // focus ring: the focused text field gets the accent border,
+        // every other text field the neutral gray (author-declared
+        // border colors always win — control_chrome only filled the UA
+        // gray in when the author said nothing)
+        if kind.takes_text() && n.bx.declared & decl::BCOLOR == 0 {
+            n.bx.bcolor = Some(if focused { FORM_ACCENT } else { 0x00_76_76_76 });
+        }
+        // live value replaces what the box shows; password fields mask
+        // (display only — storage keeps the raw text)
+        if let Some(v) = state.values.get(&node) {
+            let display = match kind {
+                FormKind::TextInput { password: true } => "\u{2022}".repeat(v.chars().count()),
+                _ => v.clone(),
+            };
+            // replace the text leaf's content (or add one when the field
+            // started empty); link chrome is irrelevant on a value leaf
+            if let Some(leaf) = n.children.iter_mut().find(|c| c.is_text) {
+                leaf.text = display;
+            } else if !display.is_empty() {
+                n.children.push(BoxNode::leaf(n.style, display, false, None));
+            }
+        }
+        // tail-clip text-ish values wider than the box's content area —
+        // covers live overrides AND long build-time values (the box
+        // keeps its ~170px default width, the value loses its tail).
+        // Only when the box width is known in px (UA default or author
+        // px width); percentage widths need layout first (shortcut:
+        // no clip — the text just overflows its line).
+        if kind.takes_text() {
+            if let Some(Len::Px(w)) = n.bx.width {
+                let content = w
+                    - resolve_len(n.bx.pad[1], w)
+                    - resolve_len(n.bx.pad[3], w)
+                    - resolve_len(n.bx.border[1], w)
+                    - resolve_len(n.bx.border[3], w);
+                if let Some(leaf) = n.children.iter_mut().find(|c| c.is_text) {
+                    while !leaf.text.is_empty() && measure(&leaf.text, &leaf.style) > content {
+                        leaf.text.pop();
+                    }
+                }
+            }
+        }
+    }
+    for c in &mut n.children {
+        apply_form_state(c, state, measure);
+    }
+}
+
+/// Post-layout walk: collect every form control's laid border-box rect
+/// (for [`Layout::hit_test_form`]) and its initial/raw value (seeded
+/// into the value map, live overrides win). The focused text field also
+/// gets a caret — a 1px vertical line at the end of its shown text,
+/// carried in the underline-rects channel main already paints.
+fn collect_forms(
+    n: &BoxNode,
+    fixed: bool,
+    state: &FormState,
+    out: &mut Vec<FormBox>,
+    uls: &mut Vec<(f32, f32, f32, f32, u32, bool)>,
+    values: &mut HashMap<u32, String>,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) {
+    if !n.is_text {
+        let fixed = fixed || n.bx.pos == Pos::Fixed;
+        if let Some(ctl) = &n.form {
+            // seed the value map: the live state value wins over the
+            // markup's initial value
+            let v = state
+                .values
+                .get(&ctl.node)
+                .cloned()
+                .unwrap_or_else(|| ctl.value.clone());
+            values.entry(ctl.node).or_insert(v);
+            let focused = state.focused == Some(ctl.node);
+            out.push(FormBox {
+                node: ctl.node,
+                rect: (n.x, n.y, n.w, n.h),
+                kind: ctl.kind,
+                focused,
+                fixed,
+            });
+            // caret: 1px line at the text end, inside the content box
+            if focused && ctl.kind.takes_text() {
+                let bt = resolve_len(n.bx.border[0], n.w);
+                let bl = resolve_len(n.bx.border[3], n.w);
+                let pt = resolve_len(n.bx.pad[0], n.w);
+                let pb = resolve_len(n.bx.pad[2], n.w);
+                let pl = resolve_len(n.bx.pad[3], n.w);
+                let text_w = n
+                    .children
+                    .iter()
+                    .find(|c| c.is_text)
+                    .map(|c| measure(&c.text, &c.style))
+                    .unwrap_or(0.0);
+                let caret_h = (n.h - bt - resolve_len(n.bx.border[2], n.w) - pt - pb).max(1.0);
+                uls.push((
+                    n.x + bl + pl + text_w,
+                    n.y + bt + pt,
+                    1.0,
+                    caret_h,
+                    FORM_ACCENT,
+                    fixed,
+                ));
+            }
+        }
+    }
+    for c in &n.children {
+        collect_forms(c, fixed, state, out, uls, values, measure);
+    }
+}
+
+impl Layout {
+    /// Index of the topmost form control under viewport point (x, y),
+    /// given the document is scrolled by `scroll` (fixed-position
+    /// controls are viewport-relative already). The returned index
+    /// addresses [`Layout::forms`].
+    pub fn hit_test_form(&self, x: f32, y: f32, scroll: f32) -> Option<usize> {
+        // later boxes paint over earlier ones → search back-to-front
+        for (i, f) in self.forms.iter().enumerate().rev() {
+            let fy = if f.fixed { y } else { y + scroll };
+            let (fx, fyy, fw, fh) = f.rect;
+            if x >= fx && x < fx + fw && fy >= fyy && fy < fyy + fh {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Raw (never masked) value of a control by DOM node id — `""` when
+    /// the node is not a known control.
+    pub fn form_value(&self, node: u32) -> &str {
+        self.form_values.get(&node).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Replace a control's value (the shell owns the editable string —
+    /// it edits here and re-runs [`layout_in_forms`] to repaint).
+    pub fn set_form_value(&mut self, node: u32, s: &str) {
+        self.form_values.insert(node, s.to_string());
+    }
+
+    /// Snapshot of the interaction state to carry into the next
+    /// [`layout_in_forms`] call — focus + live values survive re-layout
+    /// because both are keyed by DOM node id, not box index.
+    pub fn form_state(&self) -> FormState {
+        FormState {
+            focused: self.focused,
+            values: self.form_values.clone(),
+        }
     }
 }
 
@@ -2167,6 +2532,11 @@ fn layout_from(
             images: Vec::new(),
             shadows: Vec::new(),
             open_line: x > 0.0,
+            // text-only path (inline continuation): no box tree was laid
+            // → no form controls, no focus, no values
+            forms: Vec::new(),
+            focused: None,
+            form_values: HashMap::new(),
         },
         x,
     )
@@ -3597,6 +3967,191 @@ mod tests {
         }
         // no hidden value leaks into rendering
         assert!(controls(&root).iter().all(|c| !c.children.iter().any(|t| t.text.contains("secret"))));
+    }
+
+    // ---- form controls: focus / hit-test / values ----
+
+    /// DOM node id of the i-th control box in tree order (every control
+    /// box carries its FormCtl; tests need the stable node id).
+    fn ctl_node(n: &BoxNode, i: usize) -> u32 {
+        controls(n)[i].form.as_ref().expect("control box").node
+    }
+
+    #[test]
+    fn controls_render_boxes_with_ua_default_sizes() {
+        let mut root = tree_of(
+            r#"<div><input value="Hi"><input type="checkbox"><input type="submit" value="Go"><button>OK</button></div>"#,
+        );
+        let cs = controls(&root);
+        assert_eq!(cs.len(), 4, "input/checkbox/submit/button each get a box");
+        // every control box is inline-level (joins the text flow)
+        assert!(cs.iter().all(|c| c.inline), "controls flow inline");
+        drop(cs);
+        // text input: the classic ~170px default width even when filled
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let text_input = l.forms.iter().find(|f| f.kind.takes_text()).expect("text box");
+        assert!(
+            (text_input.rect.2 - 170.0).abs() < 0.01,
+            "filled text input keeps the 170px default width: {}",
+            text_input.rect.2
+        );
+        assert!(text_input.rect.3 >= 20.0 - 0.01, "one line min-height");
+        // checkbox: 14x14 square
+        let cb = l.forms.iter().find(|f| f.kind == FormKind::Checkbox).expect("checkbox");
+        assert!((cb.rect.2 - 14.0).abs() < 0.01 && (cb.rect.3 - 14.0).abs() < 0.01, "cb rect = {:?}", cb.rect);
+        // submit + <button> element: real boxes too
+        assert_eq!(l.forms.iter().filter(|f| f.kind.activates()).count(), 2, "submit + button");
+    }
+
+    #[test]
+    fn value_attr_and_textarea_content_show_in_boxes() {
+        let mut root = tree_of(
+            r#"<div><input value="typed"><textarea>multi
+line</textarea></div>"#,
+        );
+        let cs = controls(&root);
+        assert_eq!(cs[0].children[0].text, "typed", "input shows value attr");
+        assert!(
+            cs[1].children[0].text.contains("multi"),
+            "textarea content = its value"
+        );
+        // the laid output seeds the same raw values
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let nodes: Vec<u32> = l.forms.iter().map(|f| f.node).collect();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(l.form_value(nodes[0]), "typed");
+        assert!(l.form_value(nodes[1]).contains("multi"));
+    }
+
+    #[test]
+    fn hit_test_form_inside_outside_and_scroll() {
+        let mut root = tree_of(
+            r#"<div style="margin-top:100px"><input value="box"></div>"#,
+        );
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        assert_eq!(l.forms.len(), 1);
+        let (x, y, w, h) = l.forms[0].rect;
+        // inside the box (document coords == viewport coords at scroll 0)
+        assert_eq!(l.hit_test_form(x + w / 2.0, y + h / 2.0, 0.0), Some(0));
+        // outside: to the right of the box, and above it (margin area)
+        assert_eq!(l.hit_test_form(x + w + 10.0, y + h / 2.0, 0.0), None);
+        assert_eq!(l.hit_test_form(x + w / 2.0, y - 10.0, 0.0), None);
+        // scroll respected: the same viewport point maps 100px down the doc
+        assert_eq!(l.hit_test_form(x + w / 2.0, y + h / 2.0 - 100.0, 100.0), Some(0));
+        assert_eq!(l.hit_test_form(x + w / 2.0, y + h / 2.0, 100.0), None);
+    }
+
+    #[test]
+    fn focus_survives_relayout_by_node_id() {
+        let markup = r#"<div><input value="one"><input value="two"></div>"#;
+        // layout at width A, focus field 2
+        let node2;
+        let state;
+        {
+            let mut root = tree_of(markup);
+            node2 = ctl_node(&root, 1);
+            let st = FormState {
+                focused: Some(node2),
+                values: Default::default(),
+            };
+            let l = layout_in_forms(&mut root, 250.0, 400.0, &m4, &st);
+            assert!(l.forms[1].focused, "field 2 focused at width A");
+            assert!(!l.forms[0].focused, "field 1 not focused");
+            // the focus ring changed field 2's border to the accent
+            assert_eq!(
+                root.children[0].children[1].bx.bcolor,
+                Some(FORM_ACCENT),
+                "focused field border = accent"
+            );
+            state = st;
+        }
+        // rebuild at a different width (fresh box tree — like a resize),
+        // carrying the same state: same node id still focused
+        let mut root = tree_of(markup);
+        assert_eq!(ctl_node(&root, 1), node2, "node ids stable across rebuild");
+        let l = layout_in_forms(&mut root, 600.0, 400.0, &m4, &state);
+        let focused = l.forms.iter().find(|f| f.focused).expect("one focused");
+        assert_eq!(focused.node, node2, "focus maps by node id, not index");
+        assert!((focused.rect.2 - 170.0).abs() < 0.01, "re-laid at the new width");
+    }
+
+    #[test]
+    fn password_masks_display_but_stores_raw() {
+        let mut root = tree_of(r#"<div><input type="password" value="hunter2"></div>"#);
+        {
+            let cs = controls(&root);
+            assert_eq!(cs[0].children[0].text, "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}", "build shows 7 bullets");
+        }
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let node = l.forms[0].node;
+        assert_eq!(l.form_value(node), "hunter2", "storage keeps the raw text");
+        // live typing: display masks, storage stays raw
+        let mut l = l;
+        l.set_form_value(node, "pw");
+        let st = l.form_state();
+        let mut root = tree_of(r#"<div><input type="password" value="hunter2"></div>"#);
+        let l = layout_in_forms(&mut root, 500.0, 400.0, &m4, &st);
+        assert_eq!(l.runs.iter().map(|r| r.text.as_str()).find(|t| t.contains('\u{2022}')).unwrap(), "\u{2022}\u{2022}", "2-char value → 2 bullets shown");
+        assert_eq!(l.form_value(node), "pw", "raw after edit");
+    }
+
+    #[test]
+    fn submit_activates_from_hit_test() {
+        let mut root = tree_of(
+            r#"<div><input value="q"><input type="submit" value="Go"></div>"#,
+        );
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let (sx, sy, sw, sh) = l.forms[1].rect;
+        let i = l.hit_test_form(sx + sw / 2.0, sy + sh / 2.0, 0.0).expect("hit submit");
+        assert!(l.forms[i].kind.activates(), "submit kind activates");
+        assert!(!l.forms[0].kind.activates(), "text field does not");
+        // <button> element behaves the same
+        let mut root = tree_of(r#"<div><button>OK</button></div>"#);
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let (bx, by, bw, bh) = l.forms[0].rect;
+        let i = l.hit_test_form(bx + bw / 2.0, by + bh / 2.0, 0.0).expect("hit button");
+        assert!(l.forms[i].kind.activates());
+    }
+
+    #[test]
+    fn button_element_centers_its_label() {
+        let mut root = tree_of(r#"<div><button>A pretty long label</button></div>"#);
+        // the label leaf carries the UA centered text-align, and with an
+        // author-set width the slack lands on both sides evenly
+        assert_eq!(controls(&root)[0].children[0].style.text_align, 1, "UA centers button labels");
+        let mut root = tree_of(r#"<div><button style="width:300px">Hi</button></div>"#);
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let (x, _, w, _) = l.forms[0].rect;
+        assert!((w - 300.0).abs() < 0.01, "author width wins: {w}");
+        let run = l.runs.iter().find(|r| r.text == "Hi").expect("label run");
+        let slack = (w - m4("Hi", &Style::new()) - 8.0).max(0.0) / 2.0; // minus border+pad
+        assert!(
+            (run.x - (x + 4.0 + slack)).abs() < 2.0,
+            "label centered in the slack: run.x={} expected≈{}",
+            run.x,
+            x + 4.0 + slack
+        );
+    }
+
+    #[test]
+    fn long_value_tail_clips_at_box_edge() {
+        let long = "a".repeat(200);
+        let markup = format!(r#"<div><input value="{long}"></div>"#);
+        let mut root = tree_of(&markup);
+        let l = layout_in(&mut root, 800.0, 400.0, &m4);
+        let node = l.forms[0].node;
+        // storage keeps the full value
+        assert_eq!(l.form_value(node).chars().count(), 200);
+        // the shown text is clipped to the box's content width (~162px
+        // content / 4px per char ≈ 40 chars)
+        let shown = l.runs.iter().map(|r| r.text.as_str()).find(|t| !t.is_empty() && t.starts_with('a')).expect("value run");
+        assert!(
+            m4(shown, &Style::new()) <= 170.0 - 6.0 - 2.0 + 0.01,
+            "clipped to content width: {}px ({} chars)",
+            m4(shown, &Style::new()),
+            shown.chars().count()
+        );
+        assert!(shown.chars().count() < 200, "tail was cut");
     }
 
     // ---- background-image (url() painting) ----
