@@ -3,10 +3,12 @@ name = "mazda"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-minifb = "0.28"
-ureq = "2"
+# process RSS reporting (Windows only)
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_ProcessStatus"] }
+
+[dependencies]
+ureq = "2"
 ab_glyph = "0.2.32"
 url = "2.5.8"
 encoding_rs = "0.8.42"
@@ -16,6 +18,10 @@ jpeg-decoder = { version = "0.3", default-features = false }
 # zlib inflate for WOFF1 font containers (pure Rust miniz_oxide backend;
 # already in the tree via png+ureq, so no new crates to build)
 flate2 = "1"
+# window + chrome shell: eframe with the glow (OpenGL software-ish) backend,
+# NOT wgpu — wgpu would add a large driver/GPU stack to the RAM budget.
+# x11+wayland keep it Linux-capable; window controls/resize come from winit.
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
 [profile.release]
 opt-level = "s"

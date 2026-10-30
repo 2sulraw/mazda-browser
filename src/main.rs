@@ -8,8 +8,8 @@ mod svg;
 mod woff;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
+use eframe::egui;
 use layout::{Fam, Layout, Style};
-use minifb::{Key, KeyRepeat, MouseButton, Window, WindowOptions};
 
 const PADDING: usize = 12;
 const BG: u32 = 0x00_ff_ff_ff; // UA default canvas = white (matches every browser)
@@ -28,105 +28,432 @@ struct Page {
     bg: u32,
 }
 
-fn main() {
-    let start_url = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "https://example.com".to_string());
+/// One browser tab. Pages are NOT kept in RAM (that would blow the budget) —
+/// a tab stores just its URL + scroll offset, and switching tabs reloads.
+/// shortcut: reload-on-switch instead of caching every tab's DOM.
+struct Tab {
+    url: String,
+    scroll: f32,
+}
 
-    let mut fonts = Fonts::load();
-    let width = 1000usize;
-    let height = 700usize;
-    let max_w = (width - 2 * PADDING) as f32;
-    let page_h = height.saturating_sub(2 * PADDING) as f32;
+// ---------------------------------------------------------------------------
+// Window shell: eframe/egui with the glow backend. The page itself is still
+// rasterized by render() below into a CPU 0x00RRGGBB buffer and shown as a
+// single NEAREST texture; egui owns the window, tab strip and address bar.
+// ---------------------------------------------------------------------------
 
-    let mut page = load_page(&start_url, &mut fonts, max_w, page_h);
-    let mut back_stack: Vec<String> = Vec::new();
+/// Tab-strip height, logical points.
+const TAB_H: f32 = 26.0;
+/// Address-row height, logical points.
+const ADDR_H: f32 = 34.0;
 
-    let mut window = Window::new(
-        &format!("Mazda — {}", page.url),
-        width,
-        height,
-        WindowOptions::default(),
+fn main() -> eframe::Result {
+    // shortcut: native titlebar this round; borderless egui-drawn titlebar is a
+    // later flip (decorations:false + ViewportCommand buttons + drag).
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Mazda")
+            .with_inner_size([1000.0, 700.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Mazda",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
-    .expect("unable to open window");
+}
 
-    let mut scroll = 0.0f32;
-    let mut buffer = vec![BG; width * height];
-    let mut was_down = false;
+struct App {
+    fonts: Fonts,
+    page: Page,
+    tabs: Vec<Tab>,
+    active: usize,
+    back_stack: Vec<String>,
+    address: String,
+    address_focused: bool,
+    scroll: f32,
+    pixels: Vec<u32>,
+    /// GPU texture holding the last upload of `pixels`
+    tex: Option<egui::TextureHandle>,
+    /// pixel size of `pixels`/`tex` (viewport minus the two egui panels)
+    last_size: (usize, usize),
+    /// `pixels` changed since the last texture upload
+    dirty: bool,
+    /// mirror of the viewport fullscreen state for the F11 toggle
+    fullscreen: bool,
+    /// last title pushed to the viewport (avoid re-sending every frame)
+    title: String,
+}
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        let max_scroll = (page.laid.height - page_h).max(0.0);
-        if window.is_key_pressed(Key::Down, KeyRepeat::Yes) {
-            scroll = (scroll + 40.0).min(max_scroll);
+/// Address-bar heuristic (unchanged from the minifb shell): a dot and no
+/// space means URL (https:// prefixed), anything else is a DuckDuckGo search.
+fn address_target(q: &str) -> String {
+    if q.contains('.') && !q.contains(' ') {
+        if q.starts_with("http") {
+            q.to_string()
+        } else {
+            format!("https://{q}")
         }
-        if window.is_key_pressed(Key::Up, KeyRepeat::Yes) {
-            scroll = (scroll - 40.0).max(0.0);
+    } else {
+        format!("https://duckduckgo.com/?q={}", q.replace(' ', "+"))
+    }
+}
+
+/// Text-wrap width for a page viewport (matches the old shell).
+fn page_w(pw: usize) -> f32 {
+    (pw as f32 - 2.0 * PADDING as f32).max(40.0)
+}
+
+/// Viewport height for layout / scroll clamping (matches the old shell).
+fn page_h(ph: usize) -> f32 {
+    (ph as f32 - 2.0 * PADDING as f32).max(40.0)
+}
+
+/// 0x00RRGGBB framebuffer → egui ColorImage (RGBA, opaque).
+fn pixels_to_image(pixels: &[u32], w: usize, h: usize) -> egui::ColorImage {
+    debug_assert_eq!(pixels.len(), w * h);
+    let mut rgba = Vec::with_capacity(pixels.len() * 4);
+    for &p in pixels {
+        rgba.push((p >> 16) as u8); // R
+        rgba.push((p >> 8) as u8); // G
+        rgba.push(p as u8); // B
+        rgba.push(255);
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let _ = cc; // default egui UI fonts; the page rasterizes its own fonts
+        let mut fonts = Fonts::load();
+        let start = std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "https://example.com".to_string());
+        // logical viewport = NativeOptions initial size; one texture pixel per
+        // logical point (a HiDPI framebuffer upscales the texture — fine at
+        // pixels_per_point 1.0; shortcut: no per-monitor DPI raster scale).
+        let (pw, ph) = (1000usize, (700.0 - TAB_H - ADDR_H) as usize);
+        let url = address_target(start.trim());
+        let page = load_page(&url, &mut fonts, page_w(pw), page_h(ph));
+        let page_url = page.url.clone();
+        let mut pixels = vec![page.bg; pw * ph];
+        render(&mut pixels, pw, ph, &page.laid, &fonts, 0.0, page_h(ph), 0.0);
+        App {
+            fonts,
+            page,
+            tabs: vec![Tab {
+                url: page_url.clone(),
+                scroll: 0.0,
+            }],
+            active: 0,
+            back_stack: Vec::new(),
+            address: page_url.clone(),
+            address_focused: false,
+            scroll: 0.0,
+            pixels,
+            tex: None,
+            last_size: (pw, ph),
+            dirty: true,
+            fullscreen: false,
+            title: "Mazda".to_string(),
         }
-        if let Some((_, wy)) = window.get_scroll_wheel() {
-            scroll = (scroll - wy * 60.0).clamp(0.0, max_scroll);
-        }
-        // back navigation (browser-style backspace)
-        if window.is_key_pressed(Key::Backspace, KeyRepeat::No) {
-            eprintln!("[key] backspace (no-repeat)");
-            if let Some(prev) = back_stack.pop() {
-                page = load_page(&prev, &mut fonts, max_w, page_h);
-                scroll = 0.0;
-                window.set_title(&format!("Mazda — {}", page.url));
-            }
+    }
+
+    /// Re-rasterize the active page into `pixels` (marks the texture dirty).
+    fn repaint_page(&mut self, pw: usize, ph: usize) {
+        self.pixels = vec![self.page.bg; pw * ph];
+        render(
+            &mut self.pixels,
+            pw,
+            ph,
+            &self.page.laid,
+            &self.fonts,
+            self.scroll,
+            page_h(ph),
+            0.0,
+        );
+        self.dirty = true;
+    }
+
+    /// Load `url` into the active tab: push history, reset scroll.
+    fn navigate(&mut self, url: &str, pw: usize, ph: usize) {
+        self.back_stack.push(self.page.url.clone());
+        self.page = load_page(url, &mut self.fonts, page_w(pw), page_h(ph));
+        self.scroll = 0.0;
+        self.tabs[self.active].url = self.page.url.clone();
+        self.tabs[self.active].scroll = 0.0;
+        self.address = self.page.url.clone();
+        self.repaint_page(pw, ph);
+    }
+
+    /// Load `url` into the active tab WITHOUT touching history (tab switch /
+    /// close / back), restoring `scroll`.
+    fn reload_active(&mut self, url: &str, pw: usize, ph: usize, scroll: f32) {
+        self.page = load_page(url, &mut self.fonts, page_w(pw), page_h(ph));
+        self.scroll = scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
+        self.tabs[self.active].url = self.page.url.clone();
+        self.address = self.page.url.clone();
+        self.repaint_page(pw, ph);
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // F11 toggles real (viewport) fullscreen; non-repeat so a held key
+        // doesn't strobe.
+        if ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::F11,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            })
+        }) {
+            self.fullscreen = !self.fullscreen;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
 
-        // click: hit-test runs for an href, resolve relative to current page
-        let down = window.get_mouse_down(MouseButton::Left);
-        if down && !was_down {
-            if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Pass) {
-                let rx = mx - PADDING as f32;
-                let my_doc = my - PADDING as f32; // viewport y in page space
-                let hit = page.laid.runs.iter().find(|r| {
-                    // fixed runs don't scroll: compare in viewport coords
-                    let ry = if r.fixed { my_doc } else { my_doc + scroll };
-                    r.link.is_some()
-                        && rx >= r.x
-                        && rx <= r.x + r.width
-                        && ry >= r.y
-                        && ry <= r.y + r.style.size * 1.35
+        // Actions are collected during the panel closures and applied after
+        // them (the page size is only known once the panels claimed their
+        // space, and it keeps the borrows simple).
+        let mut activate: Option<usize> = None;
+        let mut close: Option<usize> = None;
+        let mut new_tab = false;
+        let mut go_back = false;
+        let mut go: Option<String> = None; // address submit or link click
+
+        let chrome_frame =
+            egui::Frame::NONE.fill(egui::Color32::from_rgb(0xf1, 0xf1, 0xf1));
+
+        // ---- tab strip ----
+        egui::Panel::top("tab_strip")
+            .exact_size(TAB_H)
+            .frame(chrome_frame.clone())
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    for i in 0..self.tabs.len() {
+                        let is_active = i == self.active;
+                        let label = format!(" {} ", short_title(&self.tabs[i].url));
+                        if ui.selectable_label(is_active, label).clicked() {
+                            activate = Some(i);
+                        }
+                        if ui.small_button("\u{d7}").on_hover_text("Close tab").clicked() {
+                            close = Some(i);
+                        }
+                    }
+                    if ui.button("+").on_hover_text("New tab").clicked() {
+                        new_tab = true;
+                    }
                 });
-                eprintln!("[click] mouse=({mx:.0},{my:.0}) scroll={scroll:.0} hit={:?}", hit.map(|h| &h.text));
-                if let Some(hit) = hit {
-                    let href = hit.link.as_ref().unwrap().to_string();
-                    if let Some(next) = resolve(&page.url, &href) {
-                        eprintln!("[nav] {} → {next}", page.url);
-                        back_stack.push(page.url.clone());
-                        page = load_page(&next, &mut fonts, max_w, page_h);
-                        scroll = 0.0;
-                        window.set_title(&format!("Mazda — {}", page.url));
+            });
+
+        // ---- address row ----
+        egui::Panel::top("address_row")
+            .exact_size(ADDR_H)
+            .frame(chrome_frame)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("\u{2190}").on_hover_text("Back").clicked() {
+                        go_back = true;
+                    }
+                    let resp = ui.add_sized(
+                        [ui.available_width(), ADDR_H - 10.0],
+                        egui::TextEdit::singleline(&mut self.address)
+                            .hint_text("Search or enter address"),
+                    );
+                    self.address_focused = resp.has_focus();
+                    if resp.gained_focus() {
+                        // the old shell cleared the bar on click — keep that
+                        self.address.clear();
+                    }
+                    if resp.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let q = self.address.trim().to_string();
+                            if !q.is_empty() {
+                                go = Some(address_target(&q));
+                            }
+                        } else {
+                            // blur without submit (e.g. Escape) → restore URL
+                            self.address = self.page.url.clone();
+                        }
+                    }
+                });
+            });
+
+        // ---- page viewport (must come last: panels claim space first) ----
+        let mut vp = self.last_size;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let avail = ui.available_size();
+                // one texture pixel per logical point (see App::new)
+                let pw = avail.x.max(1.0) as usize;
+                let ph = avail.y.max(1.0) as usize;
+                vp = (pw, ph);
+
+                if (pw, ph) != self.last_size {
+                    // live resize: re-layout once per *actual* size change
+                    let url = self.page.url.clone();
+                    self.page = load_page(&url, &mut self.fonts, page_w(pw), page_h(ph));
+                    self.last_size = (pw, ph);
+                    self.scroll = self.scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
+                    self.repaint_page(pw, ph);
+                }
+
+                // scrolling: wheel + Up/Down, clamped, suppressed while typing
+                let max_scroll = (self.page.laid.height - page_h(ph)).max(0.0);
+                if !ui.ctx().egui_wants_keyboard_input() && !self.address_focused {
+                    let before = self.scroll;
+                    let wheel = ui.input(|i| i.smooth_scroll_delta());
+                    if wheel.y != 0.0 {
+                        self.scroll = (self.scroll - wheel.y).clamp(0.0, max_scroll);
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        self.scroll = (self.scroll + 40.0).min(max_scroll);
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        self.scroll = (self.scroll - 40.0).max(0.0);
+                    }
+                    if self.scroll != before {
+                        self.repaint_page(pw, ph);
                     }
                 }
+
+                // CPU pixels → GPU texture, only when something changed
+                if self.dirty {
+                    let img = pixels_to_image(&self.pixels, self.last_size.0, self.last_size.1);
+                    match &mut self.tex {
+                        Some(t) => t.set(img, egui::TextureOptions::NEAREST),
+                        None => {
+                            self.tex = Some(ui.ctx().load_texture(
+                                "page",
+                                img,
+                                egui::TextureOptions::NEAREST,
+                            ))
+                        }
+                    }
+                    self.dirty = false;
+                }
+
+                if let Some(tex) = &self.tex {
+                    let (iw, ih) = self.last_size;
+                    let resp = ui.add(
+                        egui::Image::new(&*tex)
+                            .fit_to_exact_size(egui::vec2(iw as f32, ih as f32))
+                            .texture_options(egui::TextureOptions::NEAREST)
+                            .sense(egui::Sense::click()),
+                    );
+                    // link hit-test — identical math to the old minifb shell
+                    if resp.clicked() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            let rx = p.x - resp.rect.min.x - PADDING as f32;
+                            let my_doc = p.y - resp.rect.min.y - PADDING as f32;
+                            let hit = self.page.laid.runs.iter().find(|r| {
+                                let ry = if r.fixed { my_doc } else { my_doc + self.scroll };
+                                r.link.is_some()
+                                    && rx >= r.x
+                                    && rx <= r.x + r.width
+                                    && ry >= r.y
+                                    && ry <= r.y + r.style.size * 1.35
+                            });
+                            if let Some(hit) = hit {
+                                let href = hit.link.clone().unwrap();
+                                if let Some(next) = resolve(&self.page.url, &href) {
+                                    eprintln!("[nav] {} → {next}", self.page.url);
+                                    go = Some(next);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // RSS overlay, bottom-right (same string and color as before)
+                let rss = format!("RSS {:.1} MB", working_set_mb());
+                ui.painter().text(
+                    ui.max_rect().right_bottom() - egui::vec2(8.0, 6.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    rss,
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::from_rgb(0x88, 0xcc, 0x88),
+                );
+            });
+
+        let (pw, ph) = vp;
+
+        // ---- apply the deferred actions with the real page size ----
+        if let Some(i) = activate {
+            if i != self.active && i < self.tabs.len() {
+                self.tabs[self.active].scroll = self.scroll;
+                self.tabs[self.active].url = self.page.url.clone();
+                self.active = i;
+                let (url, saved) = (self.tabs[i].url.clone(), self.tabs[i].scroll);
+                self.reload_active(&url, pw, ph, saved);
             }
         }
-        was_down = down;
+        if let Some(i) = close {
+            if self.tabs.len() > 1 && i < self.tabs.len() {
+                self.tabs.remove(i);
+                if self.active >= self.tabs.len() {
+                    self.active = self.tabs.len() - 1;
+                } else if self.active > i {
+                    self.active -= 1;
+                }
+                let url = self.tabs[self.active].url.clone();
+                let saved = self.tabs[self.active].scroll;
+                self.reload_active(&url, pw, ph, saved);
+            }
+        }
+        if new_tab {
+            self.tabs[self.active].scroll = self.scroll;
+            self.tabs[self.active].url = self.page.url.clone();
+            self.tabs.push(Tab {
+                url: "https://example.com".into(),
+                scroll: 0.0,
+            });
+            self.active = self.tabs.len() - 1;
+            self.reload_active("https://example.com", pw, ph, 0.0);
+        }
+        if go_back {
+            if let Some(prev) = self.back_stack.pop() {
+                self.reload_active(&prev, pw, ph, 0.0);
+            }
+        }
+        if let Some(target) = go {
+            self.navigate(&target, pw, ph);
+        }
 
-        buffer.fill(page.bg);
-        render(&mut buffer, width, height, &page.laid, &fonts, scroll, page_h);
-
-        let mem = format!("RSS {:.1} MB", working_set_mb());
-        draw_text(
-            &mut buffer,
-            width,
-            (width - PADDING - mem.len() * 8) as f32,
-            (height - PADDING - 14) as f32,
-            &mem,
-            &fonts,
-            &Style {
-                color: 0x00_88_cc_88,
-                ..Style::new()
-            },
-        );
-
-        window
-            .update_with_buffer(&buffer, width, height)
-            .expect("render failed");
+        // window title follows the page (capture script matches "Mazda*")
+        let title = format!("Mazda — {}", self.page.url);
+        if title != self.title {
+            self.title = title.clone();
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        // the RSS overlay keeps ticking while idle; nothing else repaints
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
     }
-    println!("final RSS: {:.1} MB", working_set_mb());
+}
+
+/// Short tab-label from a URL: host (minus www.) or the last path segment.
+fn short_title(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let h = host.strip_prefix("www.").unwrap_or(host);
+    if h.is_empty() {
+        "New tab".into()
+    } else {
+        h.to_string()
+    }
 }
 
 /// Fetch + parse + layout one page. `vh` = viewport height (fixed boxes).
@@ -587,6 +914,7 @@ struct PageFace {
 /// regular-weight file per family: bold/italic requests fall back to the
 /// generic pick's real bold/italic faces (shortcut: no per-family variants).
 /// Not exhaustive on purpose — lazily loaded only when a page actually asks.
+#[cfg(windows)]
 const SYSTEM_FAMILIES: &[(&str, &[&str])] = &[
     ("verdana", &[r"C:\Windows\Fonts\verdana.ttf"]),
     ("tahoma", &[r"C:\Windows\Fonts\tahoma.ttf"]),
@@ -602,6 +930,52 @@ const SYSTEM_FAMILIES: &[(&str, &[&str])] = &[
     ("impact", &[r"C:\Windows\Fonts\impact.ttf"]),
     ("comic sans ms", &[r"C:\Windows\Fonts\comic.ttf"]),
     ("arial black", &[r"C:\Windows\Fonts\ariblk.ttf"]),
+];
+
+/// shortcut: guessed Linux font paths (Debian/Ubuntu/Fedora locations) —
+/// enough to build and usually land, never verified on a real Linux box.
+#[cfg(not(windows))]
+const SYSTEM_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "arial",
+        &[
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+    ),
+    (
+        "helvetica",
+        &[
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+    ),
+    (
+        "verdana",
+        &["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    ),
+    (
+        "times new roman",
+        &[
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        ],
+    ),
+    (
+        "georgia",
+        &["/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"],
+    ),
+    (
+        "courier new",
+        &[
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ],
+    ),
+    (
+        "segoe ui",
+        &["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    ),
 ];
 
 /// Generic keywords in a stack — the walk skips them; the derived `Fam`
@@ -625,6 +999,7 @@ fn is_generic_family(n: &str) -> bool {
 }
 
 /// Smallest full-coverage options first — raw bytes stay resident once loaded.
+#[cfg(windows)]
 const CJK_FONTS: &[&str] = &[
     r"C:\Windows\Fonts\msyhl.ttc", // YaHei Light 11.6MB
     r"C:\Windows\Fonts\msyh.ttc",   // YaHei 18.8MB
@@ -633,18 +1008,65 @@ const CJK_FONTS: &[&str] = &[
     r"C:\Windows\Fonts\YuGothR.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
 ];
+#[cfg(not(windows))]
+const CJK_FONTS: &[&str] = &[
+    // shortcut: guessed Linux paths, unverified (see SYSTEM_FAMILIES above)
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+];
+#[cfg(windows)]
 const HANGUL_FONTS: &[&str] = &[
     r"C:\Windows\Fonts\malgunsl.ttf", // Malgun Light 4.8MB
     r"C:\Windows\Fonts\malgun.ttf",
+];
+#[cfg(not(windows))]
+const HANGUL_FONTS: &[&str] = &[
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+];
+
+/// Primary face candidates per weight/style (used by [`Fonts::load`] and
+/// [`Fonts::pick`]).
+#[cfg(windows)]
+const FONT_REGULAR: &[&str] = &[r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf"];
+#[cfg(not(windows))]
+const FONT_REGULAR: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+];
+#[cfg(windows)]
+const FONT_BOLD: &[&str] = &[r"C:\Windows\Fonts\segoeuib.ttf", r"C:\Windows\Fonts\arialbd.ttf"];
+#[cfg(not(windows))]
+const FONT_BOLD: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+];
+#[cfg(windows)]
+const FONT_ITALIC: &[&str] = &[r"C:\Windows\Fonts\segoeuii.ttf", r"C:\Windows\Fonts\ariali.ttf"];
+#[cfg(not(windows))]
+const FONT_ITALIC: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+];
+#[cfg(windows)]
+const FONT_MONO: &[&str] = &[r"C:\Windows\Fonts\consola.ttf", r"C:\Windows\Fonts\cour.ttf"];
+#[cfg(not(windows))]
+const FONT_MONO: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+];
+#[cfg(windows)]
+const FONT_SERIF: &[&str] = &[r"C:\Windows\Fonts\georgia.ttf", r"C:\Windows\Fonts\times.ttf"];
+#[cfg(not(windows))]
+const FONT_SERIF: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
 ];
 
 impl Fonts {
     fn load() -> Self {
         Fonts {
-            regular: load_font(&[
-                r"C:\Windows\Fonts\segoeui.ttf",
-                r"C:\Windows\Fonts\arial.ttf",
-            ]),
+            regular: load_font(FONT_REGULAR),
             bold: std::sync::OnceLock::new(),
             italic: std::sync::OnceLock::new(),
             mono: std::sync::OnceLock::new(),
@@ -684,30 +1106,16 @@ impl Fonts {
 
     fn pick(&self, s: &Style) -> &FontVec {
         if s.fam == Fam::Mono {
-            self.mono.get_or_init(|| {
-                load_font(&[r"C:\Windows\Fonts\consola.ttf", r"C:\Windows\Fonts\cour.ttf"])
-            })
+            self.mono.get_or_init(|| load_font(FONT_MONO))
         } else if s.fam == Fam::Serif {
             // Georgia ships regular/bold/italic/bold-italic on every Windows
-            self.serif.get_or_init(|| {
-                load_font(&[r"C:\Windows\Fonts\georgia.ttf", r"C:\Windows\Fonts\times.ttf"])
-            })
+            self.serif.get_or_init(|| load_font(FONT_SERIF))
         } else if s.bold && s.italic {
             &self.regular // no segoui-bi fallback; shortcut: faux-skip
         } else if s.bold {
-            self.bold.get_or_init(|| {
-                load_font(&[
-                    r"C:\Windows\Fonts\segoeuib.ttf",
-                    r"C:\Windows\Fonts\arialbd.ttf",
-                ])
-            })
+            self.bold.get_or_init(|| load_font(FONT_BOLD))
         } else if s.italic {
-            self.italic.get_or_init(|| {
-                load_font(&[
-                    r"C:\Windows\Fonts\segoeuii.ttf",
-                    r"C:\Windows\Fonts\ariali.ttf",
-                ])
-            })
+            self.italic.get_or_init(|| load_font(FONT_ITALIC))
         } else {
             &self.regular
         }
@@ -848,6 +1256,10 @@ fn render(
     fonts: &Fonts,
     scroll: f32,
     page: f32,
+    // y offset of the page content inside the buffer (the old shell drew
+    // the page below its chrome; the egui shell passes 0.0 and lets the
+    // panels own that space instead)
+    top: f32,
 ) {
     // two passes: normal content (scrolled) first, then fixed overlays on
     // top in viewport coordinates (no scroll offset)
@@ -864,7 +1276,7 @@ fn render(
             if y0 + s.h + pad < 0.0 || y0 - pad > page {
                 continue;
             }
-            let (sx, sy) = (PADDING as f32 + s.x - pad, PADDING as f32 + y0 - pad);
+            let (sx, sy) = (PADDING as f32 + s.x - pad, PADDING as f32 + top + y0 - pad);
             let (bw, bh) = (s.w + pad * 2.0, s.h + pad * 2.0);
             let a = (s.color >> 24) as u8;
             let half = (s.blur * 0.5).max(0.01);
@@ -907,7 +1319,7 @@ fn render(
             if y + h < 0.0 || y > page {
                 continue;
             }
-            let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + y).max(0.0));
+            let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + top + y).max(0.0));
             let r = rad.min(w * 0.5).min(h * 0.5);
             for dy in 0..h.max(0.0) as usize {
                 let py = (sy as usize) + dy;
@@ -943,7 +1355,7 @@ fn render(
             if y0 + h < 0.0 || y0 > page {
                 continue;
             }
-            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y0);
+            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + top + y0);
             for dy in 0..h.max(0.0) as usize {
                 let py = sy as i32 + dy as i32;
                 if py < 0 || py >= height as i32 {
@@ -979,7 +1391,7 @@ fn render(
                 buf,
                 width,
                 PADDING as f32 + run.x,
-                PADDING as f32 + y,
+                PADDING as f32 + top + y,
                 &run.text,
                 fonts,
                 &run.style,
@@ -993,7 +1405,7 @@ fn render(
             if y < 0.0 || y > page {
                 continue;
             }
-            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + y);
+            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + top + y);
             for dy in 0..h.max(1.0) as usize {
                 for dx in 0..w as usize {
                     let px = sx as usize + dx;
@@ -1067,6 +1479,7 @@ fn blend(dst: &mut u32, src: u32, alpha: u8) {
 }
 
 /// Working-set size in MB via GetProcessMemoryInfo.
+#[cfg(windows)]
 fn working_set_mb() -> f64 {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1084,6 +1497,25 @@ fn working_set_mb() -> f64 {
             0.0
         }
     }
+}
+
+/// Working-set size in MB via /proc/self/status VmRSS.
+#[cfg(not(windows))]
+fn working_set_mb() -> f64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0.0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: f64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0.0);
+            return kb / 1024.0;
+        }
+    }
+    0.0
 }
 
 #[cfg(test)]
@@ -1218,7 +1650,7 @@ mod tests {
         let mut fonts = Fonts::load();
         // simulate an already-declared face: the slot is pre-filled because
         // loading goes through the network (decode path covered in woff tests)
-        let pre = try_load_font(&[r"C:\Windows\Fonts\segoeui.ttf"]).unwrap();
+        let pre = try_load_font(FONT_REGULAR).unwrap();
         fonts.faces.push(PageFace {
             family: "testface".to_string(),
             wmin: 400,
