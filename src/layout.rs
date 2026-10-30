@@ -511,27 +511,46 @@ fn build_into(
                     build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
                     out.push(g);
                 } else {
-                    // inline element: no box, children flatten into parent
-                    // flow. shortcut: horizontal margins (e.g. HN's
-                    // `.hnname{margin-right:5px}`) can't shift inline text, so
-                    // they emit one separator space — visually equivalent
-                    let has_margin = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
-                    if has_margin(outcome.bx.margin[3]) {
-                        out.push(BoxNode::leaf(
-                            outcome.style,
-                            " ".into(),
-                            false,
-                            child_link.clone(),
-                        ));
-                    }
-                    build_into(dom, child, outcome.style, sheet, child_link, out);
-                    if has_margin(outcome.bx.margin[1]) {
-                        out.push(BoxNode::leaf(
-                            outcome.style,
-                            " ".into(),
-                            false,
-                            None,
-                        ));
+                    // An inline element that PAINTS (background, border,
+                    // box-shadow) or carries horizontal padding gets a real
+                    // inline-level box. Flattening would drop the band, and a
+                    // box shrink-wrapping its text + padding is exactly the
+                    // band real engines draw (e.g. an inline <a> styled as a
+                    // button). Same placement path as author inline-block.
+                    let nz = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
+                    let paints = outcome.bx.bg.is_some()
+                        || !outcome.bx.shadows.is_empty()
+                        || outcome.bx.border.iter().any(|&l| nz(l))
+                        || nz(outcome.bx.pad[1])
+                        || nz(outcome.bx.pad[3]);
+                    if paints {
+                        let mut g = BoxNode::group(outcome.style, outcome.bx);
+                        g.inline = true;
+                        build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                        out.push(g);
+                    } else {
+                        // plain inline: no box, children flatten into parent
+                        // flow. shortcut: horizontal margins (e.g. HN's
+                        // `.hnname{margin-right:5px}`) can't shift inline text,
+                        // so they emit one separator space - visually equivalent
+                        let has_margin = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
+                        if has_margin(outcome.bx.margin[3]) {
+                            out.push(BoxNode::leaf(
+                                outcome.style,
+                                " ".into(),
+                                false,
+                                child_link.clone(),
+                            ));
+                        }
+                        build_into(dom, child, outcome.style, sheet, child_link, out);
+                        if has_margin(outcome.bx.margin[1]) {
+                            out.push(BoxNode::leaf(
+                                outcome.style,
+                                " ".into(),
+                                false,
+                                None,
+                            ));
+                        }
                     }
                 }
             }
@@ -1350,15 +1369,18 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, content: &[f32]) -> Vec<
 
 /// Block flow: consecutive text leaves become wrapped line segments; child
 /// boxes are placed at the running y. The 0.6*size paragraph gap is added at
-/// block boundaries (matches the legacy hard_break semantics: gap only after
-/// content, never between empty breaks).
+/// block boundaries only - a `<br>` inside the text advances exactly one
+/// line (see [`layout_from`]).
 ///
 /// Boxes with `inline` set (UA form-control chrome, author `display:
-/// inline-block`) join the current text line instead of opening their own:
-/// shrink-to-fit width, vertically centered against what is already on the
-/// line, and the text after them continues on that same line.
+/// inline-block`, promoted background/padding inlines) join the current
+/// text line instead of opening their own: shrink-to-fit width,
+/// vertically centered against what is already on the line, and the text
+/// after them continues on that same line.
 /// shortcut: centering approximates baseline alignment (a real engine
-/// aligns the inline-block's text baseline to the line's), and a box
+/// aligns the inline-block's text baseline to the line's), vertical
+/// padding on a promoted inline grows the line box (real engines paint
+/// it without affecting line height), and a box
 /// wider than its container overflows instead of shrink-wrapping its
 /// content to fit (no min-content measure).
 fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<PositionedRun>, uls: &mut Vec<UR>) {
@@ -1433,8 +1455,15 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             }
             i += 1;
         } else if n.children[i].inline {
-            // inline-level box (form control / author inline-block):
-            // shrink-to-fit, joins the current line
+            // inline-level box (form control / author inline-block /
+            // promoted background inline): shrink-to-fit, joins the
+            // current line. A %-width resolves against the CONTAINING
+            // BLOCK (this block's content width) per CSS - convert to px
+            // here so place()'s re-resolution is exact (width:100%
+            // buttons fill their container, not their own text)
+            if let Some(Len::Pct(p)) = n.children[i].bx.width {
+                n.children[i].bx.width = Some(Len::Px(p / 100.0 * n.w));
+            }
             let (mut line_top, mut line_h, mut cx) = cont.unwrap_or((y, 0.0, 0.0));
             let mut avail = (n.w - cx).max(0.0);
             let mut bw = natural_w(&n.children[i], avail, measure);
@@ -1596,7 +1625,16 @@ fn flex_line(
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                let adv = place(&mut n.children[i], x, y, w, measure, runs, uls);
+                // a %-width item resolves against the ROW's content width
+                // (its containing block), not its allotted slot - passing the
+                // slot re-resolved `width:30%` against 30% of the row (a
+                // side-by-side column layout came out 3x too narrow)
+                let avail = if matches!(n.children[i].bx.width, Some(Len::Pct(_))) {
+                    n.w
+                } else {
+                    w
+                };
+                let adv = place(&mut n.children[i], x, y, avail, measure, runs, uls);
                 (adv, n.children[i].open) // cross-size = margin box
             }
         };
@@ -1914,13 +1952,23 @@ fn layout_from(
 
     let space_w = |s: &Style| measure(" ", s);
 
+    // `<br>` advances exactly ONE line at the current line-height - no
+    // paragraph gap (a 0.6*size gap here spaced e.g. a hero h1's lines ~2x
+    // normal). Consecutive `<br>`s each add one empty line, the classic
+    // blank-line-per-break behavior. shortcut: a LEADING `<br>` (empty line
+    // before any content) is still a no-op.
+    let mut after_br = false;
+
     for w in &words {
         if w.hard_break {
             if x > 0.0 {
                 y += line_height;
                 x = 0.0;
                 line_height = 0.0;
-                y += w.style.size * 0.6; // paragraph gap only after content, not between empty breaks
+                after_br = true;
+            } else if after_br {
+                // consecutive <br>: the line is empty - add it
+                y += w.style.line_height();
             }
             continue;
         }
@@ -1936,6 +1984,7 @@ fn layout_from(
             x = 0.0;
             line_height = 0.0;
         }
+        after_br = false; // real content ends the <br> run
         let lh = w.style.line_height();
         runs.push(PositionedRun {
             x,
@@ -2054,6 +2103,56 @@ mod tests {
         let l = layout(&atoms, 100.0, &|s, _| s.len() as f32 * 4.0);
         assert_eq!(l.runs.len(), 2);
         assert!(l.runs[1].y > l.runs[0].y);
+    }
+
+    #[test]
+    fn br_advances_exactly_one_line_height() {
+        // <br> between two text runs advances exactly ONE line at the
+        // current line-height - no legacy 0.6*size paragraph gap (a hero
+        // h1's lines were spaced ~2x normal with it)
+        let mut n = BoxNode::group(Style::new(), BoxStyle::default());
+        n.children = vec![
+            leaf("one"),
+            BoxNode::leaf(Style::new(), String::new(), true, None), // <br>
+            leaf("two"),
+        ];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        assert_eq!(l.runs.len(), 2);
+        let line = 15.0 * 1.35;
+        assert!(
+            (l.runs[1].y - line).abs() < 0.01,
+            "y={} = exactly one line, no 0.6*size gap",
+            l.runs[1].y
+        );
+        assert!((n.h - line * 2.0).abs() < 0.01, "h={} = two lines", n.h);
+    }
+
+    #[test]
+    fn consecutive_br_each_add_one_empty_line() {
+        // classic behavior: each <br> beyond the first in a run adds one
+        // empty line - a<br><br>b puts b two lines below a, three <br>s
+        // put it three lines below
+        let mk = |brs: usize| {
+            let mut n = BoxNode::group(Style::new(), BoxStyle::default());
+            n.children = vec![leaf("a")];
+            for _ in 0..brs {
+                n.children.push(BoxNode::leaf(Style::new(), String::new(), true, None));
+            }
+            n.children.push(leaf("b"));
+            n
+        };
+        let line = 15.0 * 1.35;
+        for (brs, lines) in [(2usize, 2.0f32), (3, 3.0)] {
+            let mut n = mk(brs);
+            let l = layout_tree(&mut n, 200.0, &m4);
+            let b = l.runs.iter().find(|r| r.text == "b").expect("b run");
+            assert!(
+                (b.y - line * lines).abs() < 0.01,
+                "{brs} brs: y={} expect {}",
+                b.y,
+                line * lines
+            );
+        }
     }
 
     #[test]
@@ -2350,12 +2449,12 @@ mod tests {
         );
         let l = layout_tree(&mut root, 200.0, &m4);
         let line = 15.0 * 1.35;
-        let gap = 15.0 * 0.6; // <br> paragraph gap inside the tall block
-        // short item ("aa") shifted to the bottom of the tall item's height
+        // <br> advances exactly one line (no paragraph gap) - the tall item
+        // is two lines tall; the short item shifts to the row bottom
         let short = l.runs.iter().find(|r| r.text == "aa").unwrap();
         let tall_first = l.runs.iter().find(|r| r.text == "x").unwrap();
-        assert!((short.y - (tall_first.y + line + gap)).abs() < 0.01, "short.y={}", short.y);
-        assert!((root.h - (line * 2.0 + gap)).abs() < 0.01, "h={}", root.h);
+        assert!((short.y - (tall_first.y + line)).abs() < 0.01, "short.y={}", short.y);
+        assert!((root.h - line * 2.0).abs() < 0.01, "h={}", root.h);
     }
 
     #[test]
@@ -3165,9 +3264,61 @@ mod tests {
         // the x-advancement below is the stronger same-line proof
         assert!((mid.y - pre.y).abs() < 10.0, "box on the text line (dy={})", mid.y - pre.y);
         assert!((post.y - pre.y).abs() < 10.0, "text continues after the box");
-        // x advances left-to-right: pre → mid (inside box) → post
+        // x advances left-to-right: pre -> mid (inside box) -> post
         assert!(pre.x < mid.x, "mid after pre: {} vs {}", mid.x, pre.x);
         assert!(mid.x < post.x, "post after mid: {} vs {}", post.x, mid.x);
+    }
+
+    #[test]
+    fn inline_background_band_spans_text_and_padding() {
+        // a plain inline with background + horizontal padding paints a band
+        // across its full extent (text width + both padding sides), not just
+        // behind each glyph - the span is promoted to a real inline box
+        let dom = crate::html::parse(r#"<p>pre <span class="b">mid</span> post</p>"#);
+        let sheet = crate::css::parse(r#".b { background: #ff0000; padding: 0 8px; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 1, "span promoted to one inline box");
+            assert!(cs[0].bx.bg.is_some(), "background kept on the box");
+            assert!(cs[0].inline, "inline placement");
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let band = controls(&root)[0];
+        let pre = l.runs.iter().find(|r| r.text == "pre").expect("pre run");
+        let mid = l.runs.iter().find(|r| r.text == "mid").expect("mid run");
+        let post = l.runs.iter().find(|r| r.text == "post").expect("post run");
+        // band spans text + 8px padding on each side: border-box width >= the
+        // inner text width + 16 (the horizontal padding)
+        let text_w = m4("mid", &Style::new());
+        assert!(
+            band.w >= text_w + 16.0 - 0.01,
+            "band w={} spans text {} + 16px padding",
+            band.w,
+            text_w
+        );
+        // still one line: the band grows horizontally, not into a stacked row
+        assert!((mid.y - pre.y).abs() < 10.0, "band on the text line");
+        assert!((post.y - pre.y).abs() < 10.0, "text continues after the band");
+    }
+
+    #[test]
+    fn pct_width_inline_block_fills_containing_block() {
+        // width:100% on an inline-block resolves against the containing
+        // block's content width (the column), not the item's own natural
+        // width - the button fills its 200px column
+        let dom = crate::html::parse(r#"<div><span class="b">Go</span></div>"#);
+        let sheet = crate::css::parse(r#".b { display: inline-block; width: 100%; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 1, "one inline box");
+        }
+        let l = layout_tree(&mut root, 200.0, &m4);
+        let ib = controls(&root)[0];
+        let go = l.runs.iter().find(|r| r.text == "Go").expect("Go run");
+        assert!(go.x.abs() < 0.01, "starts at column left edge");
+        assert!((ib.w - 200.0).abs() < 0.01, "box fills 200px column, w={}", ib.w);
     }
 
     #[test]
