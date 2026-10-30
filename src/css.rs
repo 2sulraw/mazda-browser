@@ -290,6 +290,11 @@ pub struct Sheet {
     /// `set_stacks` so the font picker reads the same Vec). None in tests →
     /// `Style::fam_stack` stays 0 = generic pick, the pre-wiring behaviour.
     stacks: Option<StackTable>,
+    /// viewport (w, h) in CSS px that `vw`/`vh`/`vmin`/`vmax` resolve against
+    /// at cascade time. Width is seeded from `parse_for`'s media-query `vw`;
+    /// height defaults to 700 (= the fixed window in main.rs) until
+    /// `set_viewport` passes the real one.
+    vp: (f32, f32),
 }
 
 /// Interned `font-family` comma stacks: the cascade assigns each distinct
@@ -394,6 +399,15 @@ impl Sheet {
     /// during layout index the same Vec the font picker reads back.
     pub fn set_stacks(&mut self, t: StackTable) {
         self.stacks = Some(t);
+    }
+
+    /// Set the viewport (w, h) in CSS px that `vw`/`vh`/`vmin`/`vmax`
+    /// resolve against at cascade time. `parse_for` already seeds the width
+    /// (media queries need it at parse time); production calls this with the
+    /// real window size so vh matches the laid-out viewport. The 700px
+    /// default matches the fixed window (main.rs), so tests are deterministic.
+    pub fn set_viewport(&mut self, w: f32, h: f32) {
+        self.vp = (w, h);
     }
 
     /// Id of this font-family value's comma stack in the shared table
@@ -682,6 +696,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         var_defs,
         root_pol: None,
         stacks: None,
+        vp: (vw, 700.0),
     }
 }
 
@@ -820,7 +835,7 @@ impl Sheet {
             for d in &rule.decls {
                 let sd = self.subst(d);
                 let fs = self.fam_stack_of(&sd);
-                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, dark, fs) {
+                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
                 }
             }
@@ -830,7 +845,7 @@ impl Sheet {
             for d in &parse_decls(inline) {
                 let sd = self.subst(d);
                 let fs = self.fam_stack_of(&sd);
-                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, dark, fs) {
+                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
                 }
             }
@@ -1092,6 +1107,8 @@ fn apply_decl(
     bg: &mut Option<u32>,
     bx: &mut BoxStyle,
     parent: f32,
+    // viewport (w, h) for vw/vh/vmin/vmax — read off the sheet at resolve
+    vp: (f32, f32),
     dark: bool,
     // interned font-family stack id for this decl (from the shared table)
     fam_stack: u16,
@@ -1137,7 +1154,7 @@ fn apply_decl(
                 "inherit" | "unset" => style.size = parent, // restore the inherited size
                 "initial" => style.size = 16.0,
                 _ => {
-                    if let Some(px) = parse_size(&d.1, parent) {
+                    if let Some(px) = parse_size(&d.1, parent, vp) {
                         style.size = px.clamp(6.0, 400.0);
                     }
                 }
@@ -1205,7 +1222,7 @@ fn apply_decl(
         },
         // shadows carry their own alpha (rgba() is the common case) and may
         // stack — parse the whole list, first shadow paints on top
-        "box-shadow" => bx.shadows = parse_box_shadows(&d.1, dark),
+        "box-shadow" => bx.shadows = parse_box_shadows(&d.1, dark, vp),
         // fully transparent = invisible; shortcut: partial opacity ignored
         // (rasterizer has no alpha compositing), so only 0 hides the subtree
         "opacity" => return d.1.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false),
@@ -1247,27 +1264,27 @@ fn apply_decl(
         "gap" => {
             let mut it = d.1.split_whitespace();
             if let (Some(a), b) = (it.next(), it.next()) {
-                if let Some(v) = parse_len(a) {
+                if let Some(v) = parse_len(a, vp) {
                     bx.gap_row = len_px(v, 0.0);
                     bx.gap_col = len_px(v, 0.0);
                 }
-                if let Some(v) = b.and_then(parse_len) {
+                if let Some(v) = b.and_then(|t| parse_len(t, vp)) {
                     bx.gap_col = len_px(v, 0.0); // `gap: row col`
                 }
             }
         }
         "row-gap" => {
-            if let Some(v) = parse_len(&d.1) {
+            if let Some(v) = parse_len(&d.1, vp) {
                 bx.gap_row = len_px(v, 0.0);
             }
         }
         "column-gap" => {
-            if let Some(v) = parse_len(&d.1) {
+            if let Some(v) = parse_len(&d.1, vp) {
                 bx.gap_col = len_px(v, 0.0);
             }
         }
         "grid-template-columns" => {
-            let (cols, lines) = parse_tracks(&d.1);
+            let (cols, lines) = parse_tracks(&d.1, vp);
             bx.cols = cols;
             bx.col_lines = lines;
         }
@@ -1280,14 +1297,14 @@ fn apply_decl(
             }
         }
         "width" => {
-            if let Some(l) = parse_len(&d.1).filter(|_| d.1 != "auto") {
+            if let Some(l) = parse_len(&d.1, vp).filter(|_| d.1 != "auto") {
                 bx.width = Some(l);
                 bx.declared |= decl::WIDTH;
             }
         }
-        "height" => bx.height = parse_len(&d.1).filter(|_| d.1 != "auto"),
+        "height" => bx.height = parse_len(&d.1, vp).filter(|_| d.1 != "auto"),
         "min-height" => {
-            if let Some(l) = parse_len(&d.1).filter(|_| d.1 != "auto") {
+            if let Some(l) = parse_len(&d.1, vp).filter(|_| d.1 != "auto") {
                 bx.min_height = Some(l);
                 bx.declared |= decl::MIN_HEIGHT;
             }
@@ -1296,13 +1313,13 @@ fn apply_decl(
             bx.max_width = if d.1 == "none" {
                 None
             } else {
-                parse_len(&d.1)
+                parse_len(&d.1, vp)
             }
         }
         // shortcut: only the auto (centering) half of margin is honored —
         // fixed margins/padding per side don't exist yet
         "margin" => {
-            let v = parse_sides(&d.1);
+            let v = parse_sides(&d.1, vp);
             bx.margin = v;
             if d.1.contains("auto") {
                 // auto in a horizontal slot → centering shortcut
@@ -1310,44 +1327,44 @@ fn apply_decl(
             }
         }
         "padding" => {
-            bx.pad = parse_sides(&d.1);
+            bx.pad = parse_sides(&d.1, vp);
             bx.declared |= decl::PAD;
         }
-        "margin-top" => bx.margin[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
-        "margin-bottom" => bx.margin[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0)),
+        "margin-top" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
+        "margin-bottom" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         "margin-left" | "margin-inline" | "margin-inline-start" => {
             if d.1.contains("auto") {
                 bx.margin_x_auto = true;
             } else {
-                bx.margin[3] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+                bx.margin[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             }
         }
         "margin-right" | "margin-inline-end" => {
             if d.1.contains("auto") {
                 bx.margin_x_auto = true;
             } else {
-                bx.margin[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+                bx.margin[1] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             }
         }
         "padding-top" => {
-            bx.pad[0] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.pad[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             bx.declared |= decl::PAD;
         }
         "padding-right" => {
-            bx.pad[1] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.pad[1] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             bx.declared |= decl::PAD;
         }
         "padding-bottom" => {
-            bx.pad[2] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.pad[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             bx.declared |= decl::PAD;
         }
         "padding-left" => {
-            bx.pad[3] = parse_len(&d.1).unwrap_or(Len::Px(0.0));
+            bx.pad[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             bx.declared |= decl::PAD;
         }
         // first value only (per-corner radii: shortcut)
         "border-radius" | "border-top-left-radius" => {
-            if let Some(v) = d.1.split_whitespace().next().and_then(parse_len) {
+            if let Some(v) = d.1.split_whitespace().next().and_then(|t| parse_len(t, vp)) {
                 bx.radius = v;
                 bx.declared |= decl::RADIUS;
             }
@@ -1356,7 +1373,7 @@ fn apply_decl(
         // the full shorthand resets color to currentcolor when unspecified
         // (spec cascade), per-side shorthands only touch color when given
         "border" => {
-            let (w, c) = border_parts(&d.1, dark);
+            let (w, c) = border_parts(&d.1, dark, vp);
             if let Some(w) = w {
                 bx.border = [w; 4];
             }
@@ -1367,7 +1384,7 @@ fn apply_decl(
             bx.declared |= decl::BORDER | decl::BCOLOR;
         }
         "border-width" => {
-            bx.border = parse_sides(&d.1);
+            bx.border = parse_sides(&d.1, vp);
             bx.declared |= decl::BORDER;
         }
         "border-color" => {
@@ -1383,7 +1400,7 @@ fn apply_decl(
                 "border-bottom" => 2,
                 _ => 3,
             };
-            let (w, c) = border_parts(&d.1, dark);
+            let (w, c) = border_parts(&d.1, dark, vp);
             if let Some(w) = w {
                 bx.border[side] = w;
             }
@@ -1405,14 +1422,14 @@ fn apply_decl(
         }
         // insets — `auto`/bogus parse to None (absolute keeps its provisional
         // position on that edge, relative doesn't shift along it)
-        "top" => bx.inset[0] = parse_len(&d.1),
-        "right" => bx.inset[1] = parse_len(&d.1),
-        "bottom" => bx.inset[2] = parse_len(&d.1),
-        "left" => bx.inset[3] = parse_len(&d.1),
+        "top" => bx.inset[0] = parse_len(&d.1, vp),
+        "right" => bx.inset[1] = parse_len(&d.1, vp),
+        "bottom" => bx.inset[2] = parse_len(&d.1, vp),
+        "left" => bx.inset[3] = parse_len(&d.1, vp),
         // inset shorthand: 1–4 values, `auto` slots stay None (unlike
         // margin/padding where 0 is the fallback — None means "unset edge")
         "inset" => {
-            let vals: Vec<Option<Len>> = d.1.split_whitespace().map(parse_len).collect();
+            let vals: Vec<Option<Len>> = d.1.split_whitespace().map(|t| parse_len(t, vp)).collect();
             bx.inset = match vals.len() {
                 1 => [vals[0]; 4],
                 2 => [vals[0], vals[1], vals[0], vals[1]],
@@ -1431,13 +1448,13 @@ fn apply_decl(
 /// Style words (`solid`, `dashed`, …) are ignored — everything renders solid
 /// (shortcut); `none` resets the width to 0. Color tokens may be
 /// `light-dark(a, b)` — picked against the used scheme (`dark`).
-fn border_parts(v: &str, dark: bool) -> (Option<Len>, Option<u32>) {
+fn border_parts(v: &str, dark: bool, vp: (f32, f32)) -> (Option<Len>, Option<u32>) {
     let mut w = None;
     let mut c = None;
     for t in joined_tokens(v) {
         if t.eq_ignore_ascii_case("none") {
             w = Some(Len::Px(0.0));
-        } else if let Some(l) = parse_len(&t) {
+        } else if let Some(l) = parse_len(&t, vp) {
             w = Some(l);
         } else if let Some(col) = parse_color(pick_light_dark(&t, dark)) {
             c = Some(col);
@@ -1448,9 +1465,9 @@ fn border_parts(v: &str, dark: bool) -> (Option<Len>, Option<u32>) {
 
 /// CSS side shorthand (`margin`/`padding`: 1–4 whitespace-separated values)
 /// → [top, right, bottom, left].
-fn parse_sides(v: &str) -> [Len; 4] {
+fn parse_sides(v: &str, vp: (f32, f32)) -> [Len; 4] {
     let z = Len::Px(0.0);
-    let vals: Vec<Len> = v.split_whitespace().filter_map(parse_len).collect();
+    let vals: Vec<Len> = v.split_whitespace().filter_map(|t| parse_len(t, vp)).collect();
     match vals.len() {
         1 => [vals[0], vals[0], vals[0], vals[0]],
         2 => [vals[0], vals[1], vals[0], vals[1]],
@@ -1482,18 +1499,42 @@ fn parse_bg_url(v: &str) -> Option<std::rc::Rc<str>> {
     (!target.is_empty()).then(|| std::rc::Rc::from(target))
 }
 
-/// `200px` / `50%` / `1.5rem` → [`Len`]. Bare numbers are lenient px
+/// `200px` / `50%` / `1.5rem` / `25vh` → [`Len`]. Bare numbers are lenient px
 /// (matches `parse_size`); `em`≈rem shortcut (needs element font size).
-fn parse_len(v: &str) -> Option<Len> {
+/// Viewport units (`vh`/`vw`/`vmin`/`vmax` + the `l/s/d`-prefixed aliases,
+/// all mapped to the static viewport — shortcut: no dynamic-viewport
+/// tracking) resolve NOW against `vp` = (w, h); `%` stays symbolic — it's
+/// % of the CONTAINING BLOCK at layout, not of the viewport.
+fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
     let v = v.trim();
     if let Some(n) = v.strip_suffix('%') {
         return n.trim().parse::<f32>().ok().map(Len::Pct);
     }
+    // viewport units — longest suffixes first so the `l/s/d` aliases match
+    // before bare `vh`/`vw` could bite into them ("50svh" must not strip
+    // "vh" and fail on the leftover "50s"); each alias shares the static
+    // viewport size (dvh/svh/lvh = vh, dvw/svw/lvw = vw).
+    for (unit, px_per) in [
+        ("vmax", vp.0.max(vp.1)),
+        ("vmin", vp.0.min(vp.1)),
+        ("dvh", vp.1),
+        ("lvh", vp.1),
+        ("svh", vp.1),
+        ("vh", vp.1),
+        ("dvw", vp.0),
+        ("lvw", vp.0),
+        ("svw", vp.0),
+        ("vw", vp.0),
+    ] {
+        if let Some(f) = v.strip_suffix(unit).and_then(|n| n.trim().parse::<f32>().ok()) {
+            return Some(Len::Px(f / 100.0 * px_per));
+        }
+    }
     // `calc(<arith>)` — var() already substituted upstream; evaluate the
-    // arithmetic to px. `%`/`vw`/`vh` terms need a container/viewport that
-    // parse_len doesn't have, so they stay unresolvable (None → unset).
+    // arithmetic to px. `%` terms need a containing block that parse_len
+    // doesn't have, so they stay unresolvable (None → unset).
     if let Some(inner) = v.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
-        return eval_calc(inner).map(Len::Px);
+        return eval_calc(inner, vp).map(Len::Px);
     }
     if let Some(n) = v.strip_suffix("rem") {
         return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
@@ -1509,17 +1550,18 @@ fn parse_len(v: &str) -> Option<Len> {
 
 /// Evaluate `calc()` arithmetic (already `var()`-substituted) to px.
 /// Grammar: `+ -` at the lowest precedence, then `* /`, then a signed factor
-/// (parenthesized sub-expression or a number with an optional px/em/rem unit;
-/// unitless numbers act as multipliers). `%`, `vw`, `vh`, and other units are
-/// unsupported here (they need a container/viewport) → None. shortcut: no
-/// nested `calc(` inside the expression.
-fn eval_calc(s: &str) -> Option<f32> {
+/// (parenthesized sub-expression or a number with an optional px/em/rem/
+/// viewport unit; unitless numbers act as multipliers). `vw`/`vh`/`vmin`/
+/// `vmax` (+ aliases) resolve against the viewport `vp`; `%` and other units
+/// need a containing block → None. shortcut: no nested `calc(` inside the
+/// expression.
+fn eval_calc(s: &str, vp: (f32, f32)) -> Option<f32> {
     fn skip_ws(b: &[u8], i: &mut usize) {
         while *i < b.len() && b[*i].is_ascii_whitespace() {
             *i += 1;
         }
     }
-    fn factor(b: &[u8], s: &str, i: &mut usize) -> Option<f32> {
+    fn factor(b: &[u8], s: &str, i: &mut usize, vp: (f32, f32)) -> Option<f32> {
         skip_ws(b, i);
         let mut sign = 1.0f32;
         while *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
@@ -1531,7 +1573,7 @@ fn eval_calc(s: &str) -> Option<f32> {
         }
         if *i < b.len() && b[*i] == b'(' {
             *i += 1;
-            let v = additive(b, s, i)?;
+            let v = additive(b, s, i, vp)?;
             skip_ws(b, i);
             if *i < b.len() && b[*i] == b')' {
                 *i += 1;
@@ -1554,12 +1596,16 @@ fn eval_calc(s: &str) -> Option<f32> {
         let px = match &s[ustart..*i] {
             "" | "px" => n, // unitless = multiplier; px = identity
             "em" | "rem" => n * 16.0,
-            _ => return None, // %, vw, vh, … need a container
+            "vh" | "lvh" | "svh" | "dvh" => n / 100.0 * vp.1,
+            "vw" | "lvw" | "svw" | "dvw" => n / 100.0 * vp.0,
+            "vmin" => n / 100.0 * vp.0.min(vp.1),
+            "vmax" => n / 100.0 * vp.0.max(vp.1),
+            _ => return None, // %, … need a containing block
         };
         Some(sign * px)
     }
-    fn multiplicative(b: &[u8], s: &str, i: &mut usize) -> Option<f32> {
-        let mut lhs = factor(b, s, i)?;
+    fn multiplicative(b: &[u8], s: &str, i: &mut usize, vp: (f32, f32)) -> Option<f32> {
+        let mut lhs = factor(b, s, i, vp)?;
         loop {
             skip_ws(b, i);
             if *i >= b.len() || (b[*i] != b'*' && b[*i] != b'/') {
@@ -1567,13 +1613,13 @@ fn eval_calc(s: &str) -> Option<f32> {
             }
             let op = b[*i];
             *i += 1;
-            let rhs = factor(b, s, i)?;
+            let rhs = factor(b, s, i, vp)?;
             lhs = if op == b'*' { lhs * rhs } else { lhs / rhs };
         }
         Some(lhs)
     }
-    fn additive(b: &[u8], s: &str, i: &mut usize) -> Option<f32> {
-        let mut lhs = multiplicative(b, s, i)?;
+    fn additive(b: &[u8], s: &str, i: &mut usize, vp: (f32, f32)) -> Option<f32> {
+        let mut lhs = multiplicative(b, s, i, vp)?;
         loop {
             skip_ws(b, i);
             if *i >= b.len() || (b[*i] != b'+' && b[*i] != b'-') {
@@ -1581,14 +1627,14 @@ fn eval_calc(s: &str) -> Option<f32> {
             }
             let op = b[*i];
             *i += 1;
-            let rhs = multiplicative(b, s, i)?;
+            let rhs = multiplicative(b, s, i, vp)?;
             lhs = if op == b'+' { lhs + rhs } else { lhs - rhs };
         }
         Some(lhs)
     }
     let b = s.as_bytes();
     let mut i = 0;
-    let v = additive(b, s, &mut i)?;
+    let v = additive(b, s, &mut i, vp)?;
     skip_ws(b, &mut i);
     if i != b.len() {
         return None; // trailing junk → unresolvable
@@ -1609,7 +1655,7 @@ fn len_px(l: Len, container: f32) -> f32 {
 /// Returns the tracks plus line names (`[content-start]` → index of the
 /// track boundary it precedes) so items can place via `grid-column: name`.
 /// shortcut: `repeat(auto-fill, …)` and multi-token line names are dropped.
-fn parse_tracks(v: &str) -> (Vec<Track>, Vec<(String, usize)>) {
+fn parse_tracks(v: &str, vp: (f32, f32)) -> (Vec<Track>, Vec<(String, usize)>) {
     let mut out = Vec::new();
     let mut lines: Vec<(String, usize)> = Vec::new();
     let v = v.trim();
@@ -1644,9 +1690,12 @@ fn parse_tracks(v: &str) -> (Vec<Track>, Vec<(String, usize)>) {
             }
             i = close + 1;
         } else if v[i..].starts_with("calc(") || v[i..].starts_with("max(") || v[i..].starts_with("min(") {
-            // unresolvable math (needs the viewport for vw) — skip the WHOLE
-            // paren group. Cutting inside it used to leak inner literals
-            // (e.g. `calc(50vw - 720px)` minted a phantom 720px track)
+            // math groups skip whole — max()/min() have no evaluator, and
+            // cutting inside the parens used to leak inner literals (e.g.
+            // `calc(50vw - 720px)` minted a phantom 720px track that zeroed
+            // the 1fr tracks). shortcut: a bare `calc(…)` track COULD resolve
+            // now that the viewport is available, but one skip path for all
+            // three functions keeps the phantom fix simple.
             let open = v[i..].find('(').unwrap();
             let Some(close) = match_paren(b, i + open) else { break };
             s.push(' '); // keep neighbors separated
@@ -1674,7 +1723,7 @@ fn parse_tracks(v: &str) -> (Vec<Track>, Vec<(String, usize)>) {
             // resolved at layout (min-content ≈ max-content here — fine for
             // the single-line header labels these mostly size)
             out.push(Track::Content);
-        } else if let Some(l) = parse_len(tok) {
+        } else if let Some(l) = parse_len(tok, vp) {
             out.push(match l {
                 Len::Px(p) => Track::Px(p),
                 Len::Pct(p) => Track::Pct(p),
@@ -1703,33 +1752,47 @@ fn match_paren(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// `16px`, `1.2em` (relative to current size), `120%`, bare number (lenient px).
-fn parse_size(v: &str, current: f32) -> Option<f32> {
+/// `16px`, `1.2em` (relative to current size), `120%`, `5vw` (viewport),
+/// bare number (lenient px).
+fn parse_size(v: &str, current: f32, vp: (f32, f32)) -> Option<f32> {
     let v = v.trim();
     // clamp(min, val, max) — common for responsive font sizes; resolve the
-    // inner values (px/rem/% only; vw needs the viewport, see parse_for note)
+    // inner values (px/rem/%/viewport units; % is % of the current font-size)
     if let Some(inner) = v
         .strip_prefix("clamp(")
         .and_then(|s| s.strip_suffix(')'))
     {
         let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
         if parts.len() == 3 {
-            let (Some(lo), Some(hi)) = (parse_size(parts[0], current), parse_size(parts[2], current))
-            else {
+            let (Some(lo), Some(hi)) = (
+                parse_size(parts[0], current, vp),
+                parse_size(parts[2], current, vp),
+            ) else {
                 return None;
             };
-            let val = parse_size(parts[1], current).unwrap_or(lo);
+            let val = parse_size(parts[1], current, vp).unwrap_or(lo);
             return Some(val.clamp(lo, hi));
         }
         return None;
     }
-    // vw/vh units: no viewport here (static parse) — treat vw as % of a
-    // 1000px window (our fixed width) so headings stay proportional
-    if let Some(n) = v.strip_suffix("vw") {
-        return n.trim().parse::<f32>().ok().map(|f| f / 100.0 * 1000.0);
-    }
-    if let Some(n) = v.strip_suffix("vh") {
-        return n.trim().parse::<f32>().ok().map(|f| f / 100.0 * 700.0);
+    // viewport units resolve against the sheet viewport (font-size is an
+    // absolute used value after the cascade — no containing-block step);
+    // the l/s/d aliases map to the static size (shortcut), like parse_len
+    for (unit, px_per) in [
+        ("vmax", vp.0.max(vp.1)),
+        ("vmin", vp.0.min(vp.1)),
+        ("dvh", vp.1),
+        ("lvh", vp.1),
+        ("svh", vp.1),
+        ("vh", vp.1),
+        ("dvw", vp.0),
+        ("lvw", vp.0),
+        ("svw", vp.0),
+        ("vw", vp.0),
+    ] {
+        if let Some(f) = v.strip_suffix(unit).and_then(|n| n.trim().parse::<f32>().ok()) {
+            return Some(f / 100.0 * px_per);
+        }
     }
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse().ok();
@@ -1973,7 +2036,7 @@ fn parse_color_alpha(v: &str) -> Option<(u32, u8)> {
 /// and unparseable → empty list. `inset` shadows are dropped (shortcut: no
 /// inner-shadow rendering). Color tokens may be `light-dark(a, b)` — picked
 /// against the used scheme (`dark`).
-fn parse_box_shadows(v: &str, dark: bool) -> Vec<Shadow> {
+fn parse_box_shadows(v: &str, dark: bool, vp: (f32, f32)) -> Vec<Shadow> {
     let v = v.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return Vec::new();
@@ -1995,7 +2058,7 @@ fn parse_box_shadows(v: &str, dark: bool) -> Vec<Shadow> {
         cur.push(c);
     }
     parts.push(cur);
-    parts.iter().filter_map(|p| parse_shadow(p, dark)).collect()
+    parts.iter().filter_map(|p| parse_shadow(p, dark, vp)).collect()
 }
 
 /// Whitespace-split value tokens with `(...)` groups re-joined: function
@@ -2018,7 +2081,7 @@ fn joined_tokens(v: &str) -> Vec<String> {
 
 /// One comma-separated shadow: `dx dy [blur] [spread] [color]` in any
 /// token order (color first or last, as sites write it).
-fn parse_shadow(v: &str, dark: bool) -> Option<Shadow> {
+fn parse_shadow(v: &str, dark: bool, vp: (f32, f32)) -> Option<Shadow> {
     let mut lens = [0.0f32; 4];
     let mut n_lens = 0usize;
     let mut color = None;
@@ -2026,7 +2089,7 @@ fn parse_shadow(v: &str, dark: bool) -> Option<Shadow> {
         if t.eq_ignore_ascii_case("inset") {
             return None; // inner shadow: dropped (shortcut)
         }
-        if let Some(l) = parse_len(&t) {
+        if let Some(l) = parse_len(&t, vp) {
             if n_lens < 4 {
                 lens[n_lens] = match l {
                     Len::Px(p) => p,
@@ -2872,6 +2935,10 @@ mod tests {
     use super::*;
     use crate::html;
 
+    /// Default viewport for direct parse_len/parse_tracks calls — the fixed
+    /// window (main.rs `with_inner_size([1000, 700])`) that parse assumes.
+    const VP: (f32, f32) = (1000.0, 700.0);
+
     fn dom_of(markup: &str) -> html::Dom {
         html::parse(markup)
     }
@@ -3678,7 +3745,7 @@ mod tests {
 
     #[test]
     fn tracks_parse_fr_px_pct_and_repeat() {
-        let tracks = |v: &str| parse_tracks(v).0;
+        let tracks = |v: &str| parse_tracks(v, VP).0;
         assert_eq!(
             tracks("repeat(3, 1fr)"),
             vec![Track::Fr(1.0), Track::Fr(1.0), Track::Fr(1.0)]
@@ -3699,7 +3766,7 @@ mod tests {
         );
         // line names are recorded with the boundary index they precede
         assert_eq!(
-            parse_tracks("[a] 1fr [b-start] 200px [b-end]").1,
+            parse_tracks("[a] 1fr [b-start] 200px [b-end]", VP).1,
             vec![("a".to_string(), 0), ("b-start".to_string(), 1), ("b-end".to_string(), 2)]
         );
     }
@@ -3707,17 +3774,20 @@ mod tests {
     #[test]
     fn calc_evaluates_arithmetic_to_px() {
         // var() is substituted upstream; parse_len only sees the arithmetic
-        assert_eq!(parse_len("calc(20em * -1)"), Some(Len::Px(-320.0)), "MDN a11y-menu off-screen top");
-        assert_eq!(parse_len("calc(100px + 20px)"), Some(Len::Px(120.0)));
-        assert_eq!(parse_len("calc(100px - 20px)"), Some(Len::Px(80.0)));
-        assert_eq!(parse_len("calc(4px * 3 + 2px)"), Some(Len::Px(14.0)), "* binds tighter than +");
-        assert_eq!(parse_len("calc(2rem + 10px)"), Some(Len::Px(42.0)), "rem = 16px each");
-        assert_eq!(parse_len("calc((10px + 2px) * 2)"), Some(Len::Px(24.0)), "parenthesized sub-expression");
-        // % / vw / vh need a container/viewport → stay unresolvable (unset)
-        assert_eq!(parse_len("calc(100% - 20px)"), None);
-        assert_eq!(parse_len("calc(50vw - 720px)"), None);
+        assert_eq!(parse_len("calc(20em * -1)", VP), Some(Len::Px(-320.0)), "MDN a11y-menu off-screen top");
+        assert_eq!(parse_len("calc(100px + 20px)", VP), Some(Len::Px(120.0)));
+        assert_eq!(parse_len("calc(100px - 20px)", VP), Some(Len::Px(80.0)));
+        assert_eq!(parse_len("calc(4px * 3 + 2px)", VP), Some(Len::Px(14.0)), "* binds tighter than +");
+        assert_eq!(parse_len("calc(2rem + 10px)", VP), Some(Len::Px(42.0)), "rem = 16px each");
+        assert_eq!(parse_len("calc((10px + 2px) * 2)", VP), Some(Len::Px(24.0)), "parenthesized sub-expression");
+        // viewport units resolve inside calc against vp (1000×700)
+        assert_eq!(parse_len("calc(10vh + 20px)", VP), Some(Len::Px(90.0)), "70 + 20");
+        assert_eq!(parse_len("calc(50vw - 720px)", VP), Some(Len::Px(-220.0)), "MDN grid math");
+        assert_eq!(parse_len("calc(2 * 5vmin)", VP), Some(Len::Px(70.0)), "2 × 35");
+        // % needs a containing block → stays unresolvable (unset)
+        assert_eq!(parse_len("calc(100% - 20px)", VP), None);
         // trailing junk / malformed → unresolvable
-        assert_eq!(parse_len("calc(10px +)"), None);
+        assert_eq!(parse_len("calc(10px +)", VP), None);
     }
 
     #[test]
@@ -3726,17 +3796,80 @@ mod tests {
         // the parens, minting a bogus 720px track that zeroed the 1fr tracks
         let (cols, _) = parse_tracks(
             "[s] max(1rem,calc(50vw - 720px + 1rem)) [c0] 1fr [c1] minmax(0,48rem) [c2] 1fr [e]",
+            VP,
         );
         assert_eq!(cols, vec![Track::Fr(1.0), Track::Px(768.0), Track::Fr(1.0)]);
     }
 
     #[test]
     fn len_parses_px_pct_and_bare() {
-        assert_eq!(parse_len("12px"), Some(Len::Px(12.0)));
-        assert_eq!(parse_len("50%"), Some(Len::Pct(50.0)));
-        assert_eq!(parse_len("24"), Some(Len::Px(24.0)));
-        assert_eq!(parse_len("auto"), None);
-        assert_eq!(parse_len("1.5rem"), Some(Len::Px(24.0))); // rem = 16px root
+        assert_eq!(parse_len("12px", VP), Some(Len::Px(12.0)));
+        assert_eq!(parse_len("50%", VP), Some(Len::Pct(50.0)));
+        assert_eq!(parse_len("24", VP), Some(Len::Px(24.0)));
+        assert_eq!(parse_len("auto", VP), None);
+        assert_eq!(parse_len("1.5rem", VP), Some(Len::Px(24.0))); // rem = 16px root
+    }
+
+    #[test]
+    fn viewport_units_parse_and_resolve_to_px() {
+        // vh/vw/vmin/vmax resolve at parse against the passed viewport
+        // (1000×700): vh = 700-based, vw = 1000-based
+        assert_eq!(parse_len("50vh", VP), Some(Len::Px(350.0)));
+        assert_eq!(parse_len("100vw", VP), Some(Len::Px(1000.0)));
+        assert_eq!(parse_len("10vmin", VP), Some(Len::Px(70.0)), "min axis = height = 700");
+        assert_eq!(parse_len("25vmax", VP), Some(Len::Px(250.0)), "max axis = width = 1000");
+        // axis selection flips with a portrait viewport (400×700)
+        let portrait = (400.0, 700.0);
+        assert_eq!(parse_len("10vmin", portrait), Some(Len::Px(40.0)), "min axis now = width = 400");
+        assert_eq!(parse_len("25vmax", portrait), Some(Len::Px(175.0)), "max axis now = height = 700");
+        // dynamic/small/large aliases → the same static viewport (shortcut:
+        // no dynamic-viewport tracking on resize)
+        assert_eq!(parse_len("50dvh", VP), Some(Len::Px(350.0)));
+        assert_eq!(parse_len("50lvh", VP), Some(Len::Px(350.0)));
+        assert_eq!(parse_len("50svh", VP), Some(Len::Px(350.0)));
+        assert_eq!(parse_len("50dvw", VP), Some(Len::Px(500.0)));
+        assert_eq!(parse_len("50lvw", VP), Some(Len::Px(500.0)));
+        assert_eq!(parse_len("50svw", VP), Some(Len::Px(500.0)));
+        // malformed stays unresolvable
+        assert_eq!(parse_len("vh", VP), None);
+        assert_eq!(parse_len("50vhx", VP), None);
+    }
+
+    #[test]
+    fn viewport_units_cascade_into_boxstyle() {
+        // the cascade resolves vh/vw/vmin against the sheet viewport
+        // (parse default 1000×700 — the fixed window)
+        let sheet = parse(".a { height: 50vh; width: 25vw; padding: 10vmin 25vmax }");
+        let dom = dom_of("<div class=a></div>");
+        let bx = sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).bx;
+        assert_eq!(bx.height, Some(Len::Px(350.0)), "50vh of 700");
+        assert_eq!(bx.width, Some(Len::Px(250.0)), "25vw of 1000");
+        assert_eq!(bx.pad, [Len::Px(70.0), Len::Px(250.0), Len::Px(70.0), Len::Px(250.0)]);
+        // % stays a distinct symbolic variant — % of the containing block,
+        // NOT of the viewport
+        let sheet = parse(".b { height: 50% }");
+        let dom = dom_of("<div class=b></div>");
+        let bx = sheet.resolve(&dom, by_attr(&dom, "class", "b"), Style::new(), None).bx;
+        assert_eq!(bx.height, Some(Len::Pct(50.0)), "percent stays symbolic");
+    }
+
+    #[test]
+    fn set_viewport_retargets_vh_resolution() {
+        // the sheet carries the viewport; set_viewport retargets later cascades
+        let mut sheet = parse(".a { height: 25vh }");
+        let dom = dom_of("<div class=a></div>");
+        let node = by_attr(&dom, "class", "a");
+        assert_eq!(
+            sheet.resolve(&dom, node, Style::new(), None).bx.height,
+            Some(Len::Px(175.0)),
+            "default 700 height"
+        );
+        sheet.set_viewport(1200.0, 800.0);
+        assert_eq!(
+            sheet.resolve(&dom, node, Style::new(), None).bx.height,
+            Some(Len::Px(200.0)),
+            "25% of the new 800px height"
+        );
     }
 
     #[test]
