@@ -5,6 +5,7 @@ mod html;
 mod image;
 mod layout;
 mod svg;
+mod ui_chrome;
 mod woff;
 
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
@@ -42,17 +43,18 @@ struct Tab {
 // single NEAREST texture; egui owns the window, tab strip and address bar.
 // ---------------------------------------------------------------------------
 
-/// Tab-strip height, logical points.
-const TAB_H: f32 = 26.0;
+/// Tab-strip (= titlebar) height, logical points.
+const TAB_H: f32 = ui_chrome::TAB_H;
 /// Address-row height, logical points.
-const ADDR_H: f32 = 34.0;
+const ADDR_H: f32 = ui_chrome::TOOLBAR_H;
 
 fn main() -> eframe::Result {
-    // shortcut: native titlebar this round; borderless egui-drawn titlebar is a
-    // later flip (decorations:false + ViewportCommand buttons + drag).
+    // Borderless shell: the titlebar (tab strip, window controls, drag
+    // region) and the toolbar are drawn by ui_chrome; no native frame.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Mazda")
+            .with_decorations(false)
             .with_inner_size([1000.0, 700.0]),
         ..Default::default()
     };
@@ -124,7 +126,9 @@ fn pixels_to_image(pixels: &[u32], w: usize, h: usize) -> egui::ColorImage {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let _ = cc; // default egui UI fonts; the page rasterizes its own fonts
+        // dark widget theme so TextEdit's cursor/selection read on the dark
+        // chrome; the page rasterizes its own fonts regardless
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut fonts = Fonts::load();
         let start = std::env::args()
             .nth(1)
@@ -228,63 +232,45 @@ impl eframe::App for App {
         let mut go_back = false;
         let mut go: Option<String> = None; // address submit or link click
 
-        let chrome_frame =
-            egui::Frame::NONE.fill(egui::Color32::from_rgb(0xf1, 0xf1, 0xf1));
-
-        // ---- tab strip ----
+        // ---- tab strip (the custom titlebar) ----
+        let titles: Vec<String> = self.tabs.iter().map(|t| short_title(&t.url)).collect();
         egui::Panel::top("tab_strip")
             .exact_size(TAB_H)
-            .frame(chrome_frame.clone())
+            .frame(egui::Frame::NONE.fill(ui_chrome::CHROME_BG))
+            .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    for i in 0..self.tabs.len() {
-                        let is_active = i == self.active;
-                        let label = format!(" {} ", short_title(&self.tabs[i].url));
-                        if ui.selectable_label(is_active, label).clicked() {
-                            activate = Some(i);
-                        }
-                        if ui.small_button("\u{d7}").on_hover_text("Close tab").clicked() {
-                            close = Some(i);
-                        }
+                for ev in ui_chrome::tab_strip(ui, &titles, self.active) {
+                    match ev {
+                        ui_chrome::TabEvent::Activate(i) => activate = Some(i),
+                        ui_chrome::TabEvent::Close(i) => close = Some(i),
+                        ui_chrome::TabEvent::NewTab => new_tab = true,
                     }
-                    if ui.button("+").on_hover_text("New tab").clicked() {
-                        new_tab = true;
-                    }
-                });
+                }
             });
 
-        // ---- address row ----
-        egui::Panel::top("address_row")
+        // ---- toolbar: back button + address pill ----
+        egui::Panel::top("toolbar")
             .exact_size(ADDR_H)
-            .frame(chrome_frame)
+            .frame(egui::Frame::NONE.fill(ui_chrome::CHROME_BG))
+            .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("\u{2190}").on_hover_text("Back").clicked() {
-                        go_back = true;
-                    }
-                    let resp = ui.add_sized(
-                        [ui.available_width(), ADDR_H - 10.0],
-                        egui::TextEdit::singleline(&mut self.address)
-                            .hint_text("Search or enter address"),
-                    );
-                    self.address_focused = resp.has_focus();
-                    if resp.gained_focus() {
-                        // the old shell cleared the bar on click — keep that
-                        self.address.clear();
-                    }
-                    if resp.lost_focus() {
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let q = self.address.trim().to_string();
-                            if !q.is_empty() {
-                                go = Some(address_target(&q));
+                let can_back = !self.back_stack.is_empty();
+                for ev in ui_chrome::toolbar(ui, &mut self.address, can_back) {
+                    match ev {
+                        ui_chrome::ToolbarEvent::Back => go_back = true,
+                        ui_chrome::ToolbarEvent::Submit(q) => {
+                            self.address = q;
+                            go = Some(address_target(&self.address));
+                        }
+                        ui_chrome::ToolbarEvent::Focused(f) => {
+                            if self.address_focused && !f {
+                                // blur without submit (e.g. Escape) → restore URL
+                                self.address = self.page.url.clone();
                             }
-                        } else {
-                            // blur without submit (e.g. Escape) → restore URL
-                            self.address = self.page.url.clone();
+                            self.address_focused = f;
                         }
                     }
-                });
+                }
             });
 
         // ---- page viewport (must come last: panels claim space first) ----
@@ -374,14 +360,14 @@ impl eframe::App for App {
                     }
                 }
 
-                // RSS overlay, bottom-right (same string and color as before)
+                // RSS overlay, bottom-right (small and dim)
                 let rss = format!("RSS {:.1} MB", working_set_mb());
                 ui.painter().text(
-                    ui.max_rect().right_bottom() - egui::vec2(8.0, 6.0),
+                    ui.max_rect().right_bottom() - egui::vec2(10.0, 10.0),
                     egui::Align2::RIGHT_BOTTOM,
                     rss,
-                    egui::FontId::monospace(12.0),
-                    egui::Color32::from_rgb(0x88, 0xcc, 0x88),
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(0x5f, 0x63, 0x68),
                 );
             });
 
