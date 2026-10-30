@@ -11,6 +11,8 @@ mod woff;
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
 use eframe::egui;
 use layout::{Fam, Layout, Style};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const PADDING: usize = 12;
 const BG: u32 = 0x00_ff_ff_ff; // UA default canvas = white (matches every browser)
@@ -85,6 +87,20 @@ struct App {
     fullscreen: bool,
     /// last title pushed to the viewport (avoid re-sending every frame)
     title: String,
+    /// ---- async loader (page loads run on a worker thread) ----
+    /// generation counter: the newest request wins, older results are dropped
+    nav: NavGate,
+    /// job queue into the loader thread (unbounded: send never blocks the UI)
+    jobs: mpsc::Sender<LoadReq>,
+    /// results from the loader thread, drained once per frame
+    results: mpsc::Receiver<LoadDone>,
+    /// the in-flight request we still accept a result for
+    pending: Option<PendingNav>,
+    /// latest viewport size seen (drives the resize→relayout debounce);
+    /// `last_size` stays the size of the `pixels` buffer / texture
+    vp_size: (usize, usize),
+    /// set when the viewport changed; fires a relayout once the size settled
+    pending_resize: Option<Instant>,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -129,7 +145,7 @@ impl App {
         // dark widget theme so TextEdit's cursor/selection read on the dark
         // chrome; the page rasterizes its own fonts regardless
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let mut fonts = Fonts::load();
+        let fonts = Fonts::load();
         let start = std::env::args()
             .nth(1)
             .unwrap_or_else(|| "https://example.com".to_string());
@@ -138,20 +154,39 @@ impl App {
         // pixels_per_point 1.0; shortcut: no per-monitor DPI raster scale).
         let (pw, ph) = (1000usize, (700.0 - TAB_H - ADDR_H) as usize);
         let url = address_target(start.trim());
-        let page = load_page(&url, &mut fonts, page_w(pw), page_h(ph));
-        let page_url = page.url.clone();
-        let mut pixels = vec![page.bg; pw * ph];
-        render(&mut pixels, pw, ph, &page.laid, &fonts, 0.0, page_h(ph), 0.0);
-        App {
+        // The window opens immediately with a blank page; the first load runs
+        // on the worker thread (it used to block window creation until the
+        // network answered — the other half of the "stuck after clicking"
+        // complaint).
+        let page = Page {
+            url: url.clone(),
+            laid: Layout {
+                runs: Vec::new(),
+                height: 0.0,
+                underline_rects: Vec::new(),
+                rects: Vec::new(),
+                images: Vec::new(),
+                shadows: Vec::new(),
+                open_line: false,
+            },
+            bg: BG,
+        };
+        let pixels = vec![page.bg; pw * ph];
+        // one long-lived worker thread; unbounded channels so neither side
+        // can ever block the other on send
+        let (job_tx, job_rx) = mpsc::channel::<LoadReq>();
+        let (done_tx, done_rx) = mpsc::channel::<LoadDone>();
+        std::thread::spawn(move || loader_thread(job_rx, done_tx));
+        let mut app = App {
             fonts,
             page,
             tabs: vec![Tab {
-                url: page_url.clone(),
+                url: url.clone(),
                 scroll: 0.0,
             }],
             active: 0,
             back_stack: Vec::new(),
-            address: page_url.clone(),
+            address: url.clone(),
             address_focused: false,
             scroll: 0.0,
             pixels,
@@ -160,6 +195,60 @@ impl App {
             dirty: true,
             fullscreen: false,
             title: "Mazda".to_string(),
+            nav: NavGate::new(),
+            jobs: job_tx,
+            results: done_rx,
+            pending: None,
+            vp_size: (pw, ph),
+            pending_resize: None,
+        };
+        app.dispatch(&url, pw, ph, 0.0);
+        app
+    }
+
+    /// Queue a load of `url` on the worker thread (never blocks the UI).
+    fn dispatch(&mut self, url: &str, pw: usize, ph: usize, scroll: f32) {
+        let id = self.nav.begin();
+        eprintln!("[nav] queued load {url} (#{id}, viewport {pw}x{ph})");
+        let req = LoadReq {
+            id,
+            url: url.to_string(),
+            max_w: page_w(pw),
+            vh: page_h(ph),
+        };
+        // receiver only drops when the worker thread is gone
+        if self.jobs.send(req).is_err() {
+            eprintln!("[nav] loader thread unavailable, load of {url} dropped");
+        }
+        self.pending = Some(PendingNav { scroll });
+    }
+
+    /// Drain finished loads; apply the newest (stale generations are dropped).
+    fn drain_results(&mut self, pw: usize, ph: usize) {
+        while let Ok(done) = self.results.try_recv() {
+            if !self.nav.accept(done.id) {
+                eprintln!("[nav] dropped stale result #{} (want #{})", done.id, self.nav.next);
+                continue;
+            }
+            let scroll = self.pending.take().map(|p| p.scroll).unwrap_or(0.0);
+            let Some(mut wire) = done.page else {
+                eprintln!("[nav] load #{} failed (pipeline panic)", done.id);
+                continue;
+            };
+            // adopt the worker's font state: stack ids baked into run styles
+            // index this table, and the renderer must resolve webfonts too
+            let stacks = std::mem::take(&mut wire.stacks);
+            let faces = std::mem::take(&mut wire.faces);
+            self.fonts.begin_page(faces); // resets the stack table to [id 0]
+            *self.fonts.stacks.borrow_mut() = stacks;
+            self.page = wire_to_page(wire);
+            self.last_size = (pw, ph);
+            self.scroll = scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
+            self.tabs[self.active].url = self.page.url.clone();
+            self.tabs[self.active].scroll = self.scroll;
+            self.address = self.page.url.clone();
+            self.repaint_page(pw, ph);
+            eprintln!("[nav] applied #{} → {}", self.nav.next, self.page.url);
         }
     }
 
@@ -182,27 +271,32 @@ impl App {
     /// Load `url` into the active tab: push history, reset scroll.
     fn navigate(&mut self, url: &str, pw: usize, ph: usize) {
         self.back_stack.push(self.page.url.clone());
-        self.page = load_page(url, &mut self.fonts, page_w(pw), page_h(ph));
-        self.scroll = 0.0;
-        self.tabs[self.active].url = self.page.url.clone();
-        self.tabs[self.active].scroll = 0.0;
-        self.address = self.page.url.clone();
-        self.repaint_page(pw, ph);
+        self.dispatch(url, pw, ph, 0.0);
+        self.tabs[self.active].url = url.to_string();
+        self.address = url.to_string();
     }
 
     /// Load `url` into the active tab WITHOUT touching history (tab switch /
     /// close / back), restoring `scroll`.
     fn reload_active(&mut self, url: &str, pw: usize, ph: usize, scroll: f32) {
-        self.page = load_page(url, &mut self.fonts, page_w(pw), page_h(ph));
-        self.scroll = scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
-        self.tabs[self.active].url = self.page.url.clone();
-        self.address = self.page.url.clone();
-        self.repaint_page(pw, ph);
+        self.dispatch(url, pw, ph, scroll);
+        self.tabs[self.active].url = url.to_string();
+        self.address = url.to_string();
     }
+}
+
+/// The in-flight load we still accept a result for.
+struct PendingNav {
+    scroll: f32,
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // apply any finished page load (stale generations are dropped inside)
+        {
+            let (pw, ph) = self.vp_size;
+            self.drain_results(pw, ph);
+        }
         // F11 toggles real (viewport) fullscreen; non-repeat so a held key
         // doesn't strobe.
         if ui.input(|i| {
@@ -284,13 +378,26 @@ impl eframe::App for App {
                 let ph = avail.y.max(1.0) as usize;
                 vp = (pw, ph);
 
-                if (pw, ph) != self.last_size {
-                    // live resize: re-layout once per *actual* size change
-                    let url = self.page.url.clone();
-                    self.page = load_page(&url, &mut self.fonts, page_w(pw), page_h(ph));
-                    self.last_size = (pw, ph);
-                    self.scroll = self.scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
-                    self.repaint_page(pw, ph);
+                if (pw, ph) != self.vp_size {
+                    // live resize: the old code re-ran the WHOLE pipeline
+                    // (fetch+parse+layout) synchronously here — the main
+                    // freeze. It now goes to the worker; debounce ~150ms so a
+                    // drag storm coalesces into one relayout (worker-side
+                    // coalescing drops the queue in between anyway).
+                    // shortcut: fixed debounce, no measurement-based decision —
+                    // even cache-hit re-layouts of real pages are well over
+                    // 100ms (see "[nav] worker finished" ms in the logs).
+                    self.vp_size = (pw, ph);
+                    self.pending_resize = Some(Instant::now());
+                }
+                if let Some(t) = self.pending_resize {
+                    if t.elapsed() >= Duration::from_millis(150) {
+                        self.pending_resize = None;
+                        let url = self.page.url.clone();
+                        let scroll = self.scroll;
+                        eprintln!("[nav] resize → relayout {url} at {pw}x{ph}");
+                        self.dispatch(&url, pw, ph, scroll);
+                    }
                 }
 
                 // scrolling: wheel + Up/Down, clamped, suppressed while typing
@@ -415,15 +522,24 @@ impl eframe::App for App {
             self.navigate(&target, pw, ph);
         }
 
-        // window title follows the page (capture script matches "Mazda*")
-        let title = format!("Mazda — {}", self.page.url);
+        // window title follows the page (capture script matches "Mazda*");
+        // "…" marks a load in flight
+        let title = format!(
+            "Mazda — {}{}",
+            self.page.url,
+            if self.pending.is_some() { " …" } else { "" }
+        );
         if title != self.title {
             self.title = title.clone();
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
-        // the RSS overlay keeps ticking while idle; nothing else repaints
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_secs(1));
+        // while a load is in flight, poll fast so the result lands promptly;
+        // otherwise the RSS overlay keeps ticking at 1 Hz
+        ui.ctx().request_repaint_after(if self.pending.is_some() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        });
     }
 }
 
@@ -439,6 +555,215 @@ fn short_title(url: &str) -> String {
         "New tab".into()
     } else {
         h.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async page loading. The full pipeline (fetch → parse → cascade → layout →
+// image decode) used to run on the egui update thread, so clicking a link,
+// opening a tab or even resizing froze the window for seconds. It now runs on
+// one long-lived worker thread; the UI thread only sends jobs and drains
+// results, guarded by a generation counter so a slow old load can never
+// overwrite a newer navigation.
+// ---------------------------------------------------------------------------
+
+/// Monotonic request id: only the newest navigation's result is accepted.
+struct NavGate {
+    next: u64,
+}
+
+impl NavGate {
+    fn new() -> Self {
+        NavGate { next: 0 }
+    }
+    /// Take a fresh id for a new request (navigation / reload / resize).
+    fn begin(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+    /// Should the result of request `id` be applied? Only the latest wins.
+    fn accept(&self, id: u64) -> bool {
+        id == self.next
+    }
+}
+
+/// A page-load job for the worker thread. Plain data (`Send`): URL + the
+/// viewport metrics layout needs.
+struct LoadReq {
+    id: u64,
+    url: String,
+    max_w: f32,
+    vh: f32,
+}
+
+/// Wire form of a laid-out page: everything `Page`/`Layout` hold, minus the
+/// `Rc`s that aren't `Send`. The UI thread re-wraps into `Rc` on receipt.
+struct PageWire {
+    url: String,
+    bg: u32,
+    height: f32,
+    runs: Vec<RunWire>,
+    /// x, y, w, h, color, fixed
+    underline_rects: Vec<(f32, f32, f32, f32, u32, bool)>,
+    /// x, y, w, h, color, radius, fixed
+    rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    /// x, y, w, h, pixels (owned), fixed
+    images: Vec<(f32, f32, f32, f32, image::ImageData, bool)>,
+    shadows: Vec<layout::ShadowRect>,
+    /// the cascade's font-family stack table (ids are baked into run styles)
+    stacks: Vec<Vec<String>>,
+    /// the page's `@font-face` defs so the renderer resolves webfonts too
+    faces: Vec<css::FontFace>,
+}
+
+/// One laid-out text run without `Rc` (link href as a plain `String`).
+struct RunWire {
+    x: f32,
+    y: f32,
+    text: String,
+    style: Style,
+    width: f32,
+    link: Option<String>,
+    fixed: bool,
+}
+
+/// Result sent back by the worker: the wire page (None = the pipeline panicked).
+struct LoadDone {
+    id: u64,
+    page: Option<PageWire>,
+}
+
+/// Convert a `Page` (worker-side, holds `Rc`s) into the `Send` wire form.
+fn page_to_wire(p: Page, stacks: Vec<Vec<String>>, faces: Vec<css::FontFace>) -> PageWire {
+    PageWire {
+        url: p.url,
+        bg: p.bg,
+        height: p.laid.height,
+        runs: p
+            .laid
+            .runs
+            .into_iter()
+            .map(|r| RunWire {
+                x: r.x,
+                y: r.y,
+                text: r.text,
+                style: r.style,
+                width: r.width,
+                link: r.link.as_ref().map(|l| l.to_string()),
+                fixed: r.fixed,
+            })
+            .collect(),
+        underline_rects: p.laid.underline_rects,
+        rects: p.laid.rects,
+        images: p
+            .laid
+            .images
+            .into_iter()
+            .map(|(x, y, w, h, img, fixed)| {
+                // freshly decoded per page: refcount is 1, but be safe
+                let owned = std::rc::Rc::try_unwrap(img).unwrap_or_else(|rc| image::ImageData {
+                    w: rc.w,
+                    h: rc.h,
+                    px: rc.px.clone(),
+                });
+                (x, y, w, h, owned, fixed)
+            })
+            .collect(),
+        shadows: p.laid.shadows,
+        stacks,
+        faces,
+    }
+}
+
+/// Rebuild a `Page` from the wire form on the UI thread (re-wraps in `Rc`).
+fn wire_to_page(w: PageWire) -> Page {
+    Page {
+        url: w.url,
+        bg: w.bg,
+        laid: Layout {
+            runs: w
+                .runs
+                .into_iter()
+                .map(|r| layout::PositionedRun {
+                    x: r.x,
+                    y: r.y,
+                    text: r.text,
+                    style: r.style,
+                    width: r.width,
+                    link: r.link.map(std::rc::Rc::from),
+                    fixed: r.fixed,
+                })
+                .collect(),
+            height: w.height,
+            underline_rects: w.underline_rects,
+            rects: w.rects,
+            images: w
+                .images
+                .into_iter()
+                .map(|(x, y, w, h, img, fixed)| (x, y, w, h, std::rc::Rc::new(img), fixed))
+                .collect(),
+            shadows: w.shadows,
+            open_line: false, // paint-only consumer; flow state not needed
+        },
+    }
+}
+
+/// The single long-lived loader thread. Owns its own `Fonts` (font types
+/// aren't `Send`, so each thread loads its own — system fonts come from disk
+/// anyway) and runs the full `load_page` pipeline per job. Superseded jobs
+/// still queued are skipped, so a resize storm costs one layout, not N.
+fn loader_thread(
+    jobs: mpsc::Receiver<LoadReq>,
+    results: mpsc::Sender<LoadDone>,
+) {
+    let mut fonts = Fonts::load();
+    while let Ok(mut req) = jobs.recv() {
+        // coalesce: only the newest queued request matters
+        let mut skipped = 0u32;
+        while let Ok(newer) = jobs.try_recv() {
+            req = newer;
+            skipped += 1;
+        }
+        if skipped > 0 {
+            eprintln!("[nav] skipped {skipped} superseded job(s)");
+        }
+        let t0 = Instant::now();
+        // worker panics must not take the process down
+        let page = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = load_page(&req.url, &mut fonts, req.max_w, req.vh);
+            let stacks = fonts.stacks.borrow().clone();
+            let faces = fonts
+                .faces
+                .iter()
+                .map(|f| css::FontFace {
+                    family: f.family.clone(),
+                    srcs: f.srcs.clone(),
+                    wmin: f.wmin,
+                    wmax: f.wmax,
+                    italic: f.italic,
+                })
+                .collect();
+            page_to_wire(p, stacks, faces)
+        }))
+        .map_err(|_| {
+            eprintln!("[nav] loader pipeline panicked for {}", req.url);
+        })
+        .ok();
+        eprintln!(
+            "[nav] worker finished {} in {:.0} ms",
+            req.url,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        // unbounded channel: never blocks; UI drains every frame
+        if results
+            .send(LoadDone {
+                id: req.id,
+                page,
+            })
+            .is_err()
+        {
+            break; // UI side gone
+        }
     }
 }
 
@@ -833,6 +1158,25 @@ fn fetch_image(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
     fetch_accept(url, Some("image/png, image/jpeg;q=0.9"))
 }
 
+/// Network timeouts: ureq's defaults leave reads unbounded ("requests may
+/// block forever on reads by default"), which turned one dead server into a
+/// permanently stuck tab. The worker thread absorbs the wait either way, but
+/// bounded requests keep the queue moving.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(READ_TIMEOUT)
+            .timeout_write(WRITE_TIMEOUT)
+            .build()
+    })
+}
+
 fn fetch_accept(
     url: &str,
     accept: Option<&str>,
@@ -842,7 +1186,9 @@ fn fetch_accept(
         eprintln!("[cache] hit {url}");
         return Ok(hit);
     }
-    let mut req = ureq::get(url).set("User-Agent", "Mazda/0.1 (minimal Rust browser)");
+    let mut req = http_agent()
+        .get(url)
+        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)");
     if let Some(a) = accept {
         req = req.set("Accept", a);
     }
@@ -1685,6 +2031,116 @@ mod tests {
         let w = fonts.measure("中文テスト", &Style::new());
         assert!(w > 30.0, "expected ~5 full-width glyphs, got {w}");
         assert_eq!(fonts.measure("abc", &Style::new()) > 10.0, true);
+    }
+
+    #[test]
+    fn nav_gate_only_latest_wins() {
+        let mut g = NavGate::new();
+        let a = g.begin();
+        assert!(g.accept(a), "first request is the latest");
+        let b = g.begin();
+        assert!(!g.accept(a), "older request is stale after a new one");
+        assert!(g.accept(b), "newest request wins");
+        let c = g.begin();
+        assert!(!g.accept(b) && !g.accept(a) && g.accept(c));
+    }
+
+    /// The worker→UI channel crosses threads: the wire form must be `Send`
+    /// (compile-time check — this is the whole point of `PageWire`).
+    #[test]
+    fn page_wire_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<LoadReq>();
+        assert_send::<LoadDone>();
+        assert_send::<PageWire>();
+        assert_send::<RunWire>();
+    }
+
+    fn sample_wire() -> PageWire {
+        let laid = Layout {
+            runs: vec![layout::PositionedRun {
+                x: 1.0,
+                y: 2.0,
+                text: "hello".into(),
+                style: Style::new(),
+                width: 30.0,
+                link: Some(std::rc::Rc::from("https://example.com/x")),
+                fixed: false,
+            }],
+            height: 123.0,
+            underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
+            rects: vec![(1.0, 2.0, 3.0, 4.0, 0x00ff00, 2.0, true)],
+            images: vec![(
+                5.0,
+                6.0,
+                7.0,
+                8.0,
+                std::rc::Rc::new(image::ImageData {
+                    w: 1,
+                    h: 1,
+                    px: vec![0x80445566],
+                }),
+                false,
+            )],
+            shadows: vec![layout::ShadowRect {
+                x: 9.0,
+                y: 10.0,
+                w: 11.0,
+                h: 12.0,
+                radius: 1.0,
+                blur: 2.0,
+                color: 0x33000000,
+                fixed: false,
+            }],
+            open_line: true,
+        };
+        let page = Page {
+            url: "https://example.com/".into(),
+            laid,
+            bg: 0xabcdef,
+        };
+        page_to_wire(
+            page,
+            vec![Vec::new(), vec!["verdana".into()]],
+            vec![css::FontFace {
+                family: "test".into(),
+                srcs: vec!["https://example.com/f.woff".into()],
+                wmin: 400,
+                wmax: 700,
+                italic: false,
+            }],
+        )
+    }
+
+    #[test]
+    fn wire_roundtrip_preserves_page() {
+        let wire = sample_wire();
+        let stacks = wire.stacks.clone();
+        assert_eq!(stacks.len(), 2, "stack table travels with the page");
+        assert_eq!(wire.faces.len(), 1, "@font-face defs travel too");
+        let page = wire_to_page(wire);
+        assert_eq!(page.url, "https://example.com/");
+        assert_eq!(page.bg, 0xabcdef);
+        assert_eq!(page.laid.height, 123.0);
+        assert_eq!(page.laid.runs.len(), 1);
+        let r = &page.laid.runs[0];
+        assert_eq!(r.text, "hello");
+        assert_eq!(r.link.as_deref(), Some("https://example.com/x"));
+        assert_eq!(page.laid.images.len(), 1);
+        assert_eq!(page.laid.images[0].4.px, vec![0x80445566]);
+        assert_eq!(page.laid.shadows.len(), 1);
+        assert_eq!(page.laid.shadows[0].blur, 2.0);
+        assert_eq!(page.laid.rects.len(), 1);
+        assert_eq!(page.laid.underline_rects.len(), 1);
+    }
+
+    #[test]
+    fn fetch_timeouts_are_bounded() {
+        assert!(CONNECT_TIMEOUT.as_secs() > 0);
+        assert!(READ_TIMEOUT.as_secs() > 0);
+        assert!(WRITE_TIMEOUT.as_secs() > 0);
+        // an agent builds with them (guards against API drift)
+        let _ = http_agent();
     }
 
     #[test]
