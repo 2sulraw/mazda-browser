@@ -311,6 +311,57 @@ curve matters more than the baseline (near-flat as tabs grow).
   as the closed single-line control (no popup/listbox widget yet); the
   arrow is the ▼ text glyph, not theme-drawn art; checkbox/radio have no
   widget art)
+- [x] **UI shell: eframe/glow** — ~~minifb framebuffer window + hand-drawn chrome
+  (titlebar/tabs/address drawn into the page buffer; Win32 window controls)~~
+  **DONE: app shell swapped to eframe 0.37 with the `glow` backend (NOT wgpu —
+  wgpu would balloon the RAM floor; `default-features=false` keeps clipboard/
+  persistence/accesskit/wayland-extra out), cross-platform winit window with
+  native titlebar (min/max/close/resize/DPI for free on Windows *and* Linux —
+  the per-OS Win32/X11 control layer became unnecessary and was deleted),
+  egui-drawn chrome: tab strip (select labels, × close, + new, ≥1 tab,
+  reload-on-switch {url,scroll} tabs), address bar (Enter → URL if it looks
+  like a host, else DuckDuckGo search), Back button, link hit-test on the
+  page texture, arrow/wheel scroll clamped, F11 fullscreen, RSS overlay;
+  page still rendered by our own CPU rasterizer into one NEAREST texture,
+  re-uploaded only on scroll/resize/nav; `render()` gained a `top` offset
+  param (0 under egui); `working_set_mb` cfg-gated with a /proc VmRSS fallback
+  + best-effort Linux font paths (161 tests; example.com verified live —
+  tabs/Enter/F11/back/resize all exercised; `2473527`)**
+  Known gaps: **RAM floor is now ~106 MB idle (vs ~15-20 with minifb) — the
+  winit+glow GL context/IME stack costs ~100 MB; user accepted as the price
+  for cross-platform chrome.** Native titlebar kept (borderless egui titlebar =
+  later flip); 1 point = 1 texel (no per-monitor DPI raster scale); Linux
+  paths compile-gated but never run on real Linux; wheel-scroll unverified
+  live (synthetic events don't reach winit — arrow-key path verified instead)
+- [x] **P1 parity wave (3 parallel worktree agents)** — three high-leverage
+  rendering gaps closed at once: **(a) static pseudo-class selectors** —
+  `css.rs` now parses/matches `:link`/`:visited` (any element with `href`;
+  visit history not modeled), `:not(<compound>)`, `:is()`/`:where()`,
+  `:root`, `:first-child`/`:last-child`/`:nth-child(an+b)` (from existing DOM
+  parent linkage), class-level specificity (`:not` = its arg's, `:is` = best
+  alternate, `:where` = 0); dynamic/state pseudos (`:hover/:focus/...`) and
+  pseudo-elements still dropped whole (`00c1b7a` +8 tests) — **fixes HN's
+  entire link palette (titles now black, no UA underlines), Wikipedia's
+  underline-everywhere, MDN/wiki skip-link positioning**;
+  **(b) declarative shadow DOM** — post-parse `expand_declarative_shadow_roots`
+  in `html.rs` splices `<template shadowroot|shadowrootmode="open|closed">`
+  children into the live tree (flat expansion; plain `<template>` stays inert;
+  nested DSD terminates; `2a34274` +4 tests) — **MDN header search/theme/
+  language UI exists for the first time (46 templates)**;
+  **(c) inline backgrounds + `<br>`** — paint-worthy inlines (background/
+  border/shadow/h-padding) promote to real inline-level boxes so the bg spans
+  text+padding, `width:100%`/`%`-width resolved layout-locally in `layout.rs`
+  (no css.rs change), single `<br>` advances exactly one line (no 0.6×size
+  gap; 2+ brs each add one empty line); `7c7dc59` +4 tests.
+  Verified visually: HN titles black, wiki serif h1 + clean links, rust-lang
+  yellow button full-width with text inside, MDN hero single-gap; **177
+  tests; merged `d289fa1` + `a5fe0f2`)**
+  Known gaps spotted this round: MDN theme/language popup menus render
+  permanently open (their hiding style unapplied) + empty outlined menu box
+  top-right + MDN main nav tabs still absent (deeper than the hoisted
+  templates); Wikipedia black search/Tools widgets (var-map, P1.5 debug
+  session pending); HN vote arrows + orange full-bleed header (background-
+  image + table % widths, P2); leading `<br>` no-op; `:visited`==`:link`
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -376,6 +427,14 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | calc() arithmetic in lengths | MDN | 14.8 MB (630 runs; a11y skip-link menu now off-screen via `top: calc(-20em)`) |
 | 2026-10-30 | calc() arithmetic in lengths | nextjs.org | 43.1 MB (571 runs; pixel-unchanged) |
 | 2026-10-30 | calc() arithmetic in lengths | Wikipedia (Main_Page) | 35.1 MB (1461 runs; pixel-unchanged) |
+| 2026-10-30 | eframe/glow shell swap (minifb gone) | example.com | 106.2 MB after layout (idle ~124 MB — eframe+winit+glow GL stack = ~+100 MB floor over minifb's ~15-20 MB) |
+| 2026-10-30 | eframe/glow shell swap | Wikipedia (Main_Page) | ~158 MB idle (page engine still frees per-page state on nav — RSS drops after leaving heavy pages) |
+| 2026-10-30 | P1 parity wave (pseudo-class selectors + DSD expansion + inline bg/br) | example.com | 47.9 MB (25 runs) |
+| 2026-10-30 | P1 parity wave | hackernews | 49.7 MB (760 runs; titles black, no underlines) |
+| 2026-10-30 | P1 parity wave | rust-lang.org | 57.6 MB (483 runs; yellow button full-extent) |
+| 2026-10-30 | P1 parity wave | Wikipedia (Main_Page) | 73.5 MB (1458 runs; serif h1, no underline-everywhere) |
+| 2026-10-30 | P1 parity wave | MDN | 66.2 MB (657 runs; DSD header restored, hero one line-gap) |
+| 2026-10-30 | P1 parity wave | nextjs.org | 80.5 MB (502 runs) |
 
 ### Phase 1c (Track A) findings
 
