@@ -25,6 +25,9 @@ pub enum Track {
     Fr(f32),
     Px(f32),
     Pct(f32),
+    /// `min-content` / `max-content` / `auto` — sized to the widest item
+    /// placed in the column (resolved at layout, where items are measured)
+    Content,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1402,13 +1405,18 @@ fn parse_tracks(v: &str) -> (Vec<Track>, Vec<(String, usize)>) {
             if let Ok(f) = n.trim().parse::<f32>() {
                 out.push(Track::Fr(f.max(0.0)));
             }
+        } else if matches!(tok, "min-content" | "max-content" | "auto") {
+            // content-sized track: width = widest item in the column,
+            // resolved at layout (min-content ≈ max-content here — fine for
+            // the single-line header labels these mostly size)
+            out.push(Track::Content);
         } else if let Some(l) = parse_len(tok) {
             out.push(match l {
                 Len::Px(p) => Track::Px(p),
                 Len::Pct(p) => Track::Pct(p),
             });
         }
-        // unknown tokens (auto) are skipped
+        // other unknown tokens are skipped
     }
     (out, lines)
 }
@@ -2876,7 +2884,12 @@ mod tests {
         assert_eq!(tracks("minmax(0, 1fr)"), vec![Track::Fr(1.0)]);
         assert!(tracks("none").is_empty());
         // garbage tokens are skipped, valid ones survive
-        assert_eq!(tracks("[line1] auto 2fr"), vec![Track::Fr(2.0)]);
+        assert_eq!(tracks("[line1] bogus 2fr"), vec![Track::Fr(2.0)]);
+        // min-content / max-content / auto → content-sized track
+        assert_eq!(
+            tracks("min-content 1fr auto max-content"),
+            vec![Track::Content, Track::Fr(1.0), Track::Content, Track::Content]
+        );
         // line names are recorded with the boundary index they precede
         assert_eq!(
             parse_tracks("[a] 1fr [b-start] 200px [b-end]").1,

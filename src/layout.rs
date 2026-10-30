@@ -1127,6 +1127,9 @@ fn item_natural(
 }
 
 /// Resolved track widths + gaps: returns total width of all tracks+gaps.
+/// shortcut: `Content` tracks measure 0 here (this path sizes a grid that is
+/// itself being shrink-to-fit, where per-column item widths aren't known);
+/// the `fr` tracks absorb the slack. Layout's `grid()` sizes real content.
 fn tracks_w(cols: &[Track], avail: f32, gap: f32) -> f32 {
     let mut fixed = 0.0;
     let mut fr = 0.0;
@@ -1135,6 +1138,7 @@ fn tracks_w(cols: &[Track], avail: f32, gap: f32) -> f32 {
             Track::Px(p) => fixed += p,
             Track::Pct(p) => fixed += p / 100.0 * avail,
             Track::Fr(f) => fr += f,
+            Track::Content => {}
         }
     }
     let gaps = gap * (cols.len() as f32 - 1.0).max(0.0);
@@ -1142,20 +1146,27 @@ fn tracks_w(cols: &[Track], avail: f32, gap: f32) -> f32 {
     fixed + if fr > 0.0 { free } else { 0.0 } + gaps
 }
 
-fn resolve_tracks(cols: &[Track], avail: f32, gap: f32) -> Vec<f32> {
+/// Resolve each track to a pixel width. `content[c]` is column `c`'s measured
+/// max-content width, used only by `Track::Content` tracks (empty slice = all
+/// fixed/fr, the pre-content behavior). `fr` tracks split whatever width the
+/// fixed + content tracks leave over.
+fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, content: &[f32]) -> Vec<f32> {
+    let cw = |i: usize| content.get(i).copied().unwrap_or(0.0);
     let mut fixed = 0.0;
     let mut fr = 0.0;
-    for t in cols {
+    for (i, t) in cols.iter().enumerate() {
         match t {
             Track::Px(p) => fixed += p,
             Track::Pct(p) => fixed += p / 100.0 * avail,
             Track::Fr(f) => fr += f,
+            Track::Content => fixed += cw(i),
         }
     }
     let gaps = gap * (cols.len() as f32 - 1.0).max(0.0);
     let free = (avail - fixed - gaps).max(0.0);
     cols.iter()
-        .map(|t| match t {
+        .enumerate()
+        .map(|(i, t)| match t {
             Track::Px(p) => *p,
             Track::Pct(p) => p / 100.0 * avail,
             Track::Fr(f) => {
@@ -1165,6 +1176,7 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32) -> Vec<f32> {
                     0.0
                 }
             }
+            Track::Content => cw(i),
         })
         .collect()
 }
@@ -1518,19 +1530,10 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         n.open = false;
         return;
     }
-    let cols: Vec<f32> = if n.bx.cols.is_empty() {
-        vec![n.w]
-    } else {
-        resolve_tracks(&n.bx.cols, n.w, n.bx.gap_col)
-    };
-    let nc = cols.len();
-    // x offset + width of columns [c0, c1)
-    let span_xw = |c0: usize, c1: usize| {
-        let x: f32 = cols[..c0].iter().sum::<f32>() + n.bx.gap_col * c0 as f32;
-        let w: f32 = cols[c0..c1].iter().sum::<f32>() + n.bx.gap_col * (c1 - c0 - 1) as f32;
-        (x, w)
-    };
-    // resolve each item's (row, c0, c1)
+    let nc = if n.bx.cols.is_empty() { 1 } else { n.bx.cols.len() };
+    // resolve each item's (row, c0, c1) — needs only the column COUNT, so it
+    // runs BEFORE track widths are resolved (content tracks are sized from
+    // the items placed in them)
     let resolve_col = |name: &str| -> Option<(usize, usize)> {
         let line = |suffix: &str| {
             n.bx
@@ -1575,6 +1578,34 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             }
         });
     }
+    // per-column max-content width for `min-content`/`max-content`/`auto`
+    // tracks: the widest item placed in the column. shortcut: a multi-column
+    // span contributes its full width to each column it covers (over-allocates
+    // a spanning content track; rare in practice).
+    let content: Vec<f32> = if n.bx.cols.iter().any(|t| *t == Track::Content) {
+        let mut c = vec![0.0f32; nc];
+        for (i, it) in items.iter().enumerate() {
+            let (_, c0, c1) = spots[i];
+            let w = item_natural(n, it, n.w, measure);
+            for col in c0..c1.min(nc) {
+                c[col] = c[col].max(w);
+            }
+        }
+        c
+    } else {
+        Vec::new()
+    };
+    let cols: Vec<f32> = if n.bx.cols.is_empty() {
+        vec![n.w]
+    } else {
+        resolve_tracks(&n.bx.cols, n.w, n.bx.gap_col, &content)
+    };
+    // x offset + width of columns [c0, c1)
+    let span_xw = |c0: usize, c1: usize| {
+        let x: f32 = cols[..c0].iter().sum::<f32>() + n.bx.gap_col * c0 as f32;
+        let w: f32 = cols[c0..c1].iter().sum::<f32>() + n.bx.gap_col * (c1 - c0 - 1) as f32;
+        (x, w)
+    };
     let nrows = spots.iter().map(|s| s.0).max().unwrap_or(0) + 1;
     let mut y = n.y;
     let mut last_open = false;
@@ -2220,6 +2251,47 @@ mod tests {
         assert_eq!(l.runs[3].x, 0.0);
         let line = 15.0 * 1.35;
         assert!(l.runs[3].y >= line, "second row below first: {}", l.runs[3].y);
+    }
+
+    #[test]
+    fn grid_min_content_tracks_size_to_items_and_stay_on_one_row() {
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        // MDN-header shape: `min-content 1fr min-content min-content`
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Content, Track::Fr(1.0), Track::Content, Track::Content],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![boxed("AAAA"), boxed("B"), boxed("CCCCCC"), boxed("DD")];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        assert_eq!(l.runs.len(), 4);
+        // all four on ONE row — before min-content support this collapsed to a
+        // single fr column and stacked them vertically
+        let ys: Vec<f32> = l.runs.iter().map(|r| r.y).collect();
+        let spread =
+            ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread < 1.0, "one horizontal row, y spread={spread}");
+        // content tracks size to their item's max-content width (4px/char):
+        // col0 = "AAAA" = 16px, then the 1fr col absorbs the rest
+        // (100 - 16 - 24 - 8 = 52), col2 = "CCCCCC" = 24px, col3 = "DD" = 8px
+        let x = |t: &str| l.runs.iter().find(|r| r.text == t).unwrap().x;
+        assert!((x("AAAA") - 0.0).abs() < 0.01, "col0 x={}", x("AAAA"));
+        assert!((x("B") - 16.0).abs() < 0.01, "col1 (1fr) x={}", x("B"));
+        assert!((x("CCCCCC") - 68.0).abs() < 0.01, "col2 x={}", x("CCCCCC"));
+        assert!((x("DD") - 92.0).abs() < 0.01, "col3 x={}", x("DD"));
     }
 
     #[test]
