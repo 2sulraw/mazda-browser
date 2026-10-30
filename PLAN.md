@@ -213,6 +213,14 @@ curve matters more than the baseline (near-flat as tabs grow).
   `block()`'s inline branch), so buttons/badges paint AND flow inline; only
   `inline-flex`/`inline-grid` still stack (honest `shortcut:` — no inline
   flex/grid layout mode yet)
+  Follow-up DONE (calc round): `parse_len` now evaluates `calc()` arithmetic
+  (`eval_calc`, a recursive-descent evaluator) to px — `+ - * /` with correct
+  precedence, parenthesized sub-expressions, px/em/rem terms and unitless
+  multipliers (`var()` substituted upstream). Previously any `calc(...)` was
+  `None` → unset, so MDN's a11y skip-link menu (`top: calc(var(--offset)*-1)`)
+  rendered visibly instead of being pushed off-screen. shortcut: `%`/`vw`/`vh`
+  still unset (need a container/viewport `parse_len` doesn't have); no nested
+  `calc(`. Verified nextjs/rust-lang/wikipedia/HN pixel-unchanged
 - [x] **var() theme scoping** — ~~Wikipedia rendered dark with invisible text
   (night-scoped vars leaked past the `clientpref-day` root)~~ **DONE: `Sheet.var_defs`
   records every custom-prop definition with its selector; `scope_vars(&Dom, html)` rewrites
@@ -365,6 +373,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | SVG class-based fill (inline-SVG logo color) | MDN | 14.8 MB (630 runs; logo now blue letters + light wordmark, was solid black) |
 | 2026-10-30 | SVG class-based fill | rust-lang.org | 17.6 MB (483 runs; pixel-unchanged — gear logo not single-class-colored) |
 | 2026-10-30 | SVG class-based fill | nextjs.org | 43.0 MB (571 runs; byte-identical) |
+| 2026-10-30 | calc() arithmetic in lengths | MDN | 14.8 MB (630 runs; a11y skip-link menu now off-screen via `top: calc(-20em)`) |
+| 2026-10-30 | calc() arithmetic in lengths | nextjs.org | 43.1 MB (571 runs; pixel-unchanged) |
+| 2026-10-30 | calc() arithmetic in lengths | Wikipedia (Main_Page) | 35.1 MB (1461 runs; pixel-unchanged) |
 
 ### Phase 1c (Track A) findings
 
