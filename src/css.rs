@@ -121,6 +121,43 @@ pub enum VAlign {
     Len(Len),
 }
 
+/// `background-size`: `Auto` = intrinsic (the CSS initial value), `Cover`/
+/// `Contain` = aspect-preserving fit against the padding box, `Wh` = the
+/// two-value form — `None` in an axis slot means `auto` (intrinsic, or the
+/// intrinsic aspect ratio derived from the other axis when it's explicit).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BgSize {
+    Auto,
+    /// scale up until the padding box is fully covered (cropped)
+    Cover,
+    /// scale down until the image fully fits inside the padding box
+    Contain,
+    Wh(Option<Len>, Option<Len>),
+}
+
+/// One `background-position` axis. `Pct` applies the standard offset
+/// formula `(box − image) × p` at layout (0% flush left/top, 100% flush
+/// right/bottom); `Px` is a fixed length from the padding-box edge.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BgPos {
+    Pct(f32),
+    Px(f32),
+}
+
+/// `background-repeat`. Stored as `Option`: `None` (undeclared) keeps the
+/// engine's long-standing single draw at the computed position/size —
+/// shortcut: the CSS initial value is `repeat`, which tiles, but an
+/// undeclared background has always drawn once here and sites rely on that
+/// look; an explicit `repeat`/`repeat-x`/`repeat-y` DOES tile, `no-repeat`
+/// draws once.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BgRepeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+}
+
 /// Per-element box layout properties — the non-inherited half of CSS.
 /// Default = plain block flow (matches pre-flex rendering).
 #[derive(Clone, PartialEq, Debug)]
@@ -170,6 +207,13 @@ pub struct BoxStyle {
     /// hands it to the shared `<img>` pipeline, which resolves/fetches it
     /// against the page URL)
     pub bg_image: Option<std::rc::Rc<str>>,
+    /// `background-size` — resolved at layout against the padding box
+    pub bg_size: BgSize,
+    /// `background-position` [x, y] — see [`BgPos`] for the two forms
+    pub bg_pos: [BgPos; 2],
+    /// `background-repeat` — None = undeclared (single draw, see
+    /// [`BgRepeat`]); Some(...) tiles on the named axis/axes at paint
+    pub bg_repeat: Option<BgRepeat>,
     /// border-radius (all corners; % resolves against box width at layout)
     pub radius: Len,
     /// border widths, top/right/bottom/left (% resolves against box width)
@@ -267,6 +311,9 @@ impl Default for BoxStyle {
             margin: [Len::Px(0.0); 4],
             bg: None,
             bg_image: None,
+            bg_size: BgSize::Auto,
+            bg_pos: [BgPos::Pct(0.0); 2], // top-left
+            bg_repeat: None,
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
@@ -589,6 +636,9 @@ const KNOWN: &[&str] = &[
     "background",
     "background-color",
     "background-image",
+    "background-size",
+    "background-position",
+    "background-repeat",
     "font-size",
     "font-weight",
     "font-style",
@@ -1247,6 +1297,13 @@ fn apply_decl(
             // later color-only `background:` clears an earlier url.
             if d.0 == "background" {
                 bx.bg_image = parse_bg_url(&d.1);
+                // the shorthand resets the geometry longhands, then parses
+                // any repeat / position / size tokens it carries (spec
+                // cascade: a shorthand wins over earlier longhands)
+                let (rep, pos, size) = bg_shorthand_geom(&d.1, vp);
+                bx.bg_repeat = rep;
+                bx.bg_pos = pos;
+                bx.bg_size = size;
             } else if d.0 == "background-image" {
                 if d.1.trim() == "none" {
                     bx.bg_image = None;
@@ -1255,6 +1312,11 @@ fn apply_decl(
                 }
             }
         }
+        // geometry longhands — stored symbolically where % depends on the
+        // padding box (size/position resolve in layout.rs `place()`)
+        "background-size" => bx.bg_size = parse_bg_size(&d.1, vp),
+        "background-position" => bx.bg_pos = parse_bg_pos(&d.1, vp),
+        "background-repeat" => bx.bg_repeat = parse_bg_repeat(&d.1),
         // consumed before the cascade in `resolve_with_parent` (the used
         // value decides `light-dark()`) — nothing to do per declaration here
         "color-scheme" => {}
@@ -1689,10 +1751,9 @@ fn parse_clip_rect(v: &str, vp: (f32, f32)) -> Option<[Len; 4]> {
 
 /// `url(…)` / `url("…")` / `url('…')` → the raw target (unresolved — the
 /// `<img>` pipeline joins it against the page URL). shortcut: the FIRST url
-/// in the value only; other layers and keywords (`no-repeat`, `50% 50%`,
-/// `cover`, …) are ignored — one background image per box, drawn at natural
-/// size, top-left, no repeat (the CSS initial values, which is what sites
-/// like the HN vote arrows rely on).
+/// in the value only — one background image per box (extra layers are
+/// ignored). The `no-repeat` / `50% 50%` / `cover` tokens around it are
+/// parsed separately by [`bg_shorthand_geom`].
 fn parse_bg_url(v: &str) -> Option<std::rc::Rc<str>> {
     // values may keep raw case (url() case-sensitivity) — match the
     // function name case-insensitively via the lowered copy (1:1 bytes)
@@ -1707,6 +1768,131 @@ fn parse_bg_url(v: &str) -> Option<std::rc::Rc<str>> {
     };
     let target = target.trim();
     (!target.is_empty()).then(|| std::rc::Rc::from(target))
+}
+
+/// `background-repeat` → [`BgRepeat`]; anything else (incl. layered
+/// values) → None = undeclared.
+fn parse_bg_repeat(v: &str) -> Option<BgRepeat> {
+    match v.trim() {
+        "repeat" => Some(BgRepeat::Repeat),
+        "repeat-x" => Some(BgRepeat::RepeatX),
+        "repeat-y" => Some(BgRepeat::RepeatY),
+        "no-repeat" => Some(BgRepeat::NoRepeat),
+        _ => None,
+    }
+}
+
+/// `background-size` → [`BgSize`]. `auto` (and `initial`/`unset`) →
+/// [`BgSize::Auto`], `cover`/`contain` → their variants, ONE length/% =
+/// width with the height following the intrinsic aspect ratio, TWO values =
+/// width height (`auto` slots keep the intrinsic axis). Unparseable →
+/// [`BgSize::Auto`] (declaration dropped — lenient, like the other parsers).
+fn parse_bg_size(v: &str, vp: (f32, f32)) -> BgSize {
+    let axis = |t: &str| -> Option<Option<Len>> {
+        match t {
+            "auto" | "initial" | "unset" => Some(None),
+            _ => parse_len(t, vp).map(Some),
+        }
+    };
+    let toks = joined_tokens(v);
+    match toks.len() {
+        0 => BgSize::Auto,
+        1 => match toks[0].as_str() {
+            "cover" => BgSize::Cover,
+            "contain" => BgSize::Contain,
+            _ => match axis(&toks[0]) {
+                Some(w) => BgSize::Wh(w, None),
+                None => BgSize::Auto,
+            },
+        },
+        // shortcut: 3–4 tokens (comma-separated layers) take the first pair
+        _ => match (axis(&toks[0]), axis(&toks[1])) {
+            (Some(w), Some(h)) => BgSize::Wh(w, h),
+            _ => BgSize::Auto,
+        },
+    }
+}
+
+/// `background-position` → [x, y] as [`BgPos`]. Percentages keep the
+/// standard `(box − image) × p` formula for layout; lengths offset from the
+/// padding-box edge; keywords map to 0/50/100 % on their own axis. One
+/// value only: a lone KEYWORD centers the missing axis, a lone length/%
+/// leaves it at 0% (spec). shortcut: length/keyword tokens fill x before y
+/// and junk tokens (colors, gradients) are skipped instead of dropping the
+/// declaration (lenient, like `parse_sides`).
+fn parse_bg_pos(v: &str, vp: (f32, f32)) -> [BgPos; 2] {
+    let mut out: [Option<BgPos>; 2] = [None, None];
+    let mut given = 0usize;
+    let mut last_kw = false;
+    for t in joined_tokens(v) {
+        let low = t.to_ascii_lowercase();
+        let free = |out: &[Option<BgPos>; 2]| if out[0].is_none() { 0 } else { 1 };
+        let (axis, val, kw) = match low.as_str() {
+            "left" => (0, BgPos::Pct(0.0), true),
+            "right" => (0, BgPos::Pct(100.0), true),
+            "top" => (1, BgPos::Pct(0.0), true),
+            "bottom" => (1, BgPos::Pct(100.0), true),
+            "center" => (free(&out), BgPos::Pct(50.0), true),
+            _ => match parse_len(&t, vp) {
+                Some(Len::Pct(p)) => (free(&out), BgPos::Pct(p), false),
+                Some(Len::Px(p)) => (free(&out), BgPos::Px(p), false),
+                None => continue, // junk token — skipped
+            },
+        };
+        if out[axis].is_none() {
+            out[axis] = Some(val);
+            given += 1;
+            last_kw = kw;
+        }
+    }
+    let center = if given == 1 && last_kw { 50.0 } else { 0.0 };
+    // either axis still missing: `center` when a lone keyword was given
+    // (per spec — `top` = `center top`), else the initial 0%
+    [
+        out[0].unwrap_or(BgPos::Pct(center)),
+        out[1].unwrap_or(BgPos::Pct(center)),
+    ]
+}
+
+/// Geometry tokens of the `background` shorthand → (repeat, position, size),
+/// each absent half at its initial value (the shorthand resets longhands).
+/// Tokens after the first top-level `/` are the size, before it the
+/// position; `url(…)` tokens (which may contain `/`) and repeat keywords
+/// are peeled off first — remaining junk (colors, gradients) is skipped by
+/// the per-axis parsers.
+fn bg_shorthand_geom(v: &str, vp: (f32, f32)) -> (Option<BgRepeat>, [BgPos; 2], BgSize) {
+    let mut rep = None;
+    let mut pre: Vec<String> = Vec::new();
+    let mut post: Vec<String> = Vec::new();
+    let mut side = 0usize;
+    for t in joined_tokens(v) {
+        if t.len() >= 4 && t[..4].eq_ignore_ascii_case("url(") {
+            continue;
+        }
+        if let Some(r) = parse_bg_repeat(&t.to_ascii_lowercase()) {
+            rep = Some(r);
+            continue;
+        }
+        for (j, part) in t.split('/').enumerate() {
+            if j > 0 {
+                side = 1;
+            }
+            if !part.is_empty() {
+                (if side == 0 { &mut pre } else { &mut post }).push(part.to_string());
+            }
+        }
+    }
+    let pos = if pre.is_empty() {
+        [BgPos::Pct(0.0); 2]
+    } else {
+        parse_bg_pos(&pre.join(" "), vp)
+    };
+    let size = if post.is_empty() {
+        BgSize::Auto
+    } else {
+        parse_bg_size(&post.join(" "), vp)
+    };
+    (rep, pos, size)
 }
 
 /// `200px` / `50%` / `1.5rem` / `25vh` → [`Len`]. Bare numbers are lenient px
@@ -4697,6 +4883,92 @@ mod tests {
         assert_eq!(bx("j").float, Float::None);
         assert_eq!(bx("j").clear, Clear::None);
         assert_eq!(bx("j").valign, VAlign::Baseline);
+    }
+
+    // ---- background-size / background-position / background-repeat ----
+
+    #[test]
+    fn background_geometry_longhands_parse() {
+        let sheet = parse(
+            ".a { background-size: cover } .b { background-size: contain } \
+             .c { background-size: 50% } .d { background-size: 200px 100px } \
+             .e { background-size: auto 2em } \
+             .f { background-position: 100% 100% } .g { background-position: center } \
+             .h { background-position: right bottom } .i { background-position: 10px 25% } \
+             .j { background-position: top } \
+             .k { background-repeat: no-repeat } .l { background-repeat: repeat-x } \
+             .m { background-image: url(x.png) }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>\
+             <div class=e></div><div class=f></div><div class=g></div><div class=h></div>\
+             <div class=i></div><div class=j></div><div class=k></div><div class=l></div>\
+             <div class=m></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        // size: keywords, single value (width, aspect height), two values
+        assert_eq!(bx("a").bg_size, BgSize::Cover);
+        assert_eq!(bx("b").bg_size, BgSize::Contain);
+        assert_eq!(bx("c").bg_size, BgSize::Wh(Some(Len::Pct(50.0)), None));
+        assert_eq!(
+            bx("d").bg_size,
+            BgSize::Wh(Some(Len::Px(200.0)), Some(Len::Px(100.0)))
+        );
+        assert_eq!(bx("e").bg_size, BgSize::Wh(None, Some(Len::Px(32.0))));
+        // position: %, keywords, mixed length+% (the `(box-img)*p` fraction
+        // is kept symbolic for layout)
+        assert_eq!(bx("f").bg_pos, [BgPos::Pct(100.0), BgPos::Pct(100.0)]);
+        assert_eq!(bx("g").bg_pos, [BgPos::Pct(50.0), BgPos::Pct(50.0)]);
+        assert_eq!(bx("h").bg_pos, [BgPos::Pct(100.0), BgPos::Pct(100.0)]);
+        assert_eq!(bx("i").bg_pos, [BgPos::Px(10.0), BgPos::Pct(25.0)]);
+        // one-value form: a lone keyword centers the OTHER axis
+        assert_eq!(bx("j").bg_pos, [BgPos::Pct(50.0), BgPos::Pct(0.0)]);
+        // repeat: the four keywords
+        assert_eq!(bx("k").bg_repeat, Some(BgRepeat::NoRepeat));
+        assert_eq!(bx("l").bg_repeat, Some(BgRepeat::RepeatX));
+        // undeclared longhands keep the initial geometry: auto / 0% 0% /
+        // repeat undeclared (single draw — see the BgRepeat shortcut)
+        let m = bx("m");
+        assert_eq!(m.bg_size, BgSize::Auto);
+        assert_eq!(m.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
+        assert_eq!(m.bg_repeat, None);
+    }
+
+    #[test]
+    fn background_shorthand_parses_geometry_tokens() {
+        let sheet = parse(
+            ".a { background: url(x.png) no-repeat } \
+             .b { background: #abc url(y.png) center/cover } \
+             .c { background: linear-gradient(#a, #b) 50% 25%/30px 40px repeat-x } \
+             .d { background: red }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        let a = bx("a");
+        assert_eq!(a.bg_image.as_deref(), Some("x.png"));
+        assert_eq!(a.bg_repeat, Some(BgRepeat::NoRepeat));
+        // no position/size tokens → the shorthand resets them to initial
+        assert_eq!(a.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
+        assert_eq!(a.bg_size, BgSize::Auto);
+        let b = bx("b");
+        assert_eq!(b.bg_image.as_deref(), Some("y.png"), "color token before url");
+        assert_eq!(b.bg_pos, [BgPos::Pct(50.0), BgPos::Pct(50.0)], "center/…");
+        assert_eq!(b.bg_size, BgSize::Cover, "…/cover");
+        assert_eq!(b.bg_repeat, None, "no repeat token");
+        let c = bx("c");
+        // the gradient is not an image we support (no url), but its tokens
+        // must not derail the position/size/repeat parse around it
+        assert_eq!(c.bg_image, None);
+        assert_eq!(c.bg_pos, [BgPos::Pct(50.0), BgPos::Pct(25.0)]);
+        assert_eq!(c.bg_size, BgSize::Wh(Some(Len::Px(30.0)), Some(Len::Px(40.0))));
+        assert_eq!(c.bg_repeat, Some(BgRepeat::RepeatX));
+        let d = bx("d");
+        assert_eq!(d.bg_image, None, "color-only shorthand");
+        assert_eq!(d.bg_repeat, None);
+        assert_eq!(d.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
+        assert_eq!(d.bg_size, BgSize::Auto);
     }
 }
 
