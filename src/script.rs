@@ -179,6 +179,7 @@ fn wrap_element(node: u32) -> Val {
     o.set("setValue", js::Val::Native(n.el_set_value));
     o.set("setClassName", js::Val::Native(n.el_set_class));
     o.set("focus", js::Val::Native(n.el_focus));
+    o.set("submit", js::Val::Native(n.el_submit));
     o
 }
 
@@ -243,6 +244,7 @@ struct Nids {
     el_set_value: usize,
     el_set_class: usize,
     el_focus: usize,
+    el_submit: usize,
     loc_assign: usize,
     loc_reload: usize,
     win_add_listener: usize,
@@ -348,6 +350,8 @@ const E_SET_INNER_HTML: u16 = 19;
 const E_SET_VALUE: u16 = 20;
 const E_SET_CLASS_NAME: u16 = 21;
 const E_FOCUS: u16 = 22;
+/// `Element.submit()` — the form.submit() native (shared body in DomHost)
+const E_SUBMIT: u16 = 23;
 /// location group idxs
 const L_ASSIGN: u16 = 30;
 const L_RELOAD: u16 = 31;
@@ -519,6 +523,12 @@ fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
         E_FOCUS => {
             // the shell owns real focus; log intent and mark the node
             eprintln!("[js] element.focus() requested (node {node})");
+            Ok(Val::Undefined)
+        }
+        E_SUBMIT => {
+            // form.submit() native body: shared verbatim with engine B
+            // (collect → navigate; spec shape = no submit event here)
+            runtime::host_mut(|h| h.submit_form(node));
             Ok(Val::Undefined)
         }
         _ => Err(JsError::throw("TypeError: bad element native")),
@@ -794,6 +804,7 @@ impl PageScripts {
             el_set_value: engine.register_native("Element.setValue", el_native, E_SET_VALUE),
             el_set_class: engine.register_native("Element.setClassName", el_native, E_SET_CLASS_NAME),
             el_focus: engine.register_native("Element.focus", el_native, E_FOCUS),
+            el_submit: engine.register_native("Element.submit", el_native, E_SUBMIT),
             loc_assign: engine.register_native("location.assign", loc_native, L_ASSIGN),
             loc_reload: engine.register_native("location.reload", loc_native, L_RELOAD),
             win_add_listener: engine.register_native("window.addEventListener", win_native, W_ADD_LISTENER),
@@ -892,6 +903,7 @@ impl PageScripts {
         let scripts = collect_scripts(dom);
         let mut dirty = false;
         let mut nav = None;
+        let mut form_nav: Option<runtime::FormNav> = None;
         for s in &scripts {
             let src = match &s.src {
                 Some(u) => {
@@ -940,6 +952,13 @@ impl PageScripts {
             if nav.is_none() {
                 nav = host.take_nav();
             }
+            if let Some(f) = host.take_form_nav() {
+                // an inline script form.submit()ed a POST during this
+                // page's load (first request of the run wins)
+                if form_nav.is_none() {
+                    form_nav = Some(f);
+                }
+            }
             if let Err(err) = r {
                 eprintln!("[js] script error: {err}");
             }
@@ -954,7 +973,10 @@ impl PageScripts {
         if nav.is_none() {
             nav = t.nav;
         }
-        Turn { dirty, nav, prevent_default: false }
+        if form_nav.is_none() {
+            form_nav = t.form_nav;
+        }
+        Turn { dirty, nav, form_nav, prevent_default: false }
     }
 
     /// Dispatch one event kind to `node`'s listeners, bubbling up the
@@ -1027,6 +1049,9 @@ impl PageScripts {
                     if turn.nav.is_none() {
                         turn.nav = host.take_nav();
                     }
+                    if turn.form_nav.is_none() {
+                        turn.form_nav = host.take_form_nav();
+                    }
                     if host.prevent_default() {
                         turn.prevent_default = true;
                     }
@@ -1040,6 +1065,9 @@ impl PageScripts {
         turn.dirty = turn.dirty || t.dirty;
         if turn.nav.is_none() {
             turn.nav = t.nav;
+        }
+        if turn.form_nav.is_none() {
+            turn.form_nav = t.form_nav;
         }
         turn
     }
@@ -1121,6 +1149,9 @@ impl PageScripts {
             if turn.nav.is_none() {
                 turn.nav = host.take_nav();
             }
+            if turn.form_nav.is_none() {
+                turn.form_nav = host.take_form_nav();
+            }
             if host.prevent_default() {
                 turn.prevent_default = true;
             }
@@ -1177,6 +1208,9 @@ impl PageScripts {
             }
             if turn.nav.is_none() {
                 turn.nav = host.take_nav();
+            }
+            if turn.form_nav.is_none() {
+                turn.form_nav = host.take_form_nav();
             }
             if let Err(err) = r {
                 eprintln!("[js] rAF error: {err}");
@@ -1817,5 +1851,53 @@ mod tests {
         let l = query_all_dom(&dom, "#l")[0];
         let t = ps.dispatch(&mut dom, l, "click");
         assert!(t.prevent_default, "veto may live at any bubble stop");
+    }
+
+    /// form.submit() native — engine A, GET form: the built `?name=value`
+    /// URL rides the ordinary `nav` channel (data replaces the old query,
+    /// space → `+`) and no body carrier is queued. Spec shape: direct
+    /// navigation, no submit event fired.
+    #[test]
+    fn form_submit_get_rides_nav_channel() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><form id="f" action="/search?old=1">
+                <input name="q" type="text" value="hello world">
+            </form><script>
+                var f = document.getElementById("f");
+                f.submit();
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert_eq!(
+            turn.nav.as_deref(),
+            Some("https://example.com/search?q=hello+world"),
+            "GET form.submit() submits through the nav channel"
+        );
+        assert!(turn.form_nav.is_none(), "GET carries no body carrier");
+    }
+
+    /// form.submit() native — engine A, POST form: the resolved absolute
+    /// action plus the urlencoded body land in `Turn.form_nav` for the
+    /// worker to execute (fetch → render, exactly like every load).
+    #[test]
+    fn form_submit_post_queues_form_nav() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><form id="f" action="/save" method="post">
+                <input name="q" type="text" value="v">
+            </form><script>
+                var f = document.getElementById("f");
+                f.submit();
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert_eq!(
+            turn.form_nav,
+            Some(runtime::FormNav {
+                url: "https://example.com/save".into(),
+                body: "q=v".into(),
+            }),
+            "POST form.submit() queues the body-carrying FormNav"
+        );
+        assert!(turn.nav.is_none(), "POST never rides the plain nav channel");
     }
 }

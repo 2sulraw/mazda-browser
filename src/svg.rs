@@ -1014,6 +1014,17 @@ mod tests {
     }
 
     #[test]
+    fn unparseable_payload_renders_none_never_text() {
+        // Pins the svg pipeline's contract: garbage / non-svg payload (e.g.
+        // an html RAW_TEXT blob misdelivered to the image path) must render
+        // None (blank box in layout) - never a fallback that draws the raw
+        // markup source as pixels.
+        assert!(render(b"garbage without any root tag", 24, 24).is_none());
+        assert!(render(b"<html><body>not svg</body></html>", 24, 24).is_none());
+        assert!(render(b"<svg unterminated", 24, 24).is_none());
+    }
+
+    #[test]
     fn rect_fills_center_leaves_corners() {
         let img = render(SVG.as_bytes(), 10, 10).unwrap();
         let at = |x: usize, y: usize| img.px[y * 10 + x];

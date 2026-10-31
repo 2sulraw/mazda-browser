@@ -749,5 +749,136 @@ mod tests {
         let span = find_tag(&dom, "span");
         assert_eq!(dom.nodes[span as usize].parent, div, "inner hoist reaches div");
     }
+
+    /// Every `is_text` leaf in a laid box tree (what paint emits as runs).
+    fn text_leaves(n: &crate::layout::BoxNode, out: &mut Vec<String>) {
+        if n.is_text && !n.text.is_empty() {
+            out.push(n.text.clone());
+        }
+        for c in &n.children {
+            text_leaves(c, out);
+        }
+    }
+
+    /// Sheet from every live `<style>` block in document order (what
+    /// main.rs `collect_sheets` does over the post-hoist tree).
+    fn collect_style_text(dom: &Dom) -> String {
+        let mut css = String::new();
+        for i in 0..dom.nodes.len() as u32 {
+            if dom.tag(i) == "style" {
+                for &c in &dom.nodes[i as usize].children {
+                    if let NodeKind::Text(t) = &dom.nodes[c as usize].kind {
+                        css.push_str(t);
+                        css.push('\n');
+                    }
+                }
+            }
+        }
+        css
+    }
+
+    #[test]
+    fn dsd_hoist_binds_shadow_styles_and_keeps_svg_payload() {
+        // MDN header shape: a custom element's declarative shadow root
+        // hoists a <style> whose rules target the hoisted buttons, plus a
+        // <button> wrapping an icon <svg>. Two invariants the hoist must
+        // guarantee:
+        //   1. the hoisted <style> still cascades onto the hoisted
+        //      elements (the style element becomes a live sibling; flat
+        //      expansion must not orphan or re-order it);
+        //   2. the <svg> payload (one RAW_TEXT child of <svg>) survives
+        //      hoisting untouched, exactly where layout's inline-svg image
+        //      pipeline reassembles it.
+        let html = r#"<body><mdn-search-button><template shadowroot="open" shadowrootmode="open"><style>.mdn-search-button{display:flex;justify-content:space-between}</style><button class="mdn-search-button" type="button"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg></button></template></mdn-search-button></body>"#;
+        let dom = parse(html);
+        // (1) hoisted style cascades onto the hoisted button
+        let sheet = crate::css::parse_for(&collect_style_text(&dom), 1000.0);
+        let btn = find_tag(&dom, "button");
+        let out = sheet.resolve(&dom, btn, crate::layout::Style::new(), dom.attr(btn, "style"));
+        let flex = out.bx.display;
+        assert!(
+            matches!(flex, crate::css::Display::Flex),
+            "hoisted shadow style must cascade onto the hoisted button, got {flex:?}"
+        );
+        // the flat expansion hoisted the whole shadow payload into the host
+        let host = find_tag(&dom, "mdn-search-button");
+        assert_eq!(child_tags(&dom, host), ["style", "button"]);
+        // (2) svg payload intact under <svg> after hoisting
+        let svg = find_tag(&dom, "svg");
+        let payload: String = dom.nodes[svg as usize]
+            .children
+            .iter()
+            .filter_map(|&c| match &dom.nodes[c as usize].kind {
+                NodeKind::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            payload.contains("<path d=\"m21 21-4.34-4.34\"/><circle cx=\"11\" cy=\"11\" r=\"8\"/>"),
+            "svg shape markup must remain the svg element's RAW_TEXT child: {payload:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "queued repro: the fix lives in layout.rs `contained_text` (off-limits for the html/svg owner) - once contained_text stops treating svg payload as label text, drop this attribute: this test must pass"]
+    fn hoisted_shadow_svg_markup_never_becomes_text() {
+        // Reproduce (%TEMP%/mazda-mdn4.png): the shadow-root template of
+        // <mdn-search-button> hoists a <button> wrapping an icon <svg>.
+        // `<svg>` is RAW_TEXT, so the shape markup lives as one text child
+        // of <svg>; it must never surface as a paintable text run. Today
+        // layout.rs `contained_text` (lines 154-167, used for the button
+        // label at line 598) collects it and the pill paints the literal
+        // `<path d=.../><circle .../>` source. Queued one-line fix in
+        // layout.rs: the element arm of contained_text skips `svg` (and
+        // for the same class `script`/`style`) subtrees - markup content
+        // of svg elements is never text. The svg image pipeline is
+        // unaffected: it reads the svg element's own text children
+        // directly, not through contained_text.
+        let html = r#"<body><header><mdn-search-button><template shadowroot="open" shadowrootmode="open"><style>.mdn-search-button{width:5rem;border-radius:100px}</style><button class="mdn-search-button" title="Search the site"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg></button></template></mdn-search-button></header></body>"#;
+        let dom = parse(html);
+        let sheet = crate::css::parse_for("", 1000.0);
+        let root = dom.body_root();
+        let tree = crate::layout::build(
+            &dom,
+            root,
+            crate::layout::Style::new(),
+            crate::css::BoxStyle::default(),
+            &sheet,
+        );
+        let mut runs = Vec::new();
+        text_leaves(&tree, &mut runs);
+        for r in &runs {
+            assert!(
+                !(r.contains("<path") || r.contains("<circle") || r.contains("m21 21")),
+                "svg markup leaked into a text run: {r:?} (all: {runs:?})"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "queued repro (same root cause as hoisted_shadow_svg_markup_never_becomes_text): layout.rs `contained_text` leaks svg markup into any form-control label; the plain non-hoisted path leaks identically"]
+    fn plain_svg_never_leaks_into_a_button_label() {
+        // Same bug class with no shadow root at all: <button><svg/></button>
+        // is everywhere in real markup (icon buttons) - proof the DSD hoist
+        // is NOT the mechanism. Queued fix: see the previous test.
+        let html = r#"<body><button><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>ok</button></body>"#;
+        let dom = parse(html);
+        let sheet = crate::css::parse_for("", 1000.0);
+        let root = dom.body_root();
+        let tree = crate::layout::build(
+            &dom,
+            root,
+            crate::layout::Style::new(),
+            crate::css::BoxStyle::default(),
+            &sheet,
+        );
+        let mut runs = Vec::new();
+        text_leaves(&tree, &mut runs);
+        assert!(
+            runs.iter().all(|r| !(r.contains("<path") || r.contains("<circle"))),
+            "svg markup leaked into text runs: {runs:?}"
+        );
+        assert!(runs.iter().any(|r| r.contains("ok")), "button label text must survive: {runs:?}");
+    }
 }
 
