@@ -739,27 +739,26 @@ fn build_into(
                         build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
                         out.push(g);
                     } else {
-                        // plain inline: no box, children flatten into parent
-                        // flow. shortcut: horizontal margins (e.g. HN's
-                        // `.hnname{margin-right:5px}`) can't shift inline text,
-                        // so they emit one separator space - visually equivalent
+                        // plain inline (no paint chrome): children flatten
+                        // into the parent flow — UNLESS the element carries
+                        // horizontal margins. Those must advance the line by
+                        // their real width: emitting one literal space (the old
+                        // approximation) left adjacent inline boxes jammed or
+                        // overlapping. Promote to an inline-edge box (same
+                        // placement path as the paint branch above), so
+                        // block()'s inline branch lays out ml + width + mr.
+                        // Collapse semantics: inline margins never collapse —
+                        // CSS collapses only block-level boxes; an inline edge
+                        // margin is always real advance, and adjacent boxes'
+                        // margins simply add on the line.
                         let has_margin = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
-                        if has_margin(outcome.bx.margin[3]) {
-                            out.push(BoxNode::leaf(
-                                outcome.style,
-                                " ".into(),
-                                false,
-                                child_link.clone(),
-                            ));
-                        }
-                        build_into(dom, child, outcome.style, sheet, child_link, out);
-                        if has_margin(outcome.bx.margin[1]) {
-                            out.push(BoxNode::leaf(
-                                outcome.style,
-                                " ".into(),
-                                false,
-                                None,
-                            ));
+                        if has_margin(outcome.bx.margin[3]) || has_margin(outcome.bx.margin[1]) {
+                            let mut g = BoxNode::group(outcome.style, outcome.bx);
+                            g.inline = true;
+                            build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                            out.push(g);
+                        } else {
+                            build_into(dom, child, outcome.style, sheet, child_link, out);
                         }
                     }
                 }
@@ -1422,7 +1421,16 @@ fn position_all(
                 };
             }
             // provisional = CB origin (shortcut: real static position was
-            // skipped by the flow); insets resolve % against the CB axis
+            // skipped by the flow); insets resolve % against the CB axis.
+            // Negative insets are honored verbatim — `top:-9999px` lays the
+            // box off-canvas (nothing clamps it back), the classic
+            // off-screen skip-link pattern. Known gap: `clip`/`overflow:
+            // hidden` are unmodeled upstream (dropped with other unknown
+            // properties), so hiding rules that rely on them alone — e.g.
+            // a 1px clip-rect + overflow:hidden skip-link that declares NO
+            // insets — stay positioned at the CB origin (provisional) and
+            // render visibly instead of clipped; finishing that needs the
+            // cascade to carry the property + paint-time culling.
             place(n, c.0, c.1, c.2, measure, runs, uls);
             let ml = resolve_len(n.bx.margin[3], c.2);
             let mr = resolve_len(n.bx.margin[1], c.2);
@@ -1565,7 +1573,14 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
         };
     }
     if let Some(l) = n.bx.width {
-        return resolve_len(l, avail);
+        if !matches!(l, Len::Pct(_)) {
+            return resolve_len(l, avail);
+        }
+        // shortcut: a % width is cyclic in max-content sizing (the box
+        // would resolve it against the shrink-to-fit width it feeds) —
+        // measured intrinsically (auto), like real engines size
+        // max-content; place() still resolves the % against the
+        // containing block when laying out
     }
     if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
         return iw as f32; // intrinsic (padding added by the wrapper)
@@ -1614,7 +1629,19 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
                 if c.is_text {
                     run += natural_w(c, avail, measure);
                 } else {
-                    m = m.max(run).max(natural_w(c, avail, measure));
+                    // inline children advance the line by their horizontal
+                    // margins (block()'s inline branch adds the same ml+mr
+                    // while laying out), so the shrink-to-fit measure must
+                    // count them or the box under-sizes and its right-hand
+                    // content is advanced past by siblings
+                    let w = if c.inline {
+                        natural_w(c, avail, measure)
+                            + resolve_len(c.bx.margin[3], avail)
+                            + resolve_len(c.bx.margin[1], avail)
+                    } else {
+                        natural_w(c, avail, measure)
+                    };
+                    m = m.max(run).max(w);
                     run = 0.0;
                 }
             }
@@ -1634,7 +1661,17 @@ fn item_natural(
             .iter()
             .map(|c| natural_w(c, avail, measure))
             .sum(),
-        Item::Grp(i) => natural_w(&parent.children[*i], avail, measure),
+        Item::Grp(i) => {
+            // a flex item's horizontal margins are real advance: the slot
+            // spans the whole margin box (place() insets the item's content
+            // by its own margins within the slot). Without this, margin-only
+            // separators (e.g. inline menu items with `margin: 0 8px` in a
+            // flex row) are dropped and neighbors lay edge to edge.
+            let c = &parent.children[*i];
+            natural_w(c, avail, measure)
+                + resolve_len(c.bx.margin[3], avail)
+                + resolve_len(c.bx.margin[1], avail)
+        }
     }
 }
 
@@ -1859,8 +1896,8 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, content: &[f32]) -> Vec<
 /// line (see [`layout_from`]).
 ///
 /// Boxes with `inline` set (UA form-control chrome, author `display:
-/// inline-block`, promoted background/padding inlines) join the current
-/// text line instead of opening their own: shrink-to-fit width,
+/// inline-block`, promoted background/padding/margin inlines) join the
+/// current text line instead of opening their own: shrink-to-fit width,
 /// vertically centered against what is already on the line, and the text
 /// after them continues on that same line.
 /// shortcut: centering approximates baseline alignment (a real engine
@@ -2029,9 +2066,34 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         return;
     }
     let gap = n.bx.gap_col;
-    let mut widths: Vec<f32> = items.iter().map(|it| item_natural(n, it, n.w, measure)).collect();
-    let natural_sum: f32 = widths.iter().sum();
     let gaps = gap * (k as f32 - 1.0).max(0.0);
+    let mut widths: Vec<f32> = items.iter().map(|it| item_natural(n, it, n.w, measure)).collect();
+    // A % width on a flex item is its flex basis: it resolves against the
+    // row's content width, but the row still owes the other items their
+    // own widths — cap the margin box at the space the siblings leave and
+    // floor it at the item's intrinsic size (real engines' min-width:auto
+    // clamp). Without the cap a `width:100%` list (the wiki article-tools
+    // tabs beside the Tools menu) measured into justify-content's pocket
+    // and slid the sibling onto its end; without the basis side-by-side
+    // `%` column items sized from intrinsic text width instead of the row.
+    for (idx, it) in items.iter().enumerate() {
+        if let Item::Grp(i) = it {
+            if let Some(Len::Pct(p)) = n.children[*i].bx.width {
+                let others: f32 = widths
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != idx)
+                    .map(|(_, v)| *v)
+                    .sum();
+                let mlr = resolve_len(n.children[*i].bx.margin[3], n.w)
+                    + resolve_len(n.children[*i].bx.margin[1], n.w);
+                let basis = (p / 100.0 * n.w + mlr).max(widths[idx]);
+                let cap = (n.w - gaps - others).max(widths[idx]);
+                widths[idx] = basis.min(cap);
+            }
+        }
+    }
+    let natural_sum: f32 = widths.iter().sum();
     // nowrap shrinks to fit; wrap keeps natural widths and breaks lines
     if !n.bx.wrap && natural_sum + gaps > n.w && natural_sum > 0.0 {
         let scale = ((n.w - gaps).max(0.0)) / natural_sum;
@@ -2060,6 +2122,19 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     let mut y = n.y;
     let mut total_h = 0.0f32;
     let mut last_open = false;
+    // convert a % item's width to the slot's exact px: the row reserved
+    // exactly this width (the basis cap above), so placing must not
+    // re-resolve the % against the container and inflate past the slot —
+    // that re-resolution was what slid justified siblings onto the item
+    for (idx, it) in items.iter().enumerate() {
+        if let Item::Grp(i) = it {
+            if let Some(Len::Pct(_)) = n.children[*i].bx.width {
+                let ml = resolve_len(n.children[*i].bx.margin[3], widths[idx]);
+                let mr = resolve_len(n.children[*i].bx.margin[1], widths[idx]);
+                n.children[*i].bx.width = Some(Len::Px((widths[idx] - ml - mr).max(0.0)));
+            }
+        }
+    }
     for (li, line) in lines.iter().enumerate() {
         if li > 0 {
             y += n.bx.gap_row; // row-gap between wrapped lines
@@ -2114,16 +2189,10 @@ fn flex_line(
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                // a %-width item resolves against the ROW's content width
-                // (its containing block), not its allotted slot - passing the
-                // slot re-resolved `width:30%` against 30% of the row (a
-                // side-by-side column layout came out 3x too narrow)
-                let avail = if matches!(n.children[i].bx.width, Some(Len::Pct(_))) {
-                    n.w
-                } else {
-                    w
-                };
-                let adv = place(&mut n.children[i], x, y, avail, measure, runs, uls);
+                // a % item's width was already converted to the row's exact
+                // reserved px above, so the slot width is the containing
+                // block measure — no re-resolution here
+                let adv = place(&mut n.children[i], x, y, w, measure, runs, uls);
                 (adv, n.children[i].open) // cross-size = margin box
             }
         };
@@ -2768,6 +2837,64 @@ mod tests {
     }
 
     #[test]
+    fn pct_width_child_measured_intrinsically_for_shrink_to_fit() {
+        // `width:100%` inside an auto-width parent: max-content measurement
+        // treats it as auto (cyclic against the very box it feeds), not as
+        // filling the measuring context — when a flex row item contained a
+        // width:100% descendant, its slot measured out as the whole row and
+        // the sibling item was proportionally shrunk on top of it.
+        let dom = crate::html::parse(
+            r#"<div class="row"><div class="menu"><span class="p100">abcdefgh</span></div><div class="tool">Tools</div></div>"#,
+        );
+        let sheet = crate::css::parse(r#".row{display:flex}.p100{width:100%}"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 200.0, &m4);
+        let row = &root.children[0];
+        let menu = &row.children[0];
+        let tool = &row.children[1];
+        // menu's slot = intrinsic "abcdefgh" (32px @ 4px/char), NOT row width
+        assert!(menu.w < 60.0, "menu w={} measured intrinsically (<60), not 100% of row", menu.w);
+        // no sibling overlap: Tools starts after the menu's full extent
+        assert!(
+            tool.x >= menu.x + menu.w - 0.01,
+            "tool.x={} must not sit on the menu box (x={} w={})",
+            tool.x,
+            menu.x,
+            menu.w
+        );
+        let tool_run = l.runs.iter().find(|r| r.text == "Tools").expect("Tools run");
+        assert!(tool_run.x >= menu.x + menu.w, "tool run clear of the menu content");
+    }
+
+    #[test]
+    fn flex_row_items_advance_by_their_margins() {
+        // header-menu shape: `ul{display:flex}` with margin-bearing items
+        // (e.g. `li{margin:0 8px}`) — each item's slot spans its margin box
+        // so neighbors get real gaps (they used to lay edge to edge: the
+        // whitespace between table-less list items is dropped in flex, and
+        // the margins were measured/advanced as zero)
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(Style::new(), BoxStyle::default());
+            g.children = vec![leaf(t)];
+            g.bx.margin[3] = Len::Px(8.0);
+            g.bx.margin[1] = Len::Px(8.0);
+            g
+        };
+        let mut root = flex_row(vec![boxed("One"), boxed("Two")], BoxStyle::default());
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let one = l.runs.iter().find(|r| r.text == "One").expect("One run");
+        let two = l.runs.iter().find(|r| r.text == "Two").expect("Two run");
+        let one_end = one.x + one.width;
+        assert!(
+            two.x >= one_end + 14.0,
+            "real margin gap: two.x={} one ends at {} (want +16px margins minus slack)",
+            two.x,
+            one_end
+        );
+        assert!((one.y - two.y).abs() < 10.0, "same flex row");
+    }
+
+    #[test]
     fn min_height_shorter_content_unchanged() {        // content already taller than min-height → no shift, height stays
         // (boxed children: adjacent text leaves merge into one anonymous item)
         let boxed = |t: &str| {
@@ -2794,6 +2921,65 @@ mod tests {
         let content_h = 3.0 * 15.0 * 1.35;
         assert!((root.h - content_h).abs() < 0.01, "h={} content={}", root.h, content_h);
         assert_eq!(l.runs[0].y, 0.0, "first line stays at top");
+    }
+
+    #[test]
+    fn flex_row_pct_width_item_keeps_sibling_on_the_row() {
+        // A `width:100%` list beside a sibling in a justify-End row (the
+        // wiki article-tools tabs + Tools menu): the list's slot is its %
+        // basis capped at the space the sibling needs, so the sibling's
+        // runs sit clear of the list's runs — never on top of them. Before
+        // the cap the list reserved the whole row and justify-End slid its
+        // runs over the sibling's spot.
+        let tabs = flex_row(
+            vec![leaf("Read"), leaf("View source"), leaf("View history")],
+            BoxStyle {
+                width: Some(Len::Pct(100.0)),
+                justify: Justify::End,
+                ..BoxStyle::default()
+            },
+        );
+        let mut tool = BoxNode::group(Style::new(), BoxStyle::default());
+        tool.children = vec![leaf("Tools")];
+        let mut root = flex_row(vec![tabs, tool], BoxStyle::default());
+        let l = layout_tree(&mut root, 200.0, &m4);
+        let vh = l
+            .runs
+            .iter()
+            .find(|r| r.text == "history")
+            .expect("history run");
+        let tools = l.runs.iter().find(|r| r.text == "Tools").expect("Tools run");
+        assert!(
+            tools.x >= vh.x + vh.width - 0.01,
+            "Tools run (x={}) must sit right of the tab runs (end={})",
+            tools.x,
+            vh.x + vh.width
+        );
+        // the slot kept its intrinsic text too: tabs don't collapse to a sliver
+        assert!(
+            vh.x >= 100.0,
+            "tabs justify-End inside their slot, last run x={} (too far left)",
+            vh.x
+        );
+    }
+
+    #[test]
+    fn flex_row_pct_col_items_keep_their_row_share() {
+        // two width:30% columns side by side: each slot is 30% OF THE ROW,
+        // not 30% of the column's own intrinsic text width (that collapsed
+        // each column to a sliver when the % was resolved slot-against-slot)
+        let mut col_a = BoxNode::group(Style::new(), BoxStyle::default());
+        col_a.bx.width = Some(Len::Pct(30.0));
+        col_a.children = vec![leaf("aaaaaaaaaaaa")];
+        let mut col_b = BoxNode::group(Style::new(), BoxStyle::default());
+        col_b.bx.width = Some(Len::Pct(30.0));
+        col_b.children = vec![leaf("bbbbbbbbbbbb")];
+        let mut root = flex_row(vec![col_a, col_b], BoxStyle::default());
+        layout_tree(&mut root, 200.0, &m4);
+        let (a, b) = (&root.children[0], &root.children[1]);
+        assert!((a.w - 60.0).abs() < 0.01, "col A w={} (want 60 = 30% of 200)", a.w);
+        assert!((b.x - 60.0).abs() < 0.01, "col B x={} (want 60)", b.x);
+        assert!((b.w - 60.0).abs() < 0.01, "col B w={}", b.w);
     }
 
     #[test]
@@ -3629,6 +3815,34 @@ mod tests {
         assert!((fixed_box.x - 0.0).abs() < 0.01, "fixed x={} = viewport", fixed_box.x);
     }
 
+    #[test]
+    fn absolute_negative_top_left_lay_off_canvas() {
+        // classic off-screen helper: top:-9999px must position the box
+        // entirely above the canvas — nothing clamps it back into view
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let flow = pos_box(Pos::Static, [None; 4], vec![leaf("visible")]);
+        let hidden = pos_box(
+            Pos::Absolute,
+            [Some(Len::Px(-9999.0)), None, None, Some(Len::Px(-9999.0))],
+            vec![leaf("skip")],
+        );
+        root.children = vec![flow, hidden];
+        let l = layout_in(&mut root, 300.0, 100.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "skip").expect("skip run");
+        let total_h = 15.0 * 1.35;
+        assert!(
+            run.y + total_h <= 0.0,
+            "top:-9999px lays off-canvas: run.y={} (h={total_h})",
+            run.y
+        );
+        assert!(run.x + run.width <= 0.0, "left:-9999px too: run.x={}", run.x);
+        // no clamp to ≥0 anywhere: assert the raw magnitude survived
+        assert!(run.y < -9000.0, "y={}", run.y);
+        // the flow sibling is unaffected
+        let vis = l.runs.iter().find(|r| r.text == "visible").expect("flow run");
+        assert!(vis.y >= 0.0 && vis.y < 50.0, "in-flow text stays on canvas: y={}", vis.y);
+    }
+
     // ---- form controls (UA chrome: <select>/<input>/<textarea>) ----
 
     /// box tree from markup: parse + build over an empty sheet (UA chrome
@@ -3794,6 +4008,74 @@ mod tests {
         // still one line: the band grows horizontally, not into a stacked row
         assert!((mid.y - pre.y).abs() < 10.0, "band on the text line");
         assert!((post.y - pre.y).abs() < 10.0, "text continues after the band");
+    }
+
+    #[test]
+    fn inline_horizontal_margins_give_real_gaps() {
+        // `.m{margin: 0 10px}` on plain inlines: each side contributes its
+        // real width to the line (the old approximation emitted one literal
+        // space ≈4px per side, which jammed/overlapped dense inline menus);
+        // inline margins never collapse — adjacent boxes' margins add up.
+        // This is the inline-block promotion path's margin sibling: the box
+        // still sits ON the text line, margins don't stack it.
+        let dom = crate::html::parse(r#"<div><span class="m">Main</span><span class="m">Talk</span></div>"#);
+        let sheet = crate::css::parse(r#".m { margin: 0 10px; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        {
+            let cs = controls(&root);
+            assert_eq!(cs.len(), 2, "both spans promoted to inline boxes");
+            assert!(cs[0].inline && cs[1].inline, "inline placement");
+            assert_eq!(cs[0].bx.margin[1], Len::Px(10.0), "right margin kept on the box");
+            assert_eq!(cs[1].bx.margin[3], Len::Px(10.0), "left margin kept on the box");
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let main = l.runs.iter().find(|r| r.text == "Main").expect("Main run");
+        let talk = l.runs.iter().find(|r| r.text == "Talk").expect("Talk run");
+        // text advance = box border-box + 10px right margin + 10px left margin
+        let gap = talk.x - (main.x + main.width);
+        assert!(
+            gap >= 18.0,
+            "real margin gap: {gap} (want ≥ 20px margins minus slack; the old space ≈4px)"
+        );
+        assert!(talk.x >= main.x + main.width + 18.0, "no run overlap");
+        // and <em> without margins still flattens exactly as before
+        let dom2 = crate::html::parse(r#"<div><span>Main</span><span>Talk</span></div>"#);
+        let mut root2 = build(&dom2, dom2.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        assert_eq!(controls(&root2).len(), 0, "margin-less inlines stay flattened");
+        let l2 = layout_tree(&mut root2, 500.0, &m4);
+        let t = l2.runs.iter().find(|r| r.text == "Talk").expect("Talk run");
+        let main2 = l2.runs.iter().find(|r| r.text == "Main").expect("Main run");
+        assert_eq!(t.x, main2.x + main2.width, "adjacent text, unchanged advance");
+    }
+
+    #[test]
+    fn inline_margin_menu_advances_without_jam() {
+        // header-menu shape: inline list items whose <a> labels previously
+        // ran together ("Main PageTalk") — adjacent items get real gaps and
+        // stay on one line
+        let dom = crate::html::parse(
+            r##"<ul><li><a href="#a">Main Page</a></li><li><a href="#b">Talk</a></li></ul>"##,
+        );
+        let sheet = crate::css::parse(r#"li { display: inline; margin: 0 6px; }"#);
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        {
+            let cs: Vec<&BoxNode> = root
+                .children[0]
+                .children
+                .iter()
+                .collect();
+            assert_eq!(cs.len(), 2, "both <li> promoted to inline boxes");
+            assert!(cs[0].inline && cs[1].inline, "inline placement");
+        }
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let page = l.runs.iter().find(|r| r.text == "Page").expect("Page run");
+        let talk = l.runs.iter().find(|r| r.text == "Talk").expect("Talk run");
+        // second item starts after the first item's full extent + margins
+        // (6px right + 6px left) — no jam, no overlap
+        assert!(talk.x >= page.x + page.width + 10.0, "talk.x={} page end={}", talk.x, page.x + page.width);
+        // one line: no stacking
+        let main = l.runs.iter().find(|r| r.text == "Main").expect("Main run");
+        assert!((main.y - talk.y).abs() < 10.0, "same line");
     }
 
     #[test]
