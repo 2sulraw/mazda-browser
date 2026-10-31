@@ -1,11 +1,15 @@
-//! Hand-rolled lexer for the JS subset (see js.rs module docs for scope).
+﻿//! Hand-rolled lexer for the JS subset (see js.rs module docs for scope).
 //!
 //! Tokens carry byte spans (`Span`) so parser errors can report line/col.
 //!
 //! shortcuts (v1, all honest):
-//! - regex literals are NOT lexed: a bare `/` is always division or a syntax
-//!   error. Real-world regex support is a later wave (it needs lexing context
-//!   to disambiguate `/` and it is a large sub-language of its own).
+//! - regex literal vs division is decided with the standard lexical
+//!   previous-token heuristic (a `/` after a value-ish token â€” number, str,
+//!   template, identifier, `)`, `]`, prefix/postfix `++`/`--` â€” reads as
+//!   division; anything else starts a regex literal). This cannot see parser
+//!   state, so pathological spacing like `var r = {a:1} /2` (object literal
+//!   then division) would mislex as a regex â€” such shapes are vanishingly
+//!   rare in real code and produce a regex-parse error, not silent misbehavior.
 //! - identifiers are ASCII-only (`A-Za-z_$` + digits). Non-ASCII bytes outside
 //!   strings/comments/templates are a syntax error. Unicode identifiers are a
 //!   later wave.
@@ -32,6 +36,11 @@ pub enum Tok {
     /// Expr (and the whole template into string concatenation).
     Template(Vec<TplPart>),
     Ident(Rc<str>),
+    /// regex literal `/pattern/flags` â€” pattern and flags kept raw (escapes
+    /// unescaped later by the regex engine, which owns them)
+    Regex(Rc<str>, Rc<str>),
+    /// `...` â€” spread in calls/arrays/objects, rest in params/patterns
+    Spread,
     Kw(Kw),
     Op(Op),
     Punct(Punct),
@@ -89,6 +98,9 @@ pub enum Kw {
     Case,
     Default,
     Instanceof,
+    Async,
+    Await,
+    Yield,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,15 +168,33 @@ pub struct LexError {
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
     let mut lx = Lexer { src, pos: 0 };
-    let mut out = Vec::new();
+    let mut out: Vec<Token> = Vec::new();
     loop {
-        let t = lx.next_token()?;
+        let t = lx.next_token(regex_allowed(out.last().map(|t: &Token| &t.tok)))?;
         let eof = t.tok == Tok::Eof;
         out.push(t);
         if eof {
             return Ok(out);
         }
     }
+}
+
+/// Lexical regex-vs-division decision (see module docs): a `/` directly
+/// following a value-ish token is division; otherwise it opens a regex
+/// literal. We deliberately cannot see parser state (block vs object `}`), so
+/// after `}` we choose regex â€” statement boundaries are the common real-world
+/// reading.
+fn regex_allowed(prev: Option<&Tok>) -> bool {
+    !matches!(
+        prev,
+        Some(Tok::Num(_))
+            | Some(Tok::Str(_))
+            | Some(Tok::Template(_))
+            | Some(Tok::Ident(_))
+            | Some(Tok::Kw(Kw::True | Kw::False | Kw::Null | Kw::This))
+            | Some(Tok::Punct(Punct::RParen | Punct::RBrack))
+            | Some(Tok::Op(Op::Inc | Op::Dec))
+    )
 }
 
 struct Lexer<'a> {
@@ -208,6 +238,11 @@ fn kw_of(s: &str) -> Option<Kw> {
         "case" => Kw::Case,
         "default" => Kw::Default,
         "instanceof" => Kw::Instanceof,
+        // contextual keywords promoted to reserved (matches the strict-keyword
+        // convention of the rest of this lexer): `async`, `await`, `yield`
+        "async" => Kw::Async,
+        "await" => Kw::Await,
+        "yield" => Kw::Yield,
         _ => return None,
     })
 }
@@ -278,7 +313,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn next_token(&mut self) -> Result<Token, LexError> {
+    fn next_token(&mut self, regex_ok: bool) -> Result<Token, LexError> {
         let nl = self.skip_ws();
         let start = self.pos;
         let b = match self.peek() {
@@ -315,6 +350,9 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
             let parts = self.read_template(start)?;
             Tok::Template(parts)
+        } else if b == b'/' && regex_ok {
+            self.pos += 1; // consume the opening `/`; read_regex reads the body
+            self.read_regex(start)?
         } else {
             self.read_punct(start, b)?
         };
@@ -404,6 +442,47 @@ impl<'a> Lexer<'a> {
                     let raw = &self.src[body_start..self.pos];
                     self.pos += 1;
                     return Ok(raw);
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+    }
+
+    /// Scan a regex literal body (already past the opening `/`): `[...]`
+    /// classes protect an inner `/`, `\x` escapes protect the next char.
+    /// Pattern text is kept raw â€” the regex engine unescapes it, because it
+    /// owns the escape sub-language.
+    fn read_regex(&mut self, start: usize) -> Result<Tok, LexError> {
+        let body_start = self.pos; // after the `/`
+        let mut in_class = false;
+        loop {
+            match self.peek() {
+                None | Some(b'\n') | Some(b'\r') => {
+                    return self.err("unterminated regex literal", start)
+                }
+                Some(b'\\') => {
+                    if self.peek2().is_none() {
+                        return self.err("unterminated regex literal", start);
+                    }
+                    self.pos += 2;
+                }
+                Some(b'[') => {
+                    in_class = true;
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    in_class = false;
+                    self.pos += 1;
+                }
+                Some(b'/') if !in_class => {
+                    let pattern = &self.src[body_start..self.pos];
+                    self.pos += 1;
+                    let fstart = self.pos;
+                    while matches!(self.peek(), Some(b'g' | b'i' | b'm' | b's' | b'y')) {
+                        self.pos += 1;
+                    }
+                    let flags = &self.src[fstart..self.pos];
+                    return Ok(Tok::Regex(Rc::from(pattern), Rc::from(flags)));
                 }
                 Some(_) => self.pos += 1,
             }
@@ -560,7 +639,7 @@ impl<'a> Lexer<'a> {
         let mut out = Vec::new();
         let mut depth = 0usize;
         loop {
-            let t = self.next_token()?;
+            let t = self.next_token(regex_allowed(out.last().map(|t: &Token| &t.tok)))?;
             match &t.tok {
                 Tok::Punct(Punct::LBrace) => depth += 1,
                 Tok::Punct(Punct::RBrace) => {
@@ -738,10 +817,8 @@ impl<'a> Lexer<'a> {
             b'~' => op!(Op::BitNot),
             b'.' => {
                 if self.peek2() == Some(b'.') && self.src.as_bytes().get(self.pos + 2) == Some(&b'.') {
-                    return self.err(
-                        "spread/rest (`...`) is not supported yet (later wave)",
-                        start,
-                    );
+                    self.pos += 3;
+                    return Ok(Tok::Spread);
                 }
                 one!(Punct::Dot)
             }

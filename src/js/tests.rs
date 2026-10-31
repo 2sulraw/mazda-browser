@@ -31,6 +31,38 @@ fn err(src: &str) -> JsError {
     e.exec(src).err().unwrap_or_else(|| panic!("expected error for: {}", src))
 }
 
+/// Microtask effects are asynchronous by definition: `exec` returns the
+/// *synchronous* completion value before queued reactions run. Promise/
+/// async tests therefore store their answer in a global named `m` and
+/// probe it with a follow-up exec (which itself runs after the drain).
+fn mrun(src: &str) -> Val {
+    let mut e = JsEngine::new();
+    e.exec(src)
+        .unwrap_or_else(|err| panic!("exec failed: {}\nsrc: {}", err, src));
+    match e.exec("m") {
+        Ok(v) => v,
+        Err(err) => panic!("probe failed: {}\nsrc: {}", err, src),
+    }
+}
+
+fn mnum(src: &str) -> f64 {
+    match mrun(src) {
+        Val::Num(n) => n,
+        v => panic!("expected number, got {:?} (src: {})", v, src),
+    }
+}
+
+fn mstring(src: &str) -> String {
+    mrun(src).to_string()
+}
+
+fn mbool(src: &str) -> bool {
+    match mrun(src) {
+        Val::Bool(b) => b,
+        v => panic!("expected bool, got {:?} (src: {})", v, src),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // lexer/parser errors
 // ---------------------------------------------------------------------------
@@ -285,7 +317,7 @@ fn recursion() {
 #[test]
 fn stack_overflow_guard_returns_err_not_panic() {
     // debug-build interpreter frames are fat: run the runaway-recursion case
-    // on a thread with a generous stack — the ENGINE's own guard (depth cap)
+    // on a thread with a generous stack ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the ENGINE's own guard (depth cap)
     // must fire long before this thread's stack runs out, exactly like the
     // release browser build.
     let h = std::thread::Builder::new()
@@ -310,7 +342,7 @@ fn stack_overflow_guard_returns_err_not_panic() {
 #[test]
 fn recursion_10000_deep_is_err_not_panic() {
     // A 10000-frame chain is 10x over MAX_CALL_DEPTH (1000): the engine's
-    // guard must surface a RangeError Err — never a native stack overflow or
+    // guard must surface a RangeError Err ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â never a native stack overflow or
     // panic. Same generous-stack thread rationale as the runaway case above.
     let h = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -588,7 +620,7 @@ fn json_round_trip() {
     // unicode escape round-trip
     assert_eq!(string("JSON.parse(JSON.stringify('\\u0041'))"), "A");
     // surrogate pair: our lexer maps lone surrogate escapes to U+FFFD (see
-    // lexer.rs shortcut note), so this yields 2 chars — the same `.length`
+    // lexer.rs shortcut note), so this yields 2 chars ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the same `.length`
     // real JS reports (2 UTF-16 units) for this input.
     assert_eq!(num("JSON.parse('\"\\ud83d\\ude00\"').length"), 2.0);
 }
@@ -640,11 +672,11 @@ fn conversions_and_number_globals() {
 #[test]
 fn uri_encoding() {
     assert_eq!(string("encodeURIComponent('a b/c')"), "a%20b%2Fc");
-    assert_eq!(string("encodeURIComponent('héllo')"), "h%C3%A9llo");
+    assert_eq!(string("encodeURIComponent('h\u{e9}llo')"), "h%C3%A9llo");
     assert_eq!(string("decodeURIComponent('a%20b')"), "a b");
-    assert_eq!(string("decodeURIComponent('h%C3%A9llo')"), "héllo");
+    assert_eq!(string("decodeURIComponent('h%C3%A9llo')"), "h\u{e9}llo");
     // round trip
-    assert_eq!(string("decodeURIComponent(encodeURIComponent('π/π'))"), "π/π");
+    assert_eq!(string("decodeURIComponent(encodeURIComponent('\u{3c0}/\u{3c0}'))"), "\u{3c0}/\u{3c0}");
     match err("decodeURIComponent('%zz')") {
         JsError::Throw(_) => {}
         other => panic!("expected Throw, got {:?}", other),
@@ -685,11 +717,11 @@ fn promise_partial() {
     e.exec("let got = ''; Promise.reject('nope').catch(function(e) { got = e })").unwrap();
     e.drain_microtasks().unwrap();
     assert_eq!(e.get_global("got").to_string(), "nope");
-    // `new Promise(executor)` is honestly unsupported
-    assert!(matches!(
-        e.exec("new Promise(function(res) { res(1) })"),
-        Err(JsError::Throw(_))
-    ));
+    // `new Promise(executor)` now works: the executor runs synchronously and
+    // its resolve call settles the promise; `.then` reactions fire on drain
+    e.exec("let s = 0; new Promise(function(res) { res(9) }).then(function(v) { s = v * 3 + 1 })").unwrap();
+    e.drain_microtasks().unwrap();
+    assert_eq!(e.get_global("s").as_number(), Some(28.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +790,7 @@ fn exec_returns_last_expression_value() {
 
 #[test]
 fn val_is_compact() {
-    // RAM guard: Val must stay 24 bytes — this is the hot unit. (24 = 8-byte
+    // RAM guard: Val must stay 24 bytes ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â this is the hot unit. (24 = 8-byte
     // tag/padding + the 16-byte fat Rc<str> pointer; thinning strings would
     // cost an extra indirection per string.)
     assert!(
@@ -798,4 +830,528 @@ fn real_world_snippets() {
     assert!(boolean("let a = {}; let b = a; a === b"));
     assert!(!boolean("let a = {}; let b = {}; a === b"));
     assert!(boolean("let a = {}; let b = {}; a == b")); // both stringify
+}
+
+// ---------------------------------------------------------------------------
+// regex literals (compiled-once, step-bounded backtracking engine)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regex_test_method_and_anchors() {
+    assert!(boolean("/oo/.test('foobar')"));
+    assert!(!boolean("/oo/.test('bar')"));
+    assert!(boolean("/^cat$/.test('cat') && !/^cat$/.test('a cat')"));
+    assert_eq!(num("'cat dog cow'.search(/dog/)"), 4.0);
+}
+
+#[test]
+fn regex_greedy_vs_lazy() {
+    assert_eq!(string("'aXXbYYc'.replace(/X.*?Y/, '-')"), "a-Yc");
+    assert_eq!(string("'aXXbYYc'.replace(/X.*Y/, '-')"), "a-c");
+}
+
+#[test]
+fn regex_alternation_and_backrefs() {
+    assert!(boolean("/(ab)\\1/.test('abab')"));
+    assert!(!boolean("/(ab)\\1/.test('aba')"));
+    assert_eq!(string("'cat,bat,hat'.match(/(b|h)at/g).join('|')"), "bat|hat");
+}
+
+#[test]
+fn regex_exec_groups_index_input() {
+    assert_eq!(string("'2026-10-31'.match(/(\\d{4})-(\\d{2})-(\\d{2})/)[2]"), "10");
+    assert!(boolean(
+        "(function() { const m = /B/.exec('aBc'); return m.index === 1 && m.input === 'aBc' && m[0] === 'B'; })()"
+    ));
+    assert_eq!(string("'a1b2c'.split(/(\\d)/).join('|')"), "a|1|b|2|c");
+}
+
+#[test]
+fn regex_exec_g_advances_last_index() {
+    // /g exec/test walk lastIndex; a failed call resets it to 0
+    assert!(boolean(
+        "(() => { const r = /ab/g; let hits = 0; while (r.exec('ababab')) { hits += 1 } return hits === 3 && r.lastIndex === 0; })()"
+    ));
+    assert!(boolean(
+        "(() => { const r = /c/g; r.lastIndex = 9; return r.test('abc') === false && r.lastIndex === 0; })()"
+    ));
+}
+
+#[test]
+fn regex_replace_dollar_patterns() {
+    assert_eq!(string("'a-b-c'.replace(/(b|c)/g, '<$1>')"), "a-<b>-<c>");
+    assert_eq!(string("'foo bar'.replace(/bar/, \"[$`]\")"), "foo [foo ]");
+    assert_eq!(string("'xABy'.replace(/AB/, \"'$&'\")"), "x'AB'y");
+    assert_eq!(string("'abc'.replace(/b/, '$$')"), "a$c");
+}
+
+#[test]
+fn regex_replace_function_replacer() {
+    assert_eq!(
+        string("'x1y2'.replace(/\\d/g, function(d) { return String(Number(d) * 2) })"),
+        "x2y4"
+    );
+    assert_eq!(
+        string("'ab-11'.replace(/(\\w)(\\w)/, function(m, a, b, off) { return a + off })"),
+        "a0-11"
+    );
+}
+
+#[test]
+fn regex_flags() {
+    assert!(boolean("/HELLO/i.test('hello')"));
+    assert!(!boolean("/HELLO/.test('hello')"));
+    assert!(boolean("/^b$/m.test('a\\nb')"));
+    assert!(!boolean("/^b$/.test('a\\nb')"));
+    assert!(boolean("/a.b/s.test('a\\nb')"));
+    assert!(!boolean("/a.b/.test('a\\nb')"));
+    assert!(boolean("/\\bcat\\b/.test('a cat on a mat') && !/\\bcat\\b/.test('scatter')"));
+    assert!(boolean("/[a-f2-4]/.test('x3') && !/[a-f]/.test('zzz')"));
+    assert!(boolean("/[^a-z]/.test('abc9') && !/[^a-z]/.test('abcxyz')"));
+    assert!(boolean("/a{2,3}/.test('aaaa') && !/^a{2,3}$/.test('a')"));
+    assert!(boolean("/^a+a$/.test('aa') && /^a+$/.test('aaaa')"));
+}
+
+#[test]
+fn regex_sticky_flag() {
+    // `lastIndex` anchors the (only) attempt: at 2 the `c` matches and the
+    // match advances lastIndex to 3; from 3 (past the end) it fails and
+    // sticky-with-global-style bookkeeping resets lastIndex to 0
+    assert!(boolean(
+        "(() => { const r = /c/y; r.lastIndex = 2; const ok = r.test('abc'); const l1 = r.lastIndex; const retry = r.test('abc'); return ok && l1 === 3 && !retry; })()"
+    ));
+    // sticky scans exactly at lastIndex: at 1 there is no `c`, so no match
+    assert!(boolean(
+        "(() => { const r = /c/y; r.lastIndex = 1; return !r.test('abc'); })()"
+    ));
+}
+
+#[test]
+fn regex_object_props_and_to_string() {
+    assert_eq!(string("/ab+/i.toString()"), "/ab+/i");
+    assert!(boolean(
+        "(() => { const r = /ab/gi; return r.source === 'ab' && r.flags === 'gi' && r.global && r.ignoreCase && !r.sticky; })()"
+    ));
+    assert_eq!(string("new RegExp('a+', 'i').source"), "a+");
+    assert!(boolean("new RegExp('a+', 'i').test('AA')"));
+}
+
+#[test]
+fn regex_match_all_scan() {
+    assert_eq!(
+        string("'a1b22c333'.matchAll(/\\d+/g).map(m => m[0]).join(',')"),
+        "1,22,333"
+    );
+    assert!(boolean("'xyz'.match(/q/) === null"));
+    assert!(boolean("'ab1'.match(/\\d/).index === 2"));
+    assert_eq!(string("'aXbXc'.split(/X/).join('-')"), "a-b-c");
+}
+
+#[test]
+fn regex_unsupported_syntax_is_clean_error() {
+    assert!(matches!(err("'x'.replace(/(?<=a)b/, '')"), JsError::Syntax { .. }));
+    assert!(matches!(err("/\\p{L}/u"), JsError::Syntax { .. }));
+    assert!(matches!(err("/(?<name>a)/"), JsError::Syntax { .. }));
+    assert!(matches!(err("/[unclosed/"), JsError::Syntax { .. }));
+    assert!(matches!(err("/a+/q"), JsError::Syntax { .. })); // bad flag
+}
+
+#[test]
+fn regex_catastrophic_backtracking_bounded() {
+    // (a+)+$ on a long no-match input is the classic exponential blowup;
+    // the per-call step budget must turn it into a quick honest "no match"
+    // instead of hanging. The trailing `x` guarantees the match never
+    // succeeds, which is what drives unbounded backtrackers to explode.
+    let long = "a".repeat(400);
+    let src = format!("/(a+)+$/.test('{}x')", long);
+    assert_eq!(run(&src).as_bool(), Some(false));
+    // nested-stars are the same shape
+    let src2 = format!("/(a*)*b/.test('{}x')", long);
+    assert_eq!(run(&src2).as_bool(), Some(false));
+    // ...and the honest engine still works on the normal path
+    // (all-(a+) match can succeed: (a+)+ consumes 'aaa', then $ holds)
+    assert_eq!(run("/(a+)+$/.test('aaa')").as_bool(), Some(true));
+}
+
+#[test]
+fn regex_lookahead() {
+    assert!(boolean("/foo(?=bar)/.exec('foobar')[0] === 'foo'"));
+    assert!(boolean("!/foo(?!bar)/.test('foobar') && /foo(?!bar)/.test('foobaz')"));
+}
+
+// ---------------------------------------------------------------------------
+// promises (real chaining + FIFO microtask jobs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn promise_microtask_ordering() {
+    // sync code runs first, then queued reactions fire FIFO
+    assert_eq!(
+        mstring(
+            "let m = ''; Promise.resolve().then(() => m += '2'); m += '1'; Promise.resolve().then(() => m += '3').then(() => m += '4')"
+        ),
+        "1234"
+    );
+}
+
+#[test]
+fn promise_then_chains() {
+    assert_eq!(mnum("let m = 0; Promise.resolve(2).then(v => v * 3).then(v => m = v)"), 6.0);
+    // returning a promise from a handler chains (waits for adoption)
+    assert_eq!(
+        mnum("let m = 0; Promise.resolve(1).then(() => Promise.resolve(7)).then(v => m = v)"),
+        7.0
+    );
+    // adopting an already-thenable resolves through it
+    assert_eq!(
+        mnum("let m = 0; Promise.resolve(Promise.resolve(4)).then(v => m = v)"),
+        4.0
+    );
+    // .then on a rejected promise skips the fulfill handler, resumes at catch
+    assert_eq!(
+        mstring("let m = ''; Promise.reject('bad').then(() => m = 'fulfilled').catch(e => m = String(e))"),
+        "bad"
+    );
+    // throw inside a fulfill handler rejects the derived promise
+    assert_eq!(
+        mstring("let m = ''; Promise.resolve().then(() => { throw 'boom'; }).catch(e => m = String(e))"),
+        "boom"
+    );
+    // catch returns a fulfilled chain: further .then sees the handler result
+    assert_eq!(
+        mstring("let m = ''; Promise.reject('x').catch(e => e + '!!').then(v => m = String(v))"),
+        "x!!"
+    );
+}
+
+#[test]
+fn promise_ctor_executor() {
+    assert_eq!(mnum("let m = 0; new Promise(res => res(9)).then(v => m = v)"), 9.0);
+    // synchronous executor throw rejects
+    assert_eq!(
+        mstring("let m = ''; new Promise(() => { throw 'fail'; }).catch(e => m = String(e))"),
+        "fail"
+    );
+    // second resolve call is ignored
+    assert_eq!(mnum("let m = 0; new Promise(res => { res(1); res(2); }).then(v => m = v)"), 1.0);
+    // rejecting takes precedence over a later resolve
+    assert_eq!(
+        mstring("let m = ''; new Promise((res, rej) => { rej('no'); res('yes'); }).catch(e => m = String(e))"),
+        "no"
+    );
+}
+
+#[test]
+fn promise_identity_and_cycle() {
+    assert!(boolean("const p = Promise.resolve(3); Promise.resolve(p) === p"));
+    // resolving a pending promise with itself is a TypeError rejection
+    assert!(mbool(
+        "let m = false; let res0 = null; const p = new Promise(res => { res0 = res }); p.then(null, () => { m = true }); res0(p)"
+    ));
+}
+
+#[test]
+fn promise_finally() {
+    assert_eq!(
+        mstring("let m = ''; Promise.resolve('v').finally(() => { m += 'F' }).then(v => { m += String(v) })"),
+        "Fv"
+    );
+    // finally runs on rejection too and propagates the rejection
+    assert_eq!(
+        mstring("let m = ''; Promise.reject('e').finally(() => { m += 'F' }).catch(e => { m += String(e) })"),
+        "Fe"
+    );
+}
+
+#[test]
+fn promise_all() {
+    assert_eq!(
+        mstring("let m = 0; Promise.all([1, Promise.resolve(2), 3]).then(vs => { m = vs.join('-') })"),
+        "1-2-3"
+    );
+    assert_eq!(
+        mstring("let m = ''; Promise.all([Promise.resolve(1), Promise.reject('stop')]).catch(e => { m = String(e) })"),
+        "stop"
+    );
+    // empty input fulfills with an empty array
+    assert_eq!(
+        mstring("let m = 0; Promise.all([]).then(() => { m = 99 })"),
+        "99"
+    );
+}
+
+#[test]
+fn promise_race_any_all_settled() {
+    assert_eq!(mnum("let m = 0; Promise.race([9, 8]).then(v => { m = v })"), 9.0);
+    assert_eq!(
+        mstring("let m = ''; Promise.race([Promise.reject('L'), Promise.resolve('W')]).catch(e => { m = String(e) })"),
+        "L"
+    );
+    // any: first fulfillment wins, rejections are skipped
+    assert_eq!(
+        mnum("let m = 0; Promise.any([Promise.reject('r'), Promise.resolve(5)]).then(v => { m = v })"),
+        5.0
+    );
+    assert_eq!(
+        mstring("let m = ''; Promise.any([Promise.reject('a'), Promise.reject('b')]).catch(() => { m = 'agg' })"),
+        "agg"
+    );
+    assert_eq!(
+        mstring(
+            "let m = ''; Promise.allSettled([1, Promise.reject('x')]).then(vs => { m = vs.map(d => d.status[0]).join('') })"
+        ),
+        "fr"
+    );
+}
+
+#[test]
+fn promise_runaway_then_loop_is_bounded() {
+    // a .then that re-enqueues forever must fail with the drain cap, not hang
+    let e = err("function loop() { Promise.resolve().then(loop) } loop()");
+    match e {
+        JsError::Throw(v) => assert!(v.to_string().contains("RangeError")),
+        other => panic!("expected Throw, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// async / await (run-to-completion microtask pump)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn async_returns_promise() {
+    assert_eq!(mnum("let m = 0; async function f() { return 5 } f().then(v => { m = v })"), 5.0);
+    // returned promise from async fn is adopted
+    assert_eq!(
+        mnum("let m = 0; async function f() { return Promise.resolve(3) } f().then(v => { m = v })"),
+        3.0
+    );
+}
+
+#[test]
+fn await_values() {
+    assert_eq!(
+        mnum("let m = 0; async function f() { return await Promise.resolve(9) } f().then(v => { m = v })"),
+        9.0
+    );
+    // await of a non-promise passes the value through
+    assert_eq!(
+        mnum("let m = 0; async function f() { let x = await 20; return x + 1 } f().then(v => { m = v })"),
+        21.0
+    );
+    // await inside a loop pumps each pending step
+    assert_eq!(
+        mnum(
+            "let m = 0; async function f() { let s = 0; for (let i = 1; i <= 3; i++) { s += await Promise.resolve(i) } return s } f().then(v => { m = v })"
+        ),
+        6.0
+    );
+    // async fn + plain chaining both refill a shared queue; each pending
+    // await pumps what's queued (sequential awaits keep order). Note (honest
+    // design tradeoff): awaiting an ALREADY-settled promise unwraps inline,
+    // so microtask interleaving is not spec-FIFO here â€” "acbd"-style
+    // interleaving assertions are out of scope for this wave
+    assert_eq!(
+        mstring(
+            "let m = ''; async function f() { await Promise.resolve(); m += '1'; await Promise.resolve(); m += '2' } f().then(() => { m += '3' })"
+        ),
+        "123"
+    );
+}
+
+#[test]
+fn await_rejection_throws_into_frame() {
+    assert_eq!(
+        mstring(
+            "let m = ''; async function f() { try { await Promise.reject('no') } catch (e) { return 'caught:' + String(e) } } f().then(v => { m = String(v) })"
+        ),
+        "caught:no"
+    );
+    // an async fn that throws rejects its promise; caller catches
+    assert_eq!(
+        mstring("let m = ''; async function f() { throw 'bang' } f().catch(e => { m = String(e) })"),
+        "bang"
+    );
+}
+
+#[test]
+fn await_starved_by_macrotask_is_honest_error() {
+    // an await of a promise that can only be settled by a timer/macrotask
+    // cannot suspend in this wave: it fails with an honest error that the
+    // caller can catch
+    assert_eq!(
+        mstring(
+            "let m = ''; async function f() { await new Promise(() => {}) } f().catch(e => { m = String(e).slice(0, 15) })"
+        ),
+        "Error: await of"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// generators (resumable mini-VM)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generator_next_and_done() {
+    assert_eq!(
+        string(
+            "function* g() { yield 1; yield 2; return 3 } const it = g(); const a = [it.next(), it.next(), it.next()]; a.map(x => x.done).join(',')"
+        ),
+        "false,false,true"
+    );
+    assert_eq!(
+        num(
+            "function* g() { yield 1; yield 2; return 3 } const it = g(); it.next().value + it.next().value + it.next().value"
+        ),
+        6.0
+    );
+    // done generators keep reporting done
+    assert!(boolean(
+        "function* g() { yield 1 } const it = g(); it.next(); it.next(); it.next().done"
+    ));
+}
+
+#[test]
+fn generator_feed_next_arg() {
+    assert_eq!(
+        num("function* g() { let x = yield 1; return x * 2 } const it = g(); it.next(); it.next(5).value"),
+        10.0
+    );
+}
+
+#[test]
+fn generator_return() {
+    assert_eq!(
+        string("function* g() { yield 1; yield 2 } const it = g(); it.next(); it.return('stop').value"),
+        "stop"
+    );
+}
+
+#[test]
+fn generator_yield_inside_if_and_loop() {
+    assert_eq!(
+        string(
+            "function* g() { for (let i = 0; i < 3; i++) { if (i % 2) { yield 'o' + i } else { yield 'e' + i } } } const it = g(); [0, 1, 2].map(() => it.next().value).join(';')"
+        ),
+        "e0;o1;e2"
+    );
+    // generator holds state across suspensions (locals survive .next);
+    // yield is only supported as a plain statement or decl init, so the
+    // accumulator reads the fed value into the loop's `step` first
+    assert_eq!(
+        num("function* c() { let n = 0; while (true) { let step = yield n; n += step } } const it = c(); it.next(); it.next(3).value + it.next(4).value"),
+        10.0
+    );
+}
+
+#[test]
+fn generator_throw_unsupported() {
+    assert!(matches!(err("function* g() { yield 1 } const it = g(); it.throw(1)"), JsError::Throw(_)));
+}
+
+#[test]
+fn generator_yield_position_gated() {
+    // yield inside parenthesized / array-literal / condition expressions is
+    // a parse-time error (honest restriction: yield is only supported as a
+    // plain statement `yield x;` or a declaration initializer)
+    assert!(matches!(err("function* g() { const a = (yield); if (yield) {} }"), JsError::Syntax { .. }));
+    assert!(matches!(err("function* g() { const a = [yield 1] }"), JsError::Syntax { .. }));
+    // a bare decl-init yield inside a generator body is NOT gated: that is
+    // exactly the supported form, so it must exec without a SyntaxError
+    let mut e = JsEngine::new();
+    assert!(matches!(
+        e.exec("function* g() { const y = yield; return y } const it = g(); it.next().done"),
+        Ok(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// destructuring + spread/rest
+// ---------------------------------------------------------------------------
+
+#[test]
+fn destructuring_arrays() {
+    assert_eq!(num("const [a, b] = [10, 20]; a + b"), 30.0);
+    assert_eq!(num("const [a, , c = 5] = [1, 2]; a + c"), 6.0);
+    assert_eq!(num("const [a, ...rest] = [1, 2, 3, 4]; rest[1]"), 3.0);
+    assert_eq!(num("const [a, [b]] = [1, [9]]; a + b"), 10.0);
+    assert_eq!(string("const [a = 'd'] = []; a"), "d");
+    assert_eq!(string("const [, b] = ['x', 'y']; b"), "y");
+}
+
+#[test]
+fn destructuring_objects() {
+    assert_eq!(num("const { x, y: z } = { x: 3, y: 4 }; x * z"), 12.0);
+    assert_eq!(num("const { p = 7 } = {}; p"), 7.0);
+    assert_eq!(string("const { list: [first] } = { list: ['A'] }; first"), "A");
+    assert!(boolean("const { q, ...others } = { q: 1, r: 2 }; others.r === 2 && others.q === undefined"));
+}
+
+#[test]
+fn destructuring_params_and_rest() {
+    assert_eq!(
+        num("function f({ a, b }, [c, d], ...rest) { return a + b + c + d + rest.length } f({ a: 1, b: 2 }, [3, 4], 9, 9, 9)"),
+        13.0
+    );
+    assert_eq!(num("function g([x, y]) { return x * y } g([6, 7])"), 42.0);
+    // parameter defaults evaluate when undefined is passed
+    assert_eq!(num("function h(a = 3) { return a } h(1) + h()"), 4.0);
+}
+
+#[test]
+fn destructuring_assignment() {
+    assert_eq!(num("let a, b; [a, b] = [7, 8]; a * b"), 56.0);
+    assert_eq!(num("let p, q; ({ p, q } = { p: 2, q: 5 }); p * q"), 10.0);
+    // member targets work as leaves
+    assert_eq!(num("const o = {}; [o.a, o.b] = [3, 4]; o.a + o.b"), 7.0);
+}
+
+#[test]
+fn spread_syntax() {
+    assert_eq!(num("const a = [1, 2]; const b = [...a, 3]; b[2]"), 3.0);
+    assert_eq!(num("function f(x, y, z) { return x * y * z } f(...[2, 3], 4)"), 24.0);
+    assert_eq!(num("const ch = [...'ab']; ch.length"), 2.0);
+    assert_eq!(string("Object.keys({ ...{ a: 1 }, b: 2 }).join('')"), "ab");
+    assert_eq!(num("const r = [...[0, 1], ...[2]]; r[2]"), 2.0);
+    assert!(boolean("[...'ab'] instanceof Array"));
+}
+
+// ---------------------------------------------------------------------------
+// accessors (class get/set + Object.defineProperty)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn class_accessors() {
+    assert_eq!(
+        num(
+            "class T { constructor() { this.n = 0 } get d() { return this.n + 1 } set d(v) { this.n = v * 2 } } const t = new T(); t.d = 4; t.d"
+        ),
+        9.0
+    );
+}
+
+#[test]
+fn object_define_property() {
+    assert_eq!(num("const o = {}; Object.defineProperty(o, 'k', { value: 5 }); o.k"), 5.0);
+    assert_eq!(
+        num("const o = { a: 1 }; Object.defineProperty(o, 'g', { get: function() { return 42 } }); o.g"),
+        42.0
+    );
+    // set/get pair through defineProperty
+    assert_eq!(
+        num(
+            "const o = {}; Object.defineProperty(o, 'v', { get: function() { return this.s || 0 }, set: function(x) { this.s = x * 2 } }); o.v = 5; o.v"
+        ),
+        10.0
+    );
+    // write to a getter-only property is a sloppy-mode no-op
+    assert_eq!(
+        string(
+            "const o = {}; Object.defineProperty(o, 'r', { get: function() { return 'R' } }); o.r = 9; o.r"
+        ),
+        "R"
+    );
+    // shortcut: no object-literal getters / `__proto__` or setPrototypeOf
+    // wiring in this wave, so inherited accessors are exercised via class
+    // accessors on the prototype chain (see class_accessors) instead
 }
