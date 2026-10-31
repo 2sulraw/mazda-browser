@@ -1,8 +1,9 @@
 //! DOM → styled atoms → line layout using real glyph metrics.
-//! shortcut: only inline/block split + word wrap (no float/flex/absolute);
-//! upgrade when a real CSS engine lands (Phase 1b+).
+//! shortcut: only inline/block split + word wrap, plus a SIMPLIFIED
+//! float/clear/vertical-align model (each shortcut documented in
+//! `block()`); upgrade when a real CSS engine lands (Phase 1b+).
 
-use crate::css::{decl, Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track};
+use crate::css::{decl, Align, BoxStyle, Clear, Dir, Display, Float, Justify, Len, Pos, Sheet, Track, VAlign};
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
 use std::collections::HashMap;
@@ -694,13 +695,18 @@ fn build_into(
                 // the tag. Absolutely/fixed positioned elements ALWAYS get
                 // one — their display blockifies to block (otherwise the
                 // skip-link pattern `a{position:absolute}` would flatten
-                // into the parent flow and ignore its insets/clip).
+                // into the parent flow and ignore its insets/clip); floated
+                // elements likewise blockify (a floated inline would
+                // otherwise flatten away and lose its float).
                 let boxed = match outcome.bx.display {
                     Display::Auto => {
-                        is_block(tag) || matches!(outcome.bx.pos, Pos::Absolute | Pos::Fixed)
+                        is_block(tag)
+                            || matches!(outcome.bx.pos, Pos::Absolute | Pos::Fixed)
+                            || outcome.bx.float != Float::None
                     }
                     Display::Inline => {
                         matches!(outcome.bx.pos, Pos::Absolute | Pos::Fixed)
+                            || outcome.bx.float != Float::None
                     }
                     _ => true,
                 };
@@ -945,7 +951,7 @@ pub fn layout_in_forms(
     apply_form_state(root, state, measure);
     // initial containing block = viewport (0, 0, max_width, vh)
     let cb = (0.0f32, 0.0f32, max_width, viewport_h);
-    place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls);
+    place(root, 0.0, 0.0, max_width, measure, &mut runs, &mut uls, &[]);
     // phase 2: resolve relative/absolute/fixed against their containing
     // blocks now that every in-flow position is final (root flow box = cb)
     position_all(root, cb, cb, cb, false, measure, &mut runs, &mut uls);
@@ -1414,6 +1420,9 @@ type CB = (f32, f32, f32, f32);
 /// Place one node. `avail` = containing block's content width.
 /// Returns the outer vertical advance (margin-top + border-box height +
 /// margin-bottom) so block flow can stack siblings without overlap.
+/// `flt` = ancestor floats the box's TEXT flow avoids — only `block()`
+/// consumes it; flex/grid/absolute callers pass `&[]` (floats never
+/// affect those, per spec).
 fn place(
     n: &mut BoxNode,
     x: f32,
@@ -1422,6 +1431,7 @@ fn place(
     measure: &dyn Fn(&str, &Style) -> f32,
     runs: &mut Vec<PositionedRun>,
     uls: &mut Vec<UR>,
+    flt: &[Flt],
 ) -> f32 {
     // every run/underline this subtree emits lands in [run0..]/[ul0..] —
     // stored on the node so phase-2 repositioning can shift exactly that
@@ -1517,7 +1527,7 @@ fn place(
             (Display::Flex, Dir::Row) => flex_row(n, measure, runs, uls),
             (Display::Flex, Dir::Column) => flex_col(n, measure, runs, uls),
             (Display::Grid, _) => grid(n, measure, runs, uls),
-            _ => block(n, measure, runs, uls), // Block / Auto(block tag)
+            _ => block(n, measure, runs, uls, flt), // Block / Auto(block tag)
         }
     }
     // min-height: floor the content height. A flex column with vertical
@@ -1638,7 +1648,8 @@ fn position_all(
             // the whole rendering — so a 1px clip-rect + overflow:hidden
             // skip-link that declares NO insets stays at the CB origin but
             // paints as nothing.
-            place(n, c.0, c.1, c.2, measure, runs, uls);
+            // out of flow: floats don't apply (spec)
+            place(n, c.0, c.1, c.2, measure, runs, uls, &[]);
             let ml = resolve_len(n.bx.margin[3], c.2);
             let mr = resolve_len(n.bx.margin[1], c.2);
             let mt = resolve_len(n.bx.margin[0], c.2);
@@ -2115,6 +2126,99 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, content: &[f32]) -> Vec<
         .collect()
 }
 
+/// One placed float's margin box in DOC coordinates + its side.
+///
+/// shortcut: float scope is a downward call chain — the block() that
+/// places a float keeps the list and hands it down through `place()` into
+/// descendant block()s (so a nested paragraph beside an outer float still
+/// narrows), but a float placed inside a nested block does NOT escape UP
+/// into the parent's list: the parent's later siblings flow past it
+/// (spec would re-flow them around it and force the nested block to
+/// contain it). Flex/grid/absolute subtrees are handed no floats at all.
+#[derive(Clone, Copy)]
+struct Flt {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    /// true = `float: left`
+    left: bool,
+}
+
+/// Subtract span `[a,b]` from the sorted, disjoint intervals in `iv`
+/// (pieces that close up are dropped). Keeps `iv` sorted.
+fn iv_sub(iv: &mut Vec<(f32, f32)>, a: f32, b: f32) {
+    if b <= a {
+        return;
+    }
+    let mut out = Vec::with_capacity(iv.len() + 1);
+    for &(s, e) in iv.iter() {
+        if b <= s || a >= e {
+            out.push((s, e));
+        } else {
+            if s < a {
+                out.push((s, a));
+            }
+            if b < e {
+                out.push((b, e));
+            }
+        }
+    }
+    *iv = out;
+}
+
+/// Usable local x-interval for a text line whose doc y-span is
+/// `[oy+y, oy+y+lh)`: `[0, max_width]` minus the x-spans of the floats
+/// overlapping that span, picking the piece that reaches `cursor` (a
+/// cursor buried inside a float continues just past it — the caller
+/// clamps x into the returned range). Returns `(y_jump, x0, x1)`:
+/// `y_jump > 0` means the floats cover the line's full width (zero room)
+/// and the line must move down by that much first, then re-check.
+///
+/// An empty `flt` — every page without floats — returns
+/// `(0, 0, max_width)`, the old full-width line, so those pages lay out
+/// byte-identically.
+fn line_excl(
+    flt: &[Flt],
+    ox: f32,
+    oy: f32,
+    y: f32,
+    lh: f32,
+    cursor: f32,
+    max_width: f32,
+) -> (f32, f32, f32) {
+    if flt.is_empty() {
+        return (0.0, 0.0, max_width);
+    }
+    let (ya, yb) = (oy + y, oy + y + lh.max(1.0));
+    let mut iv = vec![(0.0f32, max_width)];
+    let mut bottom = 0.0f32;
+    let mut hit = false;
+    for f in flt {
+        if f.y0 >= yb || f.y1 <= ya {
+            continue;
+        }
+        hit = true;
+        bottom = bottom.max(f.y1);
+        iv_sub(&mut iv, f.x0 - ox, f.x1 - ox);
+    }
+    if !hit {
+        return (0.0, 0.0, max_width);
+    }
+    if iv.is_empty() {
+        // zero room: drop the line below every blocking float (strictly
+        // downward each retry, floats never move → terminates)
+        return (bottom - oy - y, 0.0, 0.0);
+    }
+    // first piece reaching the cursor: it contains the cursor, or starts
+    // just past a float that buried it
+    let (a, b) = *iv
+        .iter()
+        .find(|(_, e)| *e >= cursor)
+        .unwrap_or(iv.last().unwrap());
+    (0.0, a, b)
+}
+
 /// Block flow: consecutive text leaves become wrapped line segments; child
 /// boxes are placed at the running y. The 0.6*size paragraph gap is added at
 /// block boundaries only - a `<br>` inside the text advances exactly one
@@ -2131,7 +2235,18 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, content: &[f32]) -> Vec<
 /// it without affecting line height), and a box
 /// wider than its container overflows instead of shrink-wrapping its
 /// content to fit (no min-content measure).
-fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<PositionedRun>, uls: &mut Vec<UR>) {
+fn block(
+    n: &mut BoxNode,
+    measure: &dyn Fn(&str, &Style) -> f32,
+    runs: &mut Vec<PositionedRun>,
+    uls: &mut Vec<UR>,
+    // ancestor floats (doc coords) this block's lines must avoid — handed
+    // down by place(); flex/grid/absolute subtrees pass none (spec: floats
+    // have no effect on flex/grid items or out-of-flow boxes)
+    flt: &[Flt],
+) {
+    // everything visible here: ancestor floats + any this block places
+    let mut floats: Vec<Flt> = flt.to_vec();
     // y = bottom of the last closed content. While `cont` is Some, the
     // current line is still open: (line_top, line_h, cursor x relative to
     // n.x); y mirrors line_top + line_h.
@@ -2149,7 +2264,9 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
                 atoms.push(leaf_atom(&n.children[i]));
                 i += 1;
             }
-            let (mut l, end_x) = layout_from(&atoms, x0, n.w, measure);
+            // exclusion origin: runs are pushed at (n.x, seg_top), so
+            // layout_from's local coords map to doc space by that offset
+            let (mut l, end_x) = layout_from(&atoms, x0, n.w, measure, &floats, n.x, seg_top);
             // this batch's first-line height + last-line top (original run
             // coords, before the continuation shifts below)
             let f = l
@@ -2205,10 +2322,85 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
         } else if n.children[i].is_bg {
             // background-image placeholder: anchored by place(), no advance
             i += 1;
+        } else if let Some(left) = match n.children[i].bx.float {
+            Float::Left => Some(true),
+            Float::Right => Some(false),
+            Float::None => None,
+        } {
+            // FLOAT: out of normal flow. Placed at the current line's top
+            // edge (flow y when no line is open) and recorded in `floats`;
+            // it advances NEITHER y nor the open line — every later line
+            // shortens around the rect (layout_from's line exclusion),
+            // `clear` on the float drops it below the floats it names.
+            // shortcut: runs already laid on the open line are not
+            // re-flowed around the float (spec re-lays the line — those
+            // runs may overlap the rect; only content laid AFTER the float
+            // avoids it), and a float taller than the following content
+            // overflows this block's bottom instead of being contained.
+            let mut top = cont.map_or(y, |(t, _, _)| t);
+            for f in &floats {
+                let named = match n.children[i].bx.clear {
+                    Clear::Left => f.left,
+                    Clear::Right => !f.left,
+                    Clear::All => true,
+                    Clear::None => false,
+                };
+                if named {
+                    top = top.max(f.y1);
+                }
+            }
+            let ml = resolve_len(n.children[i].bx.margin[3], n.w);
+            let mr = resolve_len(n.children[i].bx.margin[1], n.w);
+            let mt = resolve_len(n.children[i].bx.margin[0], n.w);
+            // shrink-to-fit: max-content OUTER width (incl. margins), then
+            // clamped to the space on our side at `top`; fully blocked →
+            // drop below every blocking float and retry (top strictly
+            // grows each pass → terminates)
+            let prefer = natural_w(&n.children[i], n.w, measure) + ml + mr;
+            let (s, e) = loop {
+                let mut iv = vec![(0.0f32, n.w)];
+                let mut drop = 0.0f32;
+                for f in &floats {
+                    if f.y0 > top || f.y1 <= top {
+                        continue;
+                    }
+                    drop = drop.max(f.y1);
+                    iv_sub(&mut iv, f.x0 - n.x, f.x1 - n.x);
+                }
+                // our side's piece: lowest gap for float:left, highest for
+                // float:right
+                let pick = if left { iv.first().copied() } else { iv.last().copied() };
+                match pick {
+                    None => top = drop, // no gap at this y → try below
+                    Some(gap) => break gap,
+                }
+            };
+            // shortcut: no min-content floor — the float shrinks into
+            // whatever gap exists (even a sliver) instead of dropping
+            // below like spec; a DECLARED width wider than that gap (and a
+            // %-width, resolved here against the gap, not the containing
+            // block) overflows it instead
+            let fw = prefer.min(e - s);
+            let mx = if left { s } else { e - fw };
+            let adv =
+                place(&mut n.children[i], n.x + mx, top, fw, measure, runs, uls, &floats);
+            // record the margin box — what line boxes must avoid
+            let fy0 = n.children[i].y - mt;
+            floats.push(Flt {
+                x0: n.children[i].x - ml,
+                y0: fy0,
+                x1: n.children[i].x + n.children[i].w + mr,
+                y1: fy0 + adv,
+                left,
+            });
+            i += 1;
         } else if n.children[i].inline {
             // inline-level box (form control / author inline-block /
             // promoted background inline): shrink-to-fit, joins the
-            // current line. A %-width resolves against the CONTAINING
+            // current line. shortcut: not re-flowed around floats — only
+            // TEXT lines narrow (spec runs line-box exclusion here too),
+            // so an inline box may sit under a float placed on its line.
+            // A %-width resolves against the CONTAINING
             // BLOCK (this block's content width) per CSS - convert to px
             // here so place()'s re-resolution is exact (width:100%
             // buttons fill their container, not their own text)
@@ -2238,21 +2430,61 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             let outer = bw + ml + mr;
             ml = resolve_len(n.children[i].bx.margin[3], outer);
             mr = resolve_len(n.children[i].bx.margin[1], outer);
-            let adv = place(&mut n.children[i], n.x + cx, line_top, outer, measure, runs, uls);
-            if line_h > 0.0 && adv < line_h {
-                // vertically centered against what is already on the line
-                let dy = (line_h - adv) * 0.5;
-                shift_tree(&mut n.children[i], 0.0, dy);
-                let (a, b) = n.children[i].run_range;
-                for r in &mut runs[a as usize..b as usize] {
-                    r.y += dy;
-                }
-                let (a, b) = n.children[i].ul_range;
-                for u in &mut uls[a as usize..b as usize] {
-                    u.1 += dy;
+            let adv = place(&mut n.children[i], n.x + cx, line_top, outer, measure, runs, uls, &floats);
+            let va = n.children[i].bx.valign;
+            if va == VAlign::Baseline {
+                // baseline/absent: today's placement, byte-identical —
+                // centered against what is already on the line
+                if line_h > 0.0 && adv < line_h {
+                    let dy = (line_h - adv) * 0.5;
+                    shift_tree(&mut n.children[i], 0.0, dy);
+                    let (a, b) = n.children[i].run_range;
+                    for r in &mut runs[a as usize..b as usize] {
+                        r.y += dy;
+                    }
+                    let (a, b) = n.children[i].ul_range;
+                    for u in &mut uls[a as usize..b as usize] {
+                        u.1 += dy;
+                    }
+                } else {
+                    line_h = line_h.max(adv);
                 }
             } else {
-                line_h = line_h.max(adv);
+                // vertical-align on the inline-level box. The line's
+                // baseline is estimated from THIS block's own font —
+                // shortcut: fixed metrics (no font tables): 0.8em ascent,
+                // 0.5em x-height (so `middle` = baseline − x-height/2),
+                // sub/super = ±0.2/0.3em; a length's % resolves against
+                // the containing width, not the line height; alignment is
+                // measured at placement time (a box that later makes the
+                // line taller doesn't re-align), and the line box only
+                // grows DOWNWARD — a raised box may paint above line_top.
+                let fs = n.style.size;
+                let lh = line_h.max(adv);
+                let dy = match va {
+                    VAlign::Top => 0.0, // box top is already the line top
+                    VAlign::Bottom => lh - adv,
+                    VAlign::Middle => 0.8 * fs - 0.25 * fs - adv * 0.5,
+                    VAlign::Sub => 0.2 * fs,
+                    VAlign::Super => -0.3 * fs,
+                    VAlign::Len(l) => -resolve_len(l, n.w),
+                    VAlign::Baseline => 0.0, // handled above
+                };
+                if dy != 0.0 {
+                    shift_tree(&mut n.children[i], 0.0, dy);
+                    let (a, b) = n.children[i].run_range;
+                    for r in &mut runs[a as usize..b as usize] {
+                        r.y += dy;
+                    }
+                    let (a, b) = n.children[i].ul_range;
+                    for u in &mut uls[a as usize..b as usize] {
+                        u.1 += dy;
+                    }
+                }
+                // the line box keeps containing the box's bottom edge
+                // (below line_top); it never grows upward — the raised
+                // part simply overflows above the line
+                line_h = lh.max(dy + adv);
             }
             cx += ml + n.children[i].w + mr;
             y = line_top + line_h;
@@ -2263,7 +2495,24 @@ fn block(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<
             if let Some((top, h, _)) = cont.take() {
                 y = top + h + n.style.size * 0.6;
             }
-            let adv = place(&mut n.children[i], n.x, y, n.w, measure, runs, uls);
+            // `clear` (spec §9.5.2): start below every float this box
+            // names — ancestor floats included (they ride in `floats`)
+            y = match n.children[i].bx.clear {
+                Clear::None => y,
+                cl => floats.iter().fold(y, |acc, f| {
+                    let named = match cl {
+                        Clear::Left => f.left,
+                        Clear::Right => !f.left,
+                        _ => true, // Clear::All
+                    };
+                    if named {
+                        acc.max(f.y1)
+                    } else {
+                        acc
+                    }
+                }),
+            };
+            let adv = place(&mut n.children[i], n.x, y, n.w, measure, runs, uls, &floats);
             y += adv;
             if n.children[i].open {
                 // child's trailing break: gap styled by the child itself
@@ -2421,7 +2670,7 @@ fn flex_line(
                 // a % item's width was already converted to the row's exact
                 // reserved px above, so the slot width is the containing
                 // block measure — no re-resolution here
-                let adv = place(&mut n.children[i], x, y, w, measure, runs, uls);
+                let adv = place(&mut n.children[i], x, y, w, measure, runs, uls, &[]);
                 (adv, n.children[i].open) // cross-size = margin box
             }
         };
@@ -2485,7 +2734,7 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                let adv = place(&mut n.children[*i], n.x, y, n.w, measure, runs, uls);
+                let adv = place(&mut n.children[*i], n.x, y, n.w, measure, runs, uls, &[]);
                 let dx = match n.bx.align {
                     Align::Center => (n.w - n.children[*i].w) * 0.5,
                     Align::End => n.w - n.children[*i].w,
@@ -2625,7 +2874,7 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                     (l.height, l.open_line)
                 }
                 Item::Grp(i) => {
-                    let adv = place(&mut n.children[i], x, y, w, measure, runs, uls);
+                    let adv = place(&mut n.children[i], x, y, w, measure, runs, uls, &[]);
                     (adv, n.children[i].open)
                 }
             };
@@ -2666,17 +2915,28 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     n.open = last_open;
 }
 pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> f32) -> Layout {
-    layout_from(atoms, 0.0, max_width, measure).0
+    layout_from(atoms, 0.0, max_width, measure, &[], 0.0, 0.0).0
 }
 
 /// [`layout`], but the first line starts at `x0` — text continuing on a
 /// line that already holds an inline box. Returns the layout plus the
 /// line's end x (the continuation cursor for the next inline content).
+///
+/// `flt`/`ox`/`oy` = floats to wrap around and the doc offset of this
+/// batch's local origin (block() passes them; `layout()` passes none).
+/// shortcut: a continuation line's EXISTING height isn't visible here —
+/// float exclusion for its first line uses the first word's line height —
+/// and `text-align` still centers against the full `max_width`, so a
+/// centered/right-aligned line beside a float may overlap it (left-aligned
+/// text, the default, is exact).
 fn layout_from(
     atoms: &[Atom],
     x0: f32,
     max_width: f32,
     measure: &dyn Fn(&str, &Style) -> f32,
+    flt: &[Flt],
+    ox: f32,
+    oy: f32,
 ) -> (Layout, f32) {
     let mut runs = Vec::new();
     let mut underline_rects = Vec::new();
@@ -2746,6 +3006,12 @@ fn layout_from(
     // before any content) is still a no-op.
     let mut after_br = false;
 
+    // usable x-range of the line being built. The empty-float list keeps
+    // both at the old full-width values forever (`line_x0` = 0 ≡ the old
+    // `x > 0.0` guards), so pages without floats lay out byte-identically.
+    let mut line_x0 = 0.0;
+    let mut line_max = max_width;
+
     for w in &words {
         if w.hard_break {
             if x > 0.0 {
@@ -2760,18 +3026,37 @@ fn layout_from(
             continue;
         }
         if w.text == " " {
-            if x > 0.0 {
+            if x > line_x0 {
                 x += space_w(&w.style);
             }
             continue;
         }
         let ww = measure(&w.text, &w.style);
-        if x > 0.0 && x + ww > max_width && !w.style.nowrap {
+        if x > line_x0 && x + ww > line_max && !w.style.nowrap {
             y += line_height;
             x = 0.0;
             line_height = 0.0;
         }
         after_br = false; // real content ends the <br> run
+        if line_height == 0.0 && !flt.is_empty() {
+            // the line is starting (first word or just wrapped): take its
+            // float exclusion for this y — shortcut: measured with THIS
+            // word's line height, so a later-taller line (bigger font
+            // mid-line) doesn't re-check against the floats. A fully
+            // blocked line drops below the floats and re-checks (monotonic
+            // — see line_excl), then x clamps into the free piece (a
+            // cursor buried in a float continues just past it).
+            loop {
+                let (jump, a, b) = line_excl(flt, ox, oy, y, w.style.line_height(), x, max_width);
+                if jump == 0.0 {
+                    line_x0 = a;
+                    line_max = b;
+                    x = x.clamp(a, b);
+                    break;
+                }
+                y += jump;
+            }
+        }
         let lh = w.style.line_height();
         runs.push(PositionedRun {
             x,
@@ -3602,6 +3887,301 @@ mod tests {
         )];
         let l = layout_tree(&mut n, 100.0, &m4);
         assert!((l.runs[0].x - 46.0).abs() < 0.01, "x={}", l.runs[0].x);
+    }
+
+    // ---- float / clear / vertical-align ----
+
+    #[test]
+    fn float_left_shortens_sibling_lines_and_takes_no_stack_space() {
+        // infobox shape: `<img style="float:left"> + prose. The float sits
+        // at the content top-left, the following BLOCK sibling starts at
+        // y=0 (a float reserves no vertical stack space), and that
+        // sibling's own text lines shorten around the float rect (floats
+        // are threaded down through place() into descendant blocks).
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut fl = img_box(BoxStyle {
+            float: Float::Left,
+            ..BoxStyle::default()
+        });
+        fl.inline = true; // real <img> boxes are inline — float claims first
+        let mut blk = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        blk.children = vec![leaf(&"a ".repeat(150))];
+        root.children = vec![fl, blk];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // float: intrinsic 100×50 at the content top-left
+        let f = &root.children[0];
+        assert!(
+            (f.x - 0.0).abs() < 0.01 && (f.y - 0.0).abs() < 0.01,
+            "float at ({}, {})",
+            f.x,
+            f.y
+        );
+        assert!((f.w - 100.0).abs() < 0.01 && (f.h - 50.0).abs() < 0.01, "float {}x{}", f.w, f.h);
+        assert!(
+            (root.children[1].y - 0.0).abs() < 0.01,
+            "sibling y={} — the float takes no vertical space in the stack",
+            root.children[1].y
+        );
+        // every line whose y-span meets the float's clears its rect …
+        let lh = 15.0 * 1.35;
+        let mut beside = 0;
+        for r in &l.runs {
+            if r.y < f.y + f.h && r.y + lh > f.y {
+                beside += 1;
+                assert!(
+                    r.x >= f.x + f.w - 0.01,
+                    "run y={} x={} overlaps the float rect",
+                    r.y,
+                    r.x
+                );
+            }
+        }
+        assert!(beside >= 3, "several lines run beside the float, got {}", beside);
+        // …and a line below the float re-uses the full width (x back at 0)
+        assert!(
+            l.runs.iter().any(|r| r.y >= f.y + f.h - 0.01 && r.x < 1.0),
+            "a line below the float starts back at x=0"
+        );
+    }
+
+    #[test]
+    fn float_right_sits_at_the_right_edge() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut fl = img_box(BoxStyle {
+            float: Float::Right,
+            ..BoxStyle::default()
+        });
+        fl.inline = true;
+        let mut blk = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        blk.children = vec![leaf(&"a ".repeat(150))];
+        root.children = vec![fl, blk];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let f = &root.children[0];
+        // hugs the right edge of the 300px content box
+        assert!((f.x - 200.0).abs() < 0.01, "float x={} (expect 200)", f.x);
+        assert!((f.y - 0.0).abs() < 0.01, "float y={}", f.y);
+        assert!((f.w - 100.0).abs() < 0.01 && (f.h - 50.0).abs() < 0.01, "float {}x{}", f.w, f.h);
+        // lines beside the float end before its left edge
+        let lh = 15.0 * 1.35;
+        for r in &l.runs {
+            if r.y < f.y + f.h && r.y + lh > f.y {
+                assert!(
+                    r.x + r.width <= f.x + 0.01,
+                    "run ends at {} — overlaps the right float at x={}",
+                    r.x + r.width,
+                    f.x
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clear_left_pushes_sibling_below_the_float() {
+        // `<img float:left>` + `<div clear:left>`: the cleared sibling's
+        // flow y jumps to the float's bottom (50) before it is placed
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut fl = img_box(BoxStyle {
+            float: Float::Left,
+            ..BoxStyle::default()
+        });
+        fl.inline = true;
+        let mut blk = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                clear: Clear::Left,
+                ..BoxStyle::default()
+            },
+        );
+        blk.children = vec![leaf("abcde")];
+        root.children = vec![fl, blk];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        assert!(
+            (root.children[1].y - 50.0).abs() < 0.01,
+            "cleared sibling y={} (float bottom = 50)",
+            root.children[1].y
+        );
+        assert!((l.runs[0].y - 50.0).abs() < 0.01, "its text starts at y={}", l.runs[0].y);
+        assert!((l.runs[0].x - 0.0).abs() < 0.01, "below the float: full width");
+
+        // clear:right against a LEFT float is a no-op — side-specific …
+        let mut root2 = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut fl2 = img_box(BoxStyle {
+            float: Float::Left,
+            ..BoxStyle::default()
+        });
+        fl2.inline = true;
+        let mut blk2 = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                clear: Clear::Right,
+                ..BoxStyle::default()
+            },
+        );
+        blk2.children = vec![leaf("abcde")];
+        root2.children = vec![fl2, blk2];
+        let l2 = layout_tree(&mut root2, 300.0, &m4);
+        assert!(
+            (root2.children[1].y - 0.0).abs() < 0.01,
+            "clear:right must not push below a LEFT float (y={})",
+            root2.children[1].y
+        );
+        // …but its lines still avoid the float it wasn't clearing
+        assert!(
+            l2.runs[0].x >= 100.0 - 0.01,
+            "uncleared sibling's line still narrows around the float, x={}",
+            l2.runs[0].x
+        );
+    }
+
+    #[test]
+    fn full_width_float_wraps_lines_below_it() {
+        // zero room: the float spans the container, so the first line has
+        // no usable x-range and drops to the float's bottom instead of
+        // overlapping it
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut fl = img_box(BoxStyle {
+            width: Some(Len::Px(300.0)),
+            float: Float::Left,
+            ..BoxStyle::default()
+        });
+        fl.inline = true;
+        root.children = vec![fl, leaf("abcde")];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let f = &root.children[0];
+        assert!((f.w - 300.0).abs() < 0.01 && (f.h - 150.0).abs() < 0.01, "float {}x{}", f.w, f.h);
+        assert_eq!(l.runs.len(), 1);
+        assert!(
+            (l.runs[0].y - 150.0).abs() < 0.01,
+            "line wrapped below the float, y={}",
+            l.runs[0].y
+        );
+        assert!((l.runs[0].x - 0.0).abs() < 0.01, "x={}", l.runs[0].x);
+    }
+
+    #[test]
+    fn vertical_align_middle_raises_inline_box_vs_baseline() {
+        // an inline box AFTER a text line: baseline/absent keeps today's
+        // line centering exactly; `middle` puts the box's midpoint at
+        // baseline − x-height/2, i.e. higher on the same line
+        let mk = |va: VAlign| {
+            let mut n = BoxNode::group(Style::new(), BoxStyle::default());
+            let mut ib = img_box(BoxStyle {
+                width: Some(Len::Px(20.0)), // → 20×10 intrinsic aspect
+                valign: va,
+                ..BoxStyle::default()
+            });
+            ib.inline = true;
+            n.children = vec![leaf("ab"), ib];
+            n
+        };
+        let mut base = mk(VAlign::Baseline);
+        let mut mid = mk(VAlign::Middle);
+        layout_tree(&mut base, 300.0, &m4);
+        layout_tree(&mut mid, 300.0, &m4);
+        let line = 15.0 * 1.35;
+        let base_y = base.children[1].y;
+        let mid_y = mid.children[1].y;
+        // default/baseline = the old centering: (line_h − box_h)/2
+        assert!(
+            (base_y - (line - 10.0) * 0.5).abs() < 0.01,
+            "baseline y={} (expect {})",
+            base_y,
+            (line - 10.0) * 0.5
+        );
+        assert!(mid_y < base_y, "middle y={} should sit above baseline y={}", mid_y, base_y);
+        // …and an explicit `baseline` matches the absent-property case
+        let mut expl = mk(VAlign::Baseline);
+        layout_tree(&mut expl, 300.0, &m4);
+        assert!((expl.children[1].y - base_y).abs() < 0.01, "explicit baseline == default");
+    }
+
+    #[test]
+    fn no_float_clear_valign_keeps_known_geometry() {
+        // guard: a fixture using NONE of the three properties lays out at
+        // the exact numbers the engine produced before they existed
+        let mut n = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut b1 = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        let mut ib = img_box(BoxStyle {
+            width: Some(Len::Px(20.0)),
+            ..BoxStyle::default()
+        });
+        ib.inline = true;
+        b1.children = vec![leaf("one"), ib];
+        let mut b2 = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        b2.children = vec![leaf("two")];
+        n.children = vec![b1, b2];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        let line = 15.0 * 1.35;
+        // b1: one text line with the inline box centered in it
+        assert!((n.children[0].h - line).abs() < 0.01, "b1.h={}", n.children[0].h);
+        assert!(
+            (n.children[0].children[1].y - (line - 10.0) * 0.5).abs() < 0.01,
+            "inline box y={}",
+            n.children[0].children[1].y
+        );
+        // b2 starts after b1 + the 0.6em paragraph gap — same geometry as
+        // the pre-float engine
+        let expect = line + 15.0 * 0.6;
+        assert!((n.children[1].y - expect).abs() < 0.01, "b2.y={} expect={}", n.children[1].y, expect);
+        assert_eq!(l.runs.len(), 2);
+        assert!((l.runs[1].y - expect).abs() < 0.01, "second run y={}", l.runs[1].y);
+    }
+
+    #[test]
+    fn floated_inline_span_gets_a_box_and_flows_as_a_float() {
+        // end-to-end: parse → build → layout. A floated <span> blockifies
+        // into its own box (it would otherwise flatten into the parent's
+        // text and lose the float), sits at the flow edge, and the text
+        // after it shortens around the rect.
+        let dom = crate::html::parse(r#"<p><span style="float:left">side</span>body</p>"#);
+        let sheet = crate::css::parse("");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 100.0, &m4);
+        let p = &root.children[0];
+        let span = &p.children[0];
+        assert_eq!(span.bx.float, Float::Left, "float parsed through the pipeline");
+        assert!(!span.inline, "floated inline blockifies to a block-level box");
+        assert!(
+            (span.x - 0.0).abs() < 0.01 && (span.y - 0.0).abs() < 0.01,
+            "float at ({}, {})",
+            span.x,
+            span.y
+        );
+        let side = l.runs.iter().find(|r| r.text == "side").expect("side run in the float");
+        let body = l.runs.iter().find(|r| r.text == "body").expect("body run");
+        assert!((body.y - side.y).abs() < 0.01, "both on the first line");
+        assert!(
+            body.x >= span.x + span.w - 0.01,
+            "body x={} must clear the float (w={})",
+            body.x,
+            span.w
+        );
     }
 
     // ---- box chrome (padding/margin/line-height/background) ----

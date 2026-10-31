@@ -84,6 +84,43 @@ pub enum Pos {
     Fixed,
 }
 
+/// CSS `float` — the box leaves normal flow: it is laid at the current
+/// line's edge and later line boxes shorten around its rectangle
+/// (layout.rs `block()`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+/// CSS `clear` — start the box below every float it names (`all` = both
+/// sides).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    All,
+}
+
+/// CSS `vertical-align` of an inline-level box within its line. `Len` is a
+/// `<length>` raise (negative lowers). shortcut: a `<percentage>` parses
+/// as a Len but resolves against the containing-block width, not the line
+/// height (spec % is cyclic there); `Baseline` (also the initial value)
+/// keeps the engine's default line placement — today's centering — so a
+/// page without the property lays out byte-identically.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VAlign {
+    Baseline,
+    Top,
+    Middle,
+    Bottom,
+    Sub,
+    Super,
+    Len(Len),
+}
+
 /// Per-element box layout properties — the non-inherited half of CSS.
 /// Default = plain block flow (matches pre-flex rendering).
 #[derive(Clone, PartialEq, Debug)]
@@ -161,6 +198,13 @@ pub struct BoxStyle {
     pub inset: [Option<Len>; 4],
     /// `box-shadow` list, first = topmost (paint order reversed)
     pub shadows: Vec<Shadow>,
+    /// CSS `float` — out-of-flow box placed at the current line's edge
+    /// (layout.rs `block()`)
+    pub float: Float,
+    /// CSS `clear` — start below the floats this names
+    pub clear: Clear,
+    /// CSS `vertical-align` — inline box placement within its line
+    pub valign: VAlign,
     /// Bitmask of [`decl`] flags: which box properties the author CSS
     /// actually declared. Lets UA control chrome (`control_chrome` in
     /// layout.rs) fill only the properties the author left initial, so an
@@ -231,6 +275,9 @@ impl Default for BoxStyle {
             pos: Pos::Static,
             inset: [None; 4],
             shadows: Vec::new(),
+            float: Float::None,
+            clear: Clear::None,
+            valign: VAlign::Baseline,
             declared: 0,
         }
     }
@@ -599,6 +646,9 @@ const KNOWN: &[&str] = &[
     "overflow-y",
     "clip",
     "box-shadow",
+    "float",
+    "clear",
+    "vertical-align",
     // SVG paint properties — the rasterizer supports these; kept in decls so
     // Sheet::class_paint can resolve class-colored inline-SVG children
     // (fill/stroke/… on <path>/<rect>), which the text cascade never reaches
@@ -1518,6 +1568,36 @@ fn apply_decl(
             bx.declared |= decl::BORDER;
             if c.is_some() {
                 bx.declared |= decl::BCOLOR;
+            }
+        }
+        // flow control (layout.rs `block()`): the box leaves normal flow at
+        // the current line's edge; unknown keywords — incl. the L4
+        // `inline-start`/`inline-end` sides we don't model — → none
+        "float" => {
+            bx.float = match d.1.split_whitespace().next().unwrap_or("") {
+                "left" => Float::Left,
+                "right" => Float::Right,
+                _ => Float::None,
+            }
+        }
+        "clear" => {
+            bx.clear = match d.1.split_whitespace().next().unwrap_or("") {
+                "left" => Clear::Left,
+                "right" => Clear::Right,
+                "all" => Clear::All,
+                _ => Clear::None,
+            }
+        }
+        // inline-box alignment within a line; unknown keywords
+        // (`text-top`, …) fall back to baseline = the default placement
+        "vertical-align" => {
+            bx.valign = match d.1.split_whitespace().next().unwrap_or("") {
+                "top" => VAlign::Top,
+                "middle" => VAlign::Middle,
+                "bottom" => VAlign::Bottom,
+                "sub" => VAlign::Sub,
+                "super" => VAlign::Super,
+                v => parse_len(v, vp).map(VAlign::Len).unwrap_or(VAlign::Baseline),
             }
         }
         "position" => {
@@ -4583,6 +4663,40 @@ mod tests {
             None,
             "the word 'inherit' never becomes a stack entry"
         );
+    }
+
+    #[test]
+    fn float_clear_valign_parse_into_box_style() {
+        // these three were dropped at parse time (not in KNOWN) before —
+        // resolve must now carry them into BoxStyle
+        let sheet = parse(
+            ".a{float:left}.b{float:right}.c{float:none}\
+             .d{clear:all}.e{clear:left}.f{clear:right}\
+             .g{vertical-align:middle}.h{vertical-align:super}\
+             .i{vertical-align:12px}.j{float:bogus;clear:bogus;vertical-align:text-top}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div><div class=j></div>",
+        );
+        let bx = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx
+        };
+        assert_eq!(bx("a").float, Float::Left);
+        assert_eq!(bx("b").float, Float::Right);
+        assert_eq!(bx("c").float, Float::None);
+        assert_eq!(bx("d").clear, Clear::All);
+        assert_eq!(bx("e").clear, Clear::Left);
+        assert_eq!(bx("f").clear, Clear::Right);
+        assert_eq!(bx("g").valign, VAlign::Middle);
+        assert_eq!(bx("h").valign, VAlign::Super);
+        assert_eq!(bx("i").valign, VAlign::Len(Len::Px(12.0)));
+        // unknown keywords fall back to the initial values
+        assert_eq!(bx("j").float, Float::None);
+        assert_eq!(bx("j").clear, Clear::None);
+        assert_eq!(bx("j").valign, VAlign::Baseline);
     }
 }
 
