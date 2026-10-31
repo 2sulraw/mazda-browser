@@ -477,6 +477,30 @@ curve matters more than the baseline (near-flat as tabs grow).
   +8 tests; remaining script errors are honest unsupported-syntax reports,
   not hangs: `export const` module syntax, `\x` escape). Tests: default
   371, feature 374
+- [x] **Wave 1 (parallel worktrees) — box-sizing + overflow culling** — first wave of
+  the Wikipedia visual-parity plan (2 agents, separate worktrees, merged clean):
+  **(a) `box-sizing`** — parsed into `BoxStyle.content_box` (was dropped at parse
+  time by the KNOWN allowlist); `content-box` grows the border box by padding+
+  border after `place()` resolves them, auto-margin centering uses the FINAL
+  border box (pad/border resolution moved above the auto-margin block — no-op
+  for border-box, byte-identical default), abs-pos stretch/shrink + flex `%-slot`
+  pre-sizes restated through `as_content_decl()` so they don't double-add pads;
+  `%` padding + content-box approximate (cyclic — px exact, commented);
+  `5bfc09a`, +4 tests;
+  **(b) `overflow`/`-x`/`-y` + `clip: rect()`** — parse into `BoxStyle.clip`/
+  `clip_rect` (`hidden|clip|scroll|auto` cull; `scroll`/`auto` clip but don't
+  scroll — commented); `collect_paint` threads a composed clip window (descendants
+  clipped to the ancestor's padding box; own bg/border NOT clipped by own
+  overflow; nested clips intersect), new `apply_run_clips` post-pass intersects
+  the window into each subtree's `run_range`/`ul_range`, `build()` now
+  blockifies `position:absolute/fixed` elements (the skip-link `<a>` previously
+  flattened into flow — without this the pattern could never work), `render()`/
+  `draw_text` cull fully-outside runs and glyphs; **the documented skip-link gap
+  is closed** — live Wikipedia Main Page no longer shows "Jump to content" (was
+  visible in every capture before); `c6f0070`, +6 tests.
+  Tests: default **381**, feature **384** (2 parallel agents both branched from
+  `875d5a4`; git auto-merged both `BoxStyle` halves, verified by full suite +
+  field presence before push). Live: wiki 96.4 MB, CPU 0.9s (`18451f0` pushed).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -555,6 +579,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-31 | language-depth wave | Wikipedia (Main_Page) | 97.1 MB (1255 runs; 70KB startup bundle now runs end-to-end) |
 | 2026-10-31 | selectable runtime: A vs B | Wikipedia Rust article / DuckDuckGo ?q= | A 94.7 / 82.2 MB; B 96.3 / 176.2 MB (B heap lazy on simple pages; heavy script bundles cost far more than the +30 ballpark) |
 | 2026-10-31 | gap-fix wave (lexer `$` spin fix + JS step budget) | MDN /Web/CSS/margin | 86.4 MB (2877 runs; first successful load — previously hung forever in the lexer, 57s CPU/60s wall; now 1.7s CPU/60s wall) |
+| 2026-11-01 | wave 1 (box-sizing + overflow/clip culling) | Wikipedia Main Page | 96.4 MB (1253 runs), CPU 0.9s; skip-link "Jump to content" no longer renders (closed the documented clip/overflow known-gap) |
 
 ### Phase 1c (Track A) findings
 
