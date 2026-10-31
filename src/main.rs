@@ -5,6 +5,7 @@ mod html;
 mod image;
 mod js;
 mod layout;
+mod script;
 mod svg;
 mod ui_chrome;
 mod woff;
@@ -12,6 +13,7 @@ mod woff;
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
 use eframe::egui;
 use layout::{Fam, Layout, Style};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -77,6 +79,15 @@ struct App {
     address: String,
     address_focused: bool,
     scroll: f32,
+    /// UI-owned form interaction state: focused control + typed values.
+    /// Rides along on every worker job so it survives re-layouts.
+    forms: layout::FormState,
+    /// true when the in-flight job is a real navigation (reset scroll +
+    /// address bar); false for relayout/event (preserve both)
+    expect_nav: bool,
+    /// node id → `name` attr for the current page (worker-built), used to
+    /// log `[form] submit name=value` from the shell
+    form_names: HashMap<u32, String>,
     pixels: Vec<u32>,
     /// GPU texture holding the last upload of `pixels`
     tex: Option<egui::TextureHandle>,
@@ -193,6 +204,9 @@ impl App {
             address: url.clone(),
             address_focused: false,
             scroll: 0.0,
+            forms: layout::FormState::default(),
+            expect_nav: true,
+            form_names: HashMap::new(),
             pixels,
             tex: None,
             last_size: (pw, ph),
@@ -214,7 +228,7 @@ impl App {
     fn dispatch(&mut self, url: &str, pw: usize, ph: usize, scroll: f32) {
         let id = self.nav.begin();
         eprintln!("[nav] queued load {url} (#{id}, viewport {pw}x{ph})");
-        let req = LoadReq {
+        let req = LoadReq::Load {
             id,
             url: url.to_string(),
             max_w: page_w(pw),
@@ -225,6 +239,47 @@ impl App {
             eprintln!("[nav] loader thread unavailable, load of {url} dropped");
         }
         self.pending = Some(PendingNav { scroll });
+        self.expect_nav = true;
+        // a fresh navigation clears form focus/values (worker starts clean)
+        self.forms = layout::FormState::default();
+    }
+
+    /// Queue a re-layout of the current page (resize / form typing). Keeps
+    /// scroll + address bar; carries the live form state forward.
+    fn dispatch_relayout(&mut self, pw: usize, ph: usize) {
+        let id = self.nav.begin();
+        let url = self.page.url.clone();
+        let req = LoadReq::Relayout {
+            id,
+            url: url.clone(),
+            max_w: page_w(pw),
+            vh: page_h(ph),
+            forms: self.forms.clone(),
+        };
+        if self.jobs.send(req).is_err() {
+            eprintln!("[nav] loader thread unavailable, relayout of {url} dropped");
+        }
+        self.expect_nav = false;
+    }
+
+    /// Queue a form-control event (click/submit/change). The worker mutates
+    /// its DOM, fires listeners, re-lays out and re-emits.
+    fn dispatch_event(&mut self, node: u32, kind: &str, value: Option<String>, pw: usize, ph: usize) {
+        let id = self.nav.begin();
+        let req = LoadReq::Event {
+            id,
+            url: self.page.url.clone(),
+            max_w: page_w(pw),
+            vh: page_h(ph),
+            node,
+            kind: kind.to_string(),
+            value,
+            forms: self.forms.clone(),
+        };
+        if self.jobs.send(req).is_err() {
+            eprintln!("[nav] loader thread unavailable, {kind} event dropped");
+        }
+        self.expect_nav = false;
     }
 
     /// Drain finished loads; apply the newest (stale generations are dropped).
@@ -234,9 +289,18 @@ impl App {
                 eprintln!("[nav] dropped stale result #{} (want #{})", done.id, self.nav.next);
                 continue;
             }
-            let scroll = self.pending.take().map(|p| p.scroll).unwrap_or(0.0);
-            let Some(mut wire) = done.page else {
+            if done.panicked {
                 eprintln!("[nav] load #{} failed (pipeline panic)", done.id);
+                continue;
+            }
+            // a script may have asked to navigate (location.assign etc.)
+            if let Some(nav_url) = done.nav {
+                eprintln!("[js] script navigated to {nav_url}");
+                self.dispatch(&nav_url, pw, ph, 0.0);
+                continue;
+            }
+            let Some(mut wire) = done.page else {
+                eprintln!("[nav] load #{} returned no page", done.id);
                 continue;
             };
             // adopt the worker's font state: stack ids baked into run styles
@@ -245,12 +309,27 @@ impl App {
             let faces = std::mem::take(&mut wire.faces);
             self.fonts.begin_page(faces); // resets the stack table to [id 0]
             *self.fonts.stacks.borrow_mut() = stacks;
+            // the worker built node→name for [form] submit logging
+            let form_names = std::mem::take(&mut wire.form_names);
             self.page = wire_to_page(wire);
             self.last_size = (pw, ph);
-            self.scroll = scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
-            self.tabs[self.active].url = self.page.url.clone();
-            self.tabs[self.active].scroll = self.scroll;
-            self.address = self.page.url.clone();
+            if self.expect_nav {
+                let scroll = self.pending.take().map(|p| p.scroll).unwrap_or(0.0);
+                self.scroll = scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
+                self.tabs[self.active].url = self.page.url.clone();
+                self.tabs[self.active].scroll = self.scroll;
+                self.address = self.page.url.clone();
+            } else {
+                // relayout/event: keep scroll (clamped to new height) and
+                // don't clobber whatever the user is typing in the address
+                // bar. Adopt the worker's focused field + values so paint
+                // matches what the worker laid out.
+                self.scroll = self.scroll.min((self.page.laid.height - page_h(ph)).max(0.0));
+                self.tabs[self.active].scroll = self.scroll;
+                self.forms.focused = self.page.laid.focused;
+            }
+            // stash names for submit logging (kept with the page)
+            self.form_names = form_names;
             self.repaint_page(pw, ph);
             eprintln!("[nav] applied #{} → {}", self.nav.next, self.page.url);
         }
@@ -286,6 +365,86 @@ impl App {
         self.dispatch(url, pw, ph, scroll);
         self.tabs[self.active].url = url.to_string();
         self.address = url.to_string();
+    }
+
+    /// A form control was clicked. Text fields take focus (no worker job
+    /// needed until a key arrives); checkboxes/radios toggle + fire
+    /// listeners on the worker; submit buttons log `[form] submit` and fire
+    /// click listeners. The worker owns the DOM, so toggles/events go there.
+    fn on_form_click(&mut self, fb: layout::FormBox, pw: usize, ph: usize) {
+        match fb.kind {
+            layout::FormKind::TextInput { .. } => {
+                // focus this field, blur any other (values ride the wire)
+                if self.forms.focused != Some(fb.node) {
+                    self.forms.focused = Some(fb.node);
+                    // seed the control's current display value so typing
+                    // starts from what's shown
+                    let cur = self.page.laid.form_value(fb.node).to_string();
+                    self.forms.values.insert(fb.node, cur);
+                    self.dispatch_relayout(pw, ph);
+                }
+            }
+            layout::FormKind::Checkbox | layout::FormKind::Radio => {
+                // worker toggles `checked`, dispatches click+change, relays
+                self.forms.focused = None;
+                self.dispatch_event(fb.node, "click", None, pw, ph);
+            }
+            layout::FormKind::Submit => {
+                // shortcut: no form POST — the shell logs name=value (the
+                // same observable contract the layout module documents)
+                let name = self
+                    .form_names
+                    .get(&fb.node)
+                    .cloned()
+                    .unwrap_or_default();
+                let val = self
+                    .forms
+                    .values
+                    .get(&fb.node)
+                    .cloned()
+                    .unwrap_or_else(|| self.page.laid.form_value(fb.node).to_string());
+                eprintln!("[form] submit {name}={val}");
+                self.forms.focused = None;
+                self.dispatch_event(fb.node, "click", None, pw, ph);
+            }
+            layout::FormKind::Select | layout::FormKind::Generic => {
+                // no popup / non-interactive yet — just blur
+                self.forms.focused = None;
+                self.dispatch_relayout(pw, ph);
+            }
+        }
+    }
+}
+
+/// What a keystroke does to the focused form field. Pure so it's testable
+/// without synthesizing input (a hard constraint of this shell).
+#[derive(Debug, PartialEq, Eq)]
+enum KeyAction {
+    /// append a char to the focused field's value
+    Insert(char),
+    /// delete the char before the caret
+    Backspace,
+    /// Enter in a text field → submit (shell logs it)
+    Submit,
+    /// Escape → blur the field
+    Blur,
+    /// key doesn't apply (no field focused / not an editing key)
+    None,
+}
+
+/// Map one key event to a form action. `has_field_focus` = a form field is
+/// focused; `address_focused` suppresses page typing (the address bar owns
+/// the keyboard). Printable chars arrive as `egui::Event::Text`, not here —
+/// this handles the editing/navigation keys only.
+fn route_key(key: egui::Key, has_field_focus: bool, address_focused: bool) -> KeyAction {
+    if address_focused {
+        return KeyAction::None;
+    }
+    match key {
+        egui::Key::Escape if has_field_focus => KeyAction::Blur,
+        egui::Key::Enter if has_field_focus => KeyAction::Submit,
+        egui::Key::Backspace if has_field_focus => KeyAction::Backspace,
+        _ => KeyAction::None,
     }
 }
 
@@ -397,15 +556,81 @@ impl eframe::App for App {
                 if let Some(t) = self.pending_resize {
                     if t.elapsed() >= Duration::from_millis(150) {
                         self.pending_resize = None;
-                        let url = self.page.url.clone();
-                        let scroll = self.scroll;
-                        eprintln!("[nav] resize → relayout {url} at {pw}x{ph}");
-                        self.dispatch(&url, pw, ph, scroll);
+                        eprintln!("[nav] resize → relayout at {pw}x{ph}");
+                        // re-layout only: no refetch/reparse/script re-run
+                        self.dispatch_relayout(pw, ph);
                     }
                 }
 
                 // scrolling: wheel + Up/Down, clamped, suppressed while typing
                 let max_scroll = (self.page.laid.height - page_h(ph)).max(0.0);
+                // form typing: route keys to the focused field (the address
+                // bar owns the keyboard while it's focused). Enter submits
+                // (shell logs), Escape blurs.
+                if self.forms.focused.is_some() && !self.address_focused {
+                    let field = self.forms.focused.unwrap();
+                    let mut actions: Vec<KeyAction> = Vec::new();
+                    ui.input(|i| {
+                        for ev in &i.events {
+                            match ev {
+                                // printable text (the actual typed chars)
+                                egui::Event::Text(t) => {
+                                    for c in t.chars() {
+                                        if !c.is_control() {
+                                            actions.push(KeyAction::Insert(c));
+                                        }
+                                    }
+                                }
+                                egui::Event::Key {
+                                    key,
+                                    pressed: true,
+                                    repeat: false,
+                                    ..
+                                } => {
+                                    let a = route_key(*key, true, false);
+                                    if a != KeyAction::None {
+                                        actions.push(a);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                    let mut dirty = false;
+                    for a in actions {
+                        match a {
+                            KeyAction::Insert(c) => {
+                                self.forms.values.entry(field).or_default().push(c);
+                                dirty = true;
+                            }
+                            KeyAction::Backspace => {
+                                if let Some(v) = self.forms.values.get_mut(&field) {
+                                    v.pop();
+                                }
+                                dirty = true;
+                            }
+                            KeyAction::Submit => {
+                                let name = self
+                                    .form_names
+                                    .get(&field)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let val = self.forms.values.get(&field).cloned().unwrap_or_default();
+                                eprintln!("[form] submit {name}={val}");
+                            }
+                            KeyAction::Blur => {
+                                self.forms.focused = None;
+                                dirty = true;
+                            }
+                            KeyAction::None => {}
+                        }
+                    }
+                    if dirty {
+                        // push the new value to the worker so it re-lays out
+                        // with the updated text (and fires change listeners)
+                        self.dispatch_event(field, "change", self.forms.values.get(&field).cloned(), pw, ph);
+                    }
+                }
                 if !ui.ctx().egui_wants_keyboard_input() && !self.address_focused {
                     let before = self.scroll;
                     let wheel = ui.input(|i| i.smooth_scroll_delta());
@@ -452,19 +677,31 @@ impl eframe::App for App {
                         if let Some(p) = resp.interact_pointer_pos() {
                             let rx = p.x - resp.rect.min.x - PADDING as f32;
                             let my_doc = p.y - resp.rect.min.y - PADDING as f32;
-                            let hit = self.page.laid.runs.iter().find(|r| {
-                                let ry = if r.fixed { my_doc } else { my_doc + self.scroll };
-                                r.link.is_some()
-                                    && rx >= r.x
-                                    && rx <= r.x + r.width
-                                    && ry >= r.y
-                                    && ry <= r.y + r.style.size * 1.35
-                            });
-                            if let Some(hit) = hit {
-                                let href = hit.link.clone().unwrap();
-                                if let Some(next) = resolve(&self.page.url, &href) {
-                                    eprintln!("[nav] {} → {next}", self.page.url);
-                                    go = Some(next);
+                            // form controls win over links underneath them
+                            let fh = self.page.laid.hit_test_form(rx, my_doc, self.scroll);
+                            if let Some(fi) = fh {
+                                let fb = self.page.laid.forms[fi];
+                                self.on_form_click(fb, pw, ph);
+                            } else {
+                                let hit = self.page.laid.runs.iter().find(|r| {
+                                    let ry = if r.fixed { my_doc } else { my_doc + self.scroll };
+                                    r.link.is_some()
+                                        && rx >= r.x
+                                        && rx <= r.x + r.width
+                                        && ry >= r.y
+                                        && ry <= r.y + r.style.size * 1.35
+                                });
+                                if let Some(hit) = hit {
+                                    let href = hit.link.clone().unwrap();
+                                    if let Some(next) = resolve(&self.page.url, &href) {
+                                        eprintln!("[nav] {} → {next}", self.page.url);
+                                        go = Some(next);
+                                    }
+                                } else {
+                                    // click on empty space blurs any focused field
+                                    if self.forms.focused.take().is_some() {
+                                        self.dispatch_relayout(pw, ph);
+                                    }
                                 }
                             }
                         }
@@ -592,12 +829,57 @@ impl NavGate {
 }
 
 /// A page-load job for the worker thread. Plain data (`Send`): URL + the
-/// viewport metrics layout needs.
-struct LoadReq {
-    id: u64,
-    url: String,
-    max_w: f32,
-    vh: f32,
+/// viewport metrics layout needs, plus the form interaction state the UI
+/// thread owns (so a re-layout preserves what the user typed/focused).
+enum LoadReq {
+    /// full pipeline: fetch → parse → script → cascade → layout
+    Load {
+        id: u64,
+        url: String,
+        max_w: f32,
+        vh: f32,
+    },
+    /// re-cascade + re-layout the kept page (resize / DOM change), carrying
+    /// the UI's live form state forward
+    Relayout {
+        id: u64,
+        url: String,
+        max_w: f32,
+        vh: f32,
+        forms: layout::FormState,
+    },
+    /// a form control was activated (click/submit) or a text field changed:
+    /// the worker mutates its DOM, fires listeners, re-lays out, re-emits
+    Event {
+        id: u64,
+        url: String,
+        max_w: f32,
+        vh: f32,
+        /// DOM node id of the control
+        node: u32,
+        /// "click" | "change" | "submit"
+        kind: String,
+        /// text value to push into the control (text inputs), else None
+        value: Option<String>,
+        forms: layout::FormState,
+    },
+}
+
+impl LoadReq {
+    fn id(&self) -> u64 {
+        match self {
+            LoadReq::Load { id, .. }
+            | LoadReq::Relayout { id, .. }
+            | LoadReq::Event { id, .. } => *id,
+        }
+    }
+    fn url(&self) -> &str {
+        match self {
+            LoadReq::Load { url, .. }
+            | LoadReq::Relayout { url, .. }
+            | LoadReq::Event { url, .. } => url,
+        }
+    }
 }
 
 /// Wire form of a laid-out page: everything `Page`/`Layout` hold, minus the
@@ -618,6 +900,15 @@ struct PageWire {
     stacks: Vec<Vec<String>>,
     /// the page's `@font-face` defs so the renderer resolves webfonts too
     faces: Vec<css::FontFace>,
+    /// laid-out form-control rects (hit-testing) for the UI thread
+    forms: Vec<layout::FormBox>,
+    /// focused control node id (paints the accent border + caret)
+    focused: Option<u32>,
+    /// live values by node id (what each control displays)
+    form_values: HashMap<u32, String>,
+    /// node id → `name` attribute, built worker-side (the UI thread has no
+    /// DOM access) so `[form] submit name=value` logging works in the shell
+    form_names: HashMap<u32, String>,
 }
 
 /// One laid-out text run without `Rc` (link href as a plain `String`).
@@ -631,14 +922,26 @@ struct RunWire {
     fixed: bool,
 }
 
-/// Result sent back by the worker: the wire page (None = the pipeline panicked).
+/// Result sent back by the worker: the wire page (None = the pipeline panicked),
+/// plus a script-requested navigation and the forms state the worker ended on.
 struct LoadDone {
     id: u64,
     page: Option<PageWire>,
+    /// script called `location.assign`/`location = ...` — UI should navigate
+    nav: Option<String>,
+    /// the worker's pipeline panicked (caught; process survives)
+    panicked: bool,
 }
 
-/// Convert a `Page` (worker-side, holds `Rc`s) into the `Send` wire form.
-fn page_to_wire(p: Page, stacks: Vec<Vec<String>>, faces: Vec<css::FontFace>) -> PageWire {
+/// Convert a `Page` (worker-side, holds `Rcs`) into the `Send` wire form.
+/// `form_names` is built worker-side (node → `name` attr) — the UI thread
+/// can't read the DOM, and `[form] submit name=value` logging needs it.
+fn page_to_wire(
+    p: Page,
+    stacks: Vec<Vec<String>>,
+    faces: Vec<css::FontFace>,
+    form_names: HashMap<u32, String>,
+) -> PageWire {
     PageWire {
         url: p.url,
         bg: p.bg,
@@ -676,6 +979,10 @@ fn page_to_wire(p: Page, stacks: Vec<Vec<String>>, faces: Vec<css::FontFace>) ->
         shadows: p.laid.shadows,
         stacks,
         faces,
+        forms: p.laid.forms,
+        focused: p.laid.focused,
+        form_values: p.laid.form_values,
+        form_names,
     }
 }
 
@@ -708,75 +1015,322 @@ fn wire_to_page(w: PageWire) -> Page {
                 .collect(),
             shadows: w.shadows,
             open_line: false, // paint-only consumer; flow state not needed
-            // fresh load: no focused field / typed values survive a navigation
-            forms: Vec::new(),
-            focused: None,
-            form_values: Default::default(),
+            // forms state rides the wire: rects for hit-testing, focus +
+            // values for painting the accent border / caret / typed text
+            forms: w.forms,
+            focused: w.focused,
+            form_values: w.form_values,
         },
     }
 }
 
+/// The parsed page the worker keeps between jobs so a re-layout or a script
+/// event doesn't refetch/reparse. One live page per worker (the tabs reload
+/// on switch). Holds the non-`Send` script engine, so it never leaves this
+/// thread.
+struct KeptPage {
+    url: String,
+    dom: html::Dom,
+    /// concatenated stylesheet text (re-parsed per layout: media queries
+    /// depend on the viewport width)
+    css_text: String,
+    /// `@font-face` defs (re-registered per layout)
+    faces: Vec<css::FontFace>,
+    /// script engine + listeners for this page; None until scripts ran
+    scripts: Option<script::PageScripts>,
+}
+
 /// The single long-lived loader thread. Owns its own `Fonts` (font types
 /// aren't `Send`, so each thread loads its own — system fonts come from disk
-/// anyway) and runs the full `load_page` pipeline per job. Superseded jobs
-/// still queued are skipped, so a resize storm costs one layout, not N.
-fn loader_thread(
-    jobs: mpsc::Receiver<LoadReq>,
-    results: mpsc::Sender<LoadDone>,
-) {
+/// anyway) and the one kept page. Superseded loads/relayouts still queued are
+/// skipped, but a form Event is never dropped (it carries a user action).
+fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>) {
     let mut fonts = Fonts::load();
-    while let Ok(mut req) = jobs.recv() {
-        // coalesce: only the newest queued request matters
-        let mut skipped = 0u32;
-        while let Ok(newer) = jobs.try_recv() {
-            req = newer;
-            skipped += 1;
+    let mut kept: Option<KeptPage> = None;
+    // geometry + form state of the last layout (timers re-layout with them)
+    let mut last_geom = (0.0f32, 0.0f32);
+    let mut last_forms = layout::FormState::default();
+    // id of the job that produced the kept page (timer pushes reuse it so
+    // the UI's generation gate accepts them)
+    let mut current_id = 0u64;
+    loop {
+        // wake for the next script timer instead of blocking forever
+        let timeout = kept
+            .as_ref()
+            .and_then(|k| k.scripts.as_ref().and_then(|s| s.next_timer_deadline()))
+            .map(|d| d.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(3600));
+        let first = match jobs.recv_timeout(timeout) {
+            Ok(j) => j,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // fire due timers; a mutation re-lays out and pushes a result
+                let mut push = None;
+                if let Some(kp) = kept.as_mut() {
+                    let KeptPage { dom, scripts, css_text, faces, url, .. } = kp;
+                    if let Some(scripts) = scripts.as_mut() {
+                        let (mw, vh) = last_geom;
+                        if scripts.run_due_timers(dom) {
+                            let (page, form_names) = layout_page(
+                                dom, css_text, faces, url, &mut fonts, mw, vh, &last_forms,
+                            );
+                            let stacks = fonts.stacks.borrow().clone();
+                            let out_faces = collect_out_faces(&fonts);
+                            let wire = page_to_wire(page, stacks, out_faces, form_names);
+                            push = Some(wire);
+                        }
+                    }
+                }
+                if let Some(wire) = push {
+                    eprintln!("[js] timer mutated the page; pushed relayout");
+                    if results
+                        .send(LoadDone { id: current_id, page: Some(wire), nav: None, panicked: false })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        // ---- coalesce: drop superseded loads/relayouts, keep every event ----
+        let mut batch = vec![first];
+        while let Ok(n) = jobs.try_recv() {
+            batch.push(n);
         }
-        if skipped > 0 {
-            eprintln!("[nav] skipped {skipped} superseded job(s)");
+        // a Load supersedes everything queued before it (we'd never fetch it)
+        if let Some(p) = batch.iter().rposition(|r| matches!(r, LoadReq::Load { .. })) {
+            if p > 0 {
+                eprintln!("[nav] skipped {p} superseded job(s)");
+            }
+            batch.drain(..p);
         }
-        let t0 = Instant::now();
-        // worker panics must not take the process down
-        let page = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let p = load_page(&req.url, &mut fonts, req.max_w, req.vh);
-            let stacks = fonts.stacks.borrow().clone();
-            let faces = fonts
-                .faces
-                .iter()
-                .map(|f| css::FontFace {
-                    family: f.family.clone(),
-                    srcs: f.srcs.clone(),
-                    wmin: f.wmin,
-                    wmax: f.wmax,
-                    italic: f.italic,
-                })
-                .collect();
-            page_to_wire(p, stacks, faces)
-        }))
-        .map_err(|_| {
-            eprintln!("[nav] loader pipeline panicked for {}", req.url);
-        })
-        .ok();
-        eprintln!(
-            "[nav] worker finished {} in {:.0} ms",
-            req.url,
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
-        // unbounded channel: never blocks; UI drains every frame
-        if results
-            .send(LoadDone {
-                id: req.id,
-                page,
-            })
-            .is_err()
-        {
-            break; // UI side gone
+        // collapse a consecutive run of relayouts to the newest (events break
+        // the run, so an event between two relayouts survives)
+        let mut out: Vec<LoadReq> = Vec::new();
+        let mut collapsed = 0u32;
+        for j in batch {
+            if matches!(j, LoadReq::Relayout { .. })
+                && matches!(out.last(), Some(LoadReq::Relayout { .. }))
+            {
+                out.pop();
+                collapsed += 1;
+            }
+            out.push(j);
+        }
+        if collapsed > 0 {
+            eprintln!("[nav] skipped {collapsed} superseded relayout(s)");
+        }
+
+        for job in out {
+            let t0 = Instant::now();
+            let id = job.id();
+            let url = job.url().to_string();
+            // worker panics must not take the process down
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_job(&mut kept, &mut fonts, &job, &mut last_geom, &mut last_forms)
+            }));
+            let (wire, nav, panicked) = match outcome {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("[nav] loader pipeline panicked for {url}");
+                    kept = None; // don't trust a half-built page
+                    (None, None, true)
+                }
+            };
+            if wire.is_some() {
+                current_id = id;
+            }
+            eprintln!(
+                "[nav] worker finished {url} in {:.0} ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+            // unbounded channel: never blocks; UI drains every frame
+            if results
+                .send(LoadDone { id, page: wire, nav, panicked })
+                .is_err()
+            {
+                break; // UI side gone
+            }
         }
     }
 }
 
-/// Fetch + parse + layout one page. `vh` = viewport height (fixed boxes).
-fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
+/// Handle one job against the kept page. Returns (wire page, script-requested
+/// navigation, panicked-flag). Falls back to a full load when there's no kept
+/// page for the job's URL.
+fn process_job(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    job: &LoadReq,
+    last_geom: &mut (f32, f32),
+    last_forms: &mut layout::FormState,
+) -> (Option<PageWire>, Option<String>, bool) {
+    match job {
+        LoadReq::Load { url, max_w, vh, .. } => {
+            *last_geom = (*max_w, *vh);
+            *last_forms = layout::FormState::default();
+            do_load(kept, fonts, url, *max_w, *vh)
+        }
+        LoadReq::Relayout { url, max_w, vh, forms, .. } => {
+            *last_geom = (*max_w, *vh);
+            *last_forms = forms.clone();
+            if !kept_matches(kept, url) {
+                return do_load(kept, fonts, url, *max_w, *vh);
+            }
+            let kp = kept.as_mut().unwrap();
+            let (page, form_names) = layout_page(
+                &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms,
+            );
+            let stacks = fonts.stacks.borrow().clone();
+            let out_faces = collect_out_faces(fonts);
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false)
+        }
+        LoadReq::Event { url, max_w, vh, node, kind, value, forms, .. } => {
+            *last_geom = (*max_w, *vh);
+            *last_forms = forms.clone();
+            if !kept_matches(kept, url) {
+                return do_load(kept, fonts, url, *max_w, *vh);
+            }
+            let kp = kept.as_mut().unwrap();
+            // push the control's state into the worker DOM (value / checked)
+            apply_event(kp, *node, kind, value.as_deref());
+            // fire the node's listeners for this kind (bubbles up the tree)
+            let mut nav = None;
+            {
+                let KeptPage { dom, scripts, .. } = kp;
+                if let Some(scripts) = scripts.as_mut() {
+                    let t = scripts.dispatch(dom, *node, kind);
+                    nav = t.nav;
+                }
+            }
+            // always re-layout: the event likely changed the DOM
+            let (page, form_names) = layout_page(
+                &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms,
+            );
+            let stacks = fonts.stacks.borrow().clone();
+            let out_faces = collect_out_faces(fonts);
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), nav, false)
+        }
+    }
+}
+
+fn kept_matches(kept: &Option<KeptPage>, url: &str) -> bool {
+    kept.as_ref().map(|k| k.url == url).unwrap_or(false)
+}
+
+/// Full load: fetch + parse + run `<script>` + layout. Seeds/ replaces the
+/// kept page.
+fn do_load(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    url: &str,
+    max_w: f32,
+    vh: f32,
+) -> (Option<PageWire>, Option<String>, bool) {
+    let (dom, css_text, faces) = fetch_and_parse(url);
+    let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None };
+    // run every <script> (inline + src) BEFORE layout so the DOM is settled
+    let mut scripts = script::PageScripts::new(&mut kp.dom, url);
+    let turn = scripts.run_scripts(&mut kp.dom);
+    if turn.dirty {
+        // inline scripts mutated the DOM before the first layout — the
+        // layout below already sees the mutated tree
+        eprintln!("[js] scripts mutated the DOM before layout");
+    }
+    kp.scripts = Some(scripts);
+    let (page, form_names) = layout_page(
+        &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
+        &layout::FormState::default(),
+    );
+    let stacks = fonts.stacks.borrow().clone();
+    let out_faces = collect_out_faces(fonts);
+    let wire = page_to_wire(page, stacks, out_faces, form_names);
+    *kept = Some(kp);
+    (Some(wire), turn.nav, false)
+}
+
+/// Snapshot the worker font picker's faces into `css::FontFace` for the wire.
+fn collect_out_faces(fonts: &Fonts) -> Vec<css::FontFace> {
+    fonts
+        .faces
+        .iter()
+        .map(|f| css::FontFace {
+            family: f.family.clone(),
+            srcs: f.srcs.clone(),
+            wmin: f.wmin,
+            wmax: f.wmax,
+            italic: f.italic,
+        })
+        .collect()
+}
+
+/// Apply a form event's state to the worker DOM before listeners fire.
+fn apply_event(kp: &mut KeptPage, node: u32, kind: &str, value: Option<&str>) {
+    // text input: push the typed value into the `value` attribute so both
+    // layout and scripts reading getAttribute("value") see it
+    if let Some(v) = value {
+        set_dom_attr(&mut kp.dom, node, "value", v);
+    }
+    if kind == "click" {
+        let tag = kp.dom.tag(node).to_string();
+        if tag == "input" {
+            let ty = kp.dom.attr(node, "type").unwrap_or("text").to_string();
+            if ty == "checkbox" || ty == "radio" {
+                if kp.dom.attr(node, "checked").is_some() {
+                    remove_dom_attr(&mut kp.dom, node, "checked");
+                } else {
+                    set_dom_attr(&mut kp.dom, node, "checked", "");
+                }
+            }
+        }
+    }
+}
+
+/// Set an attribute on a DOM element node (case-insensitive name).
+fn set_dom_attr(dom: &mut html::Dom, node: u32, name: &str, val: &str) {
+    let Some(nr) = dom.nodes.get_mut(node as usize) else { return };
+    if let html::NodeKind::Element(_, attrs) = &mut nr.kind {
+        if let Some(slot) = attrs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            slot.1 = val.to_string();
+        } else {
+            let mut v: Vec<(String, String)> = attrs.iter().cloned().collect();
+            v.push((name.to_string(), val.to_string()));
+            *attrs = v.into_boxed_slice();
+        }
+    }
+}
+
+/// Remove an attribute from a DOM element node.
+fn remove_dom_attr(dom: &mut html::Dom, node: u32, name: &str) {
+    let Some(nr) = dom.nodes.get_mut(node as usize) else { return };
+    if let html::NodeKind::Element(_, attrs) = &mut nr.kind {
+        if let Some(i) = attrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            let mut v: Vec<(String, String)> = attrs.iter().cloned().collect();
+            v.remove(i);
+            *attrs = v.into_boxed_slice();
+        }
+    }
+}
+
+/// Every form control's node id → `name` attribute (for `[form] submit`
+/// logging in the shell, which can't read the DOM).
+fn collect_form_names(dom: &html::Dom) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    for i in 1..dom.nodes.len() as u32 {
+        let tag = dom.tag(i);
+        if matches!(tag, "input" | "textarea" | "select" | "button") {
+            if let Some(name) = dom.attr(i, "name") {
+                out.insert(i, name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Fetch + parse one page's HTML and every stylesheet (network + parse —
+/// the expensive half of the pipeline, done once per navigation).
+fn fetch_and_parse(url: &str) -> (html::Dom, String, Vec<css::FontFace>) {
     let source = match fetch(url) {
         Ok((bytes, ct)) => {
             let s = html::decode_html(&bytes, ct.as_deref());
@@ -795,7 +1349,6 @@ fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
     };
     let dom = html::parse(&source);
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
-    let root = dom.body_root();
 
     // Phase 1b: collect every stylesheet in document order — <style> blocks
     // (usually in <head>, which body_root skips) and external <link>s — then
@@ -830,19 +1383,49 @@ fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
             }
         }
     }
-    // media queries evaluate against the window's CSS pixel width
-    let viewport = max_w + 2.0 * PADDING as f32;
-    let mut sheet = css::parse_for(&css_text, viewport);
-    // viewport units (vh/vw/vmin/vmax) resolve against the real window size
-    sheet.set_viewport(viewport, vh);
-    // cascade writes font-family stack ids into the font picker's own table
-    sheet.set_stacks(fonts.stacks.clone());
     eprintln!(
-        "[css] {} bytes of style, {} rules ({} external sheets)",
+        "[css] {} bytes of style ({} external sheets)",
         css_text.len(),
-        sheet.rule_count(),
         ext_count
     );
+    (dom, css_text, faces)
+}
+
+/// Cascade + box tree + layout + image decode — the re-runnable half.
+/// Called for fresh loads, resizes, form events and script timers alike;
+/// `state` seeds focus/values so the controls paint what the user typed.
+/// Returns the page plus the node→name table for `[form]` logging.
+fn layout_page(
+    dom: &html::Dom,
+    css_text: &str,
+    faces: &[css::FontFace],
+    url: &str,
+    fonts: &mut Fonts,
+    max_w: f32,
+    vh: f32,
+    state: &layout::FormState,
+) -> (Page, HashMap<u32, String>) {
+    let root = dom.body_root();
+    // media queries evaluate against the window's CSS pixel width
+    let viewport = max_w + 2.0 * PADDING as f32;
+    let mut sheet = css::parse_for(css_text, viewport);
+    // viewport units (vh/vw/vmin/vmax) resolve against the real window size
+    sheet.set_viewport(viewport, vh);
+    eprintln!("[css] {} rules", sheet.rule_count());
+    // cascade writes font-family stack ids into the font picker's own table
+    sheet.set_stacks(fonts.stacks.clone());
+    // FontFace isn't Clone (all fields are) — copy for begin_page, which
+    // takes ownership and the KeptPage keeps its own copy for re-layouts
+    let owned_faces: Vec<css::FontFace> = faces
+        .iter()
+        .map(|f| css::FontFace {
+            family: f.family.clone(),
+            srcs: f.srcs.clone(),
+            wmin: f.wmin,
+            wmax: f.wmax,
+            italic: f.italic,
+        })
+        .collect();
     // the real <html> element scopes custom-property themes (below) and is the
     // canvas-background fallback
     let html_el = dom.nodes[0]
@@ -851,19 +1434,19 @@ fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
         .copied()
         .find(|&c| dom.tag(c) == "html")
         .unwrap_or(0);
-    sheet.scope_vars(&dom, html_el);
-    fonts.begin_page(faces);
+    sheet.scope_vars(dom, html_el);
+    fonts.begin_page(owned_faces);
 
     // cascade over the body element itself: page bg + initial inherited style
     // (spec: the canvas background comes from <body> if it has one, else
     // <html>'s — body wins per the HTML spec)
-    let body = sheet.resolve(&dom, root, Style::new(), dom.attr(root, "style"));
+    let body = sheet.resolve(dom, root, Style::new(), dom.attr(root, "style"));
     let bg = body
         .bg
-        .or_else(|| sheet.resolve(&dom, html_el, Style::new(), dom.attr(html_el, "style")).bg)
+        .or_else(|| sheet.resolve(dom, html_el, Style::new(), dom.attr(html_el, "style")).bg)
         .unwrap_or(BG);
 
-    let mut root_box = layout::build(&dom, root, body.style, body.bx, &sheet);
+    let mut root_box = layout::build(dom, root, body.style, body.bx, &sheet);
     eprintln!(
         "[mem] after box tree: {:.1} MB ({} boxes)",
         working_set_mb(),
@@ -878,7 +1461,9 @@ fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
         eprintln!("[img] {n_img} probed, {skipped} skipped (format)");
     }
 
-    let mut laid = layout::layout_in(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st));
+    // layout_in_forms applies `state` (focus + typed values) so the caret,
+    // accent border and live text paint correctly
+    let mut laid = layout::layout_in_forms(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st), state);
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
     let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget, false);
@@ -906,11 +1491,13 @@ fn load_page(url: &str, fonts: &mut Fonts, max_w: f32, vh: f32) -> Page {
             );
         }
     }
-    Page {
+    let form_names = collect_form_names(dom);
+    let page = Page {
         url: url.to_string(),
         laid,
         bg,
-    }
+    };
+    (page, form_names)
 }
 
 /// One stylesheet source found in document order.
@@ -2122,6 +2709,7 @@ mod tests {
                 wmax: 700,
                 italic: false,
             }],
+            HashMap::new(),
         )
     }
 
@@ -2145,6 +2733,119 @@ mod tests {
         assert_eq!(page.laid.shadows[0].blur, 2.0);
         assert_eq!(page.laid.rects.len(), 1);
         assert_eq!(page.laid.underline_rects.len(), 1);
+    }
+
+    /// Form interaction state must survive the worker→UI hop: focus, typed
+    /// values, laid-out control rects and the node→name table.
+    #[test]
+    fn wire_roundtrip_preserves_forms() {
+        let mut wire = sample_wire();
+        wire.forms.push(layout::FormBox {
+            node: 7,
+            rect: (1.0, 2.0, 30.0, 18.0),
+            kind: layout::FormKind::TextInput { password: false },
+            focused: true,
+            fixed: false,
+        });
+        wire.focused = Some(7);
+        wire.form_values.insert(7, "typed!".into());
+        wire.form_names.insert(7, "q".into());
+        let focused = wire.focused;
+        let names = wire.form_names.clone();
+        let page = wire_to_page(wire);
+        assert_eq!(page.laid.focused, focused, "focus travels");
+        assert_eq!(page.laid.form_value(7), "typed!", "typed value travels");
+        assert_eq!(page.laid.forms.len(), 1, "hit-test rects travel");
+        assert_eq!(page.laid.forms[0].node, 7);
+        assert_eq!(names.get(&7).map(|s| s.as_str()), Some("q"));
+    }
+
+    /// Key routing is a pure fn (no synthesized input — verified here):
+    /// editing keys map only when a field is focused, and the address bar
+    /// always wins when it has focus.
+    #[test]
+    fn key_routing_pure_fn() {
+        use egui::Key;
+        // field focused → editing keys route
+        assert_eq!(route_key(Key::Backspace, true, false), KeyAction::Backspace);
+        assert_eq!(route_key(Key::Enter, true, false), KeyAction::Submit);
+        assert_eq!(route_key(Key::Escape, true, false), KeyAction::Blur);
+        // no field focus → nothing routes (arrow keys keep scrolling)
+        assert_eq!(route_key(Key::Backspace, false, false), KeyAction::None);
+        assert_eq!(route_key(Key::Enter, false, false), KeyAction::None);
+        // address bar focused → page keys suppressed entirely
+        assert_eq!(route_key(Key::Backspace, true, true), KeyAction::None);
+        assert_eq!(route_key(Key::Escape, true, true), KeyAction::None);
+        // unrelated keys never route
+        assert_eq!(route_key(Key::ArrowDown, true, false), KeyAction::None);
+        assert_eq!(route_key(Key::F11, true, false), KeyAction::None);
+    }
+
+    /// `collect_form_names` reads name attributes off form controls only —
+    /// that table is how the shell logs `[form] submit name=value` without
+    /// DOM access.
+    #[test]
+    fn form_names_cover_controls_only() {
+        let dom = html::parse(
+            r#"<html><body><form>
+                <input name="user" type="text">
+                <input type="password" no-name-x>
+                <textarea name="msg"></textarea>
+                <button name="go" type="submit">Go</button>
+                <div name="not-a-control"></div>
+            </form></body></html>"#,
+        );
+        let names = collect_form_names(&dom);
+        let by_name: std::collections::HashMap<&str, u32> = names
+            .iter()
+            .map(|(&n, s)| (s.as_str(), n))
+            .collect();
+        assert!(by_name.contains_key("user"));
+        assert!(by_name.contains_key("msg"));
+        assert!(by_name.contains_key("go"));
+        assert_eq!(names.len(), 3, "non-controls and unnamed inputs excluded");
+    }
+
+    /// Worker coalescing collapses superseded relayouts but must never drop
+    /// a form Event (it carries a user action).
+    #[test]
+    fn loadreq_accessors_and_event_identity() {
+        let ev = LoadReq::Event {
+            id: 3,
+            url: "https://example.com/".into(),
+            max_w: 100.0,
+            vh: 200.0,
+            node: 9,
+            kind: "click".into(),
+            value: None,
+            forms: layout::FormState::default(),
+        };
+        let re = LoadReq::Relayout {
+            id: 4,
+            url: "https://example.com/".into(),
+            max_w: 100.0,
+            vh: 200.0,
+            forms: layout::FormState::default(),
+        };
+        assert_eq!(ev.id(), 3);
+        assert_eq!(re.id(), 4);
+        assert_eq!(ev.url(), "https://example.com/");
+        assert!(matches!(ev, LoadReq::Event { .. }));
+        assert!(!matches!(re, LoadReq::Event { .. }));
+    }
+
+    /// Script errors and form events stay `Send` across the channel after
+    /// the enum refactor (compile-time, like `page_wire_is_send`).
+    #[test]
+    fn loadreq_is_send_variants() {
+        fn assert_send<T: Send>() {}
+        assert_send::<LoadReq>();
+        let _ = LoadReq::Load {
+            id: 1,
+            url: "https://example.com/".into(),
+            max_w: 1.0,
+            vh: 1.0,
+        };
     }
 
     #[test]
