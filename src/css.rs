@@ -140,6 +140,20 @@ pub struct BoxStyle {
     /// border color; None = currentcolor (the element's own text color,
     /// resolved at paint time — never a hardcoded default)
     pub bcolor: Option<u32>,
+    /// `overflow`/`overflow-x`/`overflow-y` non-visible (`hidden`, `clip`,
+    /// `scroll`, `auto`) — the box's CONTENT (children, their fills/text)
+    /// is clipped to its padding box at paint. The element's own
+    /// background/border are NOT clipped by its own overflow.
+    /// shortcut: `scroll`/`auto` clip but don't scroll (no scrollbars yet);
+    /// the two axes collapse into this one flag, so `overflow-x:hidden;
+    /// overflow-y:visible` clips both axes.
+    pub clip: bool,
+    /// CSS 2.1 `clip: rect(top, right, bottom, left)` — edge offsets from
+    /// the element's border-box top-left (all four from that corner, so the
+    /// classic `rect(1px,1px,1px,1px)` skip-link is a zero-area window that
+    /// hides everything). Honored only on positioned boxes (spec: applies
+    /// to absolutely positioned elements); `auto`/unparseable → None.
+    pub clip_rect: Option<[Len; 4]>,
     /// CSS position (non-static boxes leave normal flow)
     pub pos: Pos,
     /// top, right, bottom, left — None = unspecified (absolute keeps its
@@ -212,6 +226,8 @@ impl Default for BoxStyle {
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
+            clip: false,
+            clip_rect: None,
             pos: Pos::Static,
             inset: [None; 4],
             shadows: Vec::new(),
@@ -578,6 +594,10 @@ const KNOWN: &[&str] = &[
     "bottom",
     "left",
     "inset",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "clip",
     "box-shadow",
     // SVG paint properties — the rasterizer supports these; kept in decls so
     // Sheet::class_paint can resolve class-colored inline-SVG children
@@ -1344,6 +1364,22 @@ fn apply_decl(
                 bx.declared |= decl::WIDTH;
             }
         }
+        // overflow: hidden|clip|scroll|auto → clip CONTENT to the padding
+        // box at paint. shortcut: scroll/auto clip but don't scroll (no
+        // scrollbars yet); the two axes share ONE flag (`overflow-x`/
+        // `overflow-y` set it too), so a mixed visible/hidden pair clips
+        // both axes. `visible` (and the default) → false.
+        "overflow" | "overflow-x" | "overflow-y" => {
+            bx.clip = matches!(
+                d.1.split_whitespace().next().unwrap_or(""),
+                "hidden" | "clip" | "scroll" | "auto"
+            );
+        }
+        // CSS 2.1 `clip: rect(top, right, bottom, left)` — all four offsets
+        // from the border-box top-left, so `rect(1px,1px,1px,1px)` is a
+        // ZERO-AREA window: the classic skip-link hide. Applied only to
+        // positioned boxes (spec); `none`/`auto`/garbage → None (no clip).
+        "clip" => bx.clip_rect = parse_clip_rect(&d.1, vp),
         "height" => bx.height = parse_len(&d.1, vp).filter(|_| d.1 != "auto"),
         "min-height" => {
             if let Some(l) = parse_len(&d.1, vp).filter(|_| d.1 != "auto") {
@@ -1547,6 +1583,28 @@ fn parse_sides(v: &str, vp: (f32, f32)) -> [Len; 4] {
         4 => [vals[0], vals[1], vals[2], vals[3]],
         _ => [z, z, z, z], // includes `auto` slots (handled separately)
     }
+}
+
+/// `clip: rect(top, right, bottom, left)` → four [`Len`] offsets from the
+/// element's border-box top-left (all four measured from that corner, so
+/// `rect(1px,1px,1px,1px)` is a zero-area window). Anything else — `none`,
+/// a non-rect value, not exactly 4 comma-separated parts, or an unparseable
+/// part (including `auto`) → None = no clip.
+/// shortcut: `auto` slots are unparseable instead of CSS 2.1's per-edge
+/// semantics (top/left≈0, right/bottom=no clip) — real skip-link patterns
+/// specify all four edges.
+fn parse_clip_rect(v: &str, vp: (f32, f32)) -> Option<[Len; 4]> {
+    let v = v.trim().to_ascii_lowercase();
+    let inner = v.strip_prefix("rect(")?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut out = [Len::Px(0.0); 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = parse_len(p, vp)?;
+    }
+    Some(out)
 }
 
 /// `url(…)` / `url("…")` / `url('…')` → the raw target (unresolved — the
@@ -3391,6 +3449,51 @@ mod tests {
         assert!(get("b").wrap, "wrap-reverse wraps (reverse ignored)");
         assert!(!get("c").wrap, "nowrap stays single-line");
         assert!(!get("d").wrap, "default nowrap");
+    }
+
+    #[test]
+    fn overflow_parses_into_clip_flag() {
+        let sheet = parse(
+            ".h { overflow: hidden } .c { overflow: clip } .s { overflow: scroll } \
+             .a { overflow: auto } .v { overflow: visible } .x { overflow-x: hidden } \
+             .y { overflow-y: visible } .d { }",
+        );
+        let dom = dom_of(
+            "<div class=h></div><div class=c></div><div class=s></div><div class=a></div>\
+             <div class=v></div><div class=x></div><div class=y></div><div class=d></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).bx;
+        assert!(get("h").clip, "overflow: hidden clips");
+        assert!(get("c").clip, "overflow: clip clips");
+        assert!(get("s").clip, "overflow: scroll clips (no scrolling yet)");
+        assert!(get("a").clip, "overflow: auto clips");
+        assert!(!get("v").clip, "overflow: visible does not clip");
+        assert!(get("x").clip, "overflow-x: hidden clips");
+        assert!(!get("y").clip, "overflow-y: visible alone leaves the flag off");
+        assert!(!get("d").clip, "default is visible");
+    }
+
+    #[test]
+    fn clip_rect_parses_offsets() {
+        let sheet = parse(
+            ".p { position: absolute; clip: rect(1px, 2px, 3px, 4px) } \
+             .n { clip: none } .g { clip: rect(5px, 5px) } .z { clip: garbage } \
+             .q { position: absolute; clip: rect(0, 10px, auto, 0) }",
+        );
+        let dom = dom_of(
+            "<div class=p></div><div class=n></div><div class=g></div>\
+             <div class=z></div><div class=q></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).bx;
+        assert_eq!(
+            get("p").clip_rect,
+            Some([Len::Px(1.0), Len::Px(2.0), Len::Px(3.0), Len::Px(4.0)]),
+            "rect(top,right,bottom,left) kept as four offsets"
+        );
+        assert_eq!(get("n").clip_rect, None, "clip: none → no clip");
+        assert_eq!(get("g").clip_rect, None, "wrong arity → no clip");
+        assert_eq!(get("z").clip_rect, None, "garbage → no clip");
+        assert_eq!(get("q").clip_rect, None, "auto slot → no clip (shortcut)");
     }
 
     #[test]

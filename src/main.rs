@@ -1243,6 +1243,9 @@ struct RunWire {
     width: f32,
     link: Option<String>,
     fixed: bool,
+    /// clip window (x0, y0, x1, y1, doc coords) from ancestor overflow/clip
+    /// boxes — None = unclipped; degenerate (x0 ≥ x1) = draw nothing
+    clip: Option<(f32, f32, f32, f32)>,
 }
 
 /// Result sent back by the worker: the wire page (None = the pipeline panicked),
@@ -1291,6 +1294,7 @@ fn page_to_wire(
                 width: r.width,
                 link: r.link.as_ref().map(|l| l.to_string()),
                 fixed: r.fixed,
+                clip: r.clip,
             })
             .collect(),
         underline_rects: p.laid.underline_rects,
@@ -1336,6 +1340,7 @@ fn wire_to_page(w: PageWire) -> Page {
                     width: r.width,
                     link: r.link.map(std::rc::Rc::from),
                     fixed: r.fixed,
+                    clip: r.clip,
                 })
                 .collect(),
             height: w.height,
@@ -3447,6 +3452,26 @@ fn render(
             if y < -run.style.size * 2.0 || y > page + run.style.size {
                 continue;
             }
+            // clip window converts like y (fixed = viewport coords, else
+            // doc coords − scroll). Fully-outside / degenerate window →
+            // draw NOTHING (the skip-link case: text outside a 1px box).
+            let clip = run.clip.map(|(x0, y0, x1, y1)| {
+                let (y0, y1) = if run.fixed { (y0, y1) } else { (y0 - scroll, y1 - scroll) };
+                (x0, y0, x1, y1)
+            });
+            if let Some((x0, y0, x1, y1)) = clip {
+                if x1 <= x0
+                    || y1 <= y0
+                    || run.x >= x1
+                    || run.x + run.width <= x0
+                    || y >= y1
+                    || y + run.style.size <= y0
+                {
+                    continue;
+                }
+            }
+            // rects/images/underlines were already intersected in layout
+            // (collect_paint / apply_run_clips) — only runs clip here.
             draw_text(
                 buf,
                 width,
@@ -3455,6 +3480,14 @@ fn render(
                 &run.text,
                 fonts,
                 &run.style,
+                clip.map(|(x0, y0, x1, y1)| {
+                    (
+                        PADDING as f32 + x0,
+                        PADDING as f32 + top + y0,
+                        PADDING as f32 + x1,
+                        PADDING as f32 + top + y1,
+                    )
+                }),
             );
         }
         for &(x, y, w, h, color, fixed) in &laid.underline_rects {
@@ -3488,6 +3521,10 @@ fn draw_text(
     s: &str,
     fonts: &Fonts,
     style: &Style,
+    // clip window in BUFFER coords (x0, y0, x1, y1); glyphs fully outside
+    // are skipped — partial overlap still blends (the buffer has no clip
+    // stack; intersection was pre-applied to the run's window in layout)
+    clip: Option<(f32, f32, f32, f32)>,
 ) {
     let scale = PxScale::from(style.size);
     // baseline sits at y0 + ascent (~0.8em for these fonts)
@@ -3503,8 +3540,19 @@ fn draw_text(
             scale,
             position: ab_glyph::point(x, baseline),
         };
+        let advance = scaled.h_advance(id);
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();
+            if let Some((cx0, cy0, cx1, cy1)) = clip {
+                if bounds.max.x <= cx0
+                    || bounds.min.x >= cx1
+                    || bounds.max.y <= cy0
+                    || bounds.min.y >= cy1
+                {
+                    x += advance;
+                    continue; // glyph entirely outside the clip window
+                }
+            }
             outlined.draw(|gx, gy, coverage| {
                 if coverage <= 0.0 {
                     return;
@@ -3520,7 +3568,7 @@ fn draw_text(
                 }
             });
         }
-        x += scaled.h_advance(id);
+        x += advance;
     }
 }
 
@@ -3794,6 +3842,7 @@ mod tests {
                 width: 30.0,
                 link: Some(std::rc::Rc::from("https://example.com/x")),
                 fixed: false,
+                clip: None,
             }],
             height: 123.0,
             underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
