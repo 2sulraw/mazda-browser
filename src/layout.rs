@@ -2,7 +2,9 @@
 //! shortcut: only inline/block split + word wrap (no float/flex/absolute);
 //! upgrade when a real CSS engine lands (Phase 1b+).
 
-use crate::css::{decl, Align, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track};
+use crate::css::{
+    decl, Align, BgPos, BgRepeat, BgSize, BoxStyle, Dir, Display, Justify, Len, Pos, Sheet, Track,
+};
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
 use std::collections::HashMap;
@@ -307,9 +309,15 @@ pub struct BoxNode {
     pub is_text: bool,
     /// synthetic background-image placeholder (first child of the element
     /// its `background-image` targets): carries an [`ImgSlot`] so the
-    /// shared `<img>` pipeline fetches/decodes it, paints at the parent's
-    /// padding-box top-left, reserves no flow space
+    /// shared `<img>` pipeline fetches/decodes it; `place()` sizes and
+    /// positions it per the element's `background-size`/`background-
+    /// position` inside the padding box, reserves no flow space
     pub is_bg: bool,
+    /// tiling region for a REPEATING background placeholder: the parent's
+    /// padding box (x0, y0, x1, y1) in document coords, recorded by
+    /// `place()`; `collect_paint` emits one entry per tile over it. None =
+    /// draw ONE entry at (x, y, w, h) — no-repeat or undeclared repeat
+    pub bg_tile_region: Option<(f32, f32, f32, f32)>,
     pub style: Style,
     pub bx: BoxStyle,
     pub text: String,
@@ -348,6 +356,7 @@ impl BoxNode {
         BoxNode {
             is_text: false,
             is_bg: false,
+            bg_tile_region: None,
             style,
             bx,
             text: String::new(),
@@ -371,6 +380,7 @@ impl BoxNode {
         BoxNode {
             is_text: true,
             is_bg: false,
+            bg_tile_region: None,
             style,
             bx: BoxStyle::default(),
             text,
@@ -404,7 +414,8 @@ pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) ->
     // body's own background-image (root = body's box) — pushed before
     // build_into appends, so it stays the first child (paints under)
     if let Some(u) = root.bx.bg_image.clone() {
-        root.children.push(bg_placeholder(&u, style));
+        let ph = bg_placeholder(&u, style, &root.bx);
+        root.children.push(ph);
     }
     build_into(dom, node, style, sheet, None, &mut root.children);
     root
@@ -415,16 +426,20 @@ pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) ->
 /// URL and probes the header, `decode_images` decodes at display size and
 /// appends the draw entry in tree order — child 0 means the background
 /// lands UNDER the element's content images, and all images draw under
-/// text. `place()` anchors it to the parent's padding-box top-left;
-/// `is_bg` keeps it out of every flow (block/flex/grid and shrink-to-fit
-/// width).
-/// shortcut: one image per box, natural size, top-left, no repeat /
-/// position / size / clip (the CSS initial values — what real sites'
-/// small icon backgrounds rely on).
-fn bg_placeholder(url: &str, style: Style) -> BoxNode {
+/// text. `place()` sizes/positions it per the parent's `background-size`/
+/// `background-position` and records the tiling region for a declared
+/// `background-repeat`; `is_bg` keeps it out of every flow (block/flex/
+/// grid and shrink-to-fit width).
+/// shortcut: one image layer per box (extra `url()` layers dropped).
+fn bg_placeholder(url: &str, style: Style, parent: &BoxStyle) -> BoxNode {
     let mut g = BoxNode::group(style, BoxStyle::default());
     g.is_bg = true;
     g.img = Some(ImgSlot::Pending(std::rc::Rc::from(url)));
+    // the geometry longhands ride along on the placeholder so `place()`
+    // and `collect_paint` can size/position/tile it without re-cascading
+    g.bx.bg_size = parent.bg_size;
+    g.bx.bg_pos = parent.bg_pos;
+    g.bx.bg_repeat = parent.bg_repeat;
     g
 }
 
@@ -724,7 +739,8 @@ fn build_into(
                     // background-image: placeholder rides the <img> pipeline
                     // and paints under this box's content (first child)
                     if let Some(u) = g.bx.bg_image.clone() {
-                        g.children.push(bg_placeholder(&u, outcome.style));
+                        let ph = bg_placeholder(&u, outcome.style, &g.bx);
+                        g.children.push(ph);
                     }
                     // inline-block: a real box (background/border paint),
                     // but placed ON the surrounding text line by block()'s
@@ -751,7 +767,8 @@ fn build_into(
                         g.inline = true;
                         // background-image placeholder (see above)
                         if let Some(u) = g.bx.bg_image.clone() {
-                            g.children.push(bg_placeholder(&u, outcome.style));
+                            let ph = bg_placeholder(&u, outcome.style, &g.bx);
+                            g.children.push(ph);
                         }
                         build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
                         out.push(g);
@@ -855,6 +872,13 @@ const VIEWPORT_H: f32 = 676.0;
 /// the remaining budget loses its slot before layout (no decode, no draw).
 /// 256K px ≈ 1 MB RGBA — keeps the project's minimal-RAM metric.
 const BG_PIXEL_BUDGET: usize = 256 * 1024;
+
+/// Cap on the tile grid (cols × rows) one repeating background-image
+/// placeholder may emit at paint. shortcut: RAM/paint discipline — a
+/// pathological 1px tile inside a huge box degrades to a partial fill
+/// instead of pushing hundreds of thousands of rects per frame; real
+/// pattern strips are far under this.
+const BG_TILE_CAP: i64 = 512;
 
 /// Drop (de-slot) background-image placeholders whose probed intrinsic
 /// pixels don't fit the remaining [`BG_PIXEL_BUDGET`]. Content `<img>`
@@ -1214,8 +1238,10 @@ fn apply_run_clips(
 
 /// Post-layout walk: every box with a background-color emits a filled rect;
 /// every decoded `<img>` emits its pixels (parent-first, so children paint
-/// over their parent's fill). `fixed` inherits down — a `position: fixed`
-/// subtree paints in viewport coordinates.
+/// over their parent's fill). A REPEATING background placeholder emits one
+/// entry per tile of its recorded region (see [`BG_TILE_CAP`]). `fixed`
+/// inherits down — a `position: fixed` subtree paints in viewport
+/// coordinates.
 ///
 /// `clip` = accumulated window (x0, y0, x1, y1, doc coords) from ancestor
 /// `overflow` boxes and `clip: rect()` — intersected into every pushed rect;
@@ -1326,8 +1352,68 @@ fn collect_paint(
         }
         if let Some(ImgSlot::Ready(d)) = &n.img {
             if n.w > 0.0 && n.h > 0.0 {
-                if let Some(q) = cull_rect((n.x, n.y, n.w, n.h), content_clip) {
-                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                match (n.bx.bg_repeat, n.bg_tile_region) {
+                    // a REPEATING background placeholder (declared repeat,
+                    // region recorded by `place()`): one entry per tile
+                    // over the region, each culled against the inherited
+                    // clip window (ancestor overflow/clip from wave 1)
+                    (Some(rep), Some(reg))
+                        if n.is_bg
+                            && matches!(
+                                rep,
+                                BgRepeat::Repeat | BgRepeat::RepeatX | BgRepeat::RepeatY
+                            ) =>
+                    {
+                        let (tw, th) = (n.w, n.h);
+                        // candidate tile indices on each axis: tiles sit at
+                        // origin + k·tile; the ±1 margin absorbs float
+                        // slop, the clamp keeps the cast bounded (values
+                        // are re-clamped to the cap below)
+                        let (kx0, kx1) = if matches!(rep, BgRepeat::Repeat | BgRepeat::RepeatX)
+                        {
+                            (
+                                (((reg.0 - n.x) / tw).floor() - 1.0).clamp(-1e5, 1e5) as i64,
+                                (((reg.2 - n.x) / tw).ceil() + 1.0).clamp(-1e5, 1e5) as i64,
+                            )
+                        } else {
+                            (0, 1) // repeat-y: a single column
+                        };
+                        let (ky0, ky1) = if matches!(rep, BgRepeat::Repeat | BgRepeat::RepeatY)
+                        {
+                            (
+                                (((reg.1 - n.y) / th).floor() - 1.0).clamp(-1e5, 1e5) as i64,
+                                (((reg.3 - n.y) / th).ceil() + 1.0).clamp(-1e5, 1e5) as i64,
+                            )
+                        } else {
+                            (0, 1) // repeat-x: a single row
+                        };
+                        let cols = (kx1 - kx0).clamp(0, BG_TILE_CAP);
+                        let rows = (ky1 - ky0).clamp(0, BG_TILE_CAP.div_euclid(cols.max(1)));
+                        // tiles paint only inside the region (the padding
+                        // box) ∩ the inherited clip window — edge tiles are
+                        // cropped to it, same rect-culling the single-draw
+                        // path uses at clip edges
+                        let win = Some(match content_clip {
+                            Some(c) => clip_intersect(c, reg),
+                            None => reg,
+                        });
+                        for ky in ky0..ky0 + rows {
+                            for kx in kx0..kx0 + cols {
+                                let t = (n.x + kx as f32 * tw, n.y + ky as f32 * th, tw, th);
+                                if let Some(q) = cull_rect(t, win) {
+                                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // single draw at (x, y, w, h) — content <img>, a
+                        // no-repeat / undeclared-repeat background, or a
+                        // de-slotted one (0×0, culled above)
+                        if let Some(q) = cull_rect((n.x, n.y, n.w, n.h), content_clip) {
+                            imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                        }
+                    }
                 }
             }
         }
@@ -1488,22 +1574,9 @@ fn place(
     n.x += pl + bl;
     n.y += pt + bt;
     n.w = (w - pl - pr - bl - br).max(0.0);
-    // background-image placeholders: anchored to this box's padding-box
-    // top-left at intrinsic size (CSS initial position/size/repeat), out of
-    // flow — block/flex/grid skip them, so they take no space. An unprobed
-    // slot (fetch failed / unsupported format / over budget) stays 0×0 and
-    // never paints.
-    for ch in &mut n.children {
-        if !ch.is_bg {
-            continue;
-        }
-        ch.x = bx0 + bl;
-        ch.y = by0 + bt;
-        if let Some((iw, ih)) = ch.img.as_ref().and_then(ImgSlot::dims) {
-            ch.w = iw as f32;
-            ch.h = ih as f32;
-        }
-    }
+    // (background-image placeholders are placed at the END of place(),
+    // once the used padding box — incl. content height + min-height — is
+    // known, so %-sizes/%-positions resolve against the final box)
     if n.img.is_some() {
         // replaced element: no children — height from declared height,
         // else aspect ratio of the content width (no size known: 0 → invisible)
@@ -1552,6 +1625,76 @@ fn place(
     n.x = bx0;
     n.y = by0;
     n.w = w;
+    // background-image placeholders: sized per `background-size` and
+    // anchored per `background-position` inside this box's padding box —
+    // placed AFTER content layout so %-sizes/%-positions resolve against
+    // the USED padding box (incl. min-height). Out of flow (block/flex/
+    // grid skipped them above), so they take no space. An unprobed slot
+    // (fetch failed / unsupported format / over budget) stays 0×0 and
+    // never paints. shortcut: the tiling region is the padding box (CSS
+    // default background-clip is the border box; the border sliver of a
+    // repeating pattern is a few px of texture).
+    let (pbx, pby) = (n.x + bl, n.y + bt);
+    let (pbw, pbh) = (n.w - bl - br, n.h - bt - bb);
+    for ch in &mut n.children {
+        if !ch.is_bg {
+            continue;
+        }
+        let Some((iw, ih)) = ch.img.as_ref().and_then(ImgSlot::dims) else {
+            continue;
+        };
+        let (iw, ih) = (iw as f32, ih as f32);
+        // drawn tile size per `background-size` — % resolves against the
+        // padding box; an `auto` axis keeps the intrinsic size or, next to
+        // an explicit axis, the intrinsic aspect ratio
+        let (tw, th) = match ch.bx.bg_size {
+            BgSize::Auto => (iw, ih),
+            BgSize::Cover => {
+                let s = (pbw / iw.max(1.0)).max(pbh / ih.max(1.0));
+                (iw * s, ih * s)
+            }
+            BgSize::Contain => {
+                let s = (pbw / iw.max(1.0)).min(pbh / ih.max(1.0));
+                (iw * s, ih * s)
+            }
+            BgSize::Wh(wopt, hopt) => match (wopt, hopt) {
+                (None, None) => (iw, ih),
+                (Some(l), None) => {
+                    let bw = resolve_len(l, pbw);
+                    (bw, bw * ih / iw.max(1.0))
+                }
+                (None, Some(l)) => {
+                    let bh = resolve_len(l, pbh);
+                    (bh * iw / ih.max(1.0), bh)
+                }
+                (Some(lw), Some(lh)) => (resolve_len(lw, pbw), resolve_len(lh, pbh)),
+            },
+        };
+        // position per `background-position`: % = (padding box − tile) × p
+        // (0% flush left/top, 100% flush right/bottom); lengths offset from
+        // the padding-box edge
+        let ox = match ch.bx.bg_pos[0] {
+            BgPos::Pct(p) => (pbw - tw) * p / 100.0,
+            BgPos::Px(v) => v,
+        };
+        let oy = match ch.bx.bg_pos[1] {
+            BgPos::Pct(p) => (pbh - th) * p / 100.0,
+            BgPos::Px(v) => v,
+        };
+        ch.x = pbx + ox;
+        ch.y = pby + oy;
+        ch.w = tw;
+        ch.h = th;
+        // a DECLARED repeat records the tiling region (`collect_paint`
+        // emits one entry per tile over it); undeclared / no-repeat stays
+        // a single draw (see the BgRepeat doc for the initial-value
+        // shortcut)
+        ch.bg_tile_region = ch
+            .bx
+            .bg_repeat
+            .filter(|r| *r != BgRepeat::NoRepeat)
+            .map(|_| (pbx, pby, pbx + pbw, pby + pbh));
+    }
     n.run_range = (run0 as u32, runs.len() as u32);
     n.ul_range = (ul0 as u32, uls.len() as u32);
     mt + n.h + mb
@@ -5030,6 +5173,188 @@ line</textarea></div>"#,
         let l = layout_tree(&mut root, 500.0, &m4);
         assert!(l.images.is_empty(), "over-budget bg never decodes/draws");
         assert_eq!(root.children[0].children[0].w, 0.0, "slot de-sized");
+    }
+
+    // ---- background-size / background-position / background-repeat ----
+
+    /// Blank decoded image for bg-paint tests (the renderer scales whatever
+    /// buffer the slot carries — pixels are irrelevant to geometry).
+    fn blank_img(w: u32, h: u32) -> std::rc::Rc<crate::image::ImageData> {
+        std::rc::Rc::new(crate::image::ImageData {
+            w,
+            h,
+            px: vec![0; (w * h) as usize],
+        })
+    }
+
+    /// Full-width box with one background placeholder whose slot carries an
+    /// image of intrinsic (iw, ih) — `ready` = decoded (paints), else
+    /// probed (geometry only).
+    fn bg_box(css: &str, iw: u32, ih: u32, ready: bool) -> BoxNode {
+        let mut root = boxes_of(&format!(r#"<div style="{css}">x</div>"#), "");
+        let ph = &mut root.children[0].children[0];
+        assert!(ph.is_bg, "placeholder is the first child");
+        ph.img = Some(if ready {
+            ImgSlot::Ready(blank_img(iw, ih))
+        } else {
+            ImgSlot::Probed {
+                src: std::rc::Rc::from("t.png"),
+                w: iw,
+                h: ih,
+            }
+        });
+        root
+    }
+
+    #[test]
+    fn background_size_percent_and_explicit_scale_placeholder() {
+        // `50%` = half the padding-box width; the missing height follows
+        // the intrinsic aspect ratio (20×10 → 100×50 in a 200px box)
+        let mut root = bg_box(
+            "width:200px;min-height:100px;background-image:url(t.png);\
+             background-size:50%;background-repeat:no-repeat",
+            20,
+            10,
+            false,
+        );
+        layout_tree(&mut root, 500.0, &m4);
+        let bg = &root.children[0].children[0];
+        assert_eq!((bg.w, bg.h), (100.0, 50.0), "50% width, aspect height");
+        assert_eq!((bg.x, bg.y), (0.0, 0.0), "0% 0% default position");
+        assert_eq!(bg.bg_tile_region, None, "no-repeat records no region");
+        // explicit two-value pair sets both axes (px lengths)
+        let mut root = bg_box(
+            "width:200px;min-height:100px;background-image:url(t.png);\
+             background-size:60px 30px;background-repeat:no-repeat",
+            20,
+            10,
+            false,
+        );
+        layout_tree(&mut root, 500.0, &m4);
+        let bg = &root.children[0].children[0];
+        assert_eq!((bg.w, bg.h), (60.0, 30.0), "explicit width height");
+    }
+
+    #[test]
+    fn background_cover_contain_fit_box_preserving_aspect() {
+        // box 200×100, intrinsic 40×40: cover scales to max(200/40, 100/40)
+        // = 5 → 200×200 (cropped); contain to min = 2.5 → 100×100 (fits)
+        for (val, want) in [("cover", (200.0, 200.0)), ("contain", (100.0, 100.0))] {
+            let mut root = bg_box(
+                &format!(
+                    "width:200px;min-height:100px;background-image:url(t.png);\
+                     background-size:{val};background-repeat:no-repeat"
+                ),
+                40,
+                40,
+                false,
+            );
+            layout_tree(&mut root, 500.0, &m4);
+            let bg = &root.children[0].children[0];
+            assert_eq!((bg.w, bg.h), want, "{} keeps aspect", val);
+        }
+    }
+
+    #[test]
+    fn background_position_percent_keywords_lengths() {
+        // box 100×50, intrinsic 10×10
+        let geom = |pos: &str| {
+            let mut root = bg_box(
+                &format!(
+                    "width:100px;min-height:50px;background-image:url(t.png);\
+                     background-position:{pos};background-repeat:no-repeat"
+                ),
+                10,
+                10,
+                false,
+            );
+            layout_tree(&mut root, 500.0, &m4);
+            let bg = &root.children[0].children[0];
+            (bg.x, bg.y)
+        };
+        // 100% 100%: (box − image) × 1 → flush bottom-right
+        assert_eq!(geom("100% 100%"), (90.0, 40.0));
+        // `center` = 50% 50% → the (100−10)/2 = 45, (50−10)/2 = 20 midpoint
+        assert_eq!(geom("center"), (45.0, 20.0));
+        // lengths offset from the padding-box edge verbatim
+        assert_eq!(geom("10px 5px"), (10.0, 5.0));
+    }
+
+    #[test]
+    fn background_repeat_declared_tiles_paint_entries() {
+        // box 50×30, 10×10 tiles: repeat = 5×3 entries over the padding box
+        for (rep, want) in [("repeat", 15), ("repeat-x", 5), ("repeat-y", 3), ("no-repeat", 1)] {
+            let mut root = bg_box(
+                &format!(
+                    "width:50px;min-height:30px;background-image:url(t.png);\
+                     background-repeat:{rep}"
+                ),
+                10,
+                10,
+                true,
+            );
+            let l = layout_tree(&mut root, 500.0, &m4);
+            assert_eq!(l.images.len(), want, "{rep} tile count");
+            assert_eq!(
+                (l.images[0].0, l.images[0].1, l.images[0].2, l.images[0].3),
+                (0.0, 0.0, 10.0, 10.0),
+                "{rep} first tile at the 0% 0% origin"
+            );
+        }
+        // the tiling region rides the laid-out placeholder for repaints
+        let mut root = bg_box(
+            "width:50px;min-height:30px;background-image:url(t.png);background-repeat:repeat",
+            10,
+            10,
+            true,
+        );
+        layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(
+            root.children[0].children[0].bg_tile_region,
+            Some((0.0, 0.0, 50.0, 30.0)),
+            "region = the used padding box"
+        );
+    }
+
+    #[test]
+    fn background_shorthand_geometry_reaches_layout() {
+        // `center/cover` through the shorthand: box 100×50, intrinsic 40×10
+        // → cover scale max(2.5, 5) = 5 → 200×50, centered → x = −50
+        let mut root = bg_box(
+            "width:100px;min-height:50px;background:url(t.png) center/cover no-repeat",
+            40,
+            10,
+            true,
+        );
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let bg = &root.children[0].children[0];
+        assert_eq!((bg.w, bg.h), (200.0, 50.0), "shorthand cover");
+        assert_eq!((bg.x, bg.y), (-50.0, 0.0), "shorthand center position");
+        assert_eq!(l.images.len(), 1, "shorthand no-repeat draws once");
+    }
+
+    #[test]
+    fn background_undeclared_geometry_keeps_today_geometry() {
+        // regression guard: `background-image` alone (none of the new
+        // properties declared) keeps the historical geometry EXACTLY —
+        // padding-box origin (border-box inset by the border widths), the
+        // padding INSIDE it, intrinsic size, ONE draw entry, no tiling
+        let mut root = bg_box(
+            "padding:10px;border:2px solid #000;background-image:url(t.png)",
+            2,
+            1,
+            true,
+        );
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let bg = &root.children[0].children[0];
+        assert_eq!((bg.x, bg.y), (2.0, 2.0), "padding-box top-left");
+        assert_eq!((bg.w, bg.h), (2.0, 1.0), "intrinsic size");
+        assert_eq!(bg.bg_tile_region, None, "undeclared repeat never tiles");
+        assert_eq!(l.images.len(), 1, "drawn exactly once");
+        assert_eq!(
+            (l.images[0].0, l.images[0].1, l.images[0].2, l.images[0].3),
+            (2.0, 2.0, 2.0, 1.0)
+        );
     }
 
     // ---- table percentage widths / presentational attributes ----
