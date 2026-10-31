@@ -560,6 +560,14 @@ committed): ES2015+ depth (promises/microtasks, classes), incremental re-layout 
 mutation. Pixel-parity on heavyweight JS applications (google.com-class) explicitly NOT
 a near-term target: those need a Chrome-scale API surface + JIT; recorded honestly here
 so the goalposts don't drift.
+**User decision 2026-10-31: selectable script runtime.** Option A = the pure-Rust
+built-in interpreter (default, the engine completed in steps); Option B = a mature
+pure-Rust engine core compiled in behind a cargo feature flag (opt-in, ~+20-40 MB
+per page, for scripts A cannot run yet). Both sit behind one `ScriptRuntime` trait
+sharing the same DOM natives in `script.rs`; a settings page in the browser UI
+persists the choice (`mazda.conf` alongside the disk cache), default A. Sequenced
+after the language-depth + event-loop waves land (same files). Per-app selection,
+not per-tab (per-tab would double engine RAM — shortcut).
 
 ## Environment notes
 
