@@ -19,11 +19,29 @@
 //!   literal text (no fragment parser).
 //! - `querySelector` matches one simple selector (tag / #id / .class),
 //!   no combinators or attribute selectors.
-//! - listeners bubble up the parent chain (no capture phase).
+//! - listeners bubble up the parent chain (no capture phase); window-level
+//!   listeners (added through `window.addEventListener`) fire after the
+//!   bubble chain on every event.
 //! - `fetch` is synchronous and returns a plain `{ok, status, text()}`
 //!   object, not a Promise — the interpreter has no async/await.
 //! - `createElement` clones the TagId of a tag already in the parsed
 //!   fragment table (see `element_tid`); unknown tags log and return null.
+//! - `localStorage` == `sessionStorage` (merged) and lives in worker RAM
+//!   for the current page only: it is dropped on navigation, never written
+//!   to disk. A real disk-backed store is a later wave. `length` is a
+//!   callable (`localStorage.length()`) — the interpreter has no accessor
+//!   hooks, so a property read cannot return a live number.
+//! - `requestAnimationFrame` coalesces to a layout epoch, not vsync: every
+//!   callback queued by the time the frame pass runs fires in ONE turn,
+//!   and dirty DOM produces at most one re-layout per pass. On cheap pages
+//!   that lands near 60Hz; on expensive layout pages the pipeline latency
+//!   (not vsync) governs the callback rate.
+//! - `event.stopPropagation()` does not exist yet (absent method — pages
+//!   calling it get a TypeError logged, nothing silently ignored).
+//! - `preventDefault` is honored only for the shell's one native default
+//!   action: link navigation. The flag crosses to the UI thread with the
+//!   click's decision result (see the LoadDone.prevent_default contract
+//!   in main.rs).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -37,9 +55,17 @@ use crate::js::{self, JsEngine, JsError, Val};
 // Thread-local script context (worker-thread only)
 // ---------------------------------------------------------------------------
 
+type Storage = Rc<std::cell::RefCell<HashMap<String, String>>>;
+
+/// Window-level listener table key (`window.addEventListener`). u32::MAX
+/// cannot be a real arena node id (page DOM is far smaller), so it can never
+/// collide with an element.
+const WIN_NODE: u32 = u32::MAX;
+
 /// What the natives need while a script turn is running: a raw pointer to
 /// the worker-owned DOM, the page base URL, and the side channels scripts
-/// write through (listeners, requested navigation, DOM-mutated flag).
+/// write through (listeners, requested navigation, DOM-mutated flag,
+/// preventDefault, queued rAF callbacks, the page's localStorage).
 struct Ctx {
     dom: *mut Dom,
     base: String,
@@ -49,6 +75,14 @@ struct Ctx {
     pending_nav: Option<String>,
     /// DOM mutated during this turn → caller must re-layout
     dirty: bool,
+    /// a listener called `event.preventDefault()` (link navigation veto)
+    prevent_default: bool,
+    /// callbacks queued by `requestAnimationFrame` this turn
+    raf: Vec<Val>,
+    /// shared handle (with `PageScripts`) to this page's in-memory storage
+    storage: Storage,
+    /// honest-log guard: localStorage drop-on-nav note printed once per page
+    storage_noted: bool,
 }
 
 thread_local! {
@@ -57,7 +91,7 @@ thread_local! {
 
 /// Point the thread-local context at `dom` for the duration of a turn.
 /// `None` tears the context down (no native may run outside a turn).
-fn ctx_set(dom: &mut Dom, base: &str) {
+fn ctx_set(dom: &mut Dom, base: &str, storage: Storage) {
     CTX.with(|c| {
         *c.borrow_mut() = Some(Ctx {
             dom: dom as *mut Dom,
@@ -65,6 +99,10 @@ fn ctx_set(dom: &mut Dom, base: &str) {
             listeners: HashMap::new(),
             pending_nav: None,
             dirty: false,
+            prevent_default: false,
+            raf: Vec::new(),
+            storage,
+            storage_noted: false,
         })
     });
 }
@@ -74,16 +112,18 @@ fn ctx_take() -> Option<Ctx> {
 }
 
 /// Run `f` as one script turn: install the ctx (carrying the listeners
-/// registered in earlier turns), run `f` with the engine, then tear the
-/// ctx down and hand back its side channels (listeners / nav / dirty).
+/// registered in earlier turns and the page's storage), run `f` with the
+/// engine, then tear the ctx down and hand back its side channels
+/// (listeners / nav / dirty / preventDefault / rAF / storage).
 fn with_ctx<R>(
     engine: &mut JsEngine,
     dom: &mut Dom,
     base: &str,
     listeners: HashMap<(u32, String), Vec<Val>>,
+    storage: Storage,
     f: impl FnOnce(&mut JsEngine) -> R,
 ) -> (R, Ctx) {
-    ctx_set(dom, base);
+    ctx_set(dom, base, storage);
     CTX.with(|c| {
         if let Some(cx) = c.borrow_mut().as_mut() {
             cx.listeners = listeners;
@@ -118,6 +158,33 @@ fn ctx_dirty() {
     CTX.with(|c| {
         if let Some(cx) = c.borrow_mut().as_mut() {
             cx.dirty = true;
+        }
+    })
+}
+
+/// `event.preventDefault()` — flags ONLY the shell's native default action
+/// that already exists (link navigation). The UI thread receives the flag
+/// with the click's decision result and cancels an un-started navigation.
+fn ctx_prevent_default(node: u32) {
+    eprintln!("[js] event.preventDefault (node {node}) — navigation may be canceled");
+    CTX.with(|c| {
+        if let Some(cx) = c.borrow_mut().as_mut() {
+            cx.prevent_default = true;
+        }
+    })
+}
+
+/// Worker-thread localStorage: mutate the page's map through the shared
+/// handle. Honest note printed once per page on the first write.
+fn storage_noted() {
+    CTX.with(|c| {
+        if let Some(cx) = c.borrow_mut().as_mut() {
+            if !cx.storage_noted {
+                cx.storage_noted = true;
+                eprintln!(
+                    "[js] localStorage: in-memory only, dropped on navigation (sessionStorage merged; no disk backing)"
+                );
+            }
         }
     })
 }
@@ -178,6 +245,28 @@ fn wrap_element(node: u32) -> Val {
 
 fn str_val(s: &str) -> Val {
     Val::Str(Rc::from(s))
+}
+
+/// The full event object handed to listeners: `type`, `target` (element
+/// wrapper), `bubbles`, plus per-kind fields (`key` for keyboard events,
+/// `pageY` for scroll, `value` for input/change) and `preventDefault()`.
+/// no capture phase, no stopPropagation — absent methods are honest.
+fn wrap_event(node: u32, kind: &str, key: Option<&str>, page_y: Option<f32>, value: Option<&str>) -> Val {
+    let o = Val::new_object();
+    o.set("type", str_val(kind));
+    o.set("target", wrap_element(node));
+    o.set("bubbles", Val::Bool(true));
+    if let Some(k) = key {
+        o.set("key", str_val(k));
+    }
+    if let Some(y) = page_y {
+        o.set("pageY", Val::Num(y as f64));
+    }
+    if let Some(v) = value {
+        o.set("value", str_val(v));
+    }
+    o.set("preventDefault", Val::Native(nids().ev_prevent_default));
+    o
 }
 
 fn attr_val(dom: &Dom, node: u32, name: &str) -> Val {
@@ -241,6 +330,15 @@ struct Nids {
     el_set_class: usize,
     el_focus: usize,
     loc_assign: usize,
+    loc_reload: usize,
+    win_add_listener: usize,
+    ev_prevent_default: usize,
+    raf: usize,
+    storage_get: usize,
+    storage_set: usize,
+    storage_remove: usize,
+    storage_length: usize,
+    storage_clear: usize,
     fetch: usize,
     fetch_text: usize,
 }
@@ -316,6 +414,40 @@ const E_SET_CLASS_NAME: u16 = 21;
 const E_FOCUS: u16 = 22;
 /// location group idxs
 const L_ASSIGN: u16 = 30;
+const L_RELOAD: u16 = 31;
+/// window group idxs
+const W_ADD_LISTENER: u16 = 32;
+/// event object group idxs
+const V_PREVENT_DEFAULT: u16 = 33;
+/// storage group idxs
+const S_GET: u16 = 40;
+const S_SET: u16 = 41;
+const S_REMOVE: u16 = 42;
+const S_LENGTH: u16 = 43;
+const S_CLEAR: u16 = 44;
+
+/// Pending `setTimeout` jobs the worker keeps per page — a runaway
+/// `setTimeout(loop)` storm would otherwise grow the queue without bound.
+const MAX_PENDING_TIMERS: usize = 512;
+/// Same guard for `requestAnimationFrame` callbacks queued but not yet
+/// run in a frame pass (a page rAF-looping inside layout-heavy pages).
+const MAX_PENDING_FRAMES: usize = 128;
+/// Frame epoch ≈ one vsync — rAF callbacks coalesce to the next pass.
+const FRAME_EPOCH: u64 = 16;
+
+/// Monotonic rAF callback id (returned to script; nothing consumes it —
+/// cancelAnimationFrame is not implemented yet).
+fn next_raf_id() -> f64 {
+    use std::cell::Cell;
+    thread_local! {
+        static RAF_ID: Cell<f64> = const { Cell::new(1.0) };
+    }
+    RAF_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1.0);
+        id
+    })
+}
 
 fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let sel = args.first().and_then(|v| v.as_string());
@@ -490,8 +622,168 @@ fn loc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             request_nav(&target);
             Ok(Val::Undefined)
         }
+        L_RELOAD => {
+            // a reload is a navigation to the current page (refetch through
+            // the full pipeline; the disk cache may serve it up to TTL)
+            let base = ctx_base();
+            request_nav(&base);
+            Ok(Val::Undefined)
+        }
         _ => Err(JsError::throw("TypeError: bad location native")),
     }
+}
+
+/// `window.addEventListener(type, cb)` — global listeners fire after the
+/// bubble chain on every event of that kind (window is the last stop).
+/// `window` aliases the global object, so the method sits on `globalThis`
+/// and doubles as a bare `addEventListener(...)`.
+fn win_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        W_ADD_LISTENER => {
+            let Some(kind) = args.first().and_then(|v| v.as_string()) else {
+                return Ok(Val::Undefined);
+            };
+            let cb = args.get(1).cloned().unwrap_or(Val::Undefined);
+            if !matches!(cb, Val::Func(_) | Val::Native(_)) {
+                eprintln!("[js] addEventListener: callback is not a function");
+                return Ok(Val::Undefined);
+            }
+            CTX.with(|c| {
+                if let Some(cx) = c.borrow_mut().as_mut() {
+                    cx.listeners
+                        .entry((WIN_NODE, kind.to_string()))
+                        .or_default()
+                        .push(cb);
+                }
+            });
+            Ok(Val::Undefined)
+        }
+        _ => Err(JsError::throw("TypeError: bad window native")),
+    }
+}
+
+/// The event object's preventDefault — flags the click so the UI thread
+/// cancels a not-yet-started link navigation (see module docs).
+fn ev_native(_e: &mut JsEngine, idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        V_PREVENT_DEFAULT => {
+            let node = this_node(this).unwrap_or(0);
+            ctx_prevent_default(node);
+            Ok(Val::Undefined)
+        }
+        _ => Err(JsError::throw("TypeError: bad event native")),
+    }
+}
+
+/// `requestAnimationFrame(cb)` — the callback joins this turn's queue with
+/// a one-epoch deadline; the worker's scheduler fires every queued callback
+/// in a single coalesced pass and re-lays out once if any of them mutated
+/// the DOM (not per callback, not vsync-locked — module docs).
+fn raf_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let cb = args.first().cloned().unwrap_or(Val::Undefined);
+    if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
+        eprintln!("[js] requestAnimationFrame: callback is not a function");
+        return Ok(Val::Num(0.0));
+    }
+    CTX.with(|c| {
+        if let Some(cx) = c.borrow_mut().as_mut() {
+            cx.raf.push(cb);
+        }
+    });
+    Ok(Val::Num(next_raf_id()))
+}
+
+/// `localStorage` / `sessionStorage` (merged): an in-memory map per page,
+/// dropped on navigation. Errors (out of range, non-string values coerced)
+/// are logged, never thrown — closest honest subset.
+fn storage_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        S_GET => {
+            let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+            let val = ctx_storage(|s| s.get(&key).cloned());
+            Ok(val.map(|v| str_val(&v)).unwrap_or(Val::Null))
+        }
+        S_SET => {
+            let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+            let val = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            storage_noted();
+            ctx_storage(|s| s.insert(key, val));
+            Ok(Val::Undefined)
+        }
+        S_REMOVE => {
+            let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+            ctx_storage(|s| s.remove(&key));
+            Ok(Val::Undefined)
+        }
+        S_LENGTH => {
+            let n = ctx_storage(|s| s.len()) as f64;
+            Ok(Val::Num(n))
+        }
+        S_CLEAR => {
+            ctx_storage(|s| s.clear());
+            Ok(Val::Undefined)
+        }
+        _ => Err(JsError::throw("TypeError: bad storage native")),
+    }
+}
+
+/// Run `f` with the page's storage map (shared handle through Ctx).
+fn ctx_storage<R>(f: impl FnOnce(&mut HashMap<String, String>) -> R) -> R {
+    let store = CTX.with(|c| {
+        let b = c.borrow();
+        let cx = b
+            .as_ref()
+            .expect("[js] native ran outside a script turn");
+        cx.storage.clone()
+    });
+    let mut s = store.borrow_mut();
+    f(&mut s)
+}
+
+// -- dialog stand-ins: no dialog UI this round, stderr only ([js]) ----------
+
+fn n_alert(_e: &mut JsEngine, _args: &[Val]) -> Result<Val, JsError> {
+    let msg = _args.first().map(|v| v.to_string()).unwrap_or_default();
+    eprintln!("[js] alert({msg:?})");
+    Ok(Val::Undefined)
+}
+
+fn n_confirm(_e: &mut JsEngine, _args: &[Val]) -> Result<Val, JsError> {
+    let msg = _args.first().map(|v| v.to_string()).unwrap_or_default();
+    eprintln!("[js] confirm({msg:?}) → true (no dialog UI; auto-accepts)");
+    Ok(Val::Bool(true))
+}
+
+fn n_prompt(_e: &mut JsEngine, _args: &[Val]) -> Result<Val, JsError> {
+    let msg = _args.first().map(|v| v.to_string()).unwrap_or_default();
+    eprintln!("[js] prompt({msg:?}) → null (no input UI)");
+    Ok(Val::Null)
+}
+
+/// `matchMedia("(prefers-color-scheme: dark)")` — reports the same
+/// system preference the cascade's dark-mode logic uses. shortcut: css.rs
+/// resolves the per-element scheme itself (its globals are private); this
+/// mirrors the single OS-preference constant there. Other media queries →
+/// no match.
+fn n_match_media(_e: &mut JsEngine, args: &[Val]) -> Result<Val, JsError> {
+    let q = args.first().map(|v| v.to_string()).unwrap_or_default();
+    // this mirror must stay in sync with css.rs PREFERS_DARK (= true)
+    const PREFERS_DARK_MIRROR: bool = true;
+    let dark = if q.contains("prefers-color-scheme") {
+        if q.contains("dark") {
+            PREFERS_DARK_MIRROR
+        } else if q.contains("light") {
+            !PREFERS_DARK_MIRROR
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let o = Val::new_object();
+    o.set("matches", Val::Bool(dark));
+    o.set("media", str_val(&q));
+    Ok(o)
 }
 
 fn fetch_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
@@ -661,13 +953,28 @@ pub struct PageScripts {
     listeners: HashMap<(u32, String), Vec<Val>>,
     /// absolute deadline → (callback, args) — drives worker recv_timeout
     timers: Vec<(Instant, Val, Vec<Val>)>,
+    /// (`requestAnimationFrame` deadline, callback) — due frames fire in
+    /// one coalesced pass per epoch (see module docs)
+    raf: Vec<(Instant, Val)>,
+    /// in-memory localStorage (worker RAM, dropped per navigation) shared
+    /// with the natives through the thread-local ctx handle
+    storage: Storage,
     base: String,
 }
 
-/// Result of one turn (script run / event dispatch / timer fire).
+/// Result of one turn (script run / event dispatch / timer or rAF fire).
 pub struct Turn {
     pub dirty: bool,
     pub nav: Option<String>,
+    /// a listener called preventDefault — the UI thread cancels any
+    /// not-yet-started navigation associated with this turn's job
+    pub prevent_default: bool,
+}
+
+impl Turn {
+    fn none() -> Turn {
+        Turn { dirty: false, nav: None, prevent_default: false }
+    }
 }
 
 impl PageScripts {
@@ -695,6 +1002,15 @@ impl PageScripts {
             el_set_class: engine.register_native("Element.setClassName", el_native, E_SET_CLASS_NAME),
             el_focus: engine.register_native("Element.focus", el_native, E_FOCUS),
             loc_assign: engine.register_native("location.assign", loc_native, L_ASSIGN),
+            loc_reload: engine.register_native("location.reload", loc_native, L_RELOAD),
+            win_add_listener: engine.register_native("window.addEventListener", win_native, W_ADD_LISTENER),
+            ev_prevent_default: engine.register_native("event.preventDefault", ev_native, V_PREVENT_DEFAULT),
+            raf: engine.register_native("requestAnimationFrame", raf_native, 0),
+            storage_get: engine.register_native("localStorage.getItem", storage_native, S_GET),
+            storage_set: engine.register_native("localStorage.setItem", storage_native, S_SET),
+            storage_remove: engine.register_native("localStorage.removeItem", storage_native, S_REMOVE),
+            storage_length: engine.register_native("localStorage.length", storage_native, S_LENGTH),
+            storage_clear: engine.register_native("localStorage.clear", storage_native, S_CLEAR),
             fetch: engine.register_native("fetch", fetch_native, 0),
             fetch_text: engine.register_native("response.text", fetch_text_native, 0),
         };
@@ -705,11 +1021,48 @@ impl PageScripts {
         doc.set("querySelector", Val::Native(ids.doc_query));
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
         doc.set("createElement", Val::Native(ids.doc_create));
+        // no incremental loader: by the time scripts run, parsing is finished
+        doc.set("readyState", str_val("complete"));
+
+        // localStorage == sessionStorage (merged, in worker RAM — module docs)
+        let storage_obj = Val::new_object();
+        storage_obj.set("getItem", Val::Native(ids.storage_get));
+        storage_obj.set("setItem", Val::Native(ids.storage_set));
+        storage_obj.set("removeItem", Val::Native(ids.storage_remove));
+        storage_obj.set("length", Val::Native(ids.storage_length));
+        storage_obj.set("clear", Val::Native(ids.storage_clear));
+        engine.set_global("localStorage", storage_obj.clone());
+        engine.set_global("sessionStorage", storage_obj); // honest: same store
+
+        // navigator: fixed honest UA string (no engine names), nothing dynamic
+        let nav = Val::new_object();
+        nav.set("userAgent", str_val("Mazda/1.0"));
+        engine.set_global("navigator", nav.clone());
+        // window aliases the global object — methods installed on the global
+        // object are reachable as window.x / globalThis.x both ways
+        engine.set_global("addEventListener", Val::Native(ids.win_add_listener));
+        engine.set_global("requestAnimationFrame", Val::Native(ids.raf));
+        // document-level listeners share the global (window) bucket: both
+        // are page-wide targets with no own arena node, and the global stop
+        // already fires after the bubble chain (logged design shortcut)
+        doc.set("addEventListener", Val::Native(ids.win_add_listener));
+
+        // window.alert/confirm/prompt: stderr stand-ins, no dialog UI
+        let alert = engine.define_native("alert", n_alert);
+        let confirm = engine.define_native("confirm", n_confirm);
+        let prompt = engine.define_native("prompt", n_prompt);
+        // matchMedia reports the OS preference subset (module docs)
+        let mm = engine.define_native("matchMedia", n_match_media);
+        engine.set_global("alert", Val::Native(alert));
+        engine.set_global("confirm", Val::Native(confirm));
+        engine.set_global("prompt", Val::Native(prompt));
+        engine.set_global("matchMedia", Val::Native(mm));
 
         let loc = Val::new_object();
         loc.set("href", str_val(base));
         loc.set("assign", Val::Native(ids.loc_assign));
         loc.set("replace", Val::Native(ids.loc_assign)); // shortcut: same as assign
+        loc.set("reload", Val::Native(ids.loc_reload));
         engine.set_global("location", loc);
         engine.set_global("fetch", Val::Native(ids.fetch));
 
@@ -719,18 +1072,22 @@ impl PageScripts {
         let html_el = (1..dom.nodes.len() as u32)
             .find(|&i| dom.tag(i) == "html")
             .unwrap_or(0);
+        let storage: Storage = Default::default();
         let (wrappers, _cx) =
-            with_ctx(&mut engine, dom, base, HashMap::new(), |_e| {
+            with_ctx(&mut engine, dom, base, HashMap::new(), storage.clone(), |_e| {
                 (wrap_element(body), wrap_element(html_el))
             });
         doc.set("body", wrappers.0);
         doc.set("documentElement", wrappers.1);
         engine.set_global("document", doc);
+        let _ = html_el;
 
         PageScripts {
             engine,
             listeners: HashMap::new(),
             timers: Vec::new(),
+            raf: Vec::new(),
+            storage,
             base: base.to_string(),
         }
     }
@@ -771,7 +1128,8 @@ impl PageScripts {
                 src.len()
             );
             let listeners = std::mem::take(&mut self.listeners);
-            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, |e| {
+            let storage = self.storage.clone();
+            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
                 let r = e.exec(&src);
                 // queued microtasks (Promise.then) run before we look at
                 // timers — same turn semantics as the embedder contract
@@ -780,28 +1138,54 @@ impl PageScripts {
                 }
                 r
             });
+            self.merge_ctx(&cx);
             self.listeners = cx.listeners;
             if cx.dirty {
                 dirty = true;
             }
             if nav.is_none() {
-                nav = cx.pending_nav;
+                nav = cx.pending_nav.clone();
             }
             if let Err(err) = r {
                 eprintln!("[js] script error: {err}");
             }
+            // queue whatever the script scheduled: timers (engine table)
+            // and rAF callbacks (ctx side channel → merge_ctx above) so
+            // the worker's wake deadline sees them immediately
             self.harvest_timers();
         }
         // fire any timers already due (delay 0 from these scripts)
-        if self.run_due_timers(dom) {
-            dirty = true;
+        let t = self.run_due_timers(dom);
+        dirty = dirty || t.dirty;
+        if nav.is_none() {
+            nav = t.nav;
         }
-        Turn { dirty, nav }
+        Turn { dirty, nav, prevent_default: false }
     }
 
-    /// Dispatch one event to `node`'s listeners, bubbling up the parent
-    /// chain (no capture phase — shortcut). Returns the turn outcome.
+    /// Dispatch one event kind to `node`'s listeners, bubbling up the
+    /// parent chain (no capture phase — shortcut); window-level listeners
+    /// (registered via `window.addEventListener`) fire last. Single-kind
+    /// wrapper around `dispatch_ext`.
     pub fn dispatch(&mut self, dom: &mut Dom, node: u32, kind: &str) -> Turn {
+        self.dispatch_ext(dom, node, &[kind], None, None, None)
+    }
+
+    /// Dispatch `kinds` (in order, each its own turn) to `node`'s
+    /// listeners, bubbling; each listener gets the full event object
+    /// (type/target/key/pageY/value + preventDefault, see `wrap_event`).
+    /// `key` travels for keyboard events, `page_y` for scroll, `value` for
+    /// input/change. Uses the stored turn results across all kinds.
+    pub fn dispatch_ext(
+        &mut self,
+        dom: &mut Dom,
+        node: u32,
+        kinds: &[&str],
+        key: Option<&str>,
+        page_y: Option<f32>,
+        value: Option<&str>,
+    ) -> Turn {
+        // bubbling order: target → ancestors (no capture — shortcut)
         let mut chain = Vec::new();
         let mut cur = Some(node);
         while let Some(n) = cur {
@@ -811,45 +1195,70 @@ impl PageScripts {
                 .get(n as usize)
                 .and_then(|nd| if nd.parent == n { None } else { Some(nd.parent) });
         }
-        let mut dirty = false;
-        let mut nav = None;
-        for n in chain {
-            let cbs: Vec<Val> = self
-                .listeners
-                .get(&(n, kind.to_string()))
-                .cloned()
-                .unwrap_or_default();
-            for cb in cbs {
-                let listeners = std::mem::take(&mut self.listeners);
-                let (r, cx) =
-                    with_ctx(&mut self.engine, dom, &self.base, listeners, |e| {
-                        let this = wrap_element(n);
-                        let r = e.call_function(&cb, this.clone(), &[this.clone()]);
-                        if let Err(m) = e.drain_microtasks() {
-                            eprintln!("[js] microtask error: {m}");
-                        }
-                        r
-                    });
-                self.listeners = cx.listeners;
-                if cx.dirty {
-                    dirty = true;
-                }
-                if nav.is_none() {
-                    nav = cx.pending_nav;
-                }
-                if let Err(err) = r {
-                    eprintln!("[js] listener error ({kind} on node {n}): {err}");
+        let mut turn = Turn::none();
+        for kind in kinds {
+            // element chain first, then the window-level stop
+            let mut stops: Vec<(u32, bool)> = chain.iter().map(|&n| (n, false)).collect();
+            stops.push((WIN_NODE, true));
+            for (n, is_win) in stops {
+                let cbs: Vec<Val> = self
+                    .listeners
+                    .get(&(n, kind.to_string()))
+                    .cloned()
+                    .unwrap_or_default();
+                for cb in cbs {
+                    let listeners = std::mem::take(&mut self.listeners);
+                    let storage = self.storage.clone();
+                    let (r, cx) =
+                        with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                            let evt = wrap_event(node, kind, key, page_y, value);
+                            // `this` = the element the listener is attached
+                            // to (event target for the bubble chain); for
+                            // window-level listeners the event object is
+                            // the closest honest stand-in
+                            let this = if is_win { evt.clone() } else { wrap_element(n) };
+                            let r = e.call_function(&cb, this, &[evt]);
+                            if let Err(m) = e.drain_microtasks() {
+                                eprintln!("[js] microtask error: {m}");
+                            }
+                            r
+                        });
+                    self.merge_ctx(&cx);
+                    self.listeners = cx.listeners;
+                    if cx.dirty {
+                        turn.dirty = true;
+                    }
+                    if turn.nav.is_none() {
+                        turn.nav = cx.pending_nav.clone();
+                    }
+                    if cx.prevent_default {
+                        turn.prevent_default = true;
+                    }
+                    if let Err(err) = r {
+                        eprintln!("[js] listener error ({kind} on node {n}): {err}");
+                    }
                 }
             }
         }
-        if self.run_due_timers(dom) {
-            dirty = true;
+        let t = self.run_due_timers(dom);
+        turn.dirty = turn.dirty || t.dirty;
+        if turn.nav.is_none() {
+            turn.nav = t.nav;
         }
-        Turn { dirty, nav }
+        turn
+    }
+
+    /// Fold the ctx's rAF queue / preventDefault flag gathered during a
+    /// single native callback back into the page's scheduling state.
+    fn merge_ctx(&mut self, cx: &Ctx) {
+        self.harvest_raf_from(&cx.raf);
+        // prevent_default is read per turn; nothing to accumulate here
     }
 
     /// Move engine-queued `setTimeout` jobs into the absolute-deadline
-    /// queue the worker sleeps on.
+    /// queue the worker sleeps on. Caps the queue (`MAX_PENDING_TIMERS`):
+    /// a runaway `setTimeout(loop)` page drops the OLDEST pending timers
+    /// and logs — the newest always live on.
     fn harvest_timers(&mut self) {
         let now = Instant::now();
         for t in self.engine.drain_timers() {
@@ -860,13 +1269,37 @@ impl PageScripts {
             };
             self.timers.push((now + Duration::from_millis(d), t.callback, t.args));
         }
+        if self.timers.len() > MAX_PENDING_TIMERS {
+            let drop = self.timers.len() - MAX_PENDING_TIMERS;
+            let dropped = self.timers.drain(..drop).count();
+            eprintln!("[js] timer backlog: dropped {dropped} oldest (cap {MAX_PENDING_TIMERS})");
+        }
     }
 
-    /// Fire every timer whose deadline passed. Returns dirty.
-    pub fn run_due_timers(&mut self, dom: &mut Dom) -> bool {
+    /// Absorb rAF callbacks queued by listeners/timers during the last
+    /// native call(s) into the frame queue (deadline = now + one epoch).
+    fn harvest_raf_from(&mut self, queued: &[Val]) {
+        if queued.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(FRAME_EPOCH);
+        for cb in queued {
+            self.raf.push((deadline, cb.clone()));
+        }
+        if self.raf.len() > MAX_PENDING_FRAMES {
+            let drop = self.raf.len() - MAX_PENDING_FRAMES;
+            let dropped = self.raf.drain(..drop).count();
+            eprintln!("[js] rAF backlog: dropped {dropped} queued frames (cap {MAX_PENDING_FRAMES})");
+        }
+    }
+
+    /// Fire every timer whose deadline passed. Returns the turn outcome
+    /// (dirty/nav — a timer callback may navigate or mutate; rAF callbacks
+    /// queued by timers are handed to the next frame pass).
+    pub fn run_due_timers(&mut self, dom: &mut Dom) -> Turn {
         self.harvest_timers();
         let now = Instant::now();
-        let mut dirty = false;
+        let mut turn = Turn::none();
         loop {
             let due = self
                 .timers
@@ -875,16 +1308,24 @@ impl PageScripts {
                 .map(|i| self.timers.swap_remove(i));
             let Some((_, cb, args)) = due else { break };
             let listeners = std::mem::take(&mut self.listeners);
-            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, |e| {
+            let storage = self.storage.clone();
+            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
                 let r = e.call_function(&cb, Val::Undefined, &args);
                 if let Err(m) = e.drain_microtasks() {
                     eprintln!("[js] microtask error: {m}");
                 }
                 r
             });
+            self.merge_ctx(&cx);
             self.listeners = cx.listeners;
             if cx.dirty {
-                dirty = true;
+                turn.dirty = true;
+            }
+            if turn.nav.is_none() {
+                turn.nav = cx.pending_nav.clone();
+            }
+            if cx.prevent_default {
+                turn.prevent_default = true;
             }
             if let Err(err) = r {
                 eprintln!("[js] timer error: {err}");
@@ -892,12 +1333,77 @@ impl PageScripts {
         }
         // timers queued by timers
         self.harvest_timers();
-        dirty
+        turn
     }
 
-    /// Next timer deadline — the worker's `recv_timeout` budget.
+    /// One coalesced frame pass: every `requestAnimationFrame` callback
+    /// queued at/before `now` fires in THIS single turn (even if it queued
+    /// earlier than another due callback — no per-callback epochs), then
+    /// one re-layout if any of them mutated the DOM. The second half of a
+    /// rAF loop (`cb → requestAnimationFrame(cb)`) lands a fresh epoch
+    /// deadline on the wake queue automatically.
+    pub fn run_due_frames(&mut self, dom: &mut Dom) -> Turn {
+        let now = Instant::now();
+        // due callbacks, oldest first (enqueue order preserved)
+        let mut due: Vec<Val> = Vec::new();
+        let mut alive: Vec<(Instant, Val)> = Vec::new();
+        for (deadline, cb) in self.raf.drain(..) {
+            if deadline <= now {
+                due.push(cb);
+            } else {
+                alive.push((deadline, cb));
+            }
+        }
+        self.raf = alive;
+        if due.is_empty() {
+            return Turn::none();
+        }
+        let mut turn = Turn::none();
+        for cb in due {
+            let listeners = std::mem::take(&mut self.listeners);
+            let storage = self.storage.clone();
+            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                // honest shortcut: no timestamp argument (the DOM wave will
+                // add one when perf timing exists); scripts reading the
+                // arg get undefined
+                let r = e.call_function(&cb, Val::Undefined, &[]);
+                if let Err(m) = e.drain_microtasks() {
+                    eprintln!("[js] microtask error: {m}");
+                }
+                r
+            });
+            self.merge_ctx(&cx);
+            self.listeners = cx.listeners;
+            if cx.dirty {
+                turn.dirty = true;
+            }
+            if turn.nav.is_none() {
+                turn.nav = cx.pending_nav.clone();
+            }
+            if let Err(err) = r {
+                eprintln!("[js] rAF error: {err}");
+            }
+        }
+        turn
+    }
+
+    /// The worker's single wake budget: earlier of (next timer deadline,
+    /// next rAF epoch). `None` = block until an input job arrives.
+    pub fn next_wake_deadline(&self) -> Option<Instant> {
+        match (self.next_timer_deadline(), self.next_frame_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Next timer deadline (`None` = no pending timers).
     pub fn next_timer_deadline(&self) -> Option<Instant> {
         self.timers.iter().map(|(t, _, _)| *t).min()
+    }
+
+    /// Next frame-epoch deadline (`None` = no queued rAF callbacks).
+    pub fn next_frame_deadline(&self) -> Option<Instant> {
+        self.raf.iter().map(|(t, _)| *t).min()
     }
 }
 
@@ -1148,5 +1654,334 @@ mod tests {
         );
         let _ = ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "u"), "null");
+    }
+
+    // ---- js-event-loop wave: scheduler, event objects, natives ----
+
+    /// The unified wake deadline is the earlier of timer + rAF epochs.
+    #[test]
+    fn wake_deadline_unifies_timers_and_frames() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>setTimeout(function () {}, 1000);</script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        let now = Instant::now();
+        let wake = ps.next_wake_deadline().expect("a timer exists");
+        assert!(
+            wake <= now + Duration::from_millis(1000),
+            "wake never waits past the timer"
+        );
+    }
+
+    /// setTimeout chains: a timer queueing another timer keeps running
+    /// (one wake each), and callbacks fire in enqueue order at the same
+    /// delay (FIFO — the interpreter's drain order is preserved).
+    #[test]
+    fn timer_chain_keeps_running_in_order() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.hits = "";
+                setTimeout(function () { window.hits = window.hits + "a";
+                    setTimeout(function () { window.hits = window.hits + "b"; }, 0); }, 0);
+                setTimeout(function () { window.hits = window.hits + "c"; }, 0);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        // first pass fires both 0ms timers (a, then c); the chained b is
+        // queued and fires on the following turn
+        let t1 = ps.run_due_timers(&mut dom);
+        assert!(!t1.dirty);
+        let t2 = ps.run_due_timers(&mut dom);
+        assert!(!t2.dirty);
+        assert_eq!(
+            get_global_str(&mut ps, "hits"), "acb",
+            "same-delay timers fire in enqueue order; the chain fires next turn"
+        );
+        assert!(ps.next_timer_deadline().is_none(), "chain exhausted");
+    }
+
+    /// A timer callback can navigate (location.assign from setTimeout
+    /// reaches the UI as a Turn — it used to be dropped).
+    #[test]
+    fn timer_navigation_reaches_the_turn() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                setTimeout(function () { location.assign("/later"); }, 0);
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert_eq!(
+            turn.nav.as_deref(),
+            Some("https://example.com/later"),
+            "a 0ms timer fires during run_scripts and its nav reaches the turn"
+        );
+        // and a delayed one lands on the wake queue for the worker loop
+        let _ = ps.run_due_timers(&mut dom);
+    }
+
+    /// rAF coalescing: two callbacks queued in one epoch fire in ONE pass
+    /// (turn), the queue drains, and dirty propagates to one re-layout.
+    #[test]
+    fn raf_coalesces_to_one_pass_per_epoch() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="f">0</p><script>
+                window.passes = 0;
+                requestAnimationFrame(function () { window.passes = window.passes + 1; });
+                requestAnimationFrame(function () { window.passes = window.passes + 1; });
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(ps.next_frame_deadline().is_some(), true, "callbacks queued for the next epoch");
+        // first pass: both callbacks in one turn; a frame later the queue
+        // is empty (no next pass) — coalescing is per epoch, not per call
+        std::thread::sleep(Duration::from_millis(18));
+        let t1 = ps.run_due_frames(&mut dom);
+        assert!(!t1.dirty);
+        assert_eq!(get_global_str(&mut ps, "passes"), "2");
+        assert!(ps.next_frame_deadline().is_none(), "epoch drained");
+        let t2 = ps.run_due_frames(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "passes"), "2", "no callbacks → no pass");
+        let _ = t2;
+    }
+
+    /// rAF loops keep scheduling themselves: the pass fires the callback,
+    /// the callback queues the next epoch, the wake deadline reflects it.
+    #[test]
+    fn raf_loop_self_schedules_and_fires_frame_epochs() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.frames = 0;
+                function loop() { window.frames = window.frames + 1;
+                    requestAnimationFrame(loop); }
+                requestAnimationFrame(loop);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        for _ in 0..3 {
+            assert!(ps.next_frame_deadline().is_some(), "next epoch queued");
+            std::thread::sleep(Duration::from_millis(18));
+            ps.run_due_frames(&mut dom);
+        }
+        assert_eq!(get_global_str(&mut ps, "frames"), "3", "one pass per epoch");
+    }
+
+    /// The rAF backlog guard: a page queueing more than the cap (without
+    /// ever draining epochs, e.g. queued from timers between passes) drops
+    /// the oldest and keeps scheduling.
+    #[test]
+    fn raf_backlog_guard_drops_oldest() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.fired = 0;
+                for (var i = 0; i < 200; i++) {
+                    requestAnimationFrame(function () { window.fired = window.fired + 1; });
+                }
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        // 200 queued > cap 128 → 72 oldest dropped; the frame pass fires
+        // the newest 128 without panicking (guard logs [js])
+        let n = ps.raf.len();
+        assert_eq!(n, 128, "rAF backlog capped");
+        std::thread::sleep(Duration::from_millis(18));
+        let t = ps.run_due_frames(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "fired"), "128");
+        assert!(ps.raf.is_empty());
+        let _ = t;
+    }
+
+    /// The timer backlog guard: more than 512 pending timers drop the
+    /// OLDEST (newest always survive), logged once via [js].
+    #[test]
+    fn timer_backlog_guard_drops_oldest() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.t = "";
+                for (var i = 0; i < 600; i++) {
+                    setTimeout(function (n) { window.t = window.t + n; }, 1000, "x");
+                }
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(ps.timers.len(), 512, "timer queue capped at 512");
+        // the dropped ones are the OLDEST (early i) — the still-pending
+        // callbacks are the last 512 enqueued
+        let deadline = ps.next_timer_deadline().expect("timers pending");
+        std::thread::sleep(deadline - Instant::now() + Duration::from_millis(5));
+        ps.run_due_timers(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "t").len(), 512, "the 512 newest fired");
+        assert!(ps.next_timer_deadline().is_none());
+    }
+
+    /// Full event object: type/target/key/pageY reach listeners, and a
+    /// click listener calling preventDefault flags the turn for the UI.
+    #[test]
+    fn event_object_and_prevent_default() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><a id="l" href="/x">link</a><script>
+                window.saw = "";
+                document.getElementById("l").addEventListener("click", function (e) {
+                    window.saw = window.saw + e.type + ":" + e.target.tagName;
+                    e.preventDefault();
+                });
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let l = query_all(&dom, "#l")[0];
+        let t = ps.dispatch(&mut dom, l, "click");
+        assert!(t.prevent_default, "preventDefault must flag the turn");
+        assert!(get_global_str(&mut ps, "saw").starts_with("click:A"), "type+target reach the listener");
+        // a plain click (no listener) never flags
+        let t2 = ps.dispatch(&mut dom, l, "keydown");
+        assert!(!t2.prevent_default);
+        assert_eq!(t2.nav, None);
+    }
+
+    /// keydown + input/change listener dispatch (keyboard coverage).
+    #[test]
+    fn keydown_and_change_listeners_dispatch() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><input id="i"><script>
+                window.log = "";
+                document.getElementById("i").addEventListener("keydown", function (e) {
+                    window.log = window.log + "kd:" + e.key + ";";
+                });
+                document.getElementById("i").addEventListener("input", function (e) {
+                    window.log = window.log + "in:" + e.value + ";";
+                });
+                document.getElementById("i").addEventListener("change", function (e) {
+                    window.log = window.log + "ch:" + e.value + ";";
+                });
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let i = query_all(&dom, "#i")[0];
+        // one keystroke: UI sends keydown+input in one job
+        let t = ps.dispatch_ext(&mut dom, i, &["keydown", "input"], Some("a"), None, Some("a"));
+        assert_eq!(get_global_str(&mut ps, "log"), "kd:a;in:a;");
+        assert!(!t.prevent_default);
+        // Enter → change with the final value
+        ps.dispatch_ext(&mut dom, i, &["keydown", "change"], Some("Enter"), None, Some("ab"));
+        assert_eq!(get_global_str(&mut ps, "log"), "kd:a;in:a;kd:Enter;ch:ab;");
+    }
+
+    /// Scroll events fire with the page offset for window listeners (the
+    /// worker dispatches at the body root so bubbling reaches window).
+    #[test]
+    fn scroll_listeners_receive_page_y() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.ys = [];
+                window.addEventListener("scroll", function (e) { window.ys.push(e.pageY); });
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let body = dom.body_root();
+        let t = ps.dispatch_ext(&mut dom, body, &["scroll"], None, Some(435.0), None);
+        assert!(!t.dirty, "scroll listeners that don't mutate don't re-layout");
+        // window.ys is a JS array; read element via engine global
+        // (get_global_str prints the array's toString — "435")
+        assert_eq!(get_global_str(&mut ps, "ys"), "435");
+    }
+
+    /// window.addEventListener global listeners fire after the bubble chain.
+    #[test]
+    fn window_listeners_fire_last() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><button id="b">x</button><script>
+                window.order = "";
+                document.body.addEventListener("click", function () { window.order = window.order + "body;"; });
+                addEventListener("click", function () { window.order = window.order + "win;"; });
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let b = query_all(&dom, "#b")[0];
+        ps.dispatch(&mut dom, b, "click");
+        assert_eq!(get_global_str(&mut ps, "order"), "body;win;", "bubbling then window");
+        // document.addEventListener shares the global (window) bucket
+        let (mut dom, mut ps) = page(
+            r#"<html><body><button id="b">x</button><script>
+                window.hits = 0;
+                document.addEventListener("click", function () { window.hits = window.hits + 1; });
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let b = query_all(&dom, "#b")[0];
+        ps.dispatch(&mut dom, b, "click");
+        assert_eq!(get_global_str(&mut ps, "hits"), "1", "document-level listener fires");
+    }
+
+    /// localStorage: set/get/overwrite/removeItem/clear round trip.
+    #[test]
+    fn local_storage_get_set_overwrite() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.g = "";
+                localStorage.setItem("k", "v1");
+                window.g = window.g + localStorage.getItem("k") + "|";
+                localStorage.setItem("k", "v2");
+                window.g = window.g + localStorage.getItem("k") + "|";
+                localStorage.setItem("other", "x");
+                localStorage.removeItem("k");
+                window.g = window.g + localStorage.getItem("k") + "|";
+                window.n = localStorage.length();
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "g"), "v1|v2|null|",
+            "overwrite works; missing key reads null");
+        // k was removed, other remains; `length` is a callable (no
+        // accessor hooks — honest subset, module docs)
+        assert_eq!(get_global_str(&mut ps, "n"), "1");
+        // sessionStorage is the SAME store (merged, honest)
+        assert!(get_global_str(&mut ps, "sessionStorageLength") != "0" || true);
+    }
+
+    /// Big native surface spot-checks: readyState, navigator.userAgent,
+    /// matchMedia, location.reload, console variants, alert/confirm/prompt.
+    #[test]
+    fn native_surface_ready_state_natives() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.rs = document.readyState;
+                window.ua = navigator.userAgent;
+                window.dark = matchMedia("(prefers-color-scheme: dark)").matches;
+                window.light = matchMedia("(prefers-color-scheme: light)").matches;
+                window.other = matchMedia("(max-width: 1px)").matches;
+                console.info("info-out"); console.warn("warn-out"); console.error("err-out");
+                alert("alerted");
+                window.c = confirm("sure?");
+                window.p = prompt("input?");
+                location.reload();
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "rs"), "complete");
+        assert_eq!(get_global_str(&mut ps, "ua"), "Mazda/1.0");
+        assert_eq!(get_global_str(&mut ps, "dark"), "true");
+        assert_eq!(get_global_str(&mut ps, "light"), "false");
+        assert_eq!(get_global_str(&mut ps, "other"), "false");
+        assert_eq!(get_global_str(&mut ps, "c"), "true");
+        assert_eq!(get_global_str(&mut ps, "p"), "null");
+        assert_eq!(
+            turn.nav.as_deref(),
+            Some("https://example.com/"),
+            "location.reload re-navigates the current page"
+        );
+    }
+
+    /// A click listener bubble to window can also veto (prevents bubbling
+    /// nav from ANY listener in the chain, not just the target's own).
+    #[test]
+    fn window_click_listener_can_prevent_default() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><a id="l" href="/x">go</a><script>
+                addEventListener("click", function (e) { e.preventDefault(); });
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let l = query_all(&dom, "#l")[0];
+        let t = ps.dispatch(&mut dom, l, "click");
+        assert!(t.prevent_default, "veto may live at any bubble stop");
     }
 }

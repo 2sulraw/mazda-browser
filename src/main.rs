@@ -113,11 +113,21 @@ struct App {
     vp_size: (usize, usize),
     /// set when the viewport changed; fires a relayout once the size settled
     pending_resize: Option<Instant>,
+    /// link click awaiting the worker's click-listener decision: (job id,
+    /// resolved target). The worker dispatches the page's click listeners;
+    /// if one calls preventDefault, the navigation never starts (decision
+    /// rides `LoadDone.prevent_default` back on the same result).
+    pending_link: Option<(u64, String)>,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
 /// space means URL (https:// prefixed), anything else is a DuckDuckGo search.
+/// data: URLs are passed through untouched (inline documents are never
+/// search queries — they contain commas/spaces that would corrupt it).
 fn address_target(q: &str) -> String {
+    if q.starts_with("data:") {
+        return q.to_string();
+    }
     if q.contains('.') && !q.contains(' ') {
         if q.starts_with("http") {
             q.to_string()
@@ -219,6 +229,7 @@ impl App {
             pending: None,
             vp_size: (pw, ph),
             pending_resize: None,
+            pending_link: None,
         };
         app.dispatch(&url, pw, ph, 0.0);
         app
@@ -262,9 +273,19 @@ impl App {
         self.expect_nav = false;
     }
 
-    /// Queue a form-control event (click/submit/change). The worker mutates
-    /// its DOM, fires listeners, re-lays out and re-emits.
-    fn dispatch_event(&mut self, node: u32, kind: &str, value: Option<String>, pw: usize, ph: usize) {
+    /// Queue a form/page event job (click/submit/change/input/scroll-adjacent).
+    /// The worker mutates its DOM, fires the registered listeners for each
+    /// kind (in order), re-lays out and re-emits. Returns the job id so
+    /// click-decision callers can match the worker's verdict.
+    fn dispatch_event(
+        &mut self,
+        node: u32,
+        kinds: &[&str],
+        value: Option<String>,
+        key: Option<&str>,
+        pw: usize,
+        ph: usize,
+    ) -> u64 {
         let id = self.nav.begin();
         let req = LoadReq::Event {
             id,
@@ -272,14 +293,17 @@ impl App {
             max_w: page_w(pw),
             vh: page_h(ph),
             node,
-            kind: kind.to_string(),
+            kinds: kinds.iter().map(|s| s.to_string()).collect(),
             value,
+            key: key.map(|s| s.to_string()),
+            href: None,
             forms: self.forms.clone(),
         };
         if self.jobs.send(req).is_err() {
-            eprintln!("[nav] loader thread unavailable, {kind} event dropped");
+            eprintln!("[nav] loader thread unavailable, {} event dropped", kinds.join("+"));
         }
         self.expect_nav = false;
+        id
     }
 
     /// Drain finished loads; apply the newest (stale generations are dropped).
@@ -298,6 +322,32 @@ impl App {
                 eprintln!("[js] script navigated to {nav_url}");
                 self.dispatch(&nav_url, pw, ph, 0.0);
                 continue;
+            }
+            // link click awaiting its listener decision: veto (preventDefault)
+            // or proceed (navigate). See `click_decision` (pure, tested).
+            if let Some((pid, url)) = self.pending_link.clone() {
+                if pid == done.id {
+                    match click_decision(&self.pending_link, done.prevent_default) {
+                        LinkDecision::Navigate(target) => {
+                            self.pending_link = None;
+                            eprintln!("[js] click listeners done → navigate {target}");
+                            self.navigate(&target, pw, ph);
+                            continue;
+                        }
+                        LinkDecision::Cancel => {
+                            self.pending_link = None;
+                            eprintln!("[js] preventDefault — link navigation to {url} canceled");
+                            // fall through: the page result still applies
+                            // (a listener may have mutated the DOM)
+                        }
+                        LinkDecision::Ignore => {}
+                    }
+                } else {
+                    // an unrelated result was accepted first (resize,
+                    // another job): the click is stale, drop the decision
+                    eprintln!("[nav] link click superseded by job #{}; not navigating to {url}", done.id);
+                    self.pending_link = None;
+                }
             }
             let Some(mut wire) = done.page else {
                 eprintln!("[nav] load #{} returned no page", done.id);
@@ -368,17 +418,25 @@ impl App {
     }
 
     /// A form control was clicked. Text fields take focus (no worker job
-    /// needed until a key arrives); checkboxes/radios toggle + fire
-    /// listeners on the worker; submit buttons log `[form] submit` and fire
-    /// click listeners. The worker owns the DOM, so toggles/events go there.
+    /// needed until a key arrives); the field that loses focus fires its
+    /// `change` listeners one round trip before the new focus settles.
+    /// checkboxes/radios toggle + fire listeners on the worker; submit
+    /// buttons log `[form] submit` and fire click listeners. The worker
+    /// owns the DOM, so toggles/events go there.
     fn on_form_click(&mut self, fb: layout::FormBox, pw: usize, ph: usize) {
         match fb.kind {
             layout::FormKind::TextInput { .. } => {
-                // focus this field, blur any other (values ride the wire)
+                // blur → change (with the final value) for the field giving
+                // up focus, THEN focus the clicked one (two round trips,
+                // processed in order by the worker)
                 if self.forms.focused != Some(fb.node) {
+                    if let Some(prev) = self.forms.focused.take() {
+                        let val = self.forms.values.get(&prev).cloned();
+                        self.dispatch_event(prev, &["change"], val, None, pw, ph);
+                    }
+                    // focus this field and seed the control's current
+                    // display value so typing starts from what's shown
                     self.forms.focused = Some(fb.node);
-                    // seed the control's current display value so typing
-                    // starts from what's shown
                     let cur = self.page.laid.form_value(fb.node).to_string();
                     self.forms.values.insert(fb.node, cur);
                     self.dispatch_relayout(pw, ph);
@@ -387,7 +445,7 @@ impl App {
             layout::FormKind::Checkbox | layout::FormKind::Radio => {
                 // worker toggles `checked`, dispatches click+change, relays
                 self.forms.focused = None;
-                self.dispatch_event(fb.node, "click", None, pw, ph);
+                self.dispatch_event(fb.node, &["click"], None, None, pw, ph);
             }
             layout::FormKind::Submit => {
                 // shortcut: no form POST — the shell logs name=value (the
@@ -404,13 +462,24 @@ impl App {
                     .cloned()
                     .unwrap_or_else(|| self.page.laid.form_value(fb.node).to_string());
                 eprintln!("[form] submit {name}={val}");
+                // leaving a text field on Enter fires its change listeners
+                if let Some(prev) = self.forms.focused.take() {
+                    if prev != fb.node {
+                        let val = self.forms.values.get(&prev).cloned();
+                        self.dispatch_event(prev, &["change"], val, None, pw, ph);
+                    }
+                }
                 self.forms.focused = None;
-                self.dispatch_event(fb.node, "click", None, pw, ph);
+                self.dispatch_event(fb.node, &["click"], None, None, pw, ph);
             }
             layout::FormKind::Select | layout::FormKind::Generic => {
                 // no popup / non-interactive yet — just blur
-                self.forms.focused = None;
-                self.dispatch_relayout(pw, ph);
+                if let Some(prev) = self.forms.focused.take() {
+                    let val = self.forms.values.get(&prev).cloned();
+                    self.dispatch_event(prev, &["change"], val, None, pw, ph);
+                } else {
+                    self.dispatch_relayout(pw, ph);
+                }
             }
         }
     }
@@ -566,7 +635,8 @@ impl eframe::App for App {
                 let max_scroll = (self.page.laid.height - page_h(ph)).max(0.0);
                 // form typing: route keys to the focused field (the address
                 // bar owns the keyboard while it's focused). Enter submits
-                // (shell logs), Escape blurs.
+                // (shell logs + fires change with the final value), Escape
+                // blurs (change fired).
                 if self.forms.focused.is_some() && !self.address_focused {
                     let field = self.forms.focused.unwrap();
                     let mut actions: Vec<KeyAction> = Vec::new();
@@ -596,18 +666,28 @@ impl eframe::App for App {
                             }
                         }
                     });
+                    // keyboard events dispatched to the worker alongside the
+                    // value application (keydown sees the post-insertion
+                    // value — honest shortcut, a pre-image pass would need a
+                    // second round trip per keystroke)
+                    let mut keydown: Option<String> = None;
                     let mut dirty = false;
+                    let mut typed = false;
+                    let mut change_now: Option<String> = None;
                     for a in actions {
                         match a {
                             KeyAction::Insert(c) => {
                                 self.forms.values.entry(field).or_default().push(c);
                                 dirty = true;
+                                typed = true;
                             }
                             KeyAction::Backspace => {
                                 if let Some(v) = self.forms.values.get_mut(&field) {
                                     v.pop();
                                 }
                                 dirty = true;
+                                typed = true;
+                                keydown = Some("Backspace".into());
                             }
                             KeyAction::Submit => {
                                 let name = self
@@ -617,8 +697,16 @@ impl eframe::App for App {
                                     .unwrap_or_default();
                                 let val = self.forms.values.get(&field).cloned().unwrap_or_default();
                                 eprintln!("[form] submit {name}={val}");
+                                // Enter → change with the final value (and a
+                                // keydown listeners can observe)
+                                keydown = Some("Enter".into());
+                                change_now = Some(val);
                             }
                             KeyAction::Blur => {
+                                // Escape → change + blur (the value stays
+                                // what it was; the field gives up focus)
+                                keydown = Some("Escape".into());
+                                change_now = self.forms.values.get(&field).cloned();
                                 self.forms.focused = None;
                                 dirty = true;
                             }
@@ -627,8 +715,23 @@ impl eframe::App for App {
                     }
                     if dirty {
                         // push the new value to the worker so it re-lays out
-                        // with the updated text (and fires change listeners)
-                        self.dispatch_event(field, "change", self.forms.values.get(&field).cloned(), pw, ph);
+                        // with the updated text, firing listeners: `input`
+                        // per keystroke (real-input-event semantics; the
+                        // per-keystroke job is also what syncs the value),
+                        // `change` on Enter/Escape with the final value
+                        let mut kinds: Vec<&str> = Vec::new();
+                        if keydown.is_some() {
+                            kinds.push("keydown");
+                        }
+                        if typed {
+                            kinds.push("input");
+                        } else if change_now.is_some() {
+                            kinds.push("change");
+                        }
+                        if kinds.is_empty() {
+                            kinds.push("change");
+                        }
+                        self.dispatch_event(field, &kinds, change_now.or_else(|| self.forms.values.get(&field).cloned()), keydown.as_deref(), pw, ph);
                     }
                 }
                 if !ui.ctx().egui_wants_keyboard_input() && !self.address_focused {
@@ -645,6 +748,17 @@ impl eframe::App for App {
                     }
                     if self.scroll != before {
                         self.repaint_page(pw, ph);
+                        // scroll listeners: worker-side coalescing keeps
+                        // only the latest scroll per batch (never drops a
+                        // non-scroll event); cheap because a scroll event
+                        // only re-lays out when a listener mutated the DOM
+                        let req = LoadReq::Scroll {
+                            url: self.page.url.clone(),
+                            y: self.scroll,
+                        };
+                        if self.jobs.send(req).is_err() {
+                            eprintln!("[nav] loader thread unavailable, scroll event dropped");
+                        }
                     }
                 }
 
@@ -694,13 +808,40 @@ impl eframe::App for App {
                                 if let Some(hit) = hit {
                                     let href = hit.link.clone().unwrap();
                                     if let Some(next) = resolve(&self.page.url, &href) {
-                                        eprintln!("[nav] {} → {next}", self.page.url);
-                                        go = Some(next);
+                                        // async preventDefault round trip: the
+                                        // worker dispatches click listeners on
+                                        // the anchor (resolved by href — layout
+                                        // runs carry the href, not a node id)
+                                        // and reports whether one called
+                                        // preventDefault; we navigate only when
+                                        // it comes back clean (`drain_results`)
+                                        let id = self.nav.begin();
+                                        eprintln!("[nav] {} → {next} (click listeners first)", self.page.url);
+                                        let req = LoadReq::Event {
+                                            id,
+                                            url: self.page.url.clone(),
+                                            max_w: page_w(pw),
+                                            vh: page_h(ph),
+                                            node: 0,
+                                            kinds: vec!["click".into()],
+                                            value: None,
+                                            key: None,
+                                            href: Some(href.to_string()),
+                                            forms: self.forms.clone(),
+                                        };
+                                        if self.jobs.send(req).is_err() {
+                                            eprintln!("[nav] loader thread unavailable, link click dropped");
+                                        }
+                                        self.expect_nav = false;
+                                        self.pending_link = Some((id, next));
                                     }
                                 } else {
-                                    // click on empty space blurs any focused field
-                                    if self.forms.focused.take().is_some() {
-                                        self.dispatch_relayout(pw, ph);
+                                    // click on empty space blurs any focused
+                                    // field — firing its change listeners
+                                    // (final value) instead of a bare relayout
+                                    if let Some(prev) = self.forms.focused.take() {
+                                        let val = self.forms.values.get(&prev).cloned();
+                                        self.dispatch_event(prev, &["change"], val, None, pw, ph);
                                     }
                                 }
                             }
@@ -774,10 +915,10 @@ impl eframe::App for App {
             self.title = title.clone();
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
-        // while a load is in flight, poll fast so the result lands promptly;
-        // otherwise the RSS overlay keeps ticking at 1 Hz
-        ui.ctx().request_repaint_after(if self.pending.is_some() {
-            Duration::from_millis(100)
+        // while a load or a link-click decision is in flight, poll fast so
+        // the result lands promptly; otherwise the RSS overlay ticks at 1 Hz
+        ui.ctx().request_repaint_after(if self.pending.is_some() || self.pending_link.is_some() {
+            Duration::from_millis(50)
         } else {
             Duration::from_secs(1)
         });
@@ -849,20 +990,31 @@ enum LoadReq {
         forms: layout::FormState,
     },
     /// a form control was activated (click/submit) or a text field changed:
-    /// the worker mutates its DOM, fires listeners, re-lays out, re-emits
+    /// the worker mutates its DOM, fires each kind's listeners in order,
+    /// re-lays out, re-emits. `href` targets a LINK click (layout runs
+    /// carry the href, not a node id — the worker resolves the first
+    /// matching anchor and bubbles from there).
     Event {
         id: u64,
         url: String,
         max_w: f32,
         vh: f32,
-        /// DOM node id of the control
+        /// DOM node id of the control (0 when `href` targeting is used)
         node: u32,
-        /// "click" | "change" | "submit"
-        kind: String,
+        /// event kinds to dispatch in order, e.g. ["keydown","input"]
+        kinds: Vec<String>,
         /// text value to push into the control (text inputs), else None
         value: Option<String>,
+        /// key name for keyboard events ("Backspace"/"Enter"/"Escape")
+        key: Option<String>,
+        /// raw href of the clicked link (click-decision flow)
+        href: Option<String>,
         forms: layout::FormState,
     },
+    /// the viewport scrolled: dispatches scroll listeners only (no
+    /// generation id — scroll events never gate other results, and the
+    /// worker coalesces a run of them to the newest)
+    Scroll { url: String, y: f32 },
 }
 
 impl LoadReq {
@@ -871,14 +1023,44 @@ impl LoadReq {
             LoadReq::Load { id, .. }
             | LoadReq::Relayout { id, .. }
             | LoadReq::Event { id, .. } => *id,
+            // scroll never gates a result: it doesn't bump the UI's
+            // generation counter and no result is sent for it
+            LoadReq::Scroll { .. } => 0,
         }
     }
     fn url(&self) -> &str {
         match self {
             LoadReq::Load { url, .. }
             | LoadReq::Relayout { url, .. }
-            | LoadReq::Event { url, .. } => url,
+            | LoadReq::Event { url, .. }
+            | LoadReq::Scroll { url, .. } => url,
         }
+    }
+}
+
+/// What the UI does with a link-click listener decision.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkDecision {
+    /// listeners ran clean → start the navigation
+    Navigate(String),
+    /// a listener called preventDefault → cancel (never start)
+    Cancel,
+    /// no decision outstanding (defensive; can't happen while gated)
+    Ignore,
+}
+
+/// Pure verdict for an arriving click decision (testable — no synthetic
+/// input the UI could act on by itself). `pending` = the awaiting decision.
+fn click_decision(pending: &Option<(u64, String)>, prevent_default: bool) -> LinkDecision {
+    match pending {
+        Some((_, url)) => {
+            if prevent_default {
+                LinkDecision::Cancel
+            } else {
+                LinkDecision::Navigate(url.clone())
+            }
+        }
+        None => LinkDecision::Ignore,
     }
 }
 
@@ -923,12 +1105,16 @@ struct RunWire {
 }
 
 /// Result sent back by the worker: the wire page (None = the pipeline panicked),
-/// plus a script-requested navigation and the forms state the worker ended on.
+/// plus a script-requested navigation, the click-decision flag and the
+/// forms state the worker ended on.
 struct LoadDone {
     id: u64,
     page: Option<PageWire>,
     /// script called `location.assign`/`location = ...` — UI should navigate
     nav: Option<String>,
+    /// a click listener called preventDefault → the UI drops the pending
+    /// link navigation this job's id belongs to (never started)
+    prevent_default: bool,
     /// the worker's pipeline panicked (caught; process survives)
     panicked: bool,
 }
@@ -1044,6 +1230,16 @@ struct KeptPage {
 /// aren't `Send`, so each thread loads its own — system fonts come from disk
 /// anyway) and the one kept page. Superseded loads/relayouts still queued are
 /// skipped, but a form Event is never dropped (it carries a user action).
+///
+/// Unified scheduler loop (one explicit wake discipline, no ad-hoc timer
+/// checks): wake = earlier of {next timer deadline, next rAF epoch} ∪
+/// {block until an input job arrives}; on wake: fire due timers → fire due
+/// rAF frames (one coalesced pass) → drain microtasks (done inside every
+/// script turn) → re-layout + push a result if any handler mutated the DOM
+/// → check the job channel again. Jobs are processed one at a time with a
+/// due-JS-work interleave between them, so a flood of input events can
+/// never starve timers, and the channel timeout keeps the thread from
+/// busy-spinning.
 fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>) {
     let mut fonts = Fonts::load();
     let mut kept: Option<KeptPage> = None;
@@ -1054,129 +1250,242 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
     // the UI's generation gate accepts them)
     let mut current_id = 0u64;
     loop {
-        // wake for the next script timer instead of blocking forever
-        let timeout = kept
+        let wake = kept
             .as_ref()
-            .and_then(|k| k.scripts.as_ref().and_then(|s| s.next_timer_deadline()))
-            .map(|d| d.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_secs(3600));
+            .and_then(|k| k.scripts.as_ref().and_then(|s| s.next_wake_deadline()));
+        let timeout = recv_budget(wake, Instant::now());
         let first = match jobs.recv_timeout(timeout) {
             Ok(j) => j,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // fire due timers; a mutation re-lays out and pushes a result
-                let mut push = None;
-                if let Some(kp) = kept.as_mut() {
-                    let KeptPage { dom, scripts, css_text, faces, url, .. } = kp;
-                    if let Some(scripts) = scripts.as_mut() {
-                        let (mw, vh) = last_geom;
-                        if scripts.run_due_timers(dom) {
-                            let (page, form_names) = layout_page(
-                                dom, css_text, faces, url, &mut fonts, mw, vh, &last_forms,
-                            );
-                            let stacks = fonts.stacks.borrow().clone();
-                            let out_faces = collect_out_faces(&fonts);
-                            let wire = page_to_wire(page, stacks, out_faces, form_names);
-                            push = Some(wire);
-                        }
-                    }
-                }
-                if let Some(wire) = push {
-                    eprintln!("[js] timer mutated the page; pushed relayout");
-                    if results
-                        .send(LoadDone { id: current_id, page: Some(wire), nav: None, panicked: false })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+                // JS work came due: timers → rAF frames → microtasks (each
+                // turn drains its own); a mutation pushes the re-layout
+                fire_due(&mut kept, &mut fonts, &mut last_geom, &mut last_forms, current_id, &results);
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // ---- coalesce: drop superseded loads/relayouts, keep every event ----
+        // ---- coalesce: drop superseded loads/relayouts/scrolls, keep every event ----
         let mut batch = vec![first];
         while let Ok(n) = jobs.try_recv() {
             batch.push(n);
         }
-        // a Load supersedes everything queued before it (we'd never fetch it)
-        if let Some(p) = batch.iter().rposition(|r| matches!(r, LoadReq::Load { .. })) {
-            if p > 0 {
-                eprintln!("[nav] skipped {p} superseded job(s)");
-            }
-            batch.drain(..p);
-        }
-        // collapse a consecutive run of relayouts to the newest (events break
-        // the run, so an event between two relayouts survives)
-        let mut out: Vec<LoadReq> = Vec::new();
-        let mut collapsed = 0u32;
-        for j in batch {
-            if matches!(j, LoadReq::Relayout { .. })
-                && matches!(out.last(), Some(LoadReq::Relayout { .. }))
-            {
-                out.pop();
-                collapsed += 1;
-            }
-            out.push(j);
-        }
-        if collapsed > 0 {
-            eprintln!("[nav] skipped {collapsed} superseded relayout(s)");
-        }
-
-        for job in out {
+        for job in coalesce_batch(batch) {
             let t0 = Instant::now();
             let id = job.id();
             let url = job.url().to_string();
-            // worker panics must not take the process down
+            let scroll_like = matches!(job, LoadReq::Scroll { .. });
+            // worker panics must not take the process down (employed for
+            // loads, relayouts AND events alike)
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 process_job(&mut kept, &mut fonts, &job, &mut last_geom, &mut last_forms)
             }));
-            let (wire, nav, panicked) = match outcome {
+            let (wire, nav, pd, panicked) = match outcome {
                 Ok(r) => r,
                 Err(_) => {
                     eprintln!("[nav] loader pipeline panicked for {url}");
                     kept = None; // don't trust a half-built page
-                    (None, None, true)
+                    (None, None, false, true)
                 }
             };
-            if wire.is_some() {
-                current_id = id;
-            }
             eprintln!(
                 "[nav] worker finished {url} in {:.0} ms",
                 t0.elapsed().as_secs_f64() * 1000.0
             );
-            // unbounded channel: never blocks; UI drains every frame
-            if results
-                .send(LoadDone { id, page: wire, nav, panicked })
-                .is_err()
-            {
-                break; // UI side gone
+            // scroll events that didn't mutate anything get no result —
+            // the UI has already scrolled itself; those that did re-layout
+            // push with the current id so the generation gate accepts them
+            if wire.is_some() || panicked || nav.is_some() || !scroll_like {
+                if wire.is_some() {
+                    current_id = id;
+                }
+                if results
+                    .send(LoadDone { id, page: wire, nav, prevent_default: pd, panicked })
+                    .is_err()
+                {
+                    break; // UI side gone
+                }
             }
+            // starvation-free interleave: a handler may have made timers or
+            // rAF frames due — run the JS turn between user jobs, never let
+            // an event flood push them out
+            fire_due(&mut kept, &mut fonts, &mut last_geom, &mut last_forms, current_id, &results);
+        }
+    }
+}
+
+/// The unified wake budget for the worker's `recv_timeout`: the wait until
+/// the earliest due piece of JS work (timer or rAF epoch), or the long
+/// idle block when nothing is scheduled. Never below ~1ms so a deadline
+/// that is already momentarily past cannot cause a busy-spin wake loop.
+fn recv_budget(wake: Option<Instant>, now: Instant) -> Duration {
+    match wake {
+        Some(d) => d.saturating_duration_since(now).max(Duration::from_millis(1)),
+        // no pending JS work: block for input jobs (an hour = the practical
+        // forever; the channel still wakes us for every job)
+        None => Duration::from_secs(3600),
+    }
+}
+
+/// Coalesce a drained job batch worker-side (pure, tested): a `Load`
+/// supersedes everything queued before it (we'd never fetch the older
+/// page), a run of consecutive relayouts collapses to the newest (events
+/// break the run, so an event between two relayouts survives), and a run
+/// of consecutive scroll events collapses to the newest scroll.
+fn coalesce_batch(batch: Vec<LoadReq>) -> Vec<LoadReq> {
+    // a Load supersedes everything queued before it
+    let mut batch = batch;
+    if let Some(p) = batch.iter().rposition(|r| matches!(r, LoadReq::Load { .. })) {
+        if p > 0 {
+            eprintln!("[nav] skipped {p} superseded job(s)");
+        }
+        batch.drain(..p);
+    }
+    // collapse consecutive relayouts / scrolls to the newest of the run
+    let mut out: Vec<LoadReq> = Vec::new();
+    let mut collapsed = 0u32;
+    let mut scrolls = 0u32;
+    for j in batch {
+        let same_run = match (&j, out.last()) {
+            (LoadReq::Relayout { .. }, Some(LoadReq::Relayout { .. })) => true,
+            (LoadReq::Scroll { .. }, Some(LoadReq::Scroll { .. })) => true,
+            _ => false,
+        };
+        if same_run {
+            out.pop();
+            // count which kind collapsed (events are never dropped)
+            if matches!(j, LoadReq::Scroll { .. }) {
+                scrolls += 1;
+            } else {
+                collapsed += 1;
+            }
+        }
+        out.push(j);
+    }
+    if collapsed > 0 {
+        eprintln!("[nav] skipped {collapsed} superseded relayout(s)");
+    }
+    if scrolls > 0 {
+        eprintln!("[nav] coalesced {scrolls} scroll event(s)");
+    }
+    out
+}
+
+/// Fire the currently-due share of the page's JS work (timers, then the
+/// rAF frame pass; microtasks drain inside each turn). Any DOM mutation
+/// re-lays out and pushes a wire result; a script navigation from a timer
+/// or rAF callback now reaches the UI too (it used to be dropped).
+/// Panics in event/timer dispatch are caught: a half-mutated page is
+/// dropped rather than trusted.
+#[allow(clippy::too_many_arguments)]
+fn fire_due(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    last_geom: &mut (f32, f32),
+    last_forms: &mut layout::FormState,
+    current_id: u64,
+    results: &mpsc::Sender<LoadDone>,
+) {
+    if !matches!(
+        kept.as_ref().map(|k| k.scripts.is_some()).unwrap_or(false),
+        true
+    ) {
+        return;
+    }
+    // cheap pre-check: nothing due → no turn at all
+    let due_now = {
+        let KeptPage { scripts, .. } = kept.as_ref().unwrap();
+        scripts
+            .as_ref()
+            .map(|s| s.next_wake_deadline().map(|d| d <= Instant::now()).unwrap_or(false))
+            .unwrap_or(false)
+    };
+    if !due_now {
+        return;
+    }
+    let KeptPage { dom, scripts, css_text, faces, url, .. } = kept.as_mut().unwrap();
+    let (mw, vh) = *last_geom;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scripts
+            .as_mut()
+            .map(|s| {
+                let mut dirty = false;
+                let mut nav = None;
+                let t = s.run_due_timers(dom);
+                dirty |= t.dirty;
+                if nav.is_none() {
+                    nav = t.nav;
+                }
+                let f = s.run_due_frames(dom);
+                dirty |= f.dirty;
+                if nav.is_none() {
+                    nav = f.nav;
+                }
+                (dirty, nav)
+            })
+            .unwrap_or((false, None))
+    }));
+    let (dirty, nav) = match outcome {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[nav] JS turn panicked (timers/rAF); page dropped");
+            *kept = None;
+            return;
+        }
+    };
+    if let Some(nav_url) = nav {
+        // a timer/rAF callback asked to navigate: hand it up untouched
+        eprintln!("[js] timer navigation → {nav_url}");
+        if results
+            .send(LoadDone { id: current_id, page: None, nav: Some(nav_url), prevent_default: false, panicked: false })
+            .is_err()
+        {
+            return; // UI side gone
+        }
+        if dirty {
+            eprintln!("[js] timer also mutated the page (nav wins)");
+        }
+        return;
+    }
+    if dirty {
+        let (page, form_names) = layout_page(
+            &*dom, css_text, faces, url, fonts, mw, vh, last_forms,
+        );
+        let stacks = fonts.stacks.borrow().clone();
+        let out_faces = collect_out_faces(fonts);
+        let wire = page_to_wire(page, stacks, out_faces, form_names);
+        eprintln!("[js] timer/frame mutated the page; pushed relayout");
+        if results
+            .send(LoadDone { id: current_id, page: Some(wire), nav: None, prevent_default: false, panicked: false })
+            .is_err()
+        {
+            // UI side gone
         }
     }
 }
 
 /// Handle one job against the kept page. Returns (wire page, script-requested
-/// navigation, panicked-flag). Falls back to a full load when there's no kept
-/// page for the job's URL.
+/// navigation, preventDefault flag, panicked-flag). Falls back to a full load
+/// when there's no kept page for the job's URL.
 fn process_job(
     kept: &mut Option<KeptPage>,
     fonts: &mut Fonts,
     job: &LoadReq,
     last_geom: &mut (f32, f32),
     last_forms: &mut layout::FormState,
-) -> (Option<PageWire>, Option<String>, bool) {
+) -> (Option<PageWire>, Option<String>, bool, bool) {
     match job {
         LoadReq::Load { url, max_w, vh, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = layout::FormState::default();
-            do_load(kept, fonts, url, *max_w, *vh)
+            let r = do_load(kept, fonts, url, *max_w, *vh);
+            (r.0, r.1, false, r.2)
         }
         LoadReq::Relayout { url, max_w, vh, forms, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                return do_load(kept, fonts, url, *max_w, *vh);
+                let r = do_load(kept, fonts, url, *max_w, *vh);
+                return (r.0, r.1, false, r.2);
             }
             let kp = kept.as_mut().unwrap();
             let (page, form_names) = layout_page(
@@ -1184,24 +1493,52 @@ fn process_job(
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
-            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false)
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false)
         }
-        LoadReq::Event { url, max_w, vh, node, kind, value, forms, .. } => {
+        LoadReq::Event { url, max_w, vh, node, kinds, value, key, href, forms, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                return do_load(kept, fonts, url, *max_w, *vh);
+                let r = do_load(kept, fonts, url, *max_w, *vh);
+                return (r.0, r.1, false, r.2);
             }
             let kp = kept.as_mut().unwrap();
-            // push the control's state into the worker DOM (value / checked)
-            apply_event(kp, *node, kind, value.as_deref());
-            // fire the node's listeners for this kind (bubbles up the tree)
+            // link clicks arrive by href (layout runs carry hrefs, not node
+            // ids): the first anchor whose resolved href matches is the
+            // target and the click bubbles from there. shortcut: several
+            // identical links share one listener target (first in DOM order).
+            let target = match href {
+                Some(h) => find_node_by_href(&kp.dom, url, h).unwrap_or(0),
+                None => *node,
+            };
+            // push the control's state into the worker DOM BEFORE the
+            // value-bearing kinds dispatch (input/change see the final value)
+            let value_kinds = kinds.iter().any(|k| k == "input" || k == "change");
+            if value_kinds {
+                if let Some(v) = value {
+                    apply_event_value(kp, target, v);
+                }
+            }
+            // restore the click semantics that used to live in apply_event:
+            // a click on a checkbox/radio toggles `checked` before listeners
+            // fire (toggles/checked boxes re-layout with the worker DOM)
+            if kinds.iter().any(|k| k == "click") {
+                apply_click_toggle(kp, target);
+            }
+            // (href clicks may resolve no anchor: nothing to listen on, the
+            // re-layout below still runs)
+            // fire the target's listeners for each kind, in order
             let mut nav = None;
+            let mut pd = false;
             {
                 let KeptPage { dom, scripts, .. } = kp;
                 if let Some(scripts) = scripts.as_mut() {
-                    let t = scripts.dispatch(dom, *node, kind);
+                    let kind_refs: Vec<&str> = kinds.iter().map(|s| s.as_str()).collect();
+                    let t = scripts.dispatch_ext(
+                        dom, target, &kind_refs, key.as_deref(), None, None,
+                    );
                     nav = t.nav;
+                    pd = t.prevent_default;
                 }
             }
             // always re-layout: the event likely changed the DOM
@@ -1210,7 +1547,85 @@ fn process_job(
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
-            (Some(page_to_wire(page, stacks, out_faces, form_names)), nav, false)
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), nav, pd, false)
+        }
+        LoadReq::Scroll { url, y } => {
+            // scroll listeners only; no re-layout unless a listener mutated
+            // the DOM (then the wire result carries it). No generation id:
+            // scrolling must never preempt other results' gating.
+            if !kept_matches(kept, url) {
+                eprintln!("[nav] scroll event for unloaded page dropped");
+                return (None, None, false, false);
+            }
+            let kp = kept.as_mut().unwrap();
+            let body = kp.dom.body_root();
+            let (page, form_names) = {
+                let mut nav = None;
+                let mut dirty = false;
+                {
+                    let KeptPage { dom, scripts, .. } = kp;
+                    if let Some(scripts) = scripts.as_mut() {
+                        let t = scripts.dispatch_ext(
+                            dom, body, &["scroll"], None, Some(*y), None,
+                        );
+                        nav = t.nav;
+                        dirty = t.dirty;
+                    }
+                    if let Some(nav_url) = nav {
+                        // scroll listener navigated: hand it up untouched
+                        eprintln!("[js] scroll listener navigates to {nav_url}");
+                        return (None, Some(nav_url), false, false);
+                    }
+                    if !dirty {
+                        // nothing mutated: the UI paints its own scroll; no
+                        // result (keeps the generation gate untouched)
+                        return (None, None, false, false);
+                    }
+                }
+                let (page, fnames) = layout_page(
+                    &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
+                );
+                (page, fnames)
+            };
+            let stacks = fonts.stacks.borrow().clone();
+            let out_faces = collect_out_faces(fonts);
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false)
+        }
+    }
+}
+
+/// First `<a>` whose resolved href equals `href` (worker has the DOM; the
+/// UI's link runs carry only the href).
+fn find_node_by_href(dom: &html::Dom, base: &str, href: &str) -> Option<u32> {
+    (1..dom.nodes.len() as u32)
+        .filter(|&i| dom.tag(i) == "a")
+        .find(|&i| {
+            let raw = dom.attr(i, "href").map(|s| s.to_string()).unwrap_or_default();
+            crate::resolve(base, &raw).as_deref() == Some(href)
+                || raw == href
+        })
+}
+
+/// Push a typed value into the target control's `value` attribute so both
+/// layout and scripts reading getAttribute("value") see it. (Only text
+/// fields get values today; checkbox/radio state flips are click-only.)
+fn apply_event_value(kp: &mut KeptPage, node: u32, value: &str) {
+    set_dom_attr(&mut kp.dom, node, "value", value);
+}
+
+/// A click on a checkbox/radio toggles the `checked` attribute state
+/// worker-side before listeners fire (the shell owns the click, the worker
+/// owns the DOM).
+fn apply_click_toggle(kp: &mut KeptPage, node: u32) {
+    if kp.dom.tag(node) != "input" {
+        return;
+    }
+    let ty = kp.dom.attr(node, "type").unwrap_or("text").to_string();
+    if ty == "checkbox" || ty == "radio" {
+        if kp.dom.attr(node, "checked").is_some() {
+            remove_dom_attr(&mut kp.dom, node, "checked");
+        } else {
+            set_dom_attr(&mut kp.dom, node, "checked", "");
         }
     }
 }
@@ -1263,28 +1678,6 @@ fn collect_out_faces(fonts: &Fonts) -> Vec<css::FontFace> {
             italic: f.italic,
         })
         .collect()
-}
-
-/// Apply a form event's state to the worker DOM before listeners fire.
-fn apply_event(kp: &mut KeptPage, node: u32, kind: &str, value: Option<&str>) {
-    // text input: push the typed value into the `value` attribute so both
-    // layout and scripts reading getAttribute("value") see it
-    if let Some(v) = value {
-        set_dom_attr(&mut kp.dom, node, "value", v);
-    }
-    if kind == "click" {
-        let tag = kp.dom.tag(node).to_string();
-        if tag == "input" {
-            let ty = kp.dom.attr(node, "type").unwrap_or("text").to_string();
-            if ty == "checkbox" || ty == "radio" {
-                if kp.dom.attr(node, "checked").is_some() {
-                    remove_dom_attr(&mut kp.dom, node, "checked");
-                } else {
-                    set_dom_attr(&mut kp.dom, node, "checked", "");
-                }
-            }
-        }
-    }
 }
 
 /// Set an attribute on a DOM element node (case-insensitive name).
@@ -1665,6 +2058,99 @@ fn resolve(base: &str, href: &str) -> Option<String> {
     Some(joined.to_string())
 }
 
+// ---------- data: inline documents (test/verification pages) ----------
+// shortcut: text payloads only — base64 and percent-decoded forms; other
+// mediatypes pass through as body bytes with their declared type.
+
+/// Decode `data:<mediatype>[;base64],<data>` into (bytes, content-type).
+/// Returns None on malformed URLs. No charset parameter modeling —
+/// callers decode UTF-8 themselves (matches the html module's sniffing).
+fn data_url_body(url: &str) -> Option<(Vec<u8>, Option<String>)> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let header = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    let (media, b64) = match header.find(';') {
+        Some(p) => {
+            let (m, rest) = header.split_at(p);
+            let is_b64 = rest == ";base64";
+            if !is_b64 && !rest.is_empty() {
+                // an unmodeled parameter (;charset etc.) — treat as plain text
+                (m, false)
+            } else {
+                (m, is_b64)
+            }
+        }
+        None => (header, false),
+    };
+    let media = media.split(';').next().unwrap_or("");
+    let ct = (!media.is_empty()).then(|| {
+        // `data:text/html` shorthand has no subtype → default text/plain
+        media.to_string()
+    });
+    let bytes = if b64 {
+        b64_decode(payload)?
+    } else {
+        percent_decode(payload)
+    };
+    Some((bytes, ct))
+}
+
+/// Percent-decoding (%XX pairs become bytes; anything else echoes).
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// RFC 4648 base64 (std/-alpha pad tolerant). None on a non-b64 char.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = s.bytes().filter(|&b| b != b'=' && !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in &clean {
+        acc = (acc << 6) | val(c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
 // ---------- HTTP disk cache (Phase 2) ----------
 // shortcut: our own TTL instead of HTTP revalidation — no ETag/If-Modified-Since
 // or 304 handling; a cached response is served as-is until TTL expires, then
@@ -1778,6 +2264,10 @@ fn fetch_accept(
     url: &str,
     accept: Option<&str>,
 ) -> Result<(Vec<u8>, Option<String>), String> {
+    // data: URLs never touch the network or the disk cache
+    if url.starts_with("data:") {
+        return data_url_body(url).ok_or_else(|| format!("malformed data: url {url:?}"));
+    }
     let dir = cache_dir();
     if let Some(hit) = cache_read_in(&dir, url, now_secs()) {
         eprintln!("[cache] hit {url}");
@@ -2816,8 +3306,10 @@ mod tests {
             max_w: 100.0,
             vh: 200.0,
             node: 9,
-            kind: "click".into(),
+            kinds: vec!["keydown".into(), "input".into()],
             value: None,
+            key: None,
+            href: None,
             forms: layout::FormState::default(),
         };
         let re = LoadReq::Relayout {
@@ -2827,8 +3319,10 @@ mod tests {
             vh: 200.0,
             forms: layout::FormState::default(),
         };
+        let sc = LoadReq::Scroll { url: "https://example.com/".into(), y: 12.0 };
         assert_eq!(ev.id(), 3);
         assert_eq!(re.id(), 4);
+        assert_eq!(sc.id(), 0, "scroll never gates a result");
         assert_eq!(ev.url(), "https://example.com/");
         assert!(matches!(ev, LoadReq::Event { .. }));
         assert!(!matches!(re, LoadReq::Event { .. }));
@@ -2870,6 +3364,142 @@ mod tests {
         }
         // the control: neither fallback may claim Thai
         assert_eq!(msyh.glyph_id('\u{0E01}').0, 0, "yahei should not have Thai");
+    }
+
+    // ---- js-event-loop wave: worker scheduler + event coverage ----
+
+    /// preventDefault cancel-navigation decision (pure): the UI navigates
+    /// only when listeners came back clean, and only while a decision is
+    /// actually pending.
+    #[test]
+    fn click_decision_cancels_or_navigates() {
+        let pending = Some((7u64, "https://example.com/x".to_string()));
+        assert!(
+            matches!(
+                click_decision(&pending, true),
+                LinkDecision::Cancel
+            ),
+            "preventDefault must cancel the not-yet-started navigation"
+        );
+        assert_eq!(
+            click_decision(&pending, false),
+            LinkDecision::Navigate("https://example.com/x".to_string()),
+            "clean listeners → start the navigation"
+        );
+        assert!(
+            matches!(click_decision(&None, false), LinkDecision::Ignore),
+            "no pending decision → nothing to act on"
+        );
+    }
+
+    /// Worker-side coalescing (pure): Load supersedes, relayout runs
+    /// collapse, scroll runs collapse to the newest — but a user Event is
+    /// never dropped and breaks both collapsing runs.
+    #[test]
+    fn coalesce_batch_superseded_runs() {
+        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0 };
+        let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default() };
+        let ev = |id, kind: &str| LoadReq::Event {
+            id,
+            url: "https://x.com/".into(),
+            max_w: 1.0,
+            vh: 1.0,
+            node: 1,
+            kinds: vec![kind.into()],
+            value: None,
+            key: None,
+            href: None,
+            forms: layout::FormState::default(),
+        };
+        let sc = |y| LoadReq::Scroll { url: "https://x.com/".into(), y };
+        // newest Load wins whole queue
+        let out = coalesce_batch(vec![load(1), ev(2, "click"), load(3)]);
+        assert_eq!(out.len(), 1, "only the newest Load survives");
+        assert!(matches!(out[0], LoadReq::Load { id: 3, .. }));
+        // consecutive relayouts collapse to the newest
+        let out = coalesce_batch(vec![relo(5), relo(6), relo(7)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id(), 7);
+        // event breaks a relayout run: both survive
+        let out = coalesce_batch(vec![relo(5), ev(6, "change"), relo(7)]);
+        assert_eq!(out.len(), 3);
+        // consecutive scrolls collapse to the newest y
+        let out = coalesce_batch(vec![sc(10.0), sc(20.0), sc(30.0)]);
+        assert_eq!(out.len(), 1, "scroll run collapses to latest");
+        if let LoadReq::Scroll { y, .. } = &out[0] {
+            assert_eq!(*y, 30.0);
+        }
+        // scroll event is never collapsed into a relayout
+        let out = coalesce_batch(vec![relo(1), sc(9.0), relo(2)]);
+        assert_eq!(out.len(), 3, "mixed kinds never merge");
+    }
+
+    /// The unified wake budget: wait until the earliest due JS work; never
+    /// less than ~1ms even for a momentarily-passed deadline (busy-spin
+    /// guard); long idle block when nothing is scheduled.
+    #[test]
+    fn recv_budget_never_spins_and_blocks_idle() {
+        let now = Instant::now();
+        assert_eq!(recv_budget(None, now), Duration::from_secs(3600));
+        // past deadline → clamps to the 1ms floor (no zero/zero wake loop)
+        assert_eq!(recv_budget(Some(now - Duration::from_secs(5)), now), Duration::from_millis(1));
+        // future deadline → exact wait (saturating)
+        assert_eq!(recv_budget(Some(now + Duration::from_secs(2)), now), Duration::from_secs(2));
+    }
+
+    /// data: URL decoding (the inline-document pages this shell can open
+    /// with no network): plain, percent-encoded, base64 and malformed.
+    #[test]
+    fn data_urls_decode_inline_documents() {
+        let (b, ct) = data_url_body("data:text/html,<h1>hi</h1>").unwrap();
+        assert_eq!(ct.as_deref(), Some("text/html"));
+        assert_eq!(b, b"<h1>hi</h1>");
+        // percent-encoded %3C %3E and a charset parameter (unmodeled, still text)
+        let (b, _) = data_url_body("data:text/html,%3Chtml%3EOK%3C/html%3E").unwrap();
+        assert_eq!(b, b"<html>OK</html>");
+        // base64 payload ("hello" → aGVsbG8=)
+        let (b, _) = data_url_body("data:text/plain;base64,aGVsbG8=").unwrap();
+        assert_eq!(b, b"hello");
+        // mediatype omitted → no content-type, plain payload
+        let (b, ct) = data_url_body("data:,plain").unwrap();
+        assert_eq!(ct, None);
+        assert_eq!(b, b"plain");
+        // malformed: no comma
+        assert!(data_url_body("data:text/html").is_none());
+        assert!(data_url_body("https://example.com/x").is_none());
+    }
+
+    /// The address bar passes data: URLs through (they are never searches).
+    #[test]
+    fn address_target_passes_data_urls() {
+        let u = "data:text/html,<p>x</p>".to_string();
+        assert_eq!(address_target(&u), u, "data: is not a search query");
+        // unchanged legacy behavior still holds
+        assert_eq!(address_target("example.com"), "https://example.com");
+        assert!(address_target("rust lang").starts_with("https://duckduckgo.com/"));
+    }
+
+    /// Link clicks land on a DOM node even though layout runs carry only
+    /// the href: the worker resolves the first anchor with a matching
+    /// resolved href and bubbles the click from there.
+    #[test]
+    fn link_clicks_resolve_to_anchor_nodes() {
+        let dom = html::parse(
+            r#"<html><body><a href="/a">A</a><a href="/b">B</a>
+                <a href="https://other.example/c">C</a></body></html>"#,
+        );
+        let base = "https://x.com/";
+        assert_eq!(find_node_by_href(&dom, base, "https://x.com/a").unwrap(), dom_child_link(&dom, "/a"));
+        assert_eq!(find_node_by_href(&dom, base, "https://x.com/b").unwrap(), dom_child_link(&dom, "/b"));
+        assert_eq!(find_node_by_href(&dom, base, "https://other.example/c").unwrap(), dom_child_link(&dom, "https://other.example/c"));
+        assert_eq!(find_node_by_href(&dom, base, "https://x.com/missing"), None);
+    }
+
+    /// helper: node id of the first <a> with the given raw href.
+    fn dom_child_link(dom: &html::Dom, href: &str) -> u32 {
+        (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "a" && dom.attr(i, "href") == Some(href))
+            .unwrap()
     }
 }
 
