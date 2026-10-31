@@ -501,6 +501,39 @@ curve matters more than the baseline (near-flat as tabs grow).
   Tests: default **381**, feature **384** (2 parallel agents both branched from
   `875d5a4`; git auto-merged both `BoxStyle` halves, verified by full suite +
   field presence before push). Live: wiki 96.4 MB, CPU 0.9s (`18451f0` pushed).
+- [x] **Wave 2 (parallel worktrees) — float/clear/vertical-align + background geometry**
+  — second wave of the Wikipedia visual-parity plan (2 agents, both branched from
+  `9e9f110`):
+  **(a) `float`/`clear`/`vertical-align`** (`4353177`, +8 tests) — parse into
+  `BoxStyle.float/clear/valign` (`Float`/`Clear`/`VAlign` enums); each `block()`
+  owns a local `Vec<Flt>` in doc coords, seeded with ancestor floats threaded
+  down from `place()`; a floated child is claimed before the inline branch, laid
+  shrink-to-fit at the current line's top, advances neither flow y nor the open
+  line; `line_excl()` subtracts overlapping floats' x-spans from each new line's
+  range (zero room → drop below the floats' bottoms); `clear` raises flow y to
+  the named floats' bottoms; floated inlines blockify in `build()` (mirrors the
+  `position:absolute` pattern); flex/grid/abs subtrees get `&[]` — floats never
+  reach them; `vertical-align` offsets inline boxes at line build (absent =
+  byte-identical). Shortcuts (all `shortcut:`-commented): no upward float
+  escaping from nested blocks, mid-line floats don't re-flow already-placed
+  runs, no min-content floor, fixed sub/super metrics, text-align only exact
+  beside floats when left-aligned;
+  **(b) `background-size`/`-position`/`-repeat`** (`1922d3e`, +8 tests) — parse
+  into `BoxStyle.bg_size/bg_pos/bg_repeat` (`BgSize`/`BgPos`/`BgRepeat` enums) +
+  the `background:` shorthand parses repeat + `position/size` around a top-level
+  `/`; the pin-to-top-left placeholder loop moved to the END of `place()` so
+  %-sizes/%-positions resolve against the USED padding box; cover/contain are
+  aspect-preserving against the padding box; position uses the standard
+  `(box−img)×p` formula; declared repeat tiles one `collect_paint` entry per
+  tile (region = padding box ∩ wave-1 clip window, capped 512/node). Shortcut:
+  undeclared `bg_repeat: None` keeps the engine's long-standing single draw (the
+  spec initial is `repeat` — sites rely on the current look, commented).
+  Merged: A fast-forwarded, B's css.rs/layout.rs conflicts hand-resolved as pure
+  unions (both sides only added new enums/tests/imports — verified by field +
+  arm + KNOWN presence). Tests: default **397**, feature **400**.
+  Live: wiki 105.4 MB (+9 MB vs wave 1 — tiled paint entries), CPU 0.5s;
+  featured-article text wraps around the floated image, sidebar images float
+  right, section headers paint sized backgrounds (`cf18ae4` pushed).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -580,6 +613,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-31 | selectable runtime: A vs B | Wikipedia Rust article / DuckDuckGo ?q= | A 94.7 / 82.2 MB; B 96.3 / 176.2 MB (B heap lazy on simple pages; heavy script bundles cost far more than the +30 ballpark) |
 | 2026-10-31 | gap-fix wave (lexer `$` spin fix + JS step budget) | MDN /Web/CSS/margin | 86.4 MB (2877 runs; first successful load — previously hung forever in the lexer, 57s CPU/60s wall; now 1.7s CPU/60s wall) |
 | 2026-11-01 | wave 1 (box-sizing + overflow/clip culling) | Wikipedia Main Page | 96.4 MB (1253 runs), CPU 0.9s; skip-link "Jump to content" no longer renders (closed the documented clip/overflow known-gap) |
+| 2026-11-01 | wave 2 (float/clear/vertical-align + background-size/position/repeat) | Wikipedia Main Page | 105.4 MB (1253 runs), CPU 0.5s; float text-wrap + right-floated sidebar + sized bg headers live (+9 MB vs wave 1 from tiled paint entries) |
 
 ### Phase 1c (Track A) findings
 
