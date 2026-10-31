@@ -79,6 +79,8 @@ pub(crate) fn install(e: &mut JsEngine) {
         let id = e.register_native(name, n_object, i as u16);
         obj_set_own(own(&object), name, Val::Native(id));
     }
+    let dp = e.register_native("Object.defineProperty", n_object, O_DEFINE_PROP);
+    obj_set_own(own(&object), "defineProperty", Val::Native(dp));
     e.set_global("Object", object);
 
     // Object.prototype + Array.prototype chain
@@ -170,13 +172,29 @@ pub(crate) fn install(e: &mut JsEngine) {
     let st = e.register_native("setTimeout", n_set_timeout, 0);
     e.set_global("setTimeout", Val::Native(st));
 
-    // -- Promise (partial: resolve/reject/.then + manual drain) ------------
+    // -- Promise (constructor + statics) ------------------------------------
+    // `new Promise(executor)` and all five static combinators below; the
+    // constructor's resolve/reject twin natives live in `js.rs` (slots).
     let promise = Val::new_object();
-    let pr = e.register_native("Promise.resolve", n_promise, 0);
-    let pj = e.register_native("Promise.reject", n_promise, 1);
-    obj_set_own(own(&promise), "resolve", Val::Native(pr));
-    obj_set_own(own(&promise), "reject", Val::Native(pj));
-    e.set_global("Promise", promise);
+    let pc = e.register_native("Promise", n_promise, PS_CTOR);
+    let prs = e.register_native("Promise.resolve", n_promise, PS_RESOLVE);
+    let prj = e.register_native("Promise.reject", n_promise, PS_REJECT);
+    let pall = e.register_native("Promise.all", n_promise, PS_ALL);
+    let pany = e.register_native("Promise.any", n_promise, PS_ANY);
+    let pray = e.register_native("Promise.race", n_promise, PS_RACE);
+    let pass = e.register_native("Promise.allSettled", n_promise, PS_ALL_SETTLED);
+    e.set_global("Promise", Val::Native(pc));
+    obj_set_own(own(&promise), "resolve", Val::Native(prs));
+    obj_set_own(own(&promise), "reject", Val::Native(prj));
+    obj_set_own(own(&promise), "all", Val::Native(pall));
+    obj_set_own(own(&promise), "any", Val::Native(pany));
+    obj_set_own(own(&promise), "race", Val::Native(pray));
+    obj_set_own(own(&promise), "allSettled", Val::Native(pass));
+    e.promise_statics = Some(obj_of(&promise));
+
+    // -- RegExp (callable constructor; same behavior plain or `new`) --------
+    let rc = e.register_native("RegExp", n_regexp, 0);
+    e.set_global("RegExp", Val::Native(rc));
 
     // -- global aliases ----------------------------------------------------
     let g = Val::Obj(e.global_obj.clone());
@@ -300,7 +318,9 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
         ));
     }
     match v {
-        Val::Undefined | Val::Func(_) | Val::Native(_) | Val::Method(_) => return Ok(false),
+        Val::Undefined | Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_) => {
+            return Ok(false)
+        }
         Val::Null => out.push_str("null"),
         Val::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Val::Num(n) => {
@@ -333,6 +353,10 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                 },
                 ObjKind::Error { .. } | ObjKind::Promise(_) => {
                     // shortcut: no toJSON support; these serialize empty
+                    out.push_str("{}");
+                }
+                // regex/generator instances: no own enumerable props -> {}
+                ObjKind::Regex(_) | ObjKind::Generator(_) => {
                     out.push_str("{}");
                 }
                 ObjKind::Plain => {
@@ -563,8 +587,9 @@ const O_KEYS: u16 = 0;
 const O_VALUES: u16 = 1;
 const O_ENTRIES: u16 = 2;
 const O_ASSIGN: u16 = 3;
+const O_DEFINE_PROP: u16 = 4;
 
-fn n_object(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         O_KEYS | O_VALUES | O_ENTRIES => {
             // shortcut: arrays yield index strings (matches real engines)
@@ -607,6 +632,57 @@ fn n_object(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Va
             }
             Ok(target)
         }
+        O_DEFINE_PROP => {
+            // Object.defineProperty(target, key, { value?, get?, set? })
+            // shortcut: writable/enumerable/configurable flags are accepted
+            // and ignored — accessors and values install normally
+            let target = args.first().cloned().unwrap_or(Val::Undefined);
+            let key = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let (vals, gets, sets) = match args.get(2) {
+                Some(d) => {
+                    let value = match d {
+                        Val::Obj(ob) => {
+                            let b = ob.borrow();
+                            b.props
+                                .iter()
+                                .find(|(k, _)| k.as_ref() == "value")
+                                .map(|(_, v)| v.clone())
+                        }
+                        _ => None,
+                    };
+                    // accessors read through get_member (callable `get`/`set`)
+                    let get = get_member(e, d, "get")?;
+                    let set = get_member(e, d, "set")?;
+                    (value, get, set)
+                }
+                _ => (None, Val::Undefined, Val::Undefined),
+            };
+            match args.first() {
+                Some(t @ Val::Obj(_)) => {
+                    let obj_rc = obj_of(t);
+                    let g = if is_callable(&gets) { Some(gets) } else { None };
+                    let s = if is_callable(&sets) { Some(sets) } else { None };
+                    if g.is_some() || s.is_some() {
+                        obj_set_own(
+                            &obj_rc,
+                            &key,
+                            Val::Acc(Rc::new(AccEntry {
+                                getter: g,
+                                setter: s,
+                            })),
+                        );
+                    } else {
+                        obj_set_own(&obj_rc, &key, vals.unwrap_or(Val::Undefined));
+                    }
+                }
+                _ => {
+                    return Err(JsError::throw(
+                        "TypeError: Object.defineProperty called on non-object",
+                    ))
+                }
+            }
+            Ok(target)
+        }
         _ => Ok(Val::Undefined),
     }
 }
@@ -623,6 +699,8 @@ fn n_objproto(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<V
                 ObjKind::Error { .. } => "[object Error]",
                 ObjKind::Date(_) => "[object Date]",
                 ObjKind::Promise(_) => "[object Promise]",
+                ObjKind::Regex(_) => "[object RegExp]",
+                ObjKind::Generator(_) => "[object Generator]",
             },
             _ => "[object Object]",
         }))),
@@ -1133,17 +1211,300 @@ fn n_set_timeout(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Resu
     Ok(Val::Num(id))
 }
 
-// -- Promise (partial) ------------------------------------------------------
+// -- Promise (constructor + statics) ----------------------------------------
 
-fn n_promise(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
-    let v = args.first().cloned().unwrap_or(Val::Undefined);
-    let state = PromiseState {
-        settled: Some(if idx == 0 { Ok(v) } else { Err(v) }),
-        handlers: Vec::new(),
+const PS_CTOR: u16 = 0;
+const PS_RESOLVE: u16 = 1;
+const PS_REJECT: u16 = 2;
+const PS_ALL: u16 = 3;
+const PS_ANY: u16 = 4;
+const PS_RACE: u16 = 5;
+const PS_ALL_SETTLED: u16 = 6;
+
+/// register a reaction on an element promise (pending -> queue; settled ->
+/// enqueue immediately); `ret` stays None for combinator elements because
+/// their outcome is deposited into the shared ComboState
+fn reg_reaction(e: &mut JsEngine, p: &Rc<RefCell<Obj>>, kind: ReactKind) {
+    let re = Reaction { kind, ret: None };
+    if let Some(out) = promise_outcome(p) {
+        e.microtasks.push(Job::Reaction(re, out));
+    } else {
+        let mut b = p.borrow_mut();
+        if let ObjKind::Promise(st) = &mut b.kind {
+            st.reactions.push(re);
+        }
+    }
+}
+
+fn n_promise(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        PS_CTOR => {
+            let executor = args.first().cloned().unwrap_or(Val::Undefined);
+            if !is_callable(&executor) {
+                return Err(JsError::throw(
+                    "TypeError: Promise executor must be a function",
+                ));
+            }
+            new_promise_with_executor(e, executor)
+        }
+        PS_RESOLVE => {
+            let v = args.first().cloned().unwrap_or(Val::Undefined);
+            if let Some(p) = promise_of(&v) {
+                return Ok(Val::Obj(p)); // `Promise.resolve(p)` is identity for promises
+            }
+            let p = new_promise_obj();
+            resolve_promise(e, &p, v);
+            Ok(Val::Obj(p))
+        }
+        PS_REJECT => {
+            let p = new_promise_obj();
+            settle_promise(
+                e,
+                &p,
+                Err(args.first().cloned().unwrap_or(Val::Undefined)),
+            );
+            Ok(Val::Obj(p))
+        }
+        PS_ALL | PS_ANY | PS_RACE | PS_ALL_SETTLED => {
+            let items = interp::for_of_items(&args.first().cloned().unwrap_or(Val::Undefined))?;
+            let result = new_promise_obj();
+            let n = items.len();
+            let mode = match idx {
+                PS_ALL => ComboMode::All,
+                PS_ANY => ComboMode::Any,
+                PS_RACE => ComboMode::Race,
+                _ => ComboMode::AllSettled,
+            };
+            let state = Rc::new(RefCell::new(ComboState {
+                result: Some(result.clone()),
+                done: false,
+                remaining: n,
+                slots: (0..n).map(|_| None).collect(),
+                mode,
+            }));
+            for (slot, v) in items.into_iter().enumerate() {
+                match promise_of(&v) {
+                    Some(p) => {
+                        let kind = match idx {
+                            PS_ALL => ReactKind::All {
+                                slot,
+                                state: state.clone(),
+                            },
+                            PS_ANY => ReactKind::Any {
+                                slot,
+                                state: state.clone(),
+                            },
+                            PS_RACE => ReactKind::Race {
+                                state: state.clone(),
+                            },
+                            _ => ReactKind::AllSettled {
+                                slot,
+                                state: state.clone(),
+                            },
+                        };
+                        reg_reaction(e, &p, kind);
+                    }
+                    None => {
+                        // non-promise element: deposit directly (with
+                        // `all(race)` semantics a fulfill/fail decision)
+                        let out: Result<Val, Val> = Ok(v.clone());
+                        deposit_combo(e, &state, slot, out);
+                    }
+                }
+                let _ = slot;
+            }
+            // all-non-promise elements may have settled the result already;
+            // an empty input settles `all`/`allSettled` immediately
+            if !state.borrow().done && n == 0 {
+                let empty: Vec<Val> = Vec::new();
+                let payload = if idx == PS_ALL_SETTLED || idx == PS_ALL {
+                    Val::new_array(empty)
+                } else if idx == PS_RACE {
+                    return Err(JsError::throw(
+                        "Error: Promise.race of an empty iterable stays pending (unsupported)",
+                    ));
+                } else {
+                    Val::Undefined // `any` of empty -> AggregateError path below
+                };
+                if idx == PS_ANY {
+                    state.borrow_mut().done = true;
+                    settle_promise(
+                        e,
+                        &result,
+                        Err(Val::Str(Rc::from(
+                            "Error: no promise from Promise.any was fulfilled",
+                        ))),
+                    );
+                } else {
+                    state.borrow_mut().done = true;
+                    resolve_promise(e, &result, payload);
+                }
+            }
+            Ok(Val::Obj(result))
+        }
+        _ => Ok(Val::Undefined),
+    }
+}
+
+/// deposit one element outcome into the combinator board (non-queue path for
+/// already-non-promise elements; mirrors the Reaction arms in `exec_job`)
+fn deposit_combo(
+    e: &mut JsEngine,
+    state: &Rc<RefCell<ComboState>>,
+    slot: usize,
+    out: Result<Val, Val>,
+) {
+    let mut finish = None;
+    {
+        let mut st = state.borrow_mut();
+        if st.done {
+            return;
+        }
+        match &st.mode {
+            ComboMode::Race => {
+                // first settlement (fulfill or reject) decides
+                st.done = true;
+                finish = st.result.take().map(|p| (p, out.clone()));
+            }
+            ComboMode::All => match &out {
+                Ok(v) => {
+                    if st.slots.len() > slot {
+                        st.slots[slot] = Some(Ok(v.clone()));
+                    }
+                    st.remaining -= 1;
+                    if st.remaining == 0 {
+                        st.done = true;
+                        let vals: Vec<Val> = st
+                            .slots
+                            .iter()
+                            .filter_map(|s| s.as_ref())
+                            .map(|r| match r {
+                                Ok(v) => v.clone(),
+                                // an Err slot never reaches `all`'s finish
+                                Err(_) => Val::Undefined,
+                            })
+                            .collect();
+                        finish = st.result.take().map(|p| (p, Ok(Val::new_array(vals))));
+                    }
+                }
+                Err(err) => {
+                    st.done = true;
+                    finish = st.result.take().map(|p| (p, Err(err.clone())));
+                }
+            },
+            ComboMode::Any => match &out {
+                Ok(v) => {
+                    // a fulfillment wins immediately regardless of order
+                    st.done = true;
+                    finish = st.result.take().map(|p| (p, Ok(v.clone())));
+                }
+                Err(_) => {
+                    // rejection only aggregates when every element rejected
+                    st.slots[slot] = Some(Err(Val::Undefined));
+                    st.remaining -= 1;
+                    if st.remaining == 0 {
+                        st.done = true;
+                        // honest shortcut: one shared aggregate error message
+                        // instead of a full AggregateError reason list
+                        finish = st.result.take().map(|p| {
+                            (
+                                p,
+                                Err(Val::Str(Rc::from(
+                                    "Error: no promise from Promise.any was fulfilled",
+                                ))),
+                            )
+                        });
+                    }
+                }
+            },
+            ComboMode::AllSettled => {
+                if st.slots.len() > slot {
+                    st.slots[slot] = Some(out.clone());
+                }
+                st.remaining -= 1;
+                if st.remaining == 0 {
+                    st.done = true;
+                    let vals: Vec<Val> = st
+                        .slots
+                        .iter()
+                        .filter_map(|s| s.as_ref())
+                        .map(|r| {
+                            let d = Val::new_object();
+                            let dob = obj_of(&d);
+                            match r {
+                                Ok(v) => {
+                                    obj_set_own(&dob, "status", Val::from("fulfilled"));
+                                    obj_set_own(&dob, "value", v.clone());
+                                }
+                                Err(reason) => {
+                                    obj_set_own(&dob, "status", Val::from("rejected"));
+                                    obj_set_own(&dob, "reason", reason.clone());
+                                }
+                            }
+                            d
+                        })
+                        .collect();
+                    finish = st.result.take().map(|p| (p, Ok(Val::new_array(vals))));
+                }
+            }
+        }
+    }
+    if let Some((p, o)) = finish {
+        match o {
+            Ok(v) => resolve_promise(e, &p, v),
+            Err(err) => settle_promise(e, &p, Err(err)),
+        }
+    }
+}
+
+/// move a stack-built ComboState into the Rc cell (helper keeps `st` local)
+
+// -- RegExp ---------------------------------------------------------------
+
+fn n_regexp(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    // `new RegExp(pat, flags)` / `RegExp(pat)` — same behavior both ways.
+    // A regex argument without explicit flags inherits its source+flags
+    // (real JS behavior); a string compiles fresh.
+    let (src, flags): (Rc<str>, Val) = match args.first() {
+        Some(Val::Obj(o)) => {
+            let is_re = matches!(o.try_borrow().map(|b| matches!(b.kind, ObjKind::Regex(_))), Ok(true));
+            if is_re {
+                let b = o.borrow();
+                let (s, f) = match &b.kind {
+                    ObjKind::Regex(ri) => (
+                        Rc::from(ri.re.src.as_str()),
+                        Rc::from(ri.re.flags.as_str()),
+                    ),
+                    _ => unreachable!(),
+                };
+                (s, args.get(1).cloned().unwrap_or(Val::Str(f)))
+            } else {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                (Rc::from(s.as_str()), args.get(1).cloned().unwrap_or(Val::Undefined))
+            }
+        }
+        Some(other) => {
+            let s = other.to_string();
+            (Rc::from(s.as_str()), args.get(1).cloned().unwrap_or(Val::Undefined))
+        }
+        None => (
+            Rc::from(""),
+            args.get(1).cloned().unwrap_or(Val::Undefined),
+        ),
     };
+    let flags_s = match flags {
+        Val::Undefined => Rc::from(""),
+        v => Rc::from(v.to_string().as_str()),
+    };
+    let re = e.regex_from_literal(src, flags_s)?;
     Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Promise(state),
+        kind: ObjKind::Regex(ReInst {
+            re,
+            last_index: Cell::new(0.0),
+        }),
         props: Vec::new(),
         proto: None,
     }))))
 }
+
+// -- end regex helper stub
