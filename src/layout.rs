@@ -1004,11 +1004,15 @@ fn apply_form_state(
         // no clip — the text just overflows its line).
         if kind.takes_text() {
             if let Some(Len::Px(w)) = n.bx.width {
-                let content = w
-                    - resolve_len(n.bx.pad[1], w)
-                    - resolve_len(n.bx.pad[3], w)
-                    - resolve_len(n.bx.border[1], w)
-                    - resolve_len(n.bx.border[3], w);
+                // content-box: the declared width IS the content area
+                let content = if n.bx.content_box {
+                    w
+                } else {
+                    w - resolve_len(n.bx.pad[1], w)
+                        - resolve_len(n.bx.pad[3], w)
+                        - resolve_len(n.bx.border[1], w)
+                        - resolve_len(n.bx.border[3], w)
+                };
                 if let Some(leaf) = n.children.iter_mut().find(|c| c.is_text) {
                     while !leaf.text.is_empty() && measure(&leaf.text, &leaf.style) > content {
                         leaf.text.pop();
@@ -1281,17 +1285,13 @@ fn place(
             w = (iw as f32).min(avail);
         }
     }
-    // auto margins: both horizontal auto → center; only-left-auto → the
-    // auto margin absorbs free space on the left, pushing the box right
-    // (right-auto-only needs no branch — the box already hugs the left)
-    if n.bx.margin_x_auto {
-        n.x = x + (avail - w).max(0.0) * 0.5;
-    } else if n.bx.margin_l_auto {
-        n.x = x + (avail - w).max(0.0);
-    }
-    // content box = border box inset by borders + padding (shortcut:
-    // border-box model — an explicit `width` includes both, matching most
-    // modern sites)
+    // border box = content inset by borders + padding (shortcut: default
+    // model is border-box — an explicit `width` includes both, matching
+    // most modern sites). shortcut: %-padding/border resolves against the
+    // box's own width below; with `box-sizing: content-box` that is the
+    // declared CONTENT width, not the border box a %-value would resolve
+    // against in CSS — cyclic (pads feed the width they resolve inside);
+    // px padding (the overwhelmingly common case) is exact
     let pl = resolve_len(n.bx.pad[3], w);
     let pr = resolve_len(n.bx.pad[1], w);
     let pt = resolve_len(n.bx.pad[0], w);
@@ -1300,6 +1300,24 @@ fn place(
     let br = resolve_len(n.bx.border[1], w);
     let bt = resolve_len(n.bx.border[0], w);
     let bb = resolve_len(n.bx.border[2], w);
+    if n.bx.content_box && n.bx.width.is_some() {
+        // content-box: the declared width measures content only — grow the
+        // border box by padding + border so the content width stays exactly
+        // the declared value (max-width above already clamped that same
+        // content width, matching content-box CSS; the border box may
+        // exceed max-width by the pads, per spec)
+        w += pl + pr + bl + br;
+    }
+    // auto margins: both horizontal auto → center; only-left-auto → the
+    // auto margin absorbs free space on the left, pushing the box right
+    // (right-auto-only needs no branch — the box already hugs the left).
+    // after the content-box growth above, so centering uses the final
+    // border-box width
+    if n.bx.margin_x_auto {
+        n.x = x + (avail - w).max(0.0) * 0.5;
+    } else if n.bx.margin_l_auto {
+        n.x = x + (avail - w).max(0.0);
+    }
     let (bx0, by0) = (n.x, n.y);
     n.x += pl + bl;
     n.y += pt + bt;
@@ -1428,11 +1446,20 @@ fn position_all(
             // (max-content clamped to the CB — shortcut: no min-content floor)
             // (img keeps its intrinsic width from place())
             if n.bx.width.is_none() && n.img.is_none() {
+                // pre-size in border-box terms, then restate as the
+                // content width a content-box declaration carries
+                // (place() grows it back — see as_content_decl)
                 n.bx.width = match (inset[3], inset[1]) {
-                    (Some(l), Some(r)) => Some(Len::Px(
+                    (Some(l), Some(r)) => Some(Len::Px(as_content_decl(
                         (c.2 - resolve_len(l, c.2) - resolve_len(r, c.2)).max(0.0),
-                    )),
-                    _ => Some(Len::Px(natural_w(n, c.2, measure).min(c.2))),
+                        &n.bx,
+                        c.2,
+                    ))),
+                    _ => Some(Len::Px(as_content_decl(
+                        natural_w(n, c.2, measure).min(c.2),
+                        &n.bx,
+                        c.2,
+                    ))),
                 };
             }
             // provisional = CB origin (shortcut: real static position was
@@ -1564,6 +1591,24 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
         }
     }
     out
+}
+
+/// Restate a border-box width (padding+border included) as the content
+/// width a `box-sizing: content-box` declaration must carry — `place()`
+/// grows a declared width by padding+border when `content_box` is set, so
+/// values the layout pre-computes in border-box terms (absolute-position
+/// pre-sizing, the flex %-slot conversion) subtract that back out here.
+/// px padding/border is exact; shortcut: %-padding resolves against
+/// `base` here but against the (smaller) content width inside `place()`.
+fn as_content_decl(w: f32, bx: &BoxStyle, base: f32) -> f32 {
+    if !bx.content_box {
+        return w;
+    }
+    let pb = resolve_len(bx.pad[1], base)
+        + resolve_len(bx.pad[3], base)
+        + resolve_len(bx.border[1], base)
+        + resolve_len(bx.border[3], base);
+    (w - pb).max(0.0)
 }
 
 /// max-content (unwrapped) width of a node, including horizontal padding.
@@ -2146,7 +2191,11 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
             if let Some(Len::Pct(_)) = n.children[*i].bx.width {
                 let ml = resolve_len(n.children[*i].bx.margin[3], widths[idx]);
                 let mr = resolve_len(n.children[*i].bx.margin[1], widths[idx]);
-                n.children[*i].bx.width = Some(Len::Px((widths[idx] - ml - mr).max(0.0)));
+                n.children[*i].bx.width = Some(Len::Px(as_content_decl(
+                    (widths[idx] - ml - mr).max(0.0),
+                    &n.children[*i].bx,
+                    widths[idx],
+                )));
             }
         }
     }
@@ -3290,6 +3339,63 @@ mod tests {
         // box x = 150 - 50 = 100; NOT (150-50)/2 = 50
         assert!((n.x - 100.0).abs() < 0.01, "box x={}", n.x);
         assert!((l.runs[0].x - 100.0).abs() < 0.01);
+    }
+
+    // ---- box-sizing ----
+
+    /// `width: 100px; padding: 10px; border: 1px solid` on a block with an
+    /// auto-width block child (the child measures the content area)
+    fn padded_box(content_box: bool) -> BoxNode {
+        let mut inner = BoxNode::group(Style::new(), BoxStyle::default());
+        inner.children = vec![leaf("hello")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                width: Some(Len::Px(100.0)),
+                pad: [Len::Px(10.0); 4],
+                border: [Len::Px(1.0); 4],
+                content_box,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![inner];
+        n
+    }
+
+    #[test]
+    fn border_box_default_declared_width_includes_padding_border() {
+        // regression guard: the default (and the CSS-initial-value shortcut
+        // this engine uses) — a declared width IS the border box
+        let mut n = padded_box(false);
+        let _l = layout_tree(&mut n, 500.0, &m4);
+        assert!((n.w - 100.0).abs() < 0.01, "border box w={}", n.w);
+        // content area = 100 - 20 padding - 2 border
+        assert!((n.children[0].w - 78.0).abs() < 0.01, "content w={}", n.children[0].w);
+    }
+
+    #[test]
+    fn content_box_declared_width_measures_content_only() {
+        let mut n = padded_box(true);
+        let _l = layout_tree(&mut n, 500.0, &m4);
+        // border box grows: 100 + 20 padding + 2 border = 122
+        assert!((n.w - 122.0).abs() < 0.01, "border box w={}", n.w);
+        // content width stays exactly the declared 100
+        assert!((n.children[0].w - 100.0).abs() < 0.01, "content w={}", n.children[0].w);
+    }
+
+    #[test]
+    fn content_box_with_auto_margins_still_centers() {
+        let mut n = padded_box(true);
+        n.bx.width = Some(Len::Px(50.0)); // like width_px_and_margin_auto_center
+        n.bx.margin_x_auto = true;
+        let l = layout_tree(&mut n, 150.0, &m4);
+        // border box = 50 + 20 padding + 2 border = 72, centered in 150 →
+        // x = 39 — centering must use the grown border box, not the 50px
+        // declared width (which would put x at (150-50)/2 = 50)
+        assert!((n.w - 72.0).abs() < 0.01, "border box w={}", n.w);
+        assert!((n.x - 39.0).abs() < 0.01, "box x={}", n.x);
+        // text starts at the content origin: x + border + padding = 50
+        assert!((l.runs[0].x - 50.0).abs() < 0.01, "run x={}", l.runs[0].x);
     }
 
     #[test]

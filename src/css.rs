@@ -106,6 +106,11 @@ pub struct BoxStyle {
     pub grid_col: Option<String>,
     pub width: Option<Len>,
     pub max_width: Option<Len>,
+    /// `box-sizing`: false = border-box (the engine default AND the CSS
+    /// initial-value shortcut — a declared `width` includes padding +
+    /// border, see layout.rs `place()`); true = content-box (declared
+    /// width measures content only, padding+border add outside)
+    pub content_box: bool,
     /// explicit height — shortcut: only consulted for replaced (`<img>`) boxes
     pub height: Option<Len>,
     /// `min-height` — floor on the box's content height (hero sections use
@@ -194,6 +199,7 @@ impl Default for BoxStyle {
             grid_col: None,
             width: None,
             max_width: None,
+            content_box: false,
             height: None,
             min_height: None,
             margin_x_auto: false,
@@ -539,6 +545,7 @@ const KNOWN: &[&str] = &[
     "grid-column",
     "width",
     "max-width",
+    "box-sizing",
     "height",
     "min-height",
     "white-space",
@@ -1351,6 +1358,9 @@ fn apply_decl(
                 parse_len(&d.1, vp)
             }
         }
+        // only `content-box` flips the engine's border-box default;
+        // anything else (border-box, garbage) keeps false
+        "box-sizing" => bx.content_box = d.1 == "content-box",
         // margin shorthand: positional expansion that KEEPS `auto` slots in
         // place (parse_sides drops unparseable tokens, shifting the rest —
         // `0 auto 0 0` parsed as a 3-value shorthand, and ANY auto flagged
@@ -3986,6 +3996,21 @@ mod tests {
         // inline layout mode yet)
         assert_eq!(bx("iflex").display, Display::Block);
         assert_eq!(bx("igrid").display, Display::Block);
+    }
+
+    #[test]
+    fn box_sizing_content_box_flips_the_border_box_default() {
+        let sheet = parse(
+            ".a { box-sizing: content-box } .b { box-sizing: border-box } \
+             .c { box-sizing: frobnicate } .d { width: 100px }",
+        );
+        let dom = dom_of(r#"<div class=a></div><div class=b></div><div class=c></div><div class=d></div>"#);
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert!(bx("a").content_box, "content-box sets the field");
+        assert!(!bx("b").content_box, "border-box keeps the default false");
+        assert!(!bx("c").content_box, "unknown value keeps false");
+        assert!(!bx("d").content_box, "undeclared keeps the default false");
+        assert!(!BoxStyle::default().content_box, "default = border-box");
     }
 
     #[test]
