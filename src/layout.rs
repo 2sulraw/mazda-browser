@@ -691,10 +691,17 @@ fn build_into(
                 }
                 // which elements get a box: flex/grid/block/inline-block
                 // always; inline tags only when CSS says so; Auto follows
-                // the tag
+                // the tag. Absolutely/fixed positioned elements ALWAYS get
+                // one — their display blockifies to block (otherwise the
+                // skip-link pattern `a{position:absolute}` would flatten
+                // into the parent flow and ignore its insets/clip).
                 let boxed = match outcome.bx.display {
-                    Display::Auto => is_block(tag),
-                    Display::Inline => false,
+                    Display::Auto => {
+                        is_block(tag) || matches!(outcome.bx.pos, Pos::Absolute | Pos::Fixed)
+                    }
+                    Display::Inline => {
+                        matches!(outcome.bx.pos, Pos::Absolute | Pos::Fixed)
+                    }
                     _ => true,
                 };
                 if boxed {
@@ -803,6 +810,11 @@ pub struct PositionedRun {
     /// inside a `position: fixed` subtree — drawn in viewport coordinates
     /// (no scroll offset), on top of scrolled content
     pub fixed: bool,
+    /// accumulated clip window (x0, y0, x1, y1 — doc coords) from ancestor
+    /// `overflow`/`clip: rect()` boxes; None = unclipped. Set by
+    /// [`apply_run_clips`] after layout; nested clips compose by
+    /// intersection. An empty window (x0 ≥ x1) means main draws nothing.
+    pub clip: Option<(f32, f32, f32, f32)>,
 }
 
 pub struct Layout {
@@ -937,10 +949,13 @@ pub fn layout_in_forms(
     // phase 2: resolve relative/absolute/fixed against their containing
     // blocks now that every in-flow position is final (root flow box = cb)
     position_all(root, cb, cb, cb, false, measure, &mut runs, &mut uls);
+    // clip runs/underline rects to ancestor overflow + clip:rect windows
+    // (after position_all so shifts are final; ranges are complete)
+    apply_run_clips(root, None, &mut runs, &mut uls);
     let mut rects = Vec::new();
     let mut images = Vec::new();
     let mut shadows = Vec::new();
-    collect_paint(root, false, &mut rects, &mut images, &mut shadows);
+    collect_paint(root, false, None, &mut rects, &mut images, &mut shadows);
     // form controls: laid rects + focus visuals (caret) + value seeding
     let mut forms = Vec::new();
     let mut form_values = HashMap::new();
@@ -1125,13 +1140,88 @@ impl Layout {
     }
 }
 
+/// Post-layout walk (after [`position_all`], ranges final): thread each
+/// box's clip window down the tree and intersect it into the runs and
+/// underline rects its subtree emitted (`run_range`/`ul_range` are
+/// start-inclusive/end-exclusive). Nested clips compose by intersection.
+/// Runs are never removed (later phases index the vecs by range) — a
+/// fully-outside run keeps a degenerate window (x0 ≥ x1) that main culls;
+/// fully-outside underline rects collapse to zero size.
+fn apply_run_clips(
+    n: &BoxNode,
+    clip: Option<(f32, f32, f32, f32)>,
+    runs: &mut [PositionedRun],
+    uls: &mut [UR],
+) {
+    if n.is_text {
+        return; // text leaves hold no ranges (batched by their container)
+    }
+    // own clip:rect (positioned) clips the whole rendering incl. own text
+    let clip = match (clip, clip_rect_window(n)) {
+        (c, None) => c,
+        (None, Some(w)) => Some(w),
+        (Some(a), Some(w)) => Some(clip_intersect(a, w)),
+    };
+    // own overflow clips content (incl. own inline text), not own chrome
+    let content_clip = if n.bx.clip {
+        let bt = resolve_len(n.bx.border[0], n.w);
+        let br = resolve_len(n.bx.border[1], n.w);
+        let bb = resolve_len(n.bx.border[2], n.w);
+        let bl = resolve_len(n.bx.border[3], n.w);
+        let pad = (n.x + bl, n.y + bt, n.x + n.w - br, n.y + n.h - bb);
+        Some(match clip {
+            Some(c) => clip_intersect(c, pad),
+            None => pad,
+        })
+    } else {
+        clip
+    };
+    if let Some(w) = content_clip {
+        let (a, b) = n.run_range;
+        for r in &mut runs[a as usize..b as usize] {
+            r.clip = Some(match r.clip {
+                Some(c) => clip_intersect(c, w),
+                None => w,
+            });
+        }
+        let (a, b) = n.ul_range;
+        for u in &mut uls[a as usize..b as usize] {
+            // intersect in place — dropping would shift indices other
+            // nodes' ranges point at; empty → zero size (drawn as nothing)
+            let x0 = u.0.max(w.0);
+            let y0 = u.1.max(w.1);
+            let x1 = (u.0 + u.2).min(w.2);
+            let y1 = (u.1 + u.3).min(w.3);
+            if x1 > x0 && y1 > y0 {
+                u.0 = x0;
+                u.1 = y0;
+                u.2 = x1 - x0;
+                u.3 = y1 - y0;
+            } else {
+                u.2 = 0.0;
+                u.3 = 0.0;
+            }
+        }
+    }
+    for ch in &n.children {
+        apply_run_clips(ch, content_clip, runs, uls);
+    }
+}
+
 /// Post-layout walk: every box with a background-color emits a filled rect;
 /// every decoded `<img>` emits its pixels (parent-first, so children paint
 /// over their parent's fill). `fixed` inherits down — a `position: fixed`
 /// subtree paints in viewport coordinates.
+///
+/// `clip` = accumulated window (x0, y0, x1, y1, doc coords) from ancestor
+/// `overflow` boxes and `clip: rect()` — intersected into every pushed rect;
+/// fully-outside rects are dropped. The element's own background/border/
+/// shadow are NOT clipped by its OWN overflow (only by ancestors' clips and
+/// its own `clip: rect()`, which per spec clips the whole rendering).
 fn collect_paint(
     n: &BoxNode,
     fixed: bool,
+    clip: Option<(f32, f32, f32, f32)>,
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
     shadows: &mut Vec<ShadowRect>,
@@ -1147,17 +1237,43 @@ fn collect_paint(
         let bc = n.bx.bcolor.unwrap_or(n.style.color);
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
         let ring = has_b && r > 0.0 && n.bx.bg.is_some();
+        // own `clip: rect()` (positioned boxes) clips this box's WHOLE
+        // rendering incl. its own background — composed with the inherited one
+        let clip = match (clip, clip_rect_window(n)) {
+            (c, None) => c,
+            (None, Some(w)) => Some(w),
+            (Some(a), Some(w)) => Some(clip_intersect(a, w)),
+        };
+        // own overflow clips CONTENT (children + own image), not own chrome
+        let content_clip = if n.bx.clip {
+            let pad = (n.x + bl, n.y + bt, n.x + n.w - br, n.y + n.h - bb);
+            Some(match clip {
+                Some(c) => clip_intersect(c, pad),
+                None => pad,
+            })
+        } else {
+            clip
+        };
         // box-shadows: spread grows the rect, blur softens it; color
         // resolves to currentcolor when unspecified, alpha from the color
         for s in &n.bx.shadows {
             let sp = s.spread;
             let c = s.color.unwrap_or(n.style.color);
             let a = s.alpha as u32;
+            // shortcut: culled against the un-blurred rect — blur may bleed
+            // a few px past a clip edge (approximation, not spec-exact)
+            let sx = n.x + s.dx - sp;
+            let sy = n.y + s.dy - sp;
+            let sw = (n.w + sp * 2.0).max(0.0);
+            let sh = (n.h + sp * 2.0).max(0.0);
+            if cull_rect((sx, sy, sw, sh), clip).is_none() {
+                continue;
+            }
             shadows.push(ShadowRect {
-                x: n.x + s.dx - sp,
-                y: n.y + s.dy - sp,
-                w: (n.w + sp * 2.0).max(0.0),
-                h: (n.h + sp * 2.0).max(0.0),
+                x: sx,
+                y: sy,
+                w: sw,
+                h: sh,
                 radius: r,
                 blur: s.blur,
                 color: (a << 24) | c,
@@ -1165,47 +1281,54 @@ fn collect_paint(
             });
         }
         if let Some(c) = n.bx.bg {
+            let mut rects = vec![(n.x, n.y, n.w, n.h, c, r)];
             if ring {
                 // rounded ring: fill the border-box with the border color,
                 // then the background inset over it (inner radius ≈ r − border)
-                out.push((n.x, n.y, n.w, n.h, bc, r, fixed));
+                rects[0].4 = bc;
                 let inner = (r - bt.max(br).max(bb).max(bl)).max(0.0);
-                out.push((
+                rects.push((
                     n.x + bl,
                     n.y + bt,
                     (n.w - bl - br).max(0.0),
                     (n.h - bt - bb).max(0.0),
                     c,
                     inner,
-                    fixed,
                 ));
-            } else {
-                out.push((n.x, n.y, n.w, n.h, c, r, fixed));
+            }
+            for (x, y, w, h, color, rad) in rects {
+                if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
+                    out.push((x, y, w, h, color, rad, fixed));
+                }
             }
         }
         if has_b && !ring {
             // four side strips over the background (square corners on a
             // rounded backgroundless box — shortcut)
-            if bt > 0.0 {
-                out.push((n.x, n.y, n.w, bt, bc, 0.0, fixed));
-            }
-            if bb > 0.0 {
-                out.push((n.x, n.y + n.h - bb, n.w, bb, bc, 0.0, fixed));
-            }
-            if bl > 0.0 {
-                out.push((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0), bc, 0.0, fixed));
-            }
-            if br > 0.0 {
-                out.push((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0), bc, 0.0, fixed));
+            let strips: [((f32, f32, f32, f32), bool); 4] = [
+                ((n.x, n.y, n.w, bt), bt > 0.0),
+                ((n.x, n.y + n.h - bb, n.w, bb), bb > 0.0),
+                ((n.x, n.y + bt, bl, (n.h - bt - bb).max(0.0)), bl > 0.0),
+                ((n.x + n.w - br, n.y + bt, br, (n.h - bt - bb).max(0.0)), br > 0.0),
+            ];
+            for (q, on) in strips {
+                if !on {
+                    continue;
+                }
+                if let Some(q) = cull_rect(q, clip) {
+                    out.push((q.0, q.1, q.2, q.3, bc, 0.0, fixed));
+                }
             }
         }
         if let Some(ImgSlot::Ready(d)) = &n.img {
             if n.w > 0.0 && n.h > 0.0 {
-                imgs.push((n.x, n.y, n.w, n.h, d.clone(), fixed));
+                if let Some(q) = cull_rect((n.x, n.y, n.w, n.h), content_clip) {
+                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                }
             }
         }
         for ch in &n.children {
-            collect_paint(ch, fixed, out, imgs, shadows);
+            collect_paint(ch, fixed, content_clip, out, imgs, shadows);
         }
     }
 }
@@ -1216,6 +1339,49 @@ fn resolve_len(l: Len, avail: f32) -> f32 {
         Len::Px(p) => p,
         Len::Pct(p) => p / 100.0 * avail,
     }
+}
+
+/// Clip window (x0, y0, x1, y1) ∩ another window — nested clips compose.
+fn clip_intersect(
+    a: (f32, f32, f32, f32),
+    b: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3))
+}
+
+/// Intersect a paint rect (x, y, w, h) with an optional clip window; no
+/// window → unchanged, fully-outside → None (drop), straddling → the
+/// clipped remainder.
+fn cull_rect(
+    r: (f32, f32, f32, f32),
+    clip: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    let Some(c) = clip else {
+        return Some(r);
+    };
+    let x0 = r.0.max(c.0);
+    let y0 = r.1.max(c.1);
+    let x1 = (r.0 + r.2).min(c.2);
+    let y1 = (r.1 + r.3).min(c.3);
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// `clip: rect(top, right, bottom, left)` on a POSITIONED box → the window
+/// (x0, y0, x1, y1) it carves out of the border box. Offsets are from the
+/// border-box top-left (all four), so `rect(1px,1px,1px,1px)` is a zero-area
+/// window — the classic skip-link hide. Static boxes ignore `clip` (spec).
+/// `%` offsets resolve against the border box (spec says lengths only;
+/// lenient parse).
+fn clip_rect_window(n: &BoxNode) -> Option<(f32, f32, f32, f32)> {
+    let c = n.bx.clip_rect?;
+    if n.bx.pos == Pos::Static {
+        return None;
+    }
+    let x0 = n.x + resolve_len(c[3], n.w);
+    let y0 = n.y + resolve_len(c[0], n.h);
+    let x1 = n.x + resolve_len(c[1], n.w);
+    let y1 = n.y + resolve_len(c[2], n.h);
+    Some((x0, y0, x1, y1))
 }
 
 fn leaf_atom(n: &BoxNode) -> Atom {
@@ -1439,13 +1605,12 @@ fn position_all(
             // skipped by the flow); insets resolve % against the CB axis.
             // Negative insets are honored verbatim — `top:-9999px` lays the
             // box off-canvas (nothing clamps it back), the classic
-            // off-screen skip-link pattern. Known gap: `clip`/`overflow:
-            // hidden` are unmodeled upstream (dropped with other unknown
-            // properties), so hiding rules that rely on them alone — e.g.
-            // a 1px clip-rect + overflow:hidden skip-link that declares NO
-            // insets — stay positioned at the CB origin (provisional) and
-            // render visibly instead of clipped; finishing that needs the
-            // cascade to carry the property + paint-time culling.
+            // off-screen skip-link pattern. `overflow`/`clip` are parsed
+            // (BoxStyle.clip / clip_rect): overflow clips descendants to the
+            // padding box at paint, `clip: rect()` (positioned boxes) clips
+            // the whole rendering — so a 1px clip-rect + overflow:hidden
+            // skip-link that declares NO insets stays at the CB origin but
+            // paints as nothing.
             place(n, c.0, c.1, c.2, measure, runs, uls);
             let ml = resolve_len(n.bx.margin[3], c.2);
             let mr = resolve_len(n.bx.margin[1], c.2);
@@ -2567,6 +2732,7 @@ fn layout_from(
             width: ww,
             link: w.link.clone(),
             fixed: false,
+            clip: None,
         });
         if w.style.underline {
             underline_rects.push((x, y + lh - 2.0, ww, 1.0, w.style.color, false));
@@ -3875,6 +4041,184 @@ mod tests {
         // the flow sibling is unaffected
         let vis = l.runs.iter().find(|r| r.text == "visible").expect("flow run");
         assert!(vis.y >= 0.0 && vis.y < 50.0, "in-flow text stays on canvas: y={}", vis.y);
+    }
+
+    // ---- overflow: hidden / clip: rect() paint culling ----
+
+    /// Box tree for the clip tests: `clipper` (100px wide, 2px border, bg,
+    /// overflow: hidden) with three children — `inside` (fully in), a wide
+    /// `straddle` (overflows right, must be cut) and `outside` (shifted far
+    /// right by `position: relative`, must be dropped entirely).
+    fn clip_tree(clip: bool) -> BoxNode {
+        let mk = |color: u32, width: f32, kids: Vec<BoxNode>| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(width)),
+                    bg: Some(color),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = kids;
+            g
+        };
+        let mut clipper = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(100.0)),
+                border: [Len::Px(2.0); 4],
+                bg: Some(0x112233),
+                clip,
+                ..BoxStyle::default()
+            },
+        );
+        let inside = mk(0xff0000, 50.0, vec![leaf("ok")]);
+        let straddle = mk(0x00ff00, 300.0, vec![leaf("over")]);
+        let mut outside = mk(0x0000ff, 60.0, vec![leaf("gone")]);
+        outside.bx.pos = Pos::Relative;
+        outside.bx.inset = [None, None, None, Some(Len::Px(400.0))]; // left: shift +400
+        clipper.children = vec![inside, straddle, outside];
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        root.children = vec![clipper];
+        root
+    }
+
+    #[test]
+    fn overflow_hidden_culls_and_intersects_descendants() {
+        let mut root = clip_tree(true);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // own chrome is NOT clipped by own overflow: the bg rect stays the
+        // full 100px BORDER box even though the padding box is only 96px
+        // wide (2px borders) and content overflows past it
+        let own = l
+            .rects
+            .iter()
+            .find(|r| r.4 == 0x112233)
+            .expect("own bg painted");
+        assert!((own.2 - 100.0).abs() < 0.01, "own bg w={} = full border box", own.2);
+        // fully-inside child: geometry untouched (content x=2, 50 wide)
+        let ins = l.rects.iter().find(|r| r.4 == 0xff0000).expect("inside rect");
+        assert!((ins.0 - 2.0).abs() < 0.01 && (ins.2 - 50.0).abs() < 0.01, "inside rect untouched: {ins:?}");
+        // straddling child: intersected down to the padding box (x 2..98)
+        let st = l.rects.iter().find(|r| r.4 == 0x00ff00).expect("straddle rect");
+        assert!((st.0 - 2.0).abs() < 0.01, "straddle x={}", st.0);
+        assert!((st.2 - 96.0).abs() < 0.01, "straddle w={} = padding box", st.2);
+        // fully-outside child: rect dropped, not drawn at 400+
+        assert!(
+            !l.rects.iter().any(|r| r.4 == 0x0000ff),
+            "outside rect culled: {:?}",
+            l.rects
+        );
+        // runs carry the clip window; the inside run sits within it
+        let ok = l.runs.iter().find(|r| r.text == "ok").expect("ok run");
+        let (_, _, x1, y1) = ok.clip.expect("inside run clipped");
+        assert!(ok.x >= 2.0 && ok.x + ok.width <= x1 + 0.01, "ok run inside window");
+        assert!(ok.y + ok.style.size <= y1 + 0.01, "ok run inside window (y)");
+        // the outside run's window excludes it entirely → main draws nothing
+        let gone = l.runs.iter().find(|r| r.text == "gone").expect("gone run");
+        let (_, _, gx1, _) = gone.clip.expect("outside run clipped");
+        assert!(gone.x >= gx1, "gone run.x={} outside window x1={gx1}", gone.x);
+    }
+
+    #[test]
+    fn overflow_visible_clips_nothing() {
+        let mut root = clip_tree(false);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let st = l.rects.iter().find(|r| r.4 == 0x00ff00).expect("straddle rect");
+        assert!((st.2 - 300.0).abs() < 0.01, "visible: straddle keeps full w={}", st.2);
+        assert!(
+            l.rects.iter().any(|r| r.4 == 0x0000ff),
+            "visible: outside rect still painted"
+        );
+        assert!(
+            l.runs.iter().all(|r| r.clip.is_none()),
+            "visible: no run carries a clip window"
+        );
+    }
+
+    #[test]
+    fn nested_overflow_clips_compose_by_intersection() {
+        // outer clips to 100px, inner to 150px — a 200px grandchild must end
+        // up 100px wide (the INTERSECTION, not the inner box alone)
+        let mut inner = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(150.0)),
+                bg: Some(0x223344),
+                clip: true,
+                ..BoxStyle::default()
+            },
+        );
+        let mut grand = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(200.0)),
+                bg: Some(0xabcdef),
+                ..BoxStyle::default()
+            },
+        );
+        grand.children = vec![leaf("deep")];
+        inner.children = vec![grand];
+        let mut outer = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(100.0)),
+                clip: true,
+                ..BoxStyle::default()
+            },
+        );
+        outer.children = vec![inner];
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        root.children = vec![outer];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // grandchild bg: inner would allow 150, outer cuts to 100
+        let g = l.rects.iter().find(|r| r.4 == 0xabcdef).expect("grand rect");
+        assert!((g.2 - 100.0).abs() < 0.01, "grand w={} = outer ∩ inner", g.2);
+        // inner's own bg is clipped by the OUTER overflow (ancestor chrome)
+        let i = l.rects.iter().find(|r| r.4 == 0x223344).expect("inner rect");
+        assert!((i.2 - 100.0).abs() < 0.01, "inner bg w={} cut by outer", i.2);
+        // the run's window is the intersection too
+        let run = l.runs.iter().find(|r| r.text == "deep").expect("deep run");
+        let (_, _, x1, _) = run.clip.expect("clipped");
+        assert!((x1 - 100.0).abs() < 0.01, "run window x1={x1} = composed");
+    }
+
+    #[test]
+    fn skip_link_1px_clip_rect_paints_nothing() {
+        // the classic visually-hidden pattern: absolutely positioned, no
+        // insets, 1x1 with overflow:hidden + clip: rect(1px,1px,1px,1px).
+        // The zero-area window must reach every run of the link so main
+        // draws nothing, while page content is untouched.
+        let dom = crate::html::parse(
+            r##"<a class="skip" href="#main">Skip to content</a><p>page</p>"##,
+        );
+        let sheet = crate::css::parse(
+            ".skip { position: absolute; width: 1px; height: 1px; \
+             overflow: hidden; clip: rect(1px, 1px, 1px, 1px) }",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // the link's words wrap in the 1px box — every one of its runs gets
+        // a degenerate window (x0 >= x1 or y0 >= y1) that main culls
+        let mut link_runs = 0;
+        for r in l.runs.iter().filter(|r| r.text == "Skip" || r.text == "to" || r.text == "content") {
+            let (x0, y0, x1, y1) = r.clip.expect("skip-link run clipped");
+            assert!(
+                x1 <= x0 || y1 <= y0,
+                "run {:?} window ({x0},{y0},{x1},{y1}) must be empty",
+                r.text
+            );
+            link_runs += 1;
+        }
+        assert!(link_runs >= 3, "found all wrapped skip-link runs: {link_runs}");
+        // page content flows unclipped
+        let page = l.runs.iter().find(|r| r.text == "page").expect("page run");
+        assert!(page.clip.is_none(), "content run unclipped");
     }
 
     // ---- form controls (UA chrome: <select>/<input>/<textarea>) ----
