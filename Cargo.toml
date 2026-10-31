@@ -15,6 +15,10 @@ encoding_rs = "0.8.42"
 # image codecs (pure Rust; not engine code)
 png = "0.17"
 jpeg-decoder = { version = "0.3", default-features = false }
+# SELECTABLE SCRIPT RUNTIME: Option B — full JS engine core, OFF by default
+# (default builds compile engine A only; `--features engine-b` pulls this in;
+# budgeted at ~+30 MB/page RAM, the honest measured delta is in the wave report)
+boa_engine = { version = "0.22.0", optional = true }
 # zlib inflate for WOFF1 font containers (pure Rust miniz_oxide backend;
 # already in the tree via png+ureq, so no new crates to build)
 flate2 = "1"
@@ -22,6 +26,9 @@ flate2 = "1"
 # NOT wgpu — wgpu would add a large driver/GPU stack to the RAM budget.
 # x11+wayland keep it Linux-capable; window controls/resize come from winit.
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+
+[features]
+engine-b = ["dep:boa_engine"]
 
 [profile.release]
 opt-level = "s"
