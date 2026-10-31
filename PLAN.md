@@ -396,6 +396,35 @@ curve matters more than the baseline (near-flat as tabs grow).
   "Jump to content" + jammed buttons, engine lacks regex/destructuring/
   async-await (scripts using them error-log), no form POST, RAM floor up
   (Retained DOM+engine: wiki 93.1 MB)
+- [x] **Event-loop wave** — unified worker scheduler: timers + rAF frame
+  epochs (16ms coalescing, 512-timer/128-frame backlog caps, drop-oldest
+  with [js] log) + microtasks run to quiescence between/after jobs;
+  **input events as script-visible**: keydown/input per keystroke, change
+  on blur/Enter, scroll coalesced, click dispatch with worker-side
+  checkbox toggling and preventDefault → Cancel/Navigate decision (pure
+  fn, UI holds pending_link until the verdict); rAF → coalesced relayout
+  signal; natives: addEventListener (global bucket), requestAnimationFrame,
+  location.reload, localStorage/sessionStorage (worker-RAM), readyState,
+  navigator.userAgent "Mazda/1.0", matchMedia, alert/confirm/prompt to
+  stderr, console variants, full event objects; stopPropagation/
+  cancelAnimationFrame/keyup deferred (`30945c8` +20 tests; wiki 100.8MB)
+- [x] **Language-depth wave (Option A grows)** — from-scratch bounded regex
+  engine (flat instruction program + iterative backtracking, MAX_STEPS 100k/
+  MAX_BACKTRACK 8k, program/group caps, lookaround via bounded sub-run,
+  512-entry literal cache; `(a+)+$` blowup returns in budget, never hangs;
+  lookbehind/named-groups/`\p` = SyntaxError), real Promise state machine +
+  chaining + all/race/any/allSettled combinators, async/await
+  run-to-completion with bounded microtask drain (10k cap) and honest
+  unsupported-error instead of silent hang, generators via mini-VM with
+  explicit frames (+2 engine bugs fixed: loop redecl shadowing, resume
+  feed), destructuring/spread/rest + class get/set accessors + instanceof
+  fixes; verified on Wikipedia: 70KB startup bundle runs end-to-end
+  (`26971f2` +39 tests; 339 total; wiki 97.1MB)
+- [ ] **Selectable script runtime (settings page)** — agreed: Option A =
+  pure-Rust built-in (default, light); Option B = full engine core opt-in
+  (+30 MB/page), `ScriptRuntime` trait + persisted `mazda.conf` + ⚙ settings
+  overlay behind cargo feature; in progress (engine-select worktree,
+  parallel with language-depth merge)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -470,6 +499,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | P1 parity wave | MDN | 66.2 MB (657 runs; DSD header restored, hero one line-gap) |
 | 2026-10-30 | P1 parity wave | nextjs.org | 80.5 MB (502 runs) |
 | 2026-10-31 | forms + scripts wave | Wikipedia (Main_Page) | 93.1 MB (1269 runs; + worker keeps DOM+JS engine+CSS between jobs, dropped on nav) |
+| 2026-10-31 | event-loop wave | Wikipedia (Main_Page) | 100.8 MB (timers/microtasks/rAF queues + listener maps; engine still dropped per nav) |
+| 2026-10-31 | language-depth wave | Wikipedia (Main_Page) | 97.1 MB (1255 runs; 70KB startup bundle now runs end-to-end) |
 
 ### Phase 1c (Track A) findings
 
