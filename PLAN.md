@@ -442,6 +442,41 @@ curve matters more than the baseline (near-flat as tabs grow).
   release built WITH the feature so B is user-selectable (binary 7.5→15.7
   MB, B costs nothing until chosen). Tests: default 344, feature 346
   (`a95010d`; both contract-tested, one conf-parser bug found+fixed by tests)
+- [x] **Gap-fix wave (form POST + layout + the MDN hang)** — four parallel
+  threads, all general fixes:
+  **(a) real form submission** — GET/POST from live DOM: checked-state from
+  worker DOM + FormState overrides, urlencoded serializer (GET replaces the
+  whole query, POST via uncached fetch adopted through the normal nav
+  channel), two-stage submit veto (button listeners → form `submit`
+  listeners) and native `form.submit()` (no event, no veto); live-proven
+  against a local HttpListener (`de58108`, +3 tests);
+  **(b) inline/flex layout** — plain inlines with horizontal margins are
+  promoted to real inline boxes (real gap advance, no jamming), flex item
+  slots span the whole margin box, `%` width is intrinsic during
+  max-content measurement (cyclic sizing) and caps at the row's remaining
+  share as a flex basis; absolute `top/left` verified unclamped (`8654f89`,
+  +7 tests, live Wikipedia header fixed);
+  **(c) label/margin semantics** — `contained_text` skips `svg`/`script`/
+  `style` subtrees (icon `<svg>` in a `<button>` no longer leaks `<path…/>`
+  source into the label), `margin` shorthand parses positionally WITH `auto`
+  slots in place and layout honors per-side auto (both → center, left-only →
+  push right, right-only → hug left) instead of any-auto → center
+  (`148968b`, +3 tests);
+  **(d) the MDN hang — two bugs deep**: (1) **interpreter had no step
+  budget** — a `for(;;)` fed by a broken scanner pegged the worker forever
+  (57s CPU/60s wall, page never completed); added a per-turn dispatch budget
+  (`steps`/`tick()` in eval_stmt/eval_expr + the generator driver, reset per
+  turn, uncatchable by script try/catch, budget error carries the spinning
+  statement's line/col via span → line_col) — a runaway loop now aborts in
+  ~1s with an honest `RangeError: script exceeded the step budget`; (2)
+  **the actual spinner was the LEXER**: a literal `$` NOT starting an
+  interpolation inside a template literal (`` `$${r}` ``) fell into the
+  raw-run arm which breaks AT the `$` without consuming → infinite loop;
+  fixed with a literal-`$` arm. With both fixes MDN's /CSS/margin completes:
+  `[mem] after layout 86.4 MB (2877 runs)`, CPU 1.7s/60s wall (`b1640ed`,
+  +8 tests; remaining script errors are honest unsupported-syntax reports,
+  not hangs: `export const` module syntax, `\x` escape). Tests: default
+  371, feature 374
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -519,6 +554,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-31 | event-loop wave | Wikipedia (Main_Page) | 100.8 MB (timers/microtasks/rAF queues + listener maps; engine still dropped per nav) |
 | 2026-10-31 | language-depth wave | Wikipedia (Main_Page) | 97.1 MB (1255 runs; 70KB startup bundle now runs end-to-end) |
 | 2026-10-31 | selectable runtime: A vs B | Wikipedia Rust article / DuckDuckGo ?q= | A 94.7 / 82.2 MB; B 96.3 / 176.2 MB (B heap lazy on simple pages; heavy script bundles cost far more than the +30 ballpark) |
+| 2026-10-31 | gap-fix wave (lexer `$` spin fix + JS step budget) | MDN /Web/CSS/margin | 86.4 MB (2877 runs; first successful load — previously hung forever in the lexer, 57s CPU/60s wall; now 1.7s CPU/60s wall) |
 
 ### Phase 1c (Track A) findings
 
