@@ -561,9 +561,16 @@ mutation. Pixel-parity on heavyweight JS applications (google.com-class) explici
 a near-term target: those need a Chrome-scale API surface + JIT; recorded honestly here
 so the goalposts don't drift.
 **User decision 2026-10-31: selectable script runtime.** Option A = the pure-Rust
-built-in interpreter (default, the engine completed in steps); Option B = a mature
-pure-Rust engine core compiled in behind a cargo feature flag (opt-in, ~+20-40 MB
-per page, for scripts A cannot run yet). Both sit behind one `ScriptRuntime` trait
+built-in interpreter (default, the engine completed in steps); Option B = a full
+JS engine core selected from the settings page (compatibility mode, ~+30 MB per
+page), compiled in behind a cargo feature flag so the default build unchanged.
+The settings page presents exactly:
+```
+JavaScript engine:
+  (•) A — Pure Rust built-in (light)
+  ( ) B — Full JS engine core (compatibility, +30 MB/page)
+```
+Both sit behind one `ScriptRuntime` trait
 sharing the same DOM natives in `script.rs`; a settings page in the browser UI
 persists the choice (`mazda.conf` alongside the disk cache), default A. Sequenced
 after the language-depth + event-loop waves land (same files). Per-app selection,
