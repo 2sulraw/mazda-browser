@@ -305,6 +305,23 @@ impl App {
         pw: usize,
         ph: usize,
     ) -> u64 {
+        self.dispatch_event_ext(node, kinds, value, key, false, pw, ph)
+    }
+
+    /// `dispatch_event` with a submission trigger: the worker runs the
+    /// listed listeners, then the form's `submit` listeners may veto
+    /// (preventDefault) before the real GET/POST load executes — all under
+    /// this one job's NavGate id (the submission IS the async load).
+    fn dispatch_event_ext(
+        &mut self,
+        node: u32,
+        kinds: &[&str],
+        value: Option<String>,
+        key: Option<&str>,
+        submit: bool,
+        pw: usize,
+        ph: usize,
+    ) -> u64 {
         let id = self.nav.begin();
         let req = LoadReq::Event {
             id,
@@ -316,6 +333,7 @@ impl App {
             value,
             key: key.map(|s| s.to_string()),
             href: None,
+            submit,
             forms: self.forms.clone(),
             engine: self.conf.engine,
         };
@@ -339,9 +357,29 @@ impl App {
             }
             // a script may have asked to navigate (location.assign etc.)
             if let Some(nav_url) = done.nav {
-                eprintln!("[js] script navigated to {nav_url}");
-                self.dispatch(&nav_url, pw, ph, 0.0);
-                continue;
+                if done.nav_done {
+                    // form submission loaded worker-side (nav + rendered
+                    // target page arrive together): adopt the page directly
+                    // with full navigation semantics (history + address); a
+                    // UI-side re-dispatch here would re-fetch the target as
+                    // a plain GET and LOSE a POST body.
+                    eprintln!(
+                        "[nav] form submission accept at #{} → {nav_url}",
+                        done.id
+                    );
+                    self.back_stack.push(self.page.url.clone());
+                    self.expect_nav = true;
+                    self.pending = None;
+                    // fall through to the shared page-apply below (the
+                    // wire's url IS nav_url and the expect_nav branch
+                    // updates tabs/address from it)
+                } else {
+                    // plain script nav on a concurrently-fetched page: the
+                    // target was never fetched — re-dispatch it as a load
+                    eprintln!("[js] script navigated to {nav_url}");
+                    self.dispatch(&nav_url, pw, ph, 0.0);
+                    continue;
+                }
             }
             // link click awaiting its listener decision: veto (preventDefault)
             // or proceed (navigate). See `click_decision` (pure, tested).
@@ -468,8 +506,12 @@ impl App {
                 self.dispatch_event(fb.node, &["click"], None, None, pw, ph);
             }
             layout::FormKind::Submit => {
-                // shortcut: no form POST — the shell logs name=value (the
-                // same observable contract the layout module documents)
+                // real submission: the shell logs the visible pair (same
+                // observable contract as before) and the event job now
+                // carries the submission trigger — the worker runs the
+                // button's click listeners, then the form's submit
+                // listeners (preventDefault may cancel), then executes the
+                // GET/POST load on the worker thread under this job's gate.
                 let name = self
                     .form_names
                     .get(&fb.node)
@@ -490,7 +532,7 @@ impl App {
                     }
                 }
                 self.forms.focused = None;
-                self.dispatch_event(fb.node, &["click"], None, None, pw, ph);
+                self.dispatch_event_ext(fb.node, &["click"], None, None, true, pw, ph);
             }
             layout::FormKind::Select | layout::FormKind::Generic => {
                 // no popup / non-interactive yet — just blur
@@ -697,6 +739,7 @@ impl eframe::App for App {
                     let mut dirty = false;
                     let mut typed = false;
                     let mut change_now: Option<String> = None;
+                    let mut got_submit = false;
                     for a in actions {
                         match a {
                             KeyAction::Insert(c) => {
@@ -720,10 +763,13 @@ impl eframe::App for App {
                                     .unwrap_or_default();
                                 let val = self.forms.values.get(&field).cloned().unwrap_or_default();
                                 eprintln!("[form] submit {name}={val}");
-                                // Enter → change with the final value (and a
-                                // keydown listeners can observe)
+                                // Enter → real submission: change with the
+                                // final value AND the submission trigger (the
+                                // worker sends the form's submit event after
+                                // the field's keydown/input/change listeners)
                                 keydown = Some("Enter".into());
                                 change_now = Some(val);
+                                got_submit = true;
                             }
                             KeyAction::Blur => {
                                 // Escape → change + blur (the value stays
@@ -736,12 +782,13 @@ impl eframe::App for App {
                             KeyAction::None => {}
                         }
                     }
-                    if dirty {
+                    if dirty || got_submit {
                         // push the new value to the worker so it re-lays out
                         // with the updated text, firing listeners: `input`
                         // per keystroke (real-input-event semantics; the
                         // per-keystroke job is also what syncs the value),
-                        // `change` on Enter/Escape with the final value
+                        // `change` on Enter/Escape with the final value. The
+                        // Enter case rides the submission trigger.
                         let mut kinds: Vec<&str> = Vec::new();
                         if keydown.is_some() {
                             kinds.push("keydown");
@@ -754,7 +801,7 @@ impl eframe::App for App {
                         if kinds.is_empty() {
                             kinds.push("change");
                         }
-                        self.dispatch_event(field, &kinds, change_now.or_else(|| self.forms.values.get(&field).cloned()), keydown.as_deref(), pw, ph);
+                        self.dispatch_event_ext(field, &kinds, change_now.or_else(|| self.forms.values.get(&field).cloned()), keydown.as_deref(), got_submit, pw, ph);
                     }
                 }
                 if !ui.ctx().egui_wants_keyboard_input() && !self.address_focused {
@@ -850,6 +897,7 @@ impl eframe::App for App {
                                             value: None,
                                             key: None,
                                             href: Some(href.to_string()),
+                                            submit: false,
                                             forms: self.forms.clone(),
                                             engine: self.conf.engine,
                                         };
@@ -1051,6 +1099,9 @@ enum LoadReq {
     /// re-lays out, re-emits. `href` targets a LINK click (layout runs
     /// carry the href, not a node id — the worker resolves the first
     /// matching anchor and bubbles from there).
+    /// `submit` = this activation is a submission trigger: after the listed
+    /// listeners run (clean), the worker sends the form's own `submit`
+    /// listeners the submit event and executes the real GET/POST load.
     Event {
         id: u64,
         url: String,
@@ -1066,6 +1117,8 @@ enum LoadReq {
         key: Option<String>,
         /// raw href of the clicked link (click-decision flow)
         href: Option<String>,
+        /// submission trigger (Enter in a field / submit-button click)
+        submit: bool,
         forms: layout::FormState,
         engine: EngineChoice,
     },
@@ -1133,6 +1186,25 @@ fn click_decision(pending: &Option<(u64, String)>, prevent_default: bool) -> Lin
     }
 }
 
+/// Pure submit-vs-cancel verdict for one submission stage (mirrors
+/// `click_decision` in shape; worker-side the decision has two stages —
+/// activation + form): the activating click's listeners and the form's
+/// `submit` listeners each write one `preventDefault` flag — either being
+/// set cancels the not-yet-built request (the request is only built clean).
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitDecision {
+    Submit,
+    Cancel,
+}
+
+fn submit_decision(prevent_default: bool) -> SubmitDecision {
+    if prevent_default {
+        SubmitDecision::Cancel
+    } else {
+        SubmitDecision::Submit
+    }
+}
+
 /// Wire form of a laid-out page: everything `Page`/`Layout` hold, minus the
 /// `Rc`s that aren't `Send`. The UI thread re-wraps into `Rc` on receipt.
 struct PageWire {
@@ -1181,6 +1253,12 @@ struct LoadDone {
     page: Option<PageWire>,
     /// script called `location.assign`/`location = ...` — UI should navigate
     nav: Option<String>,
+    /// the worker ALREADY fetched + rendered this `nav` target (a form
+    /// submission, or a nested POST `form.submit()` during the load): the
+    /// UI adopts the page instead of re-dispatching (a re-dispatch would
+    /// refetch a POST as plain GET and lose the body). false for plain
+    /// script navs (`location.assign`) — those still re-dispatch.
+    nav_done: bool,
     /// a click listener called preventDefault → the UI drops the pending
     /// link navigation this job's id belongs to (never started)
     prevent_default: bool,
@@ -1296,6 +1374,12 @@ struct KeptPage {
     /// the concrete runtime at load time and the rest of the shell never
     /// knows which one runs.
     scripts: Option<Box<dyn ScriptRuntime>>,
+    /// engine this page was BUILT with — form-submission loads fired by
+    /// script turns (`form.submit()` POST) re-run the full pipeline from a
+    /// context that has no `LoadReq` around, so the page's own engine
+    /// choice is the one that must apply (same answer as `job.engine()`
+    /// for jobs).
+    engine: EngineChoice,
 }
 
 /// The single long-lived loader thread. Owns its own `Fonts` (font types
@@ -1351,12 +1435,12 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 process_job(&mut kept, &mut fonts, &job, &mut last_geom, &mut last_forms)
             }));
-            let (wire, nav, pd, panicked) = match outcome {
+            let (wire, nav, pd, panicked, nav_done) = match outcome {
                 Ok(r) => r,
                 Err(_) => {
                     eprintln!("[nav] loader pipeline panicked for {url}");
                     kept = None; // don't trust a half-built page
-                    (None, None, false, true)
+                    (None, None, false, true, false)
                 }
             };
             eprintln!(
@@ -1371,7 +1455,7 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
                     current_id = id;
                 }
                 if results
-                    .send(LoadDone { id, page: wire, nav, prevent_default: pd, panicked })
+                    .send(LoadDone { id, page: wire, nav, nav_done, prevent_default: pd, panicked })
                     .is_err()
                 {
                     break; // UI side gone
@@ -1474,6 +1558,9 @@ fn fire_due(
     if !due_now {
         return;
     }
+    // engine of the kept page (form-submission loads fired from timer/rAF
+    // turns re-run the full pipeline and must use the same runtime choice)
+    let engine = kept.as_ref().map(|k| k.engine).unwrap_or(EngineChoice::A);
     let KeptPage { dom, scripts, css_text, faces, url, .. } = kept.as_mut().unwrap();
     let (mw, vh) = *last_geom;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1482,21 +1569,28 @@ fn fire_due(
             .map(|s| {
                 let mut dirty = false;
                 let mut nav = None;
+                let mut form_nav = None;
                 let t = s.run_due_timers(dom);
                 dirty |= t.dirty;
                 if nav.is_none() {
                     nav = t.nav;
+                }
+                if form_nav.is_none() {
+                    form_nav = t.form_nav;
                 }
                 let f = s.run_due_frames(dom);
                 dirty |= f.dirty;
                 if nav.is_none() {
                     nav = f.nav;
                 }
-                (dirty, nav)
+                if form_nav.is_none() {
+                    form_nav = f.form_nav;
+                }
+                (dirty, nav, form_nav)
             })
-            .unwrap_or((false, None))
+            .unwrap_or((false, None, None))
     }));
-    let (dirty, nav) = match outcome {
+    let (dirty, nav, form_nav) = match outcome {
         Ok(r) => r,
         Err(_) => {
             eprintln!("[nav] JS turn panicked (timers/rAF); page dropped");
@@ -1504,11 +1598,29 @@ fn fire_due(
             return;
         }
     };
+    if let Some(f) = form_nav {
+        // a timer/rAF callback form.submit()ed a POST: the worker executes
+        // the load and hands up the rendered page (same gate id)
+        eprintln!("[js] timer form.submit() (POST) executes a load → {}", f.url);
+        let (wire, nav2) = do_form_nav(kept, fonts, &f, mw, vh, engine);
+        let done = nav2.is_none();
+        let _ = results.send(LoadDone {
+            id: current_id,
+            page: wire,
+            nav: nav2.or(Some(f.url)),
+            // fetched by the worker (unless the loaded page's own scripts
+            // asked for a plain nav — that one re-dispatches)
+            nav_done: done,
+            prevent_default: false,
+            panicked: false,
+        });
+        return;
+    }
     if let Some(nav_url) = nav {
         // a timer/rAF callback asked to navigate: hand it up untouched
         eprintln!("[js] timer navigation → {nav_url}");
         if results
-            .send(LoadDone { id: current_id, page: None, nav: Some(nav_url), prevent_default: false, panicked: false })
+            .send(LoadDone { id: current_id, page: None, nav: Some(nav_url), nav_done: false, prevent_default: false, panicked: false })
             .is_err()
         {
             return; // UI side gone
@@ -1527,7 +1639,7 @@ fn fire_due(
         let wire = page_to_wire(page, stacks, out_faces, form_names);
         eprintln!("[js] timer/frame mutated the page; pushed relayout");
         if results
-            .send(LoadDone { id: current_id, page: Some(wire), nav: None, prevent_default: false, panicked: false })
+            .send(LoadDone { id: current_id, page: Some(wire), nav: None, nav_done: false, prevent_default: false, panicked: false })
             .is_err()
         {
             // UI side gone
@@ -1536,28 +1648,29 @@ fn fire_due(
 }
 
 /// Handle one job against the kept page. Returns (wire page, script-requested
-/// navigation, preventDefault flag, panicked-flag). Falls back to a full load
-/// when there's no kept page for the job's URL.
+/// navigation, preventDefault flag, panicked flag, nav-done flag — true when
+/// the worker already fetched+rendered the `nav` target). Falls back to a
+/// full load when there's no kept page for the job's URL.
 fn process_job(
     kept: &mut Option<KeptPage>,
     fonts: &mut Fonts,
     job: &LoadReq,
     last_geom: &mut (f32, f32),
     last_forms: &mut layout::FormState,
-) -> (Option<PageWire>, Option<String>, bool, bool) {
+) -> (Option<PageWire>, Option<String>, bool, bool, bool) {
     match job {
         LoadReq::Load { url, max_w, vh, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = layout::FormState::default();
             let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
-            (r.0, r.1, false, r.2)
+            (r.0, r.1, false, r.2, r.3)
         }
         LoadReq::Relayout { url, max_w, vh, forms, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
                 let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
-                return (r.0, r.1, false, r.2);
+                return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
             let (page, form_names) = layout_page(
@@ -1565,14 +1678,14 @@ fn process_job(
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
-            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false)
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false, false)
         }
-        LoadReq::Event { url, max_w, vh, node, kinds, value, key, href, forms, .. } => {
+        LoadReq::Event { url, max_w, vh, node, kinds, value, key, href, submit, forms, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
                 let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
-                return (r.0, r.1, false, r.2);
+                return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
             // link clicks arrive by href (layout runs carry hrefs, not node
@@ -1602,6 +1715,7 @@ fn process_job(
             // fire the target's listeners for each kind, in order
             let mut nav = None;
             let mut pd = false;
+            let mut script_form_nav: Option<runtime::FormNav> = None;
             {
                 let KeptPage { dom, scripts, .. } = kp;
                 if let Some(scripts) = scripts.as_mut() {
@@ -1612,6 +1726,112 @@ fn process_job(
                     );
                     nav = t.nav;
                     pd = t.prevent_default;
+                    script_form_nav = t.form_nav;
+                }
+            }
+            // a listener form.submit()ing a POST during the activation
+            // outranks every later stage of this job (a real navigation has
+            // already been queued worker-side — execute it now)
+            if nav.is_none() {
+                if let Some(f) = script_form_nav {
+                    eprintln!("[nav] listener form.submit() (POST) executes this job's load");
+                    let (wire, nav2) = do_form_nav(kept, fonts, &f, *max_w, *vh, job.engine());
+                    let done = nav2.is_none();
+                    return (wire, nav2.or(Some(f.url.clone())), false, false, done);
+                }
+            }
+            // ---- real submission stage ----
+            // Order (see the module contract): the activating listeners above
+            // had their veto — a click listener's preventDefault stops
+            // activation entirely (no submit event, `submit_decision`);
+            // otherwise the form's own submit listeners receive a `submit`
+            // event and a preventDefault there cancels the navigation (the
+            // same pure verdict, second stage). Still clean → the worker
+            // collects the successful pairs and executes the GET/POST load
+            // under this job's NavGate id (the result comes back as nav +
+            // rendered page in one shot).
+            // NOTE: if the listened-to node navigated itself (nav/form_nav
+            // above), that wins over the form data.
+            if *submit && nav.is_none() {
+                if submit_decision(pd) == SubmitDecision::Cancel {
+                    eprintln!("[js] preventDefault — submission canceled at activation (no submit event)");
+                } else {
+                    let submission = build_submission(&kp.dom, target, &forms.values, url);
+                    match submission {
+                        None => {
+                            eprintln!(
+                                "[form] activation on node {target} has no enclosing <form> (or unresolvable action) — no submission"
+                            );
+                        }
+                        Some(sub) => {
+                            eprintln!(
+                                "[form] submit method={} url={} body={} bytes (urlencoded)",
+                                sub.method.as_str(),
+                                sub.target,
+                                sub.body.len()
+                            );
+                            // the form's submit listeners get the submit event
+                            // (bubbles like the click dispatch). A preventDefault
+                            // there vetoes the build (`submit_decision` again); a
+                            // listener's own navigation outranks the form data.
+                            let mut vetoed = false;
+                            {
+                                let KeptPage { dom, scripts, .. } = kp;
+                                if let (Some(scripts), Some(form)) =
+                                    (scripts.as_mut(), form_ancestor(dom, target))
+                                {
+                                    let t = ScriptRuntime::dispatch(
+                                        scripts.as_mut(),
+                                        dom, form, &["submit"], None, None, None,
+                                    );
+                                    if let Some(f) = t.form_nav {
+                                        // a submit listener form.submit()ed a
+                                        // POST itself: execute that instead
+                                        eprintln!("[nav] submit listener form.submit() (POST) executes this job's load");
+                                        let (wire, nav2) =
+                                            do_form_nav(kept, fonts, &f, *max_w, *vh, job.engine());
+                                        let done = nav2.is_none();
+                                        return (wire, nav2.or(Some(f.url)), false, false, done);
+                                    }
+                                    if let Some(nav_target) = t.nav {
+                                        eprintln!("[js] submit listener navigated to {nav_target}");
+                                        return (None, Some(nav_target), false, false, false);
+                                    }
+                                    vetoed = submit_decision(t.prevent_default) == SubmitDecision::Cancel;
+                                }
+                            }
+                            if vetoed {
+                                eprintln!("[js] preventDefault — form submission canceled by the submit event");
+                            } else {
+                                match sub.method {
+                                    SubmitMethod::Get => {
+                                        eprintln!("[nav] queued load (form GET {})", sub.target);
+                                        let (wire, script_nav, panicked, nav_done) =
+                                            do_load(kept, fonts, &sub.target, *max_w, *vh, job.engine());
+                                        if let Some(s) = &script_nav {
+                                            // the fetched page's scripts asked for
+                                            // a plain nav: it wins (the ordinary
+                                            // load contract) — the UI re-dispatches
+                                            // it, the submission still went out
+                                            eprintln!("[js] post-submission script nav → {s}");
+                                        }
+                                        // script nav present → it is UI-side work
+                                        // (nav_done false); clean GET → the wire IS
+                                        // the submission's target page (adopt)
+                                        let done = nav_done || script_nav.is_none();
+                                        return (wire, script_nav.or(Some(sub.target)), pd, panicked, done);
+                                    }
+                                    SubmitMethod::Post => {
+                                        let f = runtime::FormNav { url: sub.target.clone(), body: sub.body };
+                                        let (wire, nav2) =
+                                            do_form_nav(kept, fonts, &f, *max_w, *vh, job.engine());
+                                        let done = nav2.is_none();
+                                        return (wire, nav2.or(Some(sub.target)), false, false, done);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // always re-layout: the event likely changed the DOM
@@ -1620,7 +1840,7 @@ fn process_job(
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
-            (Some(page_to_wire(page, stacks, out_faces, form_names)), nav, pd, false)
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), nav, pd, false, false)
         }
         LoadReq::Scroll { url, y } => {
             // scroll listeners only; no re-layout unless a listener mutated
@@ -1628,34 +1848,46 @@ fn process_job(
             // scrolling must never preempt other results' gating.
             if !kept_matches(kept, url) {
                 eprintln!("[nav] scroll event for unloaded page dropped");
-                return (None, None, false, false);
+                return (None, None, false, false, false);
             }
             let kp = kept.as_mut().unwrap();
             let body = kp.dom.body_root();
             let (page, form_names) = {
-                let mut nav = None;
-                let mut dirty = false;
-                {
-                    let KeptPage { dom, scripts, .. } = kp;
-                    if let Some(scripts) = scripts.as_mut() {
-                        let t = ScriptRuntime::dispatch(
-                            scripts.as_mut(),
-                            dom, body, &["scroll"], None, Some(*y), None,
-                        );
-                        nav = t.nav;
-                        dirty = t.dirty;
+                    let mut nav = None;
+                    let mut dirty = false;
+                    let mut form_nav: Option<runtime::FormNav> = None;
+                    {
+                        let KeptPage { dom, scripts, .. } = kp;
+                        if let Some(scripts) = scripts.as_mut() {
+                            let t = ScriptRuntime::dispatch(
+                                scripts.as_mut(),
+                                dom, body, &["scroll"], None, Some(*y), None,
+                            );
+                            nav = t.nav;
+                            dirty = t.dirty;
+                            form_nav = t.form_nav;
+                        }
+                        if let Some(f) = form_nav {
+                            // a scroll listener form.submit()ed a POST:
+                            // execute worker-side, exactly like a script nav
+                            eprintln!("[js] scroll listener form.submit() (POST) executes a load");
+                            let engine = kept.as_ref().map(|k| k.engine).unwrap_or(EngineChoice::A);
+                            let (wire, nav2) =
+                                do_form_nav(kept, fonts, &f, last_geom.0, last_geom.1, engine);
+                            let done = nav2.is_none();
+                            return (wire, nav2.or(Some(f.url.clone())), false, false, done);
+                        }
+                        if let Some(nav_url) = nav {
+                            // scroll listener navigated: hand it up untouched
+                            eprintln!("[js] scroll listener navigates to {nav_url}");
+                            return (None, Some(nav_url), false, false, false);
+                        }
+                        if !dirty {
+                            // nothing mutated: the UI paints its own scroll; no
+                            // result (keeps the generation gate untouched)
+                            return (None, None, false, false, false);
+                        }
                     }
-                    if let Some(nav_url) = nav {
-                        // scroll listener navigated: hand it up untouched
-                        eprintln!("[js] scroll listener navigates to {nav_url}");
-                        return (None, Some(nav_url), false, false);
-                    }
-                    if !dirty {
-                        // nothing mutated: the UI paints its own scroll; no
-                        // result (keeps the generation gate untouched)
-                        return (None, None, false, false);
-                    }
-                }
                 let (page, fnames) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
                 );
@@ -1663,7 +1895,7 @@ fn process_job(
             };
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
-            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false)
+            (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false, false)
         }
     }
 }
@@ -1709,7 +1941,8 @@ fn kept_matches(kept: &Option<KeptPage>, url: &str) -> bool {
 }
 
 /// Full load: fetch + parse + run `<script>` + layout. Seeds/ replaces the
-/// kept page.
+/// kept page. `settle_load` is the shared back half — submission-driven
+/// loads arrive with bytes already fetched (POST) and skip `fetch_and_parse`.
 fn do_load(
     kept: &mut Option<KeptPage>,
     fonts: &mut Fonts,
@@ -1717,9 +1950,148 @@ fn do_load(
     max_w: f32,
     vh: f32,
     engine: EngineChoice,
-) -> (Option<PageWire>, Option<String>, bool) {
+) -> (Option<PageWire>, Option<String>, bool, bool) {
     let (dom, css_text, faces) = fetch_and_parse(url);
-    let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None };
+    let (wire, nav, form_nav) = settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces);
+    if let Some(f) = form_nav {
+        // an inline script form.submit()ed a POST during the load — the
+        // worker executes it now (the first page's wire is replaced). Same
+        // declaration as the real-submission POST stage: the clean case
+        // pairs nav (= the POST target) + the fetched wire under nav_done
+        // so the UI adopts it (accept log + history); the POST response
+        // page's own script nav outranks (re-dispatched, plain contract).
+        eprintln!("[js] inline form.submit() (POST) during load → {}", f.url);
+        let (wire, nav2) = do_form_nav(kept, fonts, &f, max_w, vh, engine);
+        let done = nav2.is_none();
+        return (wire, nav2.or(Some(f.url)), false, done);
+    }
+    // plain script nav (location.assign etc.): handed up untouched — the UI
+    // re-dispatches it as a fresh load (the POST form.submit() case was the
+    // branch above, already executed worker-side)
+    (wire, nav, false, false)
+}
+
+/// POST-submission load: `fetch_post` on the worker thread, then the exact
+/// same parse → script → layout pipeline as a plain load; failure becomes
+/// the existing error page. Nav: Some(target url) for the UI (a post-load
+/// script nav wins — matching the plain-load contract).
+fn do_form_nav(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    f: &runtime::FormNav,
+    max_w: f32,
+    vh: f32,
+    engine: EngineChoice,
+) -> (Option<PageWire>, Option<String>) {
+    eprintln!(
+        "[nav] queued load (form POST {}, urlencoded body {} bytes)",
+        f.url,
+        f.body.len()
+    );
+    let fetched = fetch_post(&f.url, &f.body.clone());
+    let (wire, nav, form_nav2) =
+        do_load_full(kept, fonts, &f.url, fetched, max_w, vh, engine);
+    if let Some(f2) = form_nav2 {
+        eprintln!("[js] form.submit() chain after POST load (dropped, one step)");
+        eprintln!("[nav] form submission chain → {}", f2.url);
+    }
+    (wire, nav)
+}
+
+/// Load from already-fetched bytes (POST responses): parse + styles + run +
+/// layout, same pipeline discipline as `do_load`. Error → the existing
+/// "Failed to load" error page.
+fn do_load_full(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    url: &str,
+    fetched: Result<(Vec<u8>, Option<String>), String>,
+    max_w: f32,
+    vh: f32,
+    engine: EngineChoice,
+) -> (Option<PageWire>, Option<String>, Option<runtime::FormNav>) {
+    let (dom, css_text, faces) = match fetched {
+        Ok((bytes, ct)) => {
+            let s = html::decode_html(&bytes, ct.as_deref());
+            eprintln!(
+                "[mem] after fetch: {:.1} MB (html {} KB, {})",
+                working_set_mb(),
+                s.len() / 1024,
+                ct.as_deref().unwrap_or("no content-type")
+            );
+            parse_source_with_styles(url, s)
+        }
+        Err(e) => {
+            eprintln!("[nav] form POST failed for {url}: {e}");
+            parse_source_with_styles(url, format!("<p>Failed to load: {e}</p>"))
+        }
+    };
+    settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces)
+}
+
+/// Parse an HTML source + collect its stylesheets (`fetch_and_parse`'s back
+/// half, reused for POST responses so the stylesheet handling exists once).
+fn parse_source_with_styles(url: &str, source: String) -> (html::Dom, String, Vec<css::FontFace>) {
+    let dom = html::parse(&source);
+    eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
+
+    // Phase 1b: collect every stylesheet in document order — <style> blocks
+    // (usually in <head>, which body_root skips) and external <link>s — then
+    // parse ONCE into precompiled selectors.
+    let mut sources = Vec::new();
+    collect_sheets(&dom, 0, &mut sources);
+    let mut css_text = String::new();
+    let mut ext_count = 0usize;
+    // `@font-face` defs collected per-sheet: the cascade concatenates sheets,
+    // which would lose each sheet's base URL for resolving relative src paths
+    let mut faces: Vec<css::FontFace> = Vec::new();
+    for src in &sources {
+        match src {
+            SheetSrc::Inline(text) => {
+                faces.extend(css::collect_font_faces(text, url));
+                css_text.push_str(text);
+                css_text.push('\n');
+            }
+            SheetSrc::Link(href) => {
+                let Some(abs) = resolve(url, href) else { continue };
+                match fetch(&abs) {
+                    Ok((bytes, _)) => {
+                        // CSS is UTF-8 in practice (spec @charset unsupported — shortcut)
+                        let text = String::from_utf8_lossy(&bytes);
+                        faces.extend(css::collect_font_faces(&text, &abs));
+                        css_text.push_str(&text);
+                        css_text.push('\n');
+                        ext_count += 1;
+                    }
+                    Err(e) => eprintln!("[css] stylesheet fetch failed {abs}: {e}"),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[css] {} bytes of style ({} external sheets)",
+        css_text.len(),
+        ext_count
+    );
+    (dom, css_text, faces)
+}
+
+/// The shared back half of every load (plain fetch or a POST submission's
+/// bytes): run `<script>`, layout, replace the kept page, wire out.
+/// Also hands back a `form_nav` if one of the page's own inline scripts
+/// form.submit()ed a POST (the caller decides whether to execute it).
+fn settle_load(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    url: &str,
+    max_w: f32,
+    vh: f32,
+    engine: EngineChoice,
+    dom: html::Dom,
+    css_text: String,
+    faces: Vec<css::FontFace>,
+) -> (Option<PageWire>, Option<String>, Option<runtime::FormNav>) {
+    let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None, engine };
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = scripts.run_scripts(&mut kp.dom);
@@ -1737,7 +2109,7 @@ fn do_load(
     let out_faces = collect_out_faces(fonts);
     let wire = page_to_wire(page, stacks, out_faces, form_names);
     *kept = Some(kp);
-    (Some(wire), turn.nav, false)
+    (Some(wire), turn.nav, turn.form_nav)
 }
 
 /// Snapshot the worker font picker's faces into `css::FontFace` for the wire.
@@ -1781,6 +2153,241 @@ fn remove_dom_attr(dom: &mut html::Dom, node: u32, name: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Real form submission: collect successful form-control pairs from the
+// worker DOM, resolve the `<form>`'s method/action, then the loader worker
+// executes GET (a normal load) or an `application/x-www-form-urlencoded`
+// POST through the same fetch path — the response page is parsed/rendered
+// exactly like any navigation.
+// ---------------------------------------------------------------------------
+
+/// A successful form-control pair ready for URL encoding (`name=value` order
+/// preserved; document order — the spec-relevant order for urlencoded data).
+pub(crate) fn collect_form_pairs(
+    dom: &html::Dom,
+    form: u32,
+    live: &HashMap<u32, String>,
+) -> Vec<(String, String)> {
+    fn walk(
+        dom: &html::Dom,
+        node: u32,
+        live: &HashMap<u32, String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for &c in &dom.nodes[node as usize].children {
+            let tag = dom.tag(c).to_ascii_lowercase();
+            // honest submission set: inputs + textarea. `<select>` values are
+            // inert (no popup — no user-editable state exists yet) and
+            // `<button>`/submit-kind inputs are excluded per the builder's
+            // shortcut, so the only successful controls are text-ish fields
+            // and checked checkboxes/radios. `type=hidden` still submits: it
+            // must never be editable, and the DOM (not the layout) is the
+            // source of truth here.
+            if matches!(tag.as_str(), "input" | "textarea") {
+                if let Some(name) = dom.attr(c, "name") {
+                    let name = name.to_string();
+                    if tag == "textarea" {
+                        // live typed text first (what the user sees), then a
+                        // scripted `value` attribute, then the markup default
+                        // (the textarea's own text content)
+                        let value = live
+                            .get(&c)
+                            .cloned()
+                            .or_else(|| dom.attr(c, "value").map(|s| s.to_string()))
+                            .unwrap_or_else(|| crate::script::child_text(dom, c));
+                        out.push((name, value));
+                    } else {
+                        let ty = dom
+                            .attr(c, "type")
+                            .unwrap_or("text")
+                            .trim()
+                            .to_ascii_lowercase();
+                        match ty.as_str() {
+                            // buttons that submit (or reset/image) are never
+                            // successful pairs (see the [form] submit data
+                            // contract); `file` is the second honest shortcut
+                            // (no picker UI exists)
+                            "submit" | "reset" | "button" | "image" | "file" => {}
+                            // checked state lives engine-side in the worker
+                            // DOM (the shell's click toggles carry through
+                            // `apply_click_toggle`): only checked boxes submit
+                            "checkbox" | "radio" => {
+                                if dom.attr(c, "checked").is_some() {
+                                    // HTML default when no value attr: "on"
+                                    let value = dom
+                                        .attr(c, "value")
+                                        .unwrap_or("on")
+                                        .to_string();
+                                    out.push((name, value));
+                                }
+                            }
+                            // text-ish inputs + the inert generic types
+                            // (range/color/date — static value attr, no
+                            // interaction to change it: submitted as-is)
+                            _ => {
+                                let value = live
+                                    .get(&c)
+                                    .cloned()
+                                    .or_else(|| dom.attr(c, "value").map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                                out.push((name, value));
+                            }
+                        }
+                    }
+                }
+            }
+            walk(dom, c, live, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(dom, form, live, &mut out);
+    out
+}
+
+/// `application/x-www-form-urlencoded` serial (the `url` crate's
+/// form_urlencoded serializer: space → `+`, `&`/`=`/non-ASCII escaped).
+pub(crate) fn urlencode_pairs(pairs: &[(String, String)]) -> String {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (n, v) in pairs {
+        ser.append_pair(n, v);
+    }
+    ser.finish()
+}
+
+/// Nearest enclosing `<form>` (the activated node itself if it is one —
+/// `form.submit()` targets the form directly). None = nothing to submit.
+pub(crate) fn form_ancestor(dom: &html::Dom, node: u32) -> Option<u32> {
+    if dom.tag(node) == "form" {
+        return Some(node);
+    }
+    let mut cur = node;
+    while cur != 0 {
+        cur = dom.nodes.get(cur as usize)?.parent;
+        if cur != 0 && dom.tag(cur) == "form" {
+            return Some(cur);
+        }
+    }
+    None
+}
+
+/// Resolve the form's `action` (missing action = the current document URL).
+/// Unlike link `resolve`, same-document targets are legal here (a POST/GET
+/// to the page's own URL — the anchor rule would veto those) and fragments
+/// are dropped (form data replaces the query either way).
+pub(crate) fn resolve_form_target(base: &str, action: Option<&str>) -> Option<String> {
+    let mut target = match action.map(|a| a.trim()) {
+        None | Some("") => url::Url::parse(base).ok()?,
+        Some(a) => url::Url::parse(base).ok()?.join(a).ok()?,
+    };
+    if !matches!(target.scheme(), "http" | "https" | "data") {
+        // javascript:/mailto:/… form actions are not worker-loadable
+        return None;
+    }
+    target.set_fragment(None);
+    Some(target.to_string())
+}
+
+/// GET submission URL: the form data serial REPLACES the target's query
+/// (spec: mutate the parsed action with the urlencoded data set; real
+/// browsers drop the original query — `action="/s?q=1"` + field q=2 →
+/// `?q=2`). Fragments dropped (they'd survive a navigation but a query edit
+/// is the whole point here).
+pub(crate) fn form_get_url(target: &str, data: &str) -> Option<String> {
+    let mut u = url::Url::parse(target).ok()?;
+    u.set_fragment(None);
+    u.set_query(if data.is_empty() { None } else { Some(data) });
+    Some(u.to_string())
+}
+
+/// GET or POST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubmitMethod {
+    Get,
+    Post,
+}
+
+impl SubmitMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            SubmitMethod::Get => "GET",
+            SubmitMethod::Post => "POST",
+        }
+    }
+    /// `<form method>` spelling (default GET per the HTML spec; anything
+    /// that is not POST is treated as GET).
+    fn from_form(m: Option<&str>) -> SubmitMethod {
+        match m.map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "post" => SubmitMethod::Post,
+            _ => SubmitMethod::Get,
+        }
+    }
+}
+
+/// One resolved submission ready for the worker to execute (or for a
+/// script's `form.submit()`: GET rides the ordinary nav channel, POST the
+/// body-carrying `FormNav` channel).
+pub(crate) struct SubmissionReq {
+    pub method: SubmitMethod,
+    /// absolute target (GET: the built `?name=value&…` URL)
+    pub target: String,
+    /// urlencoded data (GET: the query serial; POST: the request body)
+    pub body: String,
+}
+
+/// Build the submission for the `<form>` that encloses `activated` (walk up
+/// from the submit button / the Enter-activated field). `live` holds the
+/// UI thread's typed values by node id (the value store rides every event
+/// job); the worker DOM's `value` attributes are the scripted fallback.
+pub(crate) fn build_submission(
+    dom: &html::Dom,
+    activated: u32,
+    live: &HashMap<u32, String>,
+    base: &str,
+) -> Option<SubmissionReq> {
+    let form = form_ancestor(dom, activated)?;
+    let pairs = collect_form_pairs(dom, form, live);
+    let body = urlencode_pairs(&pairs);
+    let action = resolve_form_target(base, dom.attr(form, "action"))
+        .or_else(|| resolve_form_target(base, None))
+        .or_else(|| {
+            eprintln!("[form] submission action unresolvable against {base}");
+            None
+        })?;
+    let method = SubmitMethod::from_form(dom.attr(form, "method"));
+    let target = match method {
+        SubmitMethod::Get => form_get_url(&action, &body).unwrap_or(action),
+        SubmitMethod::Post => action,
+    };
+    Some(SubmissionReq { method, target, body })
+}
+
+/// is a form POST allowed for a `data:` target? no — fetch_post cannot read
+/// a response from an inline document; the caller turns it into the error
+/// page (honest, same wording as a failed fetch).
+pub(crate) fn fetch_post(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    let resp = http_agent()
+        .post(url)
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)")
+        .send(body.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let content_type = resp.header("content-type").map(|s| s.to_string());
+    // same 20MB cap as every GET fetch (no disk cache: a POST response is
+    // per-submission state, caching it would be dishonest)
+    const CAP: usize = 20 * 1024 * 1024;
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while buf.len() < CAP {
+        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok((buf, content_type))
+}
+
 /// Every form control's node id → `name` attribute (for `[form] submit`
 /// logging in the shell, which can't read the DOM).
 fn collect_form_names(dom: &html::Dom) -> HashMap<u32, String> {
@@ -1815,48 +2422,7 @@ fn fetch_and_parse(url: &str) -> (html::Dom, String, Vec<css::FontFace>) {
             format!("<p>Failed to load: {e}</p>")
         }
     };
-    let dom = html::parse(&source);
-    eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
-
-    // Phase 1b: collect every stylesheet in document order — <style> blocks
-    // (usually in <head>, which body_root skips) and external <link>s — then
-    // parse ONCE into precompiled selectors.
-    let mut sources = Vec::new();
-    collect_sheets(&dom, 0, &mut sources);
-    let mut css_text = String::new();
-    let mut ext_count = 0usize;
-    // `@font-face` defs collected per-sheet: the cascade concatenates sheets,
-    // which would lose each sheet's base URL for resolving relative src paths
-    let mut faces: Vec<css::FontFace> = Vec::new();
-    for src in &sources {
-        match src {
-            SheetSrc::Inline(text) => {
-                faces.extend(css::collect_font_faces(text, url));
-                css_text.push_str(text);
-                css_text.push('\n');
-            }
-            SheetSrc::Link(href) => {
-                let Some(abs) = resolve(url, href) else { continue };
-                match fetch(&abs) {
-                    Ok((bytes, _)) => {
-                        // CSS is UTF-8 in practice (spec @charset unsupported — shortcut)
-                        let text = String::from_utf8_lossy(&bytes);
-                        faces.extend(css::collect_font_faces(&text, &abs));
-                        css_text.push_str(&text);
-                        css_text.push('\n');
-                        ext_count += 1;
-                    }
-                    Err(e) => eprintln!("[css] stylesheet fetch failed {abs}: {e}"),
-                }
-            }
-        }
-    }
-    eprintln!(
-        "[css] {} bytes of style ({} external sheets)",
-        css_text.len(),
-        ext_count
-    );
-    (dom, css_text, faces)
+    parse_source_with_styles(url, source)
 }
 
 /// Cascade + box tree + layout + image decode — the re-runnable half.
@@ -3371,6 +3937,273 @@ mod tests {
         assert_eq!(names.len(), 3, "non-controls and unnamed inputs excluded");
     }
 
+    /// Successful form-control collection (the worker-side collector):
+    /// text/password/textarea values, hidden inputs submit, checked state
+    /// comes from the worker DOM's `checked` attribute (the shell's click
+    /// toggles carry through), checked-only radios/checkboxes, and
+    /// unnamed/submitter/file controls never submit. The urlencoded serial
+    /// then turns spaces into `+` and escapes `&`/`=` (url crate).
+    #[test]
+    fn form_pairs_collect_and_encode() {
+        let dom = html::parse(
+            r#"<html><body><form>
+                <input name="user" type="text" value="Ann">
+                <input type="hidden" name="csrf" value="t0">
+                <textarea name="msg">plain</textarea>
+                <input name="cb" type="checkbox" value="yes" checked>
+                <input name="cb2" type="checkbox">
+                <input name="r1" type="radio" value="a" checked>
+                <input name="r2" type="radio" value="b">
+                <input name="go" type="submit" value="Go">
+                <input name="doc" type="file">
+                <input value="no name no submit">
+                <input name="sp" value="a b">
+                <input name="esc" value="x&y=z">
+            </form></body></html>"#,
+        );
+        let form = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "form")
+            .unwrap();
+        let pairs = collect_form_pairs(&dom, form, &Default::default());
+        let map: HashMap<&str, &str> =
+            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(map.get("user"), Some(&"Ann"));
+        assert_eq!(map.get("csrf"), Some(&"t0"), "hidden inputs submit");
+        assert_eq!(
+            map.get("msg"),
+            Some(&"plain"),
+            "textarea default = its own text content"
+        );
+        assert_eq!(map.get("cb"), Some(&"yes"), "checked box submits its value");
+        assert_eq!(map.get("r1"), Some(&"a"), "only the checked radio submits");
+        assert_eq!(map.get("sp"), Some(&"a b"));
+        assert_eq!(map.get("esc"), Some(&"x&y=z"));
+        assert!(!map.contains_key("cb2"), "unchecked box never submits");
+        assert!(!map.contains_key("r2"), "unchecked radio never submits");
+        assert!(!map.contains_key("go"), "the submitter is never a pair");
+        assert!(!map.contains_key("doc"), "file controls excluded (no picker)");
+        assert!(!map.contains_key("anon"), "nameless controls excluded");
+        let ser = urlencode_pairs(&pairs);
+        assert!(ser.contains("sp=a+b"), "space urlencodes to +");
+        assert!(ser.contains("esc=x%26y%3Dz"), "& and = must escape");
+
+        // a value-less checked checkbox defaults to "on"
+        let dom2 = html::parse(
+            r#"<html><body><form>
+                <input name="cb" type="checkbox" checked>
+            </form></body></html>"#,
+        );
+        let form2 = (1..dom2.nodes.len() as u32)
+            .find(|&i| dom2.tag(i) == "form")
+            .unwrap();
+        assert_eq!(
+            collect_form_pairs(&dom2, form2, &Default::default()),
+            vec![("cb".to_string(), "on".to_string())],
+            "checkbox without a value attr submits \"on\""
+        );
+    }
+
+    /// The UI's live (typed) value store wins over the DOM's `value`
+    /// attribute — what the user sees is what submits.
+    #[test]
+    fn form_pairs_live_value_overrides_dom_attr() {
+        let dom = html::parse(
+            r#"<html><body><form>
+                <input name="q" type="text" value="dom-value">
+            </form></body></html>"#,
+        );
+        let form = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "form")
+            .unwrap();
+        let node = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "input")
+            .unwrap();
+        let mut live: HashMap<u32, String> = HashMap::new();
+        live.insert(node, "typed".to_string());
+        assert_eq!(
+            collect_form_pairs(&dom, form, &live),
+            vec![("q".to_string(), "typed".to_string())],
+            "the live typed value replaces the markup default"
+        );
+    }
+
+    /// GET URL build: the urlencoded data set REPLACES the target's query
+    /// and the fragment is dropped (spec mutation of the parsed action).
+    #[test]
+    fn form_get_url_replaces_the_whole_query() {
+        assert_eq!(
+            form_get_url("https://e.com/s?old=1&older=2#frag", "q=2").unwrap(),
+            "https://e.com/s?q=2",
+            "old query and fragment do not survive a GET submission"
+        );
+        assert_eq!(
+            form_get_url("https://e.com/s?q=1", "").unwrap(),
+            "https://e.com/s",
+            "empty data set clears the query entirely"
+        );
+    }
+
+    /// Action resolution: no action = the current document URL (fragment
+    /// dropped), relative actions join the base, same-document targets are
+    /// legal (unlike link resolution!), and non-loadable schemes are refused.
+    #[test]
+    fn resolve_form_target_rules() {
+        assert_eq!(
+            resolve_form_target("https://e.com/pg#top", None).as_deref(),
+            Some("https://e.com/pg"),
+        );
+        assert_eq!(
+            resolve_form_target("https://e.com/pg", Some("sub/x?f=1#z")).as_deref(),
+            Some("https://e.com/sub/x?f=1"),
+        );
+        assert_eq!(
+            resolve_form_target("https://e.com/pg", Some("/pg#self")).as_deref(),
+            Some("https://e.com/pg"),
+            "same-document actions are legal for forms",
+        );
+        assert_eq!(
+            resolve_form_target("https://e.com/pg", Some("javascript:alert(1)")).is_some(),
+            false,
+            "non-http(s)/data schemes cannot route through the worker"
+        );
+    }
+
+    /// build_submission (pure): finds the enclosing `<form>`, picks the
+    /// method, and builds the target — GET mutates the action with the
+    /// data query, POST keeps the action untouched; either stage's veto
+    /// (the pure `submit_decision`) cancels before anything is built.
+    #[test]
+    fn build_submission_get_post_and_decision() {
+        let dom = html::parse(
+            r#"<html><body>
+            <form action="https://e.com/find"><input name="q" type="text" value="big cat"></form>
+            <form action="https://e.com/save" method="post"><input name="t" type="text" value="a&b"></form>
+            </body></html>"#,
+        );
+        let node_with = |name: &str| {
+            (1..dom.nodes.len() as u32)
+                .find(|&i| dom.attr(i, "name") == Some(name))
+                .unwrap()
+        };
+        let sub = build_submission(&dom, node_with("q"), &Default::default(), "https://src.com/").unwrap();
+        assert_eq!(sub.method, SubmitMethod::Get);
+        assert_eq!(sub.target, "https://e.com/find?q=big+cat");
+        assert_eq!(sub.body, "q=big+cat");
+        // the second form: POST target untouched, body urlencoded; also
+        // proves form_ancestor picked the RIGHT enclosing form
+        let sub = build_submission(&dom, node_with("t"), &Default::default(), "https://src.com/").unwrap();
+        assert_eq!(sub.method, SubmitMethod::Post);
+        assert_eq!(sub.target, "https://e.com/save");
+        assert_eq!(sub.body, "t=a%26b");
+        // no enclosing form / no activation → no submission at all
+        assert!(build_submission(&dom, 0, &Default::default(), "https://src.com/").is_none());
+
+        // the decision helper both stages share: a preventDefault anywhere
+        // cancels the not-yet-built request
+        assert_eq!(submit_decision(false), SubmitDecision::Submit);
+        assert_eq!(submit_decision(true), SubmitDecision::Cancel);
+    }
+
+    /// The worker's real submission stage through `process_job` (no network
+    /// here): a `submit` listener's `preventDefault` vetoes the build — no
+    /// navigation, no request (the veto fires before any pair is sent) —
+    /// and an activation with no enclosing `<form>` submits nothing either.
+    /// Both fall through to the plain post-event relayout.
+    #[test]
+    fn submit_event_veto_and_no_form_paths() {
+        let mut dom = html::parse(
+            r#"<html><body><form id="f" action="http://127.0.0.1:1/unreachable" method="get">
+                <input name="q" type="text" value="v">
+                <button id="b" type="submit">Go</button>
+            </form>
+            <script>
+                var f = document.getElementById("f");
+                f.addEventListener("submit", function (e) { e.preventDefault(); });
+            </script></body></html>"#,
+        );
+        let mut scripts = runtime::make_runtime(EngineChoice::A, &mut dom, "http://src/");
+        scripts.run_scripts(&mut dom);
+        let mut kept = Some(KeptPage {
+            url: "http://src/".into(),
+            dom,
+            css_text: String::new(),
+            faces: Vec::new(),
+            scripts: Some(scripts),
+            engine: EngineChoice::A,
+        });
+        let mut fonts = Fonts::load();
+        let mut last_geom = (0.0_f32, 0.0_f32);
+        let mut last_forms = layout::FormState::default();
+        // the kept page's DOM is built again after run_scripts; find the
+        // button node from the live tree
+        let btn = {
+            let d = &kept.as_ref().unwrap().dom;
+            (1..d.nodes.len() as u32).find(|&i| d.tag(i) == "button").unwrap()
+        };
+        let (wire, nav, _pd, panicked, nav_done) =
+            process_job(&mut kept, &mut fonts, &LoadReq::Event {
+                id: 1,
+                url: "http://src/".into(),
+                max_w: 100.0,
+                vh: 100.0,
+                node: btn,
+                kinds: vec!["click".into()],
+                value: None,
+                key: None,
+                href: None,
+                submit: true,
+                forms: layout::FormState::default(),
+                engine: EngineChoice::A,
+            }, &mut last_geom, &mut last_forms);
+        assert!(nav.is_none(), "vetoed submission must not navigate");
+        assert!(!nav_done, "no worker-executed navigation on veto");
+        assert!(!panicked);
+        assert!(wire.is_some(), "veto falls through to the plain relayout");
+
+        // activation with no enclosing <form>: nothing to submit, and the
+        // field's change/input listeners still run (the pre-submission code
+        // paths are untouched by the submission stage)
+        let mut dom2 = html::parse(
+            r#"<html><body><p>
+                <input name="loose" type="text" value="x">
+            </p></body></html>"#,
+        );
+        let mut kept2 = {
+            let mut scripts = runtime::make_runtime(EngineChoice::A, &mut dom2, "http://src/");
+            scripts.run_scripts(&mut dom2);
+            Some(KeptPage {
+                url: "http://src/".into(),
+                dom: dom2,
+                css_text: String::new(),
+                faces: Vec::new(),
+                scripts: Some(scripts),
+                engine: EngineChoice::A,
+            })
+        };
+        let mut fonts2 = Fonts::load();
+        let input = {
+            let d = &kept2.as_ref().unwrap().dom;
+            (1..d.nodes.len() as u32).find(|&i| d.tag(i) == "input").unwrap()
+        };
+        let (wire2, nav2, _pd2, panicked2, nav_done2) =
+            process_job(&mut kept2, &mut fonts2, &LoadReq::Event {
+                id: 2,
+                url: "http://src/".into(),
+                max_w: 100.0,
+                vh: 100.0,
+                node: input,
+                kinds: vec!["click".into()],
+                value: None,
+                key: None,
+                href: None,
+                submit: true,
+                forms: layout::FormState::default(),
+                engine: EngineChoice::A,
+            }, &mut last_geom, &mut last_forms);
+        assert!(nav2.is_none() && !nav_done2 && !panicked2 && wire2.is_some(),
+            "formless activation = plain relayout");
+    }
+
     /// Worker coalescing collapses superseded relayouts but must never drop
     /// a form Event (it carries a user action).
     #[test]
@@ -3385,6 +4218,7 @@ mod tests {
             value: None,
             key: None,
             href: None,
+            submit: false,
             forms: layout::FormState::default(),
             engine: EngineChoice::A,
         };
@@ -3487,6 +4321,7 @@ mod tests {
             value: None,
             key: None,
             href: None,
+            submit: false,
             forms: layout::FormState::default(),
             engine: EngineChoice::A,
         };
