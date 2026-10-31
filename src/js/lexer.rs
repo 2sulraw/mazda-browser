@@ -601,6 +601,15 @@ impl<'a> Lexer<'a> {
                     let toks = self.read_tokens_until_brace(start)?;
                     parts.push(TplPart::Expr(toks));
                 }
+                // a literal `$` NOT starting an interpolation (`$${x}`,
+                // `$5`, `$ `): consume it as literal text. Without this arm
+                // it fell into the raw-run arm below, which breaks AT the
+                // `$` without advancing -> infinite loop (hung a real page
+                // whose template was `` `$${r}` ``)
+                Some(b'$') => {
+                    lit.push('$');
+                    self.pos += 1;
+                }
                 Some(b'\\') => {
                     // find raw run up to next escape/delimiter/interp, unescape it
                     let raw_start = self.pos;

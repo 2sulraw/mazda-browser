@@ -229,6 +229,8 @@ pub(crate) fn run_block(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) -> Resu
 }
 
 pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, JsError> {
+    e.cur_span = s.span.start as usize; // budget error names this statement
+    e.tick()?;
     match &s.kind {
         StmtKind::Expr(x) => {
             eval_expr(e, env, x)?;
@@ -725,6 +727,7 @@ pub(crate) fn for_of_items(v: &Val) -> Result<Vec<Val>, JsError> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsError> {
+    e.tick()?;
     match &x.kind {
         ExprKind::Ident(name) => Ok(e.env_get(env, name)),
         ExprKind::Num(n) => Ok(Val::Num(*n)),

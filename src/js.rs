@@ -566,6 +566,11 @@ pub enum JsError {
         line: u32,
         col: u32,
     },
+    /// per-turn interpreter step budget exhausted (runaway loop — the
+    /// bounded-resources rule; a page script must never peg the worker).
+    /// `line`/`col` are (0, 0) when a dispatch turn (event handler/timer)
+    /// trips the budget — only `exec` has the source to resolve them
+    Budget { line: u32, col: u32 },
 }
 
 impl std::fmt::Display for JsError {
@@ -574,6 +579,16 @@ impl std::fmt::Display for JsError {
             JsError::Throw(v) => write!(f, "Uncaught {}", v.to_string()),
             JsError::Syntax { msg, line, col } => {
                 write!(f, "SyntaxError: {} (line {}, col {})", msg, line, col)
+            }
+            JsError::Budget { line, col } if *line > 0 => {
+                write!(
+                    f,
+                    "RangeError: script exceeded the step budget (runaway loop) at line {}, col {}",
+                    line, col
+                )
+            }
+            JsError::Budget { .. } => {
+                write!(f, "RangeError: script exceeded the step budget (runaway loop)")
             }
         }
     }
@@ -764,9 +779,27 @@ pub struct JsEngine {
     pub(crate) regex_cache: HashMap<(Rc<str>, Rc<str>), Rc<Regex>>,
     pub(crate) next_timer_id: f64,
     rng_state: u64,
+    /// dispatches executed since the last turn reset (`exec` /
+    /// `call_function` / `drain_microtasks` each start a fresh turn);
+    /// bounded by `step_budget` — see [`JsEngine::tick`]
+    pub(crate) steps: u64,
+    /// per-turn dispatch cap: a runaway loop aborts its turn with an
+    /// honest budget error instead of pegging the worker forever
+    /// (bounded-resources rule). Generous — real page bundles run in the
+    /// low millions; tests lower it directly
+    pub(crate) step_budget: u64,
+    /// byte offset of the statement currently evaluating — the budget
+    /// error reports line/col through this (enriched in `exec`, which has
+    /// the source; dispatch turns only carry the offset)
+    pub(crate) cur_span: usize,
 }
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
+
+/// Default per-turn statement/expression dispatch cap. Sized so real
+/// page bundles (70KB startup script ≈ low-millions of dispatches) run
+/// untouched while a `for(;;)` spin stops within ~1s of CPU in release.
+pub(crate) const DEFAULT_STEP_BUDGET: u64 = 100_000_000;
 
 impl Default for JsEngine {
     fn default() -> Self {
@@ -796,6 +829,9 @@ impl JsEngine {
             promise_statics: None,
             regex_cache: HashMap::new(),
             next_timer_id: 1.0,
+            steps: 0,
+            step_budget: DEFAULT_STEP_BUDGET,
+            cur_span: 0,
             rng_state: 0x9e37_79b9_7f4a_7c15 ^ std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -835,18 +871,28 @@ impl JsEngine {
     pub fn exec(&mut self, source: &str) -> Result<Val, JsError> {
         let program: Program = parser::parse(source)?;
         self.call_depth = 0;
+        self.steps = 0;
+        self.cur_span = 0;
         let env = self.global_env.clone();
         interp::hoist(self, &env, &program);
         let mut last = Val::Undefined;
         for st in program.iter() {
-            match &st.kind {
-                parser::StmtKind::Expr(e) => {
-                    last = interp::eval_expr(self, &env, e)?;
+            // a Budget error from this turn names the spinning statement:
+            // resolve the recorded byte offset to line/col (only `exec`
+            // has the source at hand)
+            let r = match &st.kind {
+                parser::StmtKind::Expr(e) => interp::eval_expr(self, &env, e).map(|v| {
+                    last = v;
+                }),
+                _ => interp::eval_stmt(self, &env, st).map(|_| ()),
+            };
+            r.map_err(|err| match err {
+                JsError::Budget { .. } => {
+                    let (line, col) = parser::line_col(source, self.cur_span);
+                    JsError::Budget { line, col }
                 }
-                _ => {
-                    interp::eval_stmt(self, &env, st)?;
-                }
-            }
+                other => other,
+            })?;
         }
         // microtask quiescence at the end of every execution turn (idempotent
         // with the embedder's own drain later)
@@ -858,7 +904,25 @@ impl JsEngine {
     /// callbacks, later: DOM callbacks). `this` is the method receiver
     /// (pass `Val::Undefined` for the sloppy-mode global).
     pub fn call_function(&mut self, func: &Val, this: Val, args: &[Val]) -> Result<Val, JsError> {
+        // fresh turn: dispatchers (event handlers, timers) each get their
+        // own budget — one runaway handler must not starve later turns
+        self.steps = 0;
+        self.cur_span = 0;
         self.call(func.clone(), this, args.to_vec())
+    }
+
+    /// One interpreter dispatch. Every `eval_stmt`/`eval_expr` (and the
+    /// generator driver loop) passes through here, so any loop — including
+    /// a `for(;;)` fed by a misbehaving regex scanner — is bounded. The
+    /// error carries no line/col here; `exec` resolves the recorded
+    /// `cur_span` offset against the source it owns.
+    #[inline]
+    pub(crate) fn tick(&mut self) -> Result<(), JsError> {
+        self.steps += 1;
+        if self.steps > self.step_budget {
+            return Err(JsError::Budget { line: 0, col: 0 });
+        }
+        Ok(())
     }
 
     /// Define a host function visible to scripts under `name` (fetch, DOM
@@ -922,6 +986,9 @@ impl JsEngine {
     /// internal bounded drainer: runs up to `budget` jobs; returns Err if
     /// the queue is still not empty afterwards.
     pub(crate) fn run_microtasks(&mut self, budget: u32) -> Result<(), JsError> {
+        // the drain is its own turn: reactions run against a fresh budget
+        // (each is also individually bounded by `tick` while it runs)
+        self.steps = 0;
         for _ in 0..budget {
             if self.microtasks.is_empty() {
                 return Ok(());

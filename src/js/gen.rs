@@ -287,6 +287,9 @@ pub(crate) fn gen_return(this: &Val, v: Val) -> Result<Val, JsError> {
 
 fn drive(e: &mut JsEngine, vm: &mut GenVm) -> Result<GOut, JsError> {
     loop {
+        // own tick: a cond-less generator loop re-pushes frames without
+        // passing through eval_stmt (empty body), so the driver bounds it
+        e.tick()?;
         let frame = match vm.frames.pop() {
             None => {
                 // body completed without an explicit return

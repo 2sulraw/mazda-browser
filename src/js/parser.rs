@@ -412,7 +412,7 @@ pub fn parse(source: &str) -> Result<Program, JsError> {
 }
 
 /// byte offset -> 1-based (line, col); col counted in chars
-fn line_col(source: &str, offset: usize) -> (u32, u32) {
+pub(crate) fn line_col(source: &str, offset: usize) -> (u32, u32) {
     let offset = offset.min(source.len());
     let mut line = 1u32;
     let mut line_start = 0usize;

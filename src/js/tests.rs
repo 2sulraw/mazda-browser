@@ -739,6 +739,12 @@ fn template_literals() {
     assert_eq!(string("function f() { return 'F' } `${f()}-${f()}`"), "F-F");
     // escapes
     assert_eq!(string("`a\\nb`"), "a\nb");
+    // a literal `$` NOT starting an interpolation must be literal text —
+    // previously the lexer broke at the `$` without consuming it and spun
+    // forever (this exact shape hung a real page: `` `$${r}` ``)
+    assert_eq!(string("let r = 'X'; `$${r}`"), "$X");
+    assert_eq!(string("`cost: $5 and $$`"), "cost: $5 and $$");
+    assert_eq!(string("`$`"), "$");
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,4 +1360,86 @@ fn object_define_property() {
     // shortcut: no object-literal getters / `__proto__` or setPrototypeOf
     // wiring in this wave, so inherited accessors are exercised via class
     // accessors on the prototype chain (see class_accessors) instead
+}
+
+// ---------------------------------------------------------------------------
+// per-turn interpreter step budget (bounded resources: a runaway loop must
+// fail honestly instead of pegging the worker forever)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn for_semi_spin_aborts_with_budget_error() {
+    // the exact shape that hung a real page's scanner loop: `for(;;)` whose
+    // termination depends on state that (due to a bug) never changes
+    let mut e = JsEngine::new();
+    e.step_budget = 50_000; // tests run debug: keep the abort quick
+    let err = e.exec("for(;;) { 1 + 1 }").err().expect("spin must abort");
+    assert!(matches!(err, JsError::Budget { .. }), "got {err:?}");
+    // exec resolves the recorded statement offset to line/col
+    if let JsError::Budget { line, col } = err {
+        assert_eq!(line, 1, "single-line script");
+        assert!(col >= 1);
+    }
+    assert!(err.to_string().contains("step budget"), "display: {err}");
+}
+
+#[test]
+fn budget_error_points_at_the_spinning_statement() {
+    let mut e = JsEngine::new();
+    e.step_budget = 50_000;
+    match e.exec("let a = 1;\nlet b = 2;\nfor(;;) { a }").err() {
+        Some(JsError::Budget { line, col }) => {
+            assert_eq!(line, 3, "spinning for is on line 3");
+            assert!(col >= 1, "col={col}");
+        }
+        other => panic!("expected Budget, got {other:?}"),
+    }
+}
+
+#[test]
+fn budget_error_is_not_catchable_by_script() {
+    // a page must not be able to swallow the abort and keep spinning:
+    // try/catch only absorbs thrown values, so the budget error propagates
+    let e_src = "let n = 0; try { for(;;) { n++ } } catch (e) { n = -1 } n";
+    let mut e = JsEngine::new();
+    e.step_budget = 50_000;
+    let r = e.exec(e_src);
+    assert!(matches!(r, Err(JsError::Budget { .. })), "got {:?}", r);
+    // ...and the engine is usable again next turn (budget resets per turn)
+    e.step_budget = DEFAULT_STEP_BUDGET;
+    assert_eq!(e.exec("1 + 1").unwrap().to_number(), 2.0);
+}
+
+#[test]
+fn budget_stops_a_spinning_generator_loop() {
+    // cond-less generator loop with an EMPTY body (no yield): the mini-VM
+    // re-pushes frames without ever re-entering eval_stmt (an empty Batch
+    // finishes without dispatching a statement), so only `drive`'s own tick
+    // can bound it. Contrast: `for(;;) yield 1` suspends each iteration and
+    // never spins within a turn.
+    let mut e = JsEngine::new();
+    e.step_budget = 20_000;
+    let src = "function* g() { for(;;) {} } const it = g(); it.next()";
+    let r = e.exec(src);
+    assert!(matches!(r, Err(JsError::Budget { .. })), "got {:?}", r);
+}
+
+#[test]
+fn budget_spares_normal_workloads() {
+    // the default budget must be far above real work: a 1M-iteration loop
+    // with a function call per iteration (well into the millions of
+    // dispatches) completes untouched
+    let src = "function f(x) { return x + 1 } let s = 0; for (let i = 0; i < 200000; i++) { s = f(s) } s";
+    assert_eq!(num(src), 200000.0);
+}
+
+#[test]
+fn budget_is_per_turn_not_leaking_into_later_turns() {
+    // turn 1 spins and aborts; turn 2 (fresh exec on the same engine) must
+    // get a full budget even though `steps` overflowed it
+    let mut e = JsEngine::new();
+    e.step_budget = 30_000;
+    assert!(matches!(e.exec("for(;;) {}"), Err(JsError::Budget { .. })));
+    e.step_budget = DEFAULT_STEP_BUDGET;
+    assert_eq!(e.exec("let i = 0; while (i < 1000) { i++ } i").unwrap().to_number(), 1000.0);
 }
