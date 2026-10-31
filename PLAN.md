@@ -420,11 +420,28 @@ curve matters more than the baseline (near-flat as tabs grow).
   feed), destructuring/spread/rest + class get/set accessors + instanceof
   fixes; verified on Wikipedia: 70KB startup bundle runs end-to-end
   (`26971f2` +39 tests; 339 total; wiki 97.1MB)
-- [ ] **Selectable script runtime (settings page)** — agreed: Option A =
-  pure-Rust built-in (default, light); Option B = full engine core opt-in
-  (+30 MB/page), `ScriptRuntime` trait + persisted `mazda.conf` + ⚙ settings
-  overlay behind cargo feature; in progress (engine-select worktree,
-  parallel with language-depth merge)
+- [x] **Selectable script runtime (settings page)** — the agreed A/B choice is
+  live: `ScriptRuntime` trait (5 methods: run_scripts/dispatch/run_due_timers/
+  run_due_frames/next_wake_deadline + per-nav factory); `DomHost` installed
+  per turn (DOM pointer + nav/dirty/preventDefault/storage side-channels);
+  script.rs natives now thin host wrappers shared by both engines (zero
+  behavior drift, 300-baseline tests untouched); **Option B = full engine
+  core behind `--features engine-b` (default build pulls none of it,
+  cargo-tree-verified)**: globals + 13 element methods + wrappers mirror
+  A's native surface exactly, per-turn side-channel harvest, errors logged
+  never fatal; **settings**: ⚙ button at the toolbar right end, overlay in
+  dark tokens with EXACTLY the agreed copy:
+  `JavaScript engine: (•) A — Pure Rust built-in (light) / ( ) B — Full JS
+  engine core (compatibility, +30 MB/page)`; B row inert on feature-off
+  builds; persisted to `%LOCALAPPDATA%\mazda.conf` (`engine=a|b`,
+  whitespace/comments tolerated), precedence flag `--engine=` > env
+  `MAZDA_ENGINE` > conf > default A (corrupt file → silent default A, never
+  panic); engine applies on next navigation (no hot-swap, shortcut).
+  RAM honest: A 94.7→B 96.3 MB (simple), DDG heavy-script page 82.2→176.2
+  (B ASTs — the +30 is a typical-page ballpark, bundles exceed it); shipped
+  release built WITH the feature so B is user-selectable (binary 7.5→15.7
+  MB, B costs nothing until chosen). Tests: default 344, feature 346
+  (`a95010d`; both contract-tested, one conf-parser bug found+fixed by tests)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -501,6 +518,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-31 | forms + scripts wave | Wikipedia (Main_Page) | 93.1 MB (1269 runs; + worker keeps DOM+JS engine+CSS between jobs, dropped on nav) |
 | 2026-10-31 | event-loop wave | Wikipedia (Main_Page) | 100.8 MB (timers/microtasks/rAF queues + listener maps; engine still dropped per nav) |
 | 2026-10-31 | language-depth wave | Wikipedia (Main_Page) | 97.1 MB (1255 runs; 70KB startup bundle now runs end-to-end) |
+| 2026-10-31 | selectable runtime: A vs B | Wikipedia Rust article / DuckDuckGo ?q= | A 94.7 / 82.2 MB; B 96.3 / 176.2 MB (B heap lazy on simple pages; heavy script bundles cost far more than the +30 ballpark) |
 
 ### Phase 1c (Track A) findings
 
