@@ -5,8 +5,15 @@
 //! - installs `document` / `location` / `fetch` + element-method natives,
 //! - registers/dispatches event listeners for the shell's event jobs.
 //!
+//! This is OPTION A of the SELECTABLE SCRIPT RUNTIME (`runtime.rs`): the
+//! pure-Rust built-in interpreter, the default engine. The per-turn DOM
+//! arena operations and side channels live on the shared `DomHost`
+//! (`runtime.rs`) — the engine-core adapter (Option B, behind the
+//! `engine-b` feature) calls the exact same host methods, so a page's
+//! observable script surface is identical whichever engine runs it.
+//!
 //! Threading: everything here runs on the single loader worker thread.
-//! Natives reach the page DOM through a thread-local raw pointer re-pointed
+//! The turn host holds a raw pointer to the worker-owned DOM, re-pointed
 //! at the start of every script turn — dereferenced only inside a turn on
 //! that one thread; arena node indices stay valid for the page's lifetime.
 //!
@@ -48,61 +55,38 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::html::{self, Dom, NodeKind};
+use crate::html::{Dom, NodeKind};
 use crate::js::{self, JsEngine, JsError, Val};
+use crate::runtime::{self, Turn, FRAME_EPOCH, MAX_PENDING_FRAMES, MAX_PENDING_TIMERS, WIN_NODE};
 
 // ---------------------------------------------------------------------------
 // Thread-local script context (worker-thread only)
 // ---------------------------------------------------------------------------
 
-type Storage = Rc<std::cell::RefCell<HashMap<String, String>>>;
-
-/// Window-level listener table key (`window.addEventListener`). u32::MAX
-/// cannot be a real arena node id (page DOM is far smaller), so it can never
-/// collide with an element.
-const WIN_NODE: u32 = u32::MAX;
-
-/// What the natives need while a script turn is running: a raw pointer to
-/// the worker-owned DOM, the page base URL, and the side channels scripts
-/// write through (listeners, requested navigation, DOM-mutated flag,
-/// preventDefault, queued rAF callbacks, the page's localStorage).
+/// What the natives need while a script turn is running: the listener
+/// table (registered in earlier turns, re-installed per turn) and the rAF
+/// callbacks queued this turn. Everything else the natives used to carry
+/// (DOM pointer, base, storage, nav/dirty/preventDefault side channels)
+/// now lives on the SHARED `runtime::DomHost` — one implementation of each
+/// arena operation for both engines.
 struct Ctx {
-    dom: *mut Dom,
-    base: String,
     /// (node id, event kind) → registered handler functions
     listeners: HashMap<(u32, String), Vec<Val>>,
-    /// `location.assign(...)` / `location.href = ...` target
-    pending_nav: Option<String>,
-    /// DOM mutated during this turn → caller must re-layout
-    dirty: bool,
-    /// a listener called `event.preventDefault()` (link navigation veto)
-    prevent_default: bool,
     /// callbacks queued by `requestAnimationFrame` this turn
     raf: Vec<Val>,
-    /// shared handle (with `PageScripts`) to this page's in-memory storage
-    storage: Storage,
-    /// honest-log guard: localStorage drop-on-nav note printed once per page
-    storage_noted: bool,
 }
 
 thread_local! {
     static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
 }
 
-/// Point the thread-local context at `dom` for the duration of a turn.
+/// Install the script-local context for the duration of a turn.
 /// `None` tears the context down (no native may run outside a turn).
-fn ctx_set(dom: &mut Dom, base: &str, storage: Storage) {
+fn ctx_set(listeners: HashMap<(u32, String), Vec<Val>>) {
     CTX.with(|c| {
         *c.borrow_mut() = Some(Ctx {
-            dom: dom as *mut Dom,
-            base: base.to_string(),
-            listeners: HashMap::new(),
-            pending_nav: None,
-            dirty: false,
-            prevent_default: false,
+            listeners,
             raf: Vec::new(),
-            storage,
-            storage_noted: false,
         })
     });
 }
@@ -111,80 +95,43 @@ fn ctx_take() -> Option<Ctx> {
     CTX.with(|c| c.borrow_mut().take())
 }
 
-/// Run `f` as one script turn: install the ctx (carrying the listeners
-/// registered in earlier turns and the page's storage), run `f` with the
-/// engine, then tear the ctx down and hand back its side channels
-/// (listeners / nav / dirty / preventDefault / rAF / storage).
+/// Run `f` as one script turn: install the shared DomHost (carrying the
+/// dom/base/storage + per-turn side channels) and the script-local ctx
+/// (listeners + rAF queue), run `f` with the engine, then tear both down
+/// and hand them back (listeners/raf for the next turn, host side
+/// channels folded by the caller into the Turn result).
 fn with_ctx<R>(
     engine: &mut JsEngine,
     dom: &mut Dom,
     base: &str,
     listeners: HashMap<(u32, String), Vec<Val>>,
-    storage: Storage,
+    storage: runtime::Storage,
     f: impl FnOnce(&mut JsEngine) -> R,
-) -> (R, Ctx) {
-    ctx_set(dom, base, storage);
-    CTX.with(|c| {
-        if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.listeners = listeners;
-        }
-    });
+) -> (R, runtime::DomHost, Ctx) {
+    runtime::host_install(dom, base, &storage);
+    ctx_set(listeners);
     let r = f(engine);
+    let host = runtime::host_take();
     let cx = ctx_take().expect("[js] script context vanished mid-turn");
-    (r, cx)
+    (r, host, cx)
 }
 
-/// Borrow the DOM for the current turn. Panics are impossible by contract:
-/// only natives call this, and natives only run inside `with_ctx`.
-fn with_dom<R>(f: impl FnOnce(&mut Dom) -> R) -> R {
-    CTX.with(|c| {
-        let b = c.borrow();
-        let cx = b.as_ref().expect("[js] native ran outside a script turn");
-        let dom = unsafe { &mut *cx.dom };
-        f(dom)
-    })
-}
-
-fn ctx_base() -> String {
-    CTX.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|cx| cx.base.clone())
-            .unwrap_or_default()
-    })
-}
-
-fn ctx_dirty() {
+/// Listener registered during the current turn (persisted across turns by
+/// the turn drivers, which swap the table in and out).
+fn ctx_add_listener(node: u32, kind: String, cb: Val) {
     CTX.with(|c| {
         if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.dirty = true;
+            cx.listeners.entry((node, kind)).or_default().push(cb);
         }
     })
 }
 
-/// `event.preventDefault()` — flags ONLY the shell's native default action
-/// that already exists (link navigation). The UI thread receives the flag
-/// with the click's decision result and cancels an un-started navigation.
-fn ctx_prevent_default(node: u32) {
-    eprintln!("[js] event.preventDefault (node {node}) — navigation may be canceled");
+/// rAF callback queued during the current turn (folded into the runtime's
+/// frame queue by the turn drivers).
+fn ctx_queue_raf(cb: Val) {
     CTX.with(|c| {
         if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.prevent_default = true;
-        }
-    })
-}
-
-/// Worker-thread localStorage: mutate the page's map through the shared
-/// handle. Honest note printed once per page on the first write.
-fn storage_noted() {
-    CTX.with(|c| {
-        if let Some(cx) = c.borrow_mut().as_mut() {
-            if !cx.storage_noted {
-                cx.storage_noted = true;
-                eprintln!(
-                    "[js] localStorage: in-memory only, dropped on navigation (sessionStorage merged; no disk backing)"
-                );
-            }
+            cx.raf.push(cb);
         }
     })
 }
@@ -193,39 +140,31 @@ fn storage_noted() {
 // Element wrappers
 // ---------------------------------------------------------------------------
 
-/// Snapshot `node` into a JS object: `__node` (id) + readable props taken
-/// live at wrap time (no accessor hooks — see module docs). Methods are
-/// `Val::Native` entries that read `__node` off `this`.
+/// Snapshot `node` into a JS object: `__node` (id) + readable props read
+/// live at wrap time through the shared host (`runtime::DomHost::snapshot`
+/// — the exact prop set both engines expose), then attach the method
+/// natives. Methods are `Val::Native` entries that read `__node` off `this`.
 fn wrap_element(node: u32) -> Val {
     let o = js::Val::new_object();
     o.set("__node", js::Val::Num(node as f64));
-    with_dom(|dom| {
-        if node as usize >= dom.nodes.len() {
-            return;
-        }
-        o.set("tagName", str_val(&dom.tag(node).to_ascii_uppercase()));
-        o.set("id", attr_val(dom, node, "id"));
-        o.set("className", attr_val(dom, node, "class"));
-        let t = dom.tag(node);
+    let p = runtime::host(|h| h.snapshot(node));
+    if let Some(p) = p {
+        o.set("tagName", str_val(&p.tag));
+        o.set("id", str_val(p.id.as_deref().unwrap_or("")));
+        o.set("className", str_val(p.class.as_deref().unwrap_or("")));
         // value-like props snapshot: input/textarea current value
-        if t == "input" || t == "textarea" || t == "select" {
-            o.set("value", attr_val(dom, node, "value"));
+        if let Some(v) = p.value {
+            o.set("value", str_val(&v));
         }
-        if t == "input" {
-            let ty = dom.attr(node, "type").unwrap_or("text");
-            o.set("type", str_val(ty));
-            o.set(
-                "checked",
-                js::Val::Bool(dom.attr(node, "checked").is_some()),
-            );
+        if let Some(t) = p.ty {
+            o.set("type", str_val(&t));
+            o.set("checked", js::Val::Bool(p.checked));
         }
-        if t == "a" {
-            o.set("href", attr_val(dom, node, "href"));
+        if let Some(href) = p.href {
+            o.set("href", str_val(&href));
         }
-        // text-ish containers get a live-read textContent via get below?
-        // No accessor hooks: snapshot children text too.
-        o.set("textContent", str_val(&child_text(dom, node)));
-    });
+        o.set("textContent", str_val(&p.text));
+    }
     let n = nids();
     o.set("getElementById", js::Val::Native(n.el_get_element));
     o.set("querySelector", js::Val::Native(n.el_query));
@@ -267,31 +206,6 @@ fn wrap_event(node: u32, kind: &str, key: Option<&str>, page_y: Option<f32>, val
     }
     o.set("preventDefault", Val::Native(nids().ev_prevent_default));
     o
-}
-
-fn attr_val(dom: &Dom, node: u32, name: &str) -> Val {
-    match dom.attr(node, name) {
-        Some(v) => str_val(v),
-        None => Val::Str(Rc::from("")),
-    }
-}
-
-/// Concatenated text of every descendant text node (textContent/innerHTML
-/// snapshot). innerHTML returns markup-less text — shortcut documented.
-fn child_text(dom: &Dom, node: u32) -> String {
-    fn walk(dom: &Dom, node: u32, out: &mut String) {
-        match &dom.nodes[node as usize].kind {
-            NodeKind::Text(t) => out.push_str(t),
-            NodeKind::Element(_, _) => {
-                for &c in &dom.nodes[node as usize].children {
-                    walk(dom, c, out);
-                }
-            }
-        }
-    }
-    let mut out = String::new();
-    walk(dom, node, &mut out);
-    out
 }
 
 /// `__node` off a wrapper; throws TypeError when missing/non-object.
@@ -375,17 +289,39 @@ fn matches_simple(dom: &Dom, node: u32, sel: &str) -> bool {
 
 /// All element nodes in document order (skips the `#document` sentinel at
 /// index 0, which is an Element kind with tag "#document").
-fn all_elements(dom: &Dom) -> Vec<u32> {
+/// `pub(crate)`: the shared DomHost delegates to this canonical copy.
+pub(crate) fn all_elements_dom(dom: &Dom) -> Vec<u32> {
     (1..dom.nodes.len() as u32)
         .filter(|&i| dom.tag(i) != "#text" && dom.tag(i) != "#document")
         .collect()
 }
 
-fn query_all(dom: &Dom, sel: &str) -> Vec<u32> {
-    all_elements(dom)
+/// Simple-selector matches over the whole document (document order).
+/// `pub(crate)`: the shared DomHost delegates to this canonical copy.
+pub(crate) fn query_all_dom(dom: &Dom, sel: &str) -> Vec<u32> {
+    all_elements_dom(dom)
         .into_iter()
         .filter(|&i| matches_simple(dom, i, sel))
         .collect()
+}
+
+/// Concatenated text of every descendant text node (textContent/innerHTML
+/// snapshot). innerHTML returns markup-less text — shortcut documented.
+/// `pub(crate)`: the shared DomHost delegates to this canonical copy.
+pub(crate) fn child_text(dom: &Dom, node: u32) -> String {
+    fn walk(dom: &Dom, node: u32, out: &mut String) {
+        match &dom.nodes[node as usize].kind {
+            NodeKind::Text(t) => out.push_str(t),
+            NodeKind::Element(_, _) => {
+                for &c in &dom.nodes[node as usize].children {
+                    walk(dom, c, out);
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(dom, node, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -426,14 +362,8 @@ const S_REMOVE: u16 = 42;
 const S_LENGTH: u16 = 43;
 const S_CLEAR: u16 = 44;
 
-/// Pending `setTimeout` jobs the worker keeps per page — a runaway
-/// `setTimeout(loop)` storm would otherwise grow the queue without bound.
-const MAX_PENDING_TIMERS: usize = 512;
-/// Same guard for `requestAnimationFrame` callbacks queued but not yet
-/// run in a frame pass (a page rAF-looping inside layout-heavy pages).
-const MAX_PENDING_FRAMES: usize = 128;
-/// Frame epoch ≈ one vsync — rAF callbacks coalesce to the next pass.
-const FRAME_EPOCH: u64 = 16;
+// Scheduler budgets (MAX_PENDING_TIMERS / MAX_PENDING_FRAMES /
+// FRAME_EPOCH) live ONCE in runtime.rs — single source for both engines.
 
 /// Monotonic rAF callback id (returned to script; nothing consumes it —
 /// cancelAnimationFrame is not implemented yet).
@@ -454,26 +384,28 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
     match idx {
         D_GET_ELEMENT_BY_ID => {
             let Some(sel) = sel else { return Ok(Val::Null) };
-            Ok(with_dom(|dom| {
-                query_all(dom, &format!("#{}", sel))
-                    .first()
-                    .map(|&n| wrap_element(n))
-                    .unwrap_or(Val::Null)
+            Ok(runtime::host(|h| {
+                let found = h.query_all(&format!("#{}", sel)).into_iter().next();
+                match found {
+                    Some(n) => wrap_element(n),
+                    None => Val::Null,
+                }
             }))
         }
         D_QUERY => {
             let Some(sel) = sel else { return Ok(Val::Null) };
-            Ok(with_dom(|dom| {
-                query_all(dom, &sel)
-                    .first()
-                    .map(|&n| wrap_element(n))
-                    .unwrap_or(Val::Null)
+            Ok(runtime::host(|h| {
+                let found = h.query_all(&sel).into_iter().next();
+                match found {
+                    Some(n) => wrap_element(n),
+                    None => Val::Null,
+                }
             }))
         }
         D_QUERY_ALL => {
             let Some(sel) = sel else { return Ok(js::Val::new_array(vec![])) };
-            Ok(with_dom(|dom| {
-                js::Val::new_array(query_all(dom, &sel).into_iter().map(wrap_element).collect())
+            Ok(runtime::host(|h| {
+                js::Val::new_array(h.query_all(&sel).into_iter().map(wrap_element).collect())
             }))
         }
         D_CREATE_ELEMENT => {
@@ -486,28 +418,19 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
 
 /// `createElement`: the tag interner is private to html.rs, so clone the
 /// TagId from any existing element with the same tag (parsed documents
-/// almost always contain it); unknown tags log + null.
+/// almost always contain it); unknown tags log + null. The arena push is
+/// split from wrapper construction (on the shared host) so an unwrapped
+/// orphan node can never leak into script-visible state.
 fn create_element(tag: &str) -> Result<Val, JsError> {
     let tag = tag.to_ascii_lowercase();
-    Ok(with_dom(|dom| {
-        let tid = match all_elements(dom).into_iter().find(|&i| dom.tag(i) == tag) {
-            Some(i) => match &dom.nodes[i as usize].kind {
-                NodeKind::Element(t, _) => *t,
-                _ => return Val::Null,
-            },
-            None => {
-                eprintln!("[js] createElement: unknown tag {tag:?} (not in document)");
-                return Val::Null;
-            }
-        };
-        let id = dom.nodes.len() as u32;
-        dom.nodes.push(html::Node {
-            parent: 0,
-            children: Vec::new(),
-            kind: NodeKind::Element(tid, Box::from([])),
-        });
-        wrap_element(id)
-    }))
+    let made = runtime::host_mut(|h| h.create_element(&tag));
+    match made {
+        Some(id) => Ok(wrap_element(id)),
+        None => {
+            eprintln!("[js] createElement: unknown tag {tag:?} (not in document)");
+            Ok(Val::Null)
+        }
+    }
 }
 
 fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
@@ -516,44 +439,35 @@ fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
     match idx {
         E_GET_ELEMENT_BY_ID => {
             let Some(sel) = a0.as_string() else { return Ok(Val::Null) };
-            Ok(with_dom(|dom| {
-                subtree_query(dom, node, &format!("#{}", sel))
-                    .first()
-                    .map(|&n| wrap_element(n))
-                    .unwrap_or(Val::Null)
+            Ok(runtime::host(|h| {
+                let found = h.first_subtree(node, &format!("#{}", sel));
+                match found {
+                    Some(n) => wrap_element(n),
+                    None => Val::Null,
+                }
             }))
         }
         E_QUERY => {
             let Some(sel) = a0.as_string() else { return Ok(Val::Null) };
-            Ok(with_dom(|dom| {
-                subtree_query(dom, node, &sel)
-                    .first()
-                    .map(|&n| wrap_element(n))
-                    .unwrap_or(Val::Null)
+            Ok(runtime::host(|h| {
+                let found = h.first_subtree(node, &sel);
+                match found {
+                    Some(n) => wrap_element(n),
+                    None => Val::Null,
+                }
             }))
         }
         E_QUERY_ALL => {
             let Some(sel) = a0.as_string() else { return Ok(js::Val::new_array(vec![])) };
-            Ok(with_dom(|dom| {
-                js::Val::new_array(
-                    subtree_query(dom, node, &sel).into_iter().map(wrap_element).collect(),
-                )
+            Ok(runtime::host(|h| {
+                js::Val::new_array(h.subtree_all(node, &sel).into_iter().map(wrap_element).collect())
             }))
         }
         E_APPEND_CHILD => {
             let child = this_node(&a0)?;
-            let attached = with_dom(|dom| {
-                if (child as usize) < dom.nodes.len() && (node as usize) < dom.nodes.len() {
-                    dom.nodes[child as usize].parent = node;
-                    dom.nodes[node as usize].children.push(child);
-                    true
-                } else {
-                    false
-                }
-            });
-            if attached {
-                ctx_dirty();
-            }
+            // dirty flag bookkeeping lives inside the host write (as
+            // before: an out-of-range no-op never dirties the page)
+            runtime::host_mut(|h| h.append_child(node, child));
             Ok(a0)
         }
         E_SET_ATTRIBUTE => {
@@ -562,8 +476,8 @@ fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
             set_attr(node, &name, &val);
             Ok(Val::Undefined)
         }
-        E_GET_ATTRIBUTE => Ok(with_dom(|dom| match dom.attr(node, &a0.to_string()) {
-            Some(v) => str_val(v),
+        E_GET_ATTRIBUTE => Ok(runtime::host(|h| match h.attr(node, &a0.to_string()) {
+            Some(v) => str_val(&v),
             None => Val::Null,
         })),
         E_REMOVE_ATTRIBUTE => {
@@ -578,11 +492,7 @@ fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
                 eprintln!("[js] addEventListener: callback is not a function");
                 return Ok(Val::Undefined);
             }
-            CTX.with(|c| {
-                if let Some(cx) = c.borrow_mut().as_mut() {
-                    cx.listeners.entry((node, kind.to_string())).or_default().push(cb);
-                }
-            });
+            ctx_add_listener(node, kind.to_string(), cb);
             Ok(Val::Undefined)
         }
         E_SET_TEXT_CONTENT => {
@@ -619,14 +529,14 @@ fn loc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
     match idx {
         L_ASSIGN => {
             let target = args.first().map(|v| v.to_string()).unwrap_or_default();
-            request_nav(&target);
+            runtime::host_mut(|h| h.request_nav(&target));
             Ok(Val::Undefined)
         }
         L_RELOAD => {
             // a reload is a navigation to the current page (refetch through
             // the full pipeline; the disk cache may serve it up to TTL)
-            let base = ctx_base();
-            request_nav(&base);
+            let base = runtime::host(|h| h.base().to_string());
+            runtime::host_mut(|h| h.request_nav(&base));
             Ok(Val::Undefined)
         }
         _ => Err(JsError::throw("TypeError: bad location native")),
@@ -648,14 +558,7 @@ fn win_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
                 eprintln!("[js] addEventListener: callback is not a function");
                 return Ok(Val::Undefined);
             }
-            CTX.with(|c| {
-                if let Some(cx) = c.borrow_mut().as_mut() {
-                    cx.listeners
-                        .entry((WIN_NODE, kind.to_string()))
-                        .or_default()
-                        .push(cb);
-                }
-            });
+            ctx_add_listener(WIN_NODE, kind.to_string(), cb);
             Ok(Val::Undefined)
         }
         _ => Err(JsError::throw("TypeError: bad window native")),
@@ -668,7 +571,7 @@ fn ev_native(_e: &mut JsEngine, idx: u16, this: &Val, _args: &[Val]) -> Result<V
     match idx {
         V_PREVENT_DEFAULT => {
             let node = this_node(this).unwrap_or(0);
-            ctx_prevent_default(node);
+            runtime::host_mut(|h| h.note_prevent_default(node));
             Ok(Val::Undefined)
         }
         _ => Err(JsError::throw("TypeError: bad event native")),
@@ -685,59 +588,44 @@ fn raf_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result
         eprintln!("[js] requestAnimationFrame: callback is not a function");
         return Ok(Val::Num(0.0));
     }
-    CTX.with(|c| {
-        if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.raf.push(cb);
-        }
-    });
+    // the callback joins the turn's rAF queue; the turn driver folds it
+    // into the runtime's frame queue (next epoch) when the turn ends
+    ctx_queue_raf(cb);
     Ok(Val::Num(next_raf_id()))
 }
 
 /// `localStorage` / `sessionStorage` (merged): an in-memory map per page,
 /// dropped on navigation. Errors (out of range, non-string values coerced)
-/// are logged, never thrown — closest honest subset.
+/// are logged, never thrown — closest honest subset. Reads/writes go
+/// through the shared host (the once-per-page honest note lives there).
 fn storage_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         S_GET => {
             let key = args.first().map(|v| v.to_string()).unwrap_or_default();
-            let val = ctx_storage(|s| s.get(&key).cloned());
+            let val = runtime::host(|h| h.storage_get(&key));
             Ok(val.map(|v| str_val(&v)).unwrap_or(Val::Null))
         }
         S_SET => {
             let key = args.first().map(|v| v.to_string()).unwrap_or_default();
             let val = args.get(1).map(|v| v.to_string()).unwrap_or_default();
-            storage_noted();
-            ctx_storage(|s| s.insert(key, val));
+            runtime::host_mut(|h| h.storage_set(&key, &val));
             Ok(Val::Undefined)
         }
         S_REMOVE => {
             let key = args.first().map(|v| v.to_string()).unwrap_or_default();
-            ctx_storage(|s| s.remove(&key));
+            runtime::host_mut(|h| h.storage_remove(&key));
             Ok(Val::Undefined)
         }
         S_LENGTH => {
-            let n = ctx_storage(|s| s.len()) as f64;
+            let n = runtime::host(|h| h.storage_len()) as f64;
             Ok(Val::Num(n))
         }
         S_CLEAR => {
-            ctx_storage(|s| s.clear());
+            runtime::host_mut(|h| h.storage_clear());
             Ok(Val::Undefined)
         }
         _ => Err(JsError::throw("TypeError: bad storage native")),
     }
-}
-
-/// Run `f` with the page's storage map (shared handle through Ctx).
-fn ctx_storage<R>(f: impl FnOnce(&mut HashMap<String, String>) -> R) -> R {
-    let store = CTX.with(|c| {
-        let b = c.borrow();
-        let cx = b
-            .as_ref()
-            .expect("[js] native ran outside a script turn");
-        cx.storage.clone()
-    });
-    let mut s = store.borrow_mut();
-    f(&mut s)
 }
 
 // -- dialog stand-ins: no dialog UI this round, stderr only ([js]) ----------
@@ -762,24 +650,12 @@ fn n_prompt(_e: &mut JsEngine, _args: &[Val]) -> Result<Val, JsError> {
 
 /// `matchMedia("(prefers-color-scheme: dark)")` — reports the same
 /// system preference the cascade's dark-mode logic uses. shortcut: css.rs
-/// resolves the per-element scheme itself (its globals are private); this
-/// mirrors the single OS-preference constant there. Other media queries →
-/// no match.
+/// resolves the per-element scheme itself (its globals are private); the
+/// mirror lives on the shared host (single copy for both engines).
+/// Other media queries → no match.
 fn n_match_media(_e: &mut JsEngine, args: &[Val]) -> Result<Val, JsError> {
     let q = args.first().map(|v| v.to_string()).unwrap_or_default();
-    // this mirror must stay in sync with css.rs PREFERS_DARK (= true)
-    const PREFERS_DARK_MIRROR: bool = true;
-    let dark = if q.contains("prefers-color-scheme") {
-        if q.contains("dark") {
-            PREFERS_DARK_MIRROR
-        } else if q.contains("light") {
-            !PREFERS_DARK_MIRROR
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let dark = runtime::host(|h| h.match_media_dark(&q));
     let o = Val::new_object();
     o.set("matches", Val::Bool(dark));
     o.set("media", str_val(&q));
@@ -788,19 +664,14 @@ fn n_match_media(_e: &mut JsEngine, args: &[Val]) -> Result<Val, JsError> {
 
 fn fetch_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let url = args.first().map(|v| v.to_string()).unwrap_or_default();
-    let base = ctx_base();
-    let abs = match crate::resolve(&base, &url) {
-        Some(a) => a,
-        None => {
-            eprintln!("[js] fetch: unresolvable url {url:?}");
-            return Ok(Val::Null);
-        }
+    let Some(abs) = runtime::host(|h| h.resolve_url(&url)) else {
+        eprintln!("[js] fetch: unresolvable url {url:?}");
+        return Ok(Val::Null);
     };
-    match crate::fetch(&abs) {
-        Ok((bytes, ct)) => {
+    match runtime::host(|h| h.fetch_text(&url)) {
+        Ok((body, ct)) => {
             // shortcut: cap honored by fetch's own 20MB bound; response
             // exposes text() only (no headers/blob)
-            let body = String::from_utf8_lossy(&bytes).into_owned();
             let o = Val::new_object();
             o.set("ok", Val::Bool(true));
             o.set("status", Val::Num(200.0));
@@ -835,93 +706,28 @@ fn fetch_text_native(_e: &mut JsEngine, _idx: u16, this: &Val, _args: &[Val]) ->
 }
 
 // ---------------------------------------------------------------------------
-// DOM mutation helpers (mark dirty AFTER releasing the ctx borrow)
+// DOM mutation helpers — thin wrappers over the shared host (the arena
+// writes and dirty-flag bookkeeping exist ONCE, in runtime.rs; both
+// engines call them with identical semantics).
 // ---------------------------------------------------------------------------
 
 fn set_attr(node: u32, name: &str, val: &str) {
-    let changed = with_dom(|dom| {
-        let Some(NodeKind::Element(_, attrs)) = dom.nodes.get_mut(node as usize).map(|n| &mut n.kind)
-        else {
-            return false;
-        };
-        match attrs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
-            Some((_, v)) => {
-                let same = v == val;
-                if !same {
-                    *v = val.to_string();
-                }
-                !same
-            }
-            None => {
-                let mut v: Vec<(String, String)> = attrs.iter().cloned().collect();
-                v.push((name.to_string(), val.to_string()));
-                *attrs = v.into_boxed_slice();
-                true
-            }
-        }
-    });
-    if changed {
-        ctx_dirty();
-    }
+    runtime::host_mut(|h| h.set_attribute(node, name, val));
 }
 
 fn remove_attr(node: u32, name: &str) {
-    let changed = with_dom(|dom| {
-        let Some(NodeKind::Element(_, attrs)) = dom.nodes.get_mut(node as usize).map(|n| &mut n.kind)
-        else {
-            return false;
-        };
-        if let Some(i) = attrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
-            let mut v: Vec<(String, String)> = attrs.iter().cloned().collect();
-            v.remove(i);
-            *attrs = v.into_boxed_slice();
-            true
-        } else {
-            false
-        }
-    });
-    if changed {
-        ctx_dirty();
-    }
+    runtime::host_mut(|h| h.remove_attribute(node, name));
 }
 
 /// Replace all children of `node` with a single text node (`textContent`,
 /// text-only `innerHTML`).
 fn set_text_content(node: u32, text: &str) {
-    with_dom(|dom| {
-        if (node as usize) >= dom.nodes.len() {
-            return;
-        }
-        dom.nodes[node as usize].children.clear();
-        if !text.is_empty() {
-            let id = dom.nodes.len() as u32;
-            dom.nodes.push(html::Node {
-                parent: node,
-                children: Vec::new(),
-                kind: NodeKind::Text(text.to_string()),
-            });
-            dom.nodes[node as usize].children.push(id);
-        }
-    });
-    ctx_dirty();
-}
-
-fn request_nav(target: &str) {
-    // resolve against the page base here: the worker treats the result
-    // as an absolute URL
-    let resolved = {
-        let base = ctx_base();
-        crate::resolve(&base, target).unwrap_or_else(|| target.to_string())
-    };
-    CTX.with(|c| {
-        if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.pending_nav = Some(resolved);
-        }
-    });
+    runtime::host_mut(|h| h.set_text_content(node, text));
 }
 
 /// Descendants of `root` matching `sel` (document order; root excluded).
-fn subtree_query(dom: &Dom, root: u32, sel: &str) -> Vec<u32> {
+/// `pub(crate)`: the shared DomHost delegates to this canonical copy.
+pub(crate) fn subtree_query_dom(dom: &Dom, root: u32, sel: &str) -> Vec<u32> {
     let mut out = Vec::new();
     let mut stack: Vec<u32> = dom
         .nodes
@@ -957,25 +763,12 @@ pub struct PageScripts {
     /// one coalesced pass per epoch (see module docs)
     raf: Vec<(Instant, Val)>,
     /// in-memory localStorage (worker RAM, dropped per navigation) shared
-    /// with the natives through the thread-local ctx handle
-    storage: Storage,
+    /// with the natives through the shared host handle
+    storage: runtime::Storage,
     base: String,
 }
-
-/// Result of one turn (script run / event dispatch / timer or rAF fire).
-pub struct Turn {
-    pub dirty: bool,
-    pub nav: Option<String>,
-    /// a listener called preventDefault — the UI thread cancels any
-    /// not-yet-started navigation associated with this turn's job
-    pub prevent_default: bool,
-}
-
-impl Turn {
-    fn none() -> Turn {
-        Turn { dirty: false, nav: None, prevent_default: false }
-    }
-}
+// The per-turn Turn result lives in runtime.rs (same contract for both
+// engines) — script.rs re-exports it via the import at the top.
 
 impl PageScripts {
     /// Fresh engine per page (documented design): install the DOM natives
@@ -1072,8 +865,8 @@ impl PageScripts {
         let html_el = (1..dom.nodes.len() as u32)
             .find(|&i| dom.tag(i) == "html")
             .unwrap_or(0);
-        let storage: Storage = Default::default();
-        let (wrappers, _cx) =
+        let storage: runtime::Storage = Default::default();
+        let (wrappers, _host, _cx) =
             with_ctx(&mut engine, dom, base, HashMap::new(), storage.clone(), |_e| {
                 (wrap_element(body), wrap_element(html_el))
             });
@@ -1129,22 +922,23 @@ impl PageScripts {
             );
             let listeners = std::mem::take(&mut self.listeners);
             let storage = self.storage.clone();
-            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
-                let r = e.exec(&src);
-                // queued microtasks (Promise.then) run before we look at
-                // timers — same turn semantics as the embedder contract
-                if let Err(m) = e.drain_microtasks() {
-                    eprintln!("[js] microtask error: {m}");
-                }
-                r
-            });
+            let (r, mut host, cx) =
+                with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                    let r = e.exec(&src);
+                    // queued microtasks (Promise.then) run before we look at
+                    // timers — same turn semantics as the embedder contract
+                    if let Err(m) = e.drain_microtasks() {
+                        eprintln!("[js] microtask error: {m}");
+                    }
+                    r
+                });
             self.merge_ctx(&cx);
             self.listeners = cx.listeners;
-            if cx.dirty {
+            if host.dirty() {
                 dirty = true;
             }
             if nav.is_none() {
-                nav = cx.pending_nav.clone();
+                nav = host.take_nav();
             }
             if let Err(err) = r {
                 eprintln!("[js] script error: {err}");
@@ -1166,7 +960,9 @@ impl PageScripts {
     /// Dispatch one event kind to `node`'s listeners, bubbling up the
     /// parent chain (no capture phase — shortcut); window-level listeners
     /// (registered via `window.addEventListener`) fire last. Single-kind
-    /// wrapper around `dispatch_ext`.
+    /// wrapper around `dispatch_ext`. (test-only convenience; the shell
+    /// goes through the runtime trait's multi-kind dispatch)
+    #[cfg(test)]
     pub fn dispatch(&mut self, dom: &mut Dom, node: u32, kind: &str) -> Turn {
         self.dispatch_ext(dom, node, &[kind], None, None, None)
     }
@@ -1209,7 +1005,7 @@ impl PageScripts {
                 for cb in cbs {
                     let listeners = std::mem::take(&mut self.listeners);
                     let storage = self.storage.clone();
-                    let (r, cx) =
+                    let (r, mut host, cx) =
                         with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
                             let evt = wrap_event(node, kind, key, page_y, value);
                             // `this` = the element the listener is attached
@@ -1225,13 +1021,13 @@ impl PageScripts {
                         });
                     self.merge_ctx(&cx);
                     self.listeners = cx.listeners;
-                    if cx.dirty {
+                    if host.dirty() {
                         turn.dirty = true;
                     }
                     if turn.nav.is_none() {
-                        turn.nav = cx.pending_nav.clone();
+                        turn.nav = host.take_nav();
                     }
-                    if cx.prevent_default {
+                    if host.prevent_default() {
                         turn.prevent_default = true;
                     }
                     if let Err(err) = r {
@@ -1248,11 +1044,11 @@ impl PageScripts {
         turn
     }
 
-    /// Fold the ctx's rAF queue / preventDefault flag gathered during a
-    /// single native callback back into the page's scheduling state.
+    /// Fold the ctx's rAF queue gathered during a single native callback
+    /// back into the page's frame queue (prevent_default lives on the
+    /// host; nothing to accumulate here).
     fn merge_ctx(&mut self, cx: &Ctx) {
         self.harvest_raf_from(&cx.raf);
-        // prevent_default is read per turn; nothing to accumulate here
     }
 
     /// Move engine-queued `setTimeout` jobs into the absolute-deadline
@@ -1309,22 +1105,23 @@ impl PageScripts {
             let Some((_, cb, args)) = due else { break };
             let listeners = std::mem::take(&mut self.listeners);
             let storage = self.storage.clone();
-            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
-                let r = e.call_function(&cb, Val::Undefined, &args);
-                if let Err(m) = e.drain_microtasks() {
-                    eprintln!("[js] microtask error: {m}");
-                }
-                r
-            });
+            let (r, mut host, cx) =
+                with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                    let r = e.call_function(&cb, Val::Undefined, &args);
+                    if let Err(m) = e.drain_microtasks() {
+                        eprintln!("[js] microtask error: {m}");
+                    }
+                    r
+                });
             self.merge_ctx(&cx);
             self.listeners = cx.listeners;
-            if cx.dirty {
+            if host.dirty() {
                 turn.dirty = true;
             }
             if turn.nav.is_none() {
-                turn.nav = cx.pending_nav.clone();
+                turn.nav = host.take_nav();
             }
-            if cx.prevent_default {
+            if host.prevent_default() {
                 turn.prevent_default = true;
             }
             if let Err(err) = r {
@@ -1362,23 +1159,24 @@ impl PageScripts {
         for cb in due {
             let listeners = std::mem::take(&mut self.listeners);
             let storage = self.storage.clone();
-            let (r, cx) = with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
-                // honest shortcut: no timestamp argument (the DOM wave will
-                // add one when perf timing exists); scripts reading the
-                // arg get undefined
-                let r = e.call_function(&cb, Val::Undefined, &[]);
-                if let Err(m) = e.drain_microtasks() {
-                    eprintln!("[js] microtask error: {m}");
-                }
-                r
-            });
+            let (r, mut host, cx) =
+                with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                    // honest shortcut: no timestamp argument (the DOM wave will
+                    // add one when perf timing exists); scripts reading the
+                    // arg get undefined
+                    let r = e.call_function(&cb, Val::Undefined, &[]);
+                    if let Err(m) = e.drain_microtasks() {
+                        eprintln!("[js] microtask error: {m}");
+                    }
+                    r
+                });
             self.merge_ctx(&cx);
             self.listeners = cx.listeners;
-            if cx.dirty {
+            if host.dirty() {
                 turn.dirty = true;
             }
             if turn.nav.is_none() {
-                turn.nav = cx.pending_nav.clone();
+                turn.nav = host.take_nav();
             }
             if let Err(err) = r {
                 eprintln!("[js] rAF error: {err}");
@@ -1407,18 +1205,53 @@ impl PageScripts {
     }
 }
 
+/// OPTION A behind the selectable-runtime contract: `PageScripts` IS the
+/// pure-Rust built-in engine, so the trait methods delegate to its
+/// inherent, fully-tested API.
+impl runtime::ScriptRuntime for PageScripts {
+    fn run_scripts(&mut self, dom: &mut Dom) -> Turn {
+        PageScripts::run_scripts(self, dom)
+    }
+
+    fn dispatch(
+        &mut self,
+        dom: &mut Dom,
+        node: u32,
+        kinds: &[&str],
+        key: Option<&str>,
+        page_y: Option<f32>,
+        value: Option<&str>,
+    ) -> Turn {
+        self.dispatch_ext(dom, node, kinds, key, page_y, value)
+    }
+
+    fn run_due_timers(&mut self, dom: &mut Dom) -> Turn {
+        PageScripts::run_due_timers(self, dom)
+    }
+
+    fn run_due_frames(&mut self, dom: &mut Dom) -> Turn {
+        PageScripts::run_due_frames(self, dom)
+    }
+
+    fn next_wake_deadline(&self) -> Option<Instant> {
+        PageScripts::next_wake_deadline(self)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Script collection
 // ---------------------------------------------------------------------------
 
-struct ScriptSrc {
+/// A `<script>` element's source (shared with the engine-core adapter).
+pub(crate) struct ScriptSrc {
     /// inline source (text children) — empty when `src` is set
-    text: String,
-    src: Option<String>,
+    pub(crate) text: String,
+    pub(crate) src: Option<String>,
 }
 
 /// Every `<script>` element in document order.
-fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
+/// `pub(crate)`: the engine-core adapter reuses this exact walk.
+pub(crate) fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
     let mut out = Vec::new();
     let mut stack: Vec<u32> = vec![0];
     while let Some(n) = stack.pop() {
@@ -1443,9 +1276,10 @@ fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::html;
 
-    fn page(html: &str) -> (Dom, PageScripts) {
-        let mut dom = html::parse(html);
+    fn page(html_src: &str) -> (Dom, PageScripts) {
+        let mut dom = html::parse(html_src);
         let ps = PageScripts::new(&mut dom, "https://example.com/");
         (dom, ps)
     }
@@ -1464,7 +1298,7 @@ mod tests {
         );
         let turn = ps.run_scripts(&mut dom);
         assert!(turn.dirty, "setTextContent must mark the page dirty");
-        let p = query_all(&dom, "#t")[0];
+        let p = query_all_dom(&dom, "#t")[0];
         assert_eq!(child_text(&dom, p), "new");
     }
 
@@ -1477,7 +1311,7 @@ mod tests {
         // must not panic; the second script still doesn't exist here, but
         // the page survives the throw
         let _ = ps.run_scripts(&mut dom);
-        assert_eq!(query_all(&dom, "#after").len(), 1);
+        assert_eq!(query_all_dom(&dom, "#after").len(), 1);
     }
 
     #[test]
@@ -1510,7 +1344,7 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let b = query_all(&dom, "#b")[0];
+        let b = query_all_dom(&dom, "#b")[0];
         let turn = ps.dispatch(&mut dom, b, "click");
         assert!(!turn.dirty);
         // 1 on the button + 10 bubbled to body
@@ -1530,10 +1364,10 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let b = query_all(&dom, "#b")[0];
+        let b = query_all_dom(&dom, "#b")[0];
         let turn = ps.dispatch(&mut dom, b, "click");
         assert!(turn.dirty);
-        let out = query_all(&dom, "#out")[0];
+        let out = query_all_dom(&dom, "#out")[0];
         assert_eq!(child_text(&dom, out), "clicked");
     }
 
@@ -1561,7 +1395,7 @@ mod tests {
         assert!(turn.dirty, "value mutation re-layouts");
         assert_eq!(get_global_str(&mut ps, "v"), "hello");
         assert_eq!(get_global_str(&mut ps, "x"), "1");
-        let i = query_all(&dom, "#i")[0];
+        let i = query_all_dom(&dom, "#i")[0];
         assert_eq!(dom.attr(i, "value"), Some("hello"));
     }
 
@@ -1577,11 +1411,11 @@ mod tests {
         );
         let turn = ps.run_scripts(&mut dom);
         assert!(turn.dirty);
-        let made = query_all(&dom, "#made");
+        let made = query_all_dom(&dom, "#made");
         assert_eq!(made.len(), 1);
         assert_eq!(child_text(&dom, made[0]), "made!");
         // attached under #host
-        let host = query_all(&dom, "#host")[0];
+        let host = query_all_dom(&dom, "#host")[0];
         assert!(dom.nodes[host as usize].children.contains(&made[0]));
     }
 
@@ -1607,7 +1441,7 @@ mod tests {
         );
         let turn = ps.run_scripts(&mut dom);
         assert!(turn.dirty, "0ms timer fires within run_scripts");
-        let t = query_all(&dom, "#t")[0];
+        let t = query_all_dom(&dom, "#t")[0];
         assert_eq!(child_text(&dom, t), "later");
     }
 
@@ -1625,11 +1459,11 @@ mod tests {
     #[test]
     fn selector_matching_unit() {
         let dom = html::parse(r#"<html><body><div id="x" class="a b">1</div><div>2</div></body></html>"#);
-        assert!(query_all(&dom, "#x").len() == 1);
-        assert!(query_all(&dom, ".b").len() == 1);
-        assert!(query_all(&dom, ".c").is_empty());
-        assert!(query_all(&dom, "div").len() == 2);
-        assert!(query_all(&dom, "p").is_empty());
+        assert!(query_all_dom(&dom, "#x").len() == 1);
+        assert!(query_all_dom(&dom, ".b").len() == 1);
+        assert!(query_all_dom(&dom, ".c").is_empty());
+        assert!(query_all_dom(&dom, "div").len() == 2);
+        assert!(query_all_dom(&dom, "p").is_empty());
     }
 
     #[test]
@@ -1827,7 +1661,7 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let l = query_all(&dom, "#l")[0];
+        let l = query_all_dom(&dom, "#l")[0];
         let t = ps.dispatch(&mut dom, l, "click");
         assert!(t.prevent_default, "preventDefault must flag the turn");
         assert!(get_global_str(&mut ps, "saw").starts_with("click:A"), "type+target reach the listener");
@@ -1855,7 +1689,7 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let i = query_all(&dom, "#i")[0];
+        let i = query_all_dom(&dom, "#i")[0];
         // one keystroke: UI sends keydown+input in one job
         let t = ps.dispatch_ext(&mut dom, i, &["keydown", "input"], Some("a"), None, Some("a"));
         assert_eq!(get_global_str(&mut ps, "log"), "kd:a;in:a;");
@@ -1895,7 +1729,7 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let b = query_all(&dom, "#b")[0];
+        let b = query_all_dom(&dom, "#b")[0];
         ps.dispatch(&mut dom, b, "click");
         assert_eq!(get_global_str(&mut ps, "order"), "body;win;", "bubbling then window");
         // document.addEventListener shares the global (window) bucket
@@ -1906,7 +1740,7 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let b = query_all(&dom, "#b")[0];
+        let b = query_all_dom(&dom, "#b")[0];
         ps.dispatch(&mut dom, b, "click");
         assert_eq!(get_global_str(&mut ps, "hits"), "1", "document-level listener fires");
     }
@@ -1980,7 +1814,7 @@ mod tests {
             </script></body></html>"#,
         );
         ps.run_scripts(&mut dom);
-        let l = query_all(&dom, "#l")[0];
+        let l = query_all_dom(&dom, "#l")[0];
         let t = ps.dispatch(&mut dom, l, "click");
         assert!(t.prevent_default, "veto may live at any bubble stop");
     }

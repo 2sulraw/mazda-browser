@@ -5,6 +5,7 @@ mod html;
 mod image;
 mod js;
 mod layout;
+mod runtime;
 mod script;
 mod svg;
 mod ui_chrome;
@@ -13,6 +14,7 @@ mod woff;
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
 use eframe::egui;
 use layout::{Fam, Layout, Style};
+use runtime::{Conf, EngineChoice, ScriptRuntime};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -118,6 +120,11 @@ struct App {
     /// if one calls preventDefault, the navigation never starts (decision
     /// rides `LoadDone.prevent_default` back on the same result).
     pending_link: Option<(u64, String)>,
+    /// persistent app settings (mazda.conf loaded/resolved at startup;
+    /// written through whenever the settings page changes one)
+    conf: Conf,
+    /// the ⚙ settings overlay is open (drawn + interactive)
+    settings_open: bool,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -168,8 +175,11 @@ impl App {
         // chrome; the page rasterizes its own fonts regardless
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let fonts = Fonts::load();
+        // start URL = first arg that is not a `--engine=` testing knob
+        // (the selectable-runtime CLI override may come in any position)
         let start = std::env::args()
-            .nth(1)
+            .skip(1)
+            .find(|a| !a.starts_with("--engine="))
             .unwrap_or_else(|| "https://example.com".to_string());
         // logical viewport = NativeOptions initial size; one texture pixel per
         // logical point (a HiDPI framebuffer upscales the texture — fine at
@@ -202,6 +212,11 @@ impl App {
         let (job_tx, job_rx) = mpsc::channel::<LoadReq>();
         let (done_tx, done_rx) = mpsc::channel::<LoadDone>();
         std::thread::spawn(move || loader_thread(job_rx, done_tx));
+        // resolve the script engine once: `--engine=a|b` flag > MAZDA_ENGINE
+        // env > mazda.conf on disk > default A (the selectable runtime;
+        // the settings page writes through on every change from here)
+        let args: Vec<String> = std::env::args().collect();
+        let conf = Conf::init(&args);
         let mut app = App {
             fonts,
             page,
@@ -230,6 +245,8 @@ impl App {
             vp_size: (pw, ph),
             pending_resize: None,
             pending_link: None,
+            conf,
+            settings_open: false,
         };
         app.dispatch(&url, pw, ph, 0.0);
         app
@@ -244,6 +261,7 @@ impl App {
             url: url.to_string(),
             max_w: page_w(pw),
             vh: page_h(ph),
+            engine: self.conf.engine,
         };
         // receiver only drops when the worker thread is gone
         if self.jobs.send(req).is_err() {
@@ -266,6 +284,7 @@ impl App {
             max_w: page_w(pw),
             vh: page_h(ph),
             forms: self.forms.clone(),
+            engine: self.conf.engine,
         };
         if self.jobs.send(req).is_err() {
             eprintln!("[nav] loader thread unavailable, relayout of {url} dropped");
@@ -298,6 +317,7 @@ impl App {
             key: key.map(|s| s.to_string()),
             href: None,
             forms: self.forms.clone(),
+            engine: self.conf.engine,
         };
         if self.jobs.send(req).is_err() {
             eprintln!("[nav] loader thread unavailable, {} event dropped", kinds.join("+"));
@@ -595,6 +615,9 @@ impl eframe::App for App {
                             }
                             self.address_focused = f;
                         }
+                        ui_chrome::ToolbarEvent::Settings => {
+                            self.settings_open = true;
+                        }
                     }
                 }
             });
@@ -828,6 +851,7 @@ impl eframe::App for App {
                                             key: None,
                                             href: Some(href.to_string()),
                                             forms: self.forms.clone(),
+                                            engine: self.conf.engine,
                                         };
                                         if self.jobs.send(req).is_err() {
                                             eprintln!("[nav] loader thread unavailable, link click dropped");
@@ -858,6 +882,34 @@ impl eframe::App for App {
                     egui::FontId::proportional(11.0),
                     egui::Color32::from_rgb(0x5f, 0x63, 0x68),
                 );
+
+                // ---- ⚙ settings overlay — drawn LAST so it sits over the
+                // page; the choice persists immediately and applies from the
+                // next navigation (here: re-load the current page through the
+                // new engine, the honest "no hot-swap" flow) ----
+                if self.settings_open {
+                    for ev in ui_chrome::settings_overlay(
+                        ui,
+                        self.conf.engine,
+                        crate::runtime::EngineChoice::B.available(),
+                    ) {
+                        match ev {
+                            ui_chrome::SettingsEvent::SetEngine(choice) => {
+                                self.conf.engine = choice;
+                                self.conf.save();
+                                eprintln!("[settings] engine set to {}", choice.as_conf());
+                                // note (not yet shipped): a per-engine reload
+                                // of OTHER tabs happens on their next load;
+                                // this reload covers the current one
+                                let target = self.page.url.clone();
+                                self.dispatch(&target, pw, ph, 0.0);
+                            }
+                            ui_chrome::SettingsEvent::Close => {
+                                self.settings_open = false;
+                            }
+                        }
+                    }
+                }
             });
 
         let (pw, ph) = vp;
@@ -979,6 +1031,10 @@ enum LoadReq {
         url: String,
         max_w: f32,
         vh: f32,
+        /// which script runtime builds the page's scripts (selectable
+        /// runtime). A relayout/event never switches engines: the kept
+        /// page keeps its runtime; this only matters for loads.
+        engine: EngineChoice,
     },
     /// re-cascade + re-layout the kept page (resize / DOM change), carrying
     /// the UI's live form state forward
@@ -988,6 +1044,7 @@ enum LoadReq {
         max_w: f32,
         vh: f32,
         forms: layout::FormState,
+        engine: EngineChoice,
     },
     /// a form control was activated (click/submit) or a text field changed:
     /// the worker mutates its DOM, fires each kind's listeners in order,
@@ -1010,11 +1067,23 @@ enum LoadReq {
         /// raw href of the clicked link (click-decision flow)
         href: Option<String>,
         forms: layout::FormState,
+        engine: EngineChoice,
     },
     /// the viewport scrolled: dispatches scroll listeners only (no
     /// generation id — scroll events never gate other results, and the
     /// worker coalesces a run of them to the newest)
     Scroll { url: String, y: f32 },
+}
+
+impl LoadReq {
+    /// The engine to build a (re)load with when this job falls back to
+    /// `do_load` (kept page missing). Scroll never loads.
+    fn engine(&self) -> EngineChoice {
+        match self {
+            LoadReq::Load { engine, .. } | LoadReq::Relayout { engine, .. } | LoadReq::Event { engine, .. } => *engine,
+            LoadReq::Scroll { .. } => EngineChoice::A,
+        }
+    }
 }
 
 impl LoadReq {
@@ -1222,8 +1291,11 @@ struct KeptPage {
     css_text: String,
     /// `@font-face` defs (re-registered per layout)
     faces: Vec<css::FontFace>,
-    /// script engine + listeners for this page; None until scripts ran
-    scripts: Option<script::PageScripts>,
+    /// script engine + listeners for this page; None until scripts ran.
+    /// Trait object: the engine choice (settings page / CLI / conf) picks
+    /// the concrete runtime at load time and the rest of the shell never
+    /// knows which one runs.
+    scripts: Option<Box<dyn ScriptRuntime>>,
 }
 
 /// The single long-lived loader thread. Owns its own `Fonts` (font types
@@ -1477,14 +1549,14 @@ fn process_job(
         LoadReq::Load { url, max_w, vh, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = layout::FormState::default();
-            let r = do_load(kept, fonts, url, *max_w, *vh);
+            let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
             (r.0, r.1, false, r.2)
         }
         LoadReq::Relayout { url, max_w, vh, forms, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                let r = do_load(kept, fonts, url, *max_w, *vh);
+                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
                 return (r.0, r.1, false, r.2);
             }
             let kp = kept.as_mut().unwrap();
@@ -1499,7 +1571,7 @@ fn process_job(
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                let r = do_load(kept, fonts, url, *max_w, *vh);
+                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
                 return (r.0, r.1, false, r.2);
             }
             let kp = kept.as_mut().unwrap();
@@ -1534,7 +1606,8 @@ fn process_job(
                 let KeptPage { dom, scripts, .. } = kp;
                 if let Some(scripts) = scripts.as_mut() {
                     let kind_refs: Vec<&str> = kinds.iter().map(|s| s.as_str()).collect();
-                    let t = scripts.dispatch_ext(
+                    let t = ScriptRuntime::dispatch(
+                        scripts.as_mut(),
                         dom, target, &kind_refs, key.as_deref(), None, None,
                     );
                     nav = t.nav;
@@ -1565,7 +1638,8 @@ fn process_job(
                 {
                     let KeptPage { dom, scripts, .. } = kp;
                     if let Some(scripts) = scripts.as_mut() {
-                        let t = scripts.dispatch_ext(
+                        let t = ScriptRuntime::dispatch(
+                            scripts.as_mut(),
                             dom, body, &["scroll"], None, Some(*y), None,
                         );
                         nav = t.nav;
@@ -1642,11 +1716,12 @@ fn do_load(
     url: &str,
     max_w: f32,
     vh: f32,
+    engine: EngineChoice,
 ) -> (Option<PageWire>, Option<String>, bool) {
     let (dom, css_text, faces) = fetch_and_parse(url);
     let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None };
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
-    let mut scripts = script::PageScripts::new(&mut kp.dom, url);
+    let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = scripts.run_scripts(&mut kp.dom);
     if turn.dirty {
         // inline scripts mutated the DOM before the first layout — the
@@ -3311,6 +3386,7 @@ mod tests {
             key: None,
             href: None,
             forms: layout::FormState::default(),
+            engine: EngineChoice::A,
         };
         let re = LoadReq::Relayout {
             id: 4,
@@ -3318,6 +3394,7 @@ mod tests {
             max_w: 100.0,
             vh: 200.0,
             forms: layout::FormState::default(),
+            engine: EngineChoice::A,
         };
         let sc = LoadReq::Scroll { url: "https://example.com/".into(), y: 12.0 };
         assert_eq!(ev.id(), 3);
@@ -3339,6 +3416,7 @@ mod tests {
             url: "https://example.com/".into(),
             max_w: 1.0,
             vh: 1.0,
+            engine: EngineChoice::A,
         };
     }
 
@@ -3397,8 +3475,8 @@ mod tests {
     /// never dropped and breaks both collapsing runs.
     #[test]
     fn coalesce_batch_superseded_runs() {
-        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0 };
-        let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default() };
+        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, engine: EngineChoice::A };
+        let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default(), engine: EngineChoice::A };
         let ev = |id, kind: &str| LoadReq::Event {
             id,
             url: "https://x.com/".into(),
@@ -3410,6 +3488,7 @@ mod tests {
             key: None,
             href: None,
             forms: layout::FormState::default(),
+            engine: EngineChoice::A,
         };
         let sc = |y| LoadReq::Scroll { url: "https://x.com/".into(), y };
         // newest Load wins whole queue

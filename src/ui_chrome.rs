@@ -46,13 +46,18 @@ const WIN_CLOSE_BG: Color32 = Color32::from_rgb(0xe8, 0x11, 0x23);
 const PILL_H: f32 = 28.0;
 const PILL_RADIUS: f32 = 10.0;
 const PILL_X0: f32 = 52.0;
-const PILL_X1: f32 = 12.0;
+/// Right inset of the address pill — keeps room for the ⚙ settings button.
+const PILL_X1: f32 = 34.0 + 12.0;
 const PILL_PAD: f32 = 12.0;
 const PILL_BG: Color32 = BG_HOVER;
 const PILL_RING: Color32 = Color32::from_rgb(0x6a, 0x9c, 0xff);
 const PILL_FG: Color32 = FG_HOVER;
 const PILL_HINT: Color32 = Color32::from_rgb(0x8b, 0x90, 0x96);
 const DISABLED_FG: Color32 = Color32::from_rgb(0x5f, 0x63, 0x68);
+
+/// ⚙ settings button (right end of the toolbar row).
+const GEAR_SIZE: f32 = 28.0;
+const GEAR_RIGHT: f32 = 12.0;
 
 const TEXT: f32 = 13.0;
 const NEW_TAB_SIZE: f32 = 24.0;
@@ -76,6 +81,16 @@ pub enum ToolbarEvent {
     Back,
     Submit(String),
     Focused(bool),
+    /// the ⚙ button was clicked — open the settings overlay
+    Settings,
+}
+
+/// What the settings overlay wants `main.rs` to do.
+pub enum SettingsEvent {
+    /// the user picked an engine (radio row click)
+    SetEngine(crate::runtime::EngineChoice),
+    /// close requested (✕ or click outside)
+    Close,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +387,27 @@ pub fn toolbar(ui: &mut Ui, text: &mut String, can_go_back: bool) -> Vec<Toolbar
         tresp.request_focus();
     }
 
+    // ---- ⚙ settings (right end of the row) ----
+    let grect = Rect::from_center_size(
+        pos2(row.right() - GEAR_RIGHT - GEAR_SIZE / 2.0, cy),
+        vec2(GEAR_SIZE, GEAR_SIZE),
+    );
+    let gresp = ui.interact(grect, ui.scope_id().with("chrome_settings"), Sense::click());
+    if gresp.hovered() {
+        ui.painter().rect_filled(grect, 6.0, BG_HOVER);
+    }
+    ui.painter().text(
+        grect.center(),
+        Align2::CENTER_CENTER,
+        "\u{2699}", // ⚙
+        FontId::proportional(16.0),
+        if gresp.hovered() { ICON_HOVER } else { ICON },
+    );
+    if gresp.clicked() {
+        eprintln!("[chrome] settings");
+        events.push(ToolbarEvent::Settings);
+    }
+
     if tresp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         let q = text.trim().to_string();
         if !q.is_empty() {
@@ -380,6 +416,144 @@ pub fn toolbar(ui: &mut Ui, text: &mut String, can_go_back: bool) -> Vec<Toolbar
         }
     }
     events.push(ToolbarEvent::Focused(tresp.has_focus()));
+    events
+}
+
+// ---------------------------------------------------------------------------
+// ⚙ settings overlay (SELECTABLE SCRIPT RUNTIME)
+// ---------------------------------------------------------------------------
+
+// dialog tokens: slightly lifted panel on the dimmed page, hairline border
+const SET_BG: Color32 = Color32::from_rgb(0x1f, 0x20, 0x23);
+const SET_BORDER: Color32 = SEP_PAGE; // #2c2d31
+const SET_RADIUS: f32 = 10.0;
+const SET_TEXT: f32 = TEXT; // 13px
+const SET_FG: Color32 = FG_HOVER; // #e8eaed (same token as the chrome text)
+const SET_DIM: Color32 = DISABLED_FG;
+const SET_W: f32 = 430.0;
+const SET_H: f32 = 128.0;
+const SET_PAD: f32 = 16.0;
+const SET_ROW_H: f32 = 30.0;
+
+/// The modal settings dialog: pick the script runtime the next page loads
+/// run through. Painted with the same raw-shapes style as the chrome rows.
+///
+/// Exact copy (per the plan):
+/// ```text
+/// JavaScript engine:
+///   (•) A — Pure Rust built-in (light)
+///   ( ) B — Full JS engine core (compatibility, +30 MB/page)
+/// ```
+/// Engine B's row is dimmed and inert when this build was compiled without
+/// the feature (the runtime falls back to A with a `[settings]` stderr
+/// note); both sit behind the same runtime contract, the choice applies
+/// from the NEXT navigation on (no hot-swap of a running page).
+pub fn settings_overlay(
+    ui: &mut Ui,
+    chosen: crate::runtime::EngineChoice,
+    b_available: bool,
+) -> Vec<SettingsEvent> {
+    use crate::runtime::EngineChoice;
+    let mut events = Vec::new();
+    let screen = ui.max_rect();
+    let center = screen.center();
+
+    // dim + click-outside catcher (drawn first = below the panel)
+    ui.painter()
+        .rect_filled(screen, 0.0, Color32::from_black_alpha(120));
+    let outer = ui.allocate_rect(screen, Sense::click());
+
+    // panel
+    let panel = Rect::from_center_size(center, vec2(SET_W, SET_H));
+    ui.painter().rect_filled(panel, SET_RADIUS, SET_BG);
+    ui.painter().rect_stroke(
+        panel,
+        SET_RADIUS,
+        Stroke::new(1.0, SET_BORDER),
+        StrokeKind::Inside,
+    );
+    // clicks on panel padding must not fall through to the "outside" catcher
+    ui.allocate_rect(panel, Sense::click());
+
+    // title
+    let font = FontId::proportional(SET_TEXT);
+    ui.painter().text(
+        pos2(panel.left() + SET_PAD, panel.top() + SET_PAD + 6.0),
+        Align2::LEFT_CENTER,
+        "JavaScript engine:",
+        font.clone(),
+        SET_FG,
+    );
+
+    // close ✕ (top-right)
+    let x = pos2(panel.right() - 14.0, panel.top() + 14.0);
+    let xrect = Rect::from_center_size(x, vec2(16.0, 16.0));
+    let xresp = ui.interact(xrect, ui.scope_id().with("settings_close"), Sense::click());
+    paint_x(ui, x, 3.5, if xresp.hovered() { ICON_HOVER } else { ICON });
+    if xresp.clicked() {
+        eprintln!("[chrome] settings close");
+        events.push(SettingsEvent::Close);
+    }
+
+    // radio rows: (label, choice) — the "(•)"/"( )" marker tracks the choice
+    let mut row_y = panel.top() + SET_PAD + 30.0;
+    let row_w = SET_W - 2.0 * SET_PAD;
+    for (label, choice) in [
+        ("A — Pure Rust built-in (light)", EngineChoice::A),
+        (
+            "B — Full JS engine core (compatibility, +30 MB/page)",
+            EngineChoice::B,
+        ),
+    ] {
+        let sel = chosen == choice;
+        let m = if sel { "(•)" } else { "( )" };
+        let rect = Rect::from_min_size(pos2(panel.left() + SET_PAD, row_y), vec2(row_w, SET_ROW_H));
+        let resp = ui.interact(
+            rect,
+            ui.scope_id().with(("settings_engine", choice.as_conf())),
+            Sense::click(),
+        );
+        // an unavailable B row dims everything (and stays inert)
+        let dim = !b_available && choice == EngineChoice::B;
+        let (mark_fg, text_fg) = if dim {
+            (SET_DIM, SET_DIM)
+        } else if sel {
+            (SET_FG, SET_FG)
+        } else {
+            (ICON, SET_FG)
+        };
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 6.0, BG_HOVER);
+        }
+        ui.painter().text(
+            pos2(rect.left() + 4.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            m,
+            font.clone(),
+            mark_fg,
+        );
+        ui.painter().text(
+            pos2(rect.left() + 34.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            text_fg,
+        );
+        if resp.clicked() {
+            if choice.available() {
+                eprintln!("[chrome] settings: engine set to {}", choice.as_conf());
+                events.push(SettingsEvent::SetEngine(choice));
+            } else {
+                eprintln!("[chrome] settings: engine B unavailable in this build");
+            }
+        }
+        row_y += SET_ROW_H;
+    }
+
+    if outer.clicked() {
+        eprintln!("[chrome] settings close (outside click)");
+        events.push(SettingsEvent::Close);
+    }
     events
 }
 
