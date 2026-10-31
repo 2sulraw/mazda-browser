@@ -362,6 +362,40 @@ curve matters more than the baseline (near-flat as tabs grow).
   templates); Wikipedia black search/Tools widgets (var-map, P1.5 debug
   session pending); HN vote arrows + orange full-bleed header (background-
   image + table % widths, P2); leading `<br>` no-op; `:visited`==`:link`
+- [x] **Forms + scripts wave (3 parallel agents + integrator fixes)** — user-visible
+  interactivity milestone: **(a) async shell** — the whole fetch/decode/parse/
+  cascade/layout pipeline moved to a worker thread (mpsc job enum Load/Relayout/
+  Event; NavGate generation guard; job coalescing; 10s/15s ureq timeouts —
+  infinite default was the freeze; catch_unwind; worker Fonts; PageWire Send
+  form; 150ms resize debounce, measured Wikipedia pipeline 6.6s;
+  `511e8e0`+4 tests); **(b) form controls** — inputs/textarea/button/checkbox/
+  radio render as real UA-default boxes, `FormState{focused,values}` node-id
+  keyed survives re-layout, `hit_test_form`, password mask, tail-clip;
+  `layout_in_forms` (6ca9247 +8 tests); **(c) shell wiring** — click = form
+  hit-test first, letters/backspace route to the focused field (pure
+  `route_key`), Enter logs `[form] submit`, Esc blurs; FormState rides every
+  worker job; (d) **JS: from-scratch tree-walking interpreter** (js.rs +
+  js/{lexer,parser,interp,builtins,tests}.rs: closures, classes-desugar,
+  template literals, JSON/Math/Array/Object/Date/URI/timers/Promise-microtasks,
+  24-byte Val, depth caps → Err not panic; `8b38556` +52 tests) and its
+  **activation**: `<script>` inline+src run in document order on the worker,
+  DOM natives in script.rs (`getElementById/querySelector/single-selector/
+  createElement/append/attrs/textContent/innerHTML-text/className/
+  addEventListener+bubbling/location/fetch-sync/setTimeout`), listener dispatch
+  from click routing, worker keeps DOM+engine+CSS between jobs, engine dropped
+  per nav; errors `[js]`-logged never fatal (`6d15851` +19 tests);
+  **(e) dark-scheme text colors** — UA default text color flips black→white
+  only when the page declares `color-scheme` dark and no author color
+  cascaded; same fix repaired MDN's invisible dark logo; example.com h1 turned
+  out to be absent from the source page (not our bug) (`3278e26` +2 tests).
+  Verified live: Wikipedia runs real scripts (`[js] run inline/external`),
+  typed fields focusable, logo dark-correct; **280 tests; master**
+  `aa53bbf→…` merges + `3db8950` vh hookup + `0d8b866` wire-literal fields.
+  Known gaps queued: MDN raw SVG source text paints in header (SVG escaping
+  its element via DSD hoist), MDN header action row as text line, wiki
+  "Jump to content" + jammed buttons, engine lacks regex/destructuring/
+  async-await (scripts using them error-log), no form POST, RAM floor up
+  (Retained DOM+engine: wiki 93.1 MB)
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -435,6 +469,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-30 | P1 parity wave | Wikipedia (Main_Page) | 73.5 MB (1458 runs; serif h1, no underline-everywhere) |
 | 2026-10-30 | P1 parity wave | MDN | 66.2 MB (657 runs; DSD header restored, hero one line-gap) |
 | 2026-10-30 | P1 parity wave | nextjs.org | 80.5 MB (502 runs) |
+| 2026-10-31 | forms + scripts wave | Wikipedia (Main_Page) | 93.1 MB (1269 runs; + worker keeps DOM+JS engine+CSS between jobs, dropped on nav) |
 
 ### Phase 1c (Track A) findings
 
