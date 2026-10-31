@@ -151,13 +151,23 @@ fn control_chrome(bx: &mut BoxStyle, min_h: f32, default_w: Option<f32>) {
 /// soup parser nests an unclosed `<option>` inside the previous one, and
 /// each option's label belongs to it alone. (Textareas are raw text, so
 /// their default value comes out whole.)
+///
+/// `svg`/`script`/`style` subtrees are skipped: their payload is markup or
+/// commands (svg holds its shapes as a RAW_TEXT child), never user-visible
+/// label text — an icon `<svg>` inside a `<button>` must not leak
+/// `<path d="…"/>` source into the button's label. The svg image pipeline
+/// reads svg's own text children directly, never through this fn.
 fn contained_text(dom: &Dom, node: u32) -> String {
+    fn is_hidden_payload(tag: &str) -> bool {
+        matches!(tag, "svg" | "script" | "style")
+    }
     let mut s = String::new();
     for &c in &dom.nodes[node as usize].children {
         match &dom.nodes[c as usize].kind {
             NodeKind::Text(t) => s.push_str(t),
             NodeKind::Element(..) => {
-                if dom.tag(c) != "option" {
+                let tag = dom.tag(c);
+                if tag != "option" && !is_hidden_payload(&tag) {
                     s.push_str(&contained_text(dom, c));
                 }
             }
@@ -1271,8 +1281,13 @@ fn place(
             w = (iw as f32).min(avail);
         }
     }
+    // auto margins: both horizontal auto → center; only-left-auto → the
+    // auto margin absorbs free space on the left, pushing the box right
+    // (right-auto-only needs no branch — the box already hugs the left)
     if n.bx.margin_x_auto {
         n.x = x + (avail - w).max(0.0) * 0.5;
+    } else if n.bx.margin_l_auto {
+        n.x = x + (avail - w).max(0.0);
     }
     // content box = border box inset by borders + padding (shortcut:
     // border-box model — an explicit `width` includes both, matching most
@@ -3256,6 +3271,25 @@ mod tests {
         assert!((n.x - 50.0).abs() < 0.01, "box x={}", n.x);
         assert!((l.runs[0].x - 50.0).abs() < 0.01);
         assert!(n.w <= 50.0 + 0.001);
+    }
+
+    #[test]
+    fn margin_left_auto_pushes_right_not_centers() {
+        // `margin-left: auto` alone absorbs free space on the LEFT, so the
+        // box hugs the right edge (the old shortcut centered it instead)
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                width: Some(Len::Px(50.0)),
+                margin_l_auto: true,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("push right")];
+        let l = layout_tree(&mut n, 150.0, &m4);
+        // box x = 150 - 50 = 100; NOT (150-50)/2 = 50
+        assert!((n.x - 100.0).abs() < 0.01, "box x={}", n.x);
+        assert!((l.runs[0].x - 100.0).abs() < 0.01);
     }
 
     #[test]

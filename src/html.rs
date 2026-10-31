@@ -820,20 +820,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "queued repro: the fix lives in layout.rs `contained_text` (off-limits for the html/svg owner) - once contained_text stops treating svg payload as label text, drop this attribute: this test must pass"]
     fn hoisted_shadow_svg_markup_never_becomes_text() {
         // Reproduce (%TEMP%/mazda-mdn4.png): the shadow-root template of
         // <mdn-search-button> hoists a <button> wrapping an icon <svg>.
         // `<svg>` is RAW_TEXT, so the shape markup lives as one text child
-        // of <svg>; it must never surface as a paintable text run. Today
-        // layout.rs `contained_text` (lines 154-167, used for the button
-        // label at line 598) collects it and the pill paints the literal
-        // `<path d=.../><circle .../>` source. Queued one-line fix in
-        // layout.rs: the element arm of contained_text skips `svg` (and
-        // for the same class `script`/`style`) subtrees - markup content
-        // of svg elements is never text. The svg image pipeline is
-        // unaffected: it reads the svg element's own text children
-        // directly, not through contained_text.
+        // of <svg>; it must never surface as a paintable text run. Fixed in
+        // layout.rs `contained_text`: the element arm skips `svg` (and for
+        // the same class `script`/`style`) subtrees - markup content of svg
+        // elements is never text. The svg image pipeline is unaffected: it
+        // reads the svg element's own text children directly, not through
+        // contained_text.
         let html = r#"<body><header><mdn-search-button><template shadowroot="open" shadowrootmode="open"><style>.mdn-search-button{width:5rem;border-radius:100px}</style><button class="mdn-search-button" title="Search the site"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg></button></template></mdn-search-button></header></body>"#;
         let dom = parse(html);
         let sheet = crate::css::parse_for("", 1000.0);
@@ -856,11 +852,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "queued repro (same root cause as hoisted_shadow_svg_markup_never_becomes_text): layout.rs `contained_text` leaks svg markup into any form-control label; the plain non-hoisted path leaks identically"]
     fn plain_svg_never_leaks_into_a_button_label() {
         // Same bug class with no shadow root at all: <button><svg/></button>
         // is everywhere in real markup (icon buttons) - proof the DSD hoist
-        // is NOT the mechanism. Queued fix: see the previous test.
+        // is NOT the mechanism. Fixed in layout.rs `contained_text`; see the
+        // previous test.
         let html = r#"<body><button><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>ok</button></body>"#;
         let dom = parse(html);
         let sheet = crate::css::parse_for("", 1000.0);

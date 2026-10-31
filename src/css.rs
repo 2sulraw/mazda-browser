@@ -112,6 +112,12 @@ pub struct BoxStyle {
     /// `min-h-[560px]` + `justify-end` to push content to the bottom)
     pub min_height: Option<Len>,
     pub margin_x_auto: bool,
+    /// per-slot auto margins (`margin-left/right: auto`) — CSS: both auto →
+    /// center, left-auto-only → push right, right-auto-only → hug left.
+    /// `margin_x_auto` stays the shorthand "both auto" centering flag (the
+    /// table `align=center` hint sets it directly)
+    pub margin_l_auto: bool,
+    pub margin_r_auto: bool,
     /// top, right, bottom, left (CSS shorthand order)
     pub pad: [Len; 4],
     /// top, right, bottom, left — `margin_x_auto` overrides left/right
@@ -191,6 +197,8 @@ impl Default for BoxStyle {
             height: None,
             min_height: None,
             margin_x_auto: false,
+            margin_l_auto: false,
+            margin_r_auto: false,
             pad: [Len::Px(0.0); 4],
             margin: [Len::Px(0.0); 4],
             bg: None,
@@ -1343,32 +1351,59 @@ fn apply_decl(
                 parse_len(&d.1, vp)
             }
         }
-        // shortcut: only the auto (centering) half of margin is honored —
-        // fixed margins/padding per side don't exist yet
+        // margin shorthand: positional expansion that KEEPS `auto` slots in
+        // place (parse_sides drops unparseable tokens, shifting the rest —
+        // `0 auto 0 0` parsed as a 3-value shorthand, and ANY auto flagged
+        // centering). Per CSS: both horizontal slots auto → centering; only
+        // one auto → the auto margin absorbs free space on ITS side, so the
+        // box hugs the opposite edge (layout reads margin_l/r_auto)
         "margin" => {
-            let v = parse_sides(&d.1, vp);
-            bx.margin = v;
-            if d.1.contains("auto") {
-                // auto in a horizontal slot → centering shortcut
-                bx.margin_x_auto = true;
+            let tok: Vec<&str> = d.1.split_whitespace().collect();
+            let slots: [&str; 4] = match tok.len() {
+                1 => [tok[0]; 4],
+                2 => [tok[0], tok[1], tok[0], tok[1]],
+                3 => [tok[0], tok[1], tok[2], tok[1]],
+                4 => [tok[0], tok[1], tok[2], tok[3]],
+                _ => ["0"; 4], // includes >4 garbage slots
+            };
+            // shorthand resets all four sides (a prior longhand `auto` is
+            // overridden when a later `margin:` shorthand wins the cascade)
+            bx.margin_l_auto = false;
+            bx.margin_r_auto = false;
+            for (i, t) in slots.iter().enumerate() {
+                if *t == "auto" {
+                    match i {
+                        1 => bx.margin_r_auto = true,
+                        3 => bx.margin_l_auto = true,
+                        _ => {} // vertical auto = no-op in flow layout
+                    }
+                } else if let Some(l) = parse_len(t, vp) {
+                    bx.margin[i] = l;
+                }
             }
+            bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
         }
         "padding" => {
             bx.pad = parse_sides(&d.1, vp);
             bx.declared |= decl::PAD;
         }
+        // longhand auto: per-side flag; `margin_x_auto` (centering) is
+        // recomputed so `margin-left: auto; margin-right: auto` still
+        // centers regardless of declaration order
         "margin-top" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         "margin-bottom" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         "margin-left" | "margin-inline" | "margin-inline-start" => {
             if d.1.contains("auto") {
-                bx.margin_x_auto = true;
+                bx.margin_l_auto = true;
+                bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
             } else {
                 bx.margin[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             }
         }
         "margin-right" | "margin-inline-end" => {
             if d.1.contains("auto") {
-                bx.margin_x_auto = true;
+                bx.margin_r_auto = true;
+                bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
             } else {
                 bx.margin[1] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             }
@@ -3985,6 +4020,41 @@ mod tests {
             [Len::Px(1.0), Len::Px(2.0), Len::Px(3.0), Len::Px(4.0)]
         );
         assert_eq!(s.bx.margin[2], Len::Px(9.0));
+    }
+
+    #[test]
+    fn margin_auto_is_per_slot_not_any_auto_centers() {
+        // real-world: `.breadcrumbs { margin: 0 auto 0 0 }` — only the RIGHT
+        // slot is auto, so the box hugs the left edge (the auto margin
+        // absorbs free space on its own side). The old shortcut flagged ANY
+        // auto as centering AND shifted the fixed slots (`0 auto 0 0` was
+        // re-parsed as a 3-value shorthand).
+        let sheet = parse(
+            ".l { margin: 0 auto 0 0 } .r { margin: 0 0 0 auto } .b { margin: 10px auto } \
+             .lh { margin-left: auto } .two { margin-left: auto; margin-right: auto } \
+             .reset { margin-left: auto; margin: 5px 6px }",
+        );
+        let dom = dom_of(
+            "<div class=l></div><div class=r></div><div class=b></div><div class=lh></div>\
+             <div class=two></div><div class=reset></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+
+        let l = bx("l"); // `margin: 0 auto 0 0` → right-auto only: hug left
+        assert!(!l.margin_x_auto && !l.margin_l_auto && l.margin_r_auto);
+        let r = bx("r"); // left-auto only: push right
+        assert!(!r.margin_x_auto && r.margin_l_auto && !r.margin_r_auto);
+        let b = bx("b"); // both horizontal auto → centering
+        assert!(b.margin_x_auto);
+        assert_eq!(b.margin[0], Len::Px(10.0));
+        let lh = bx("lh"); // longhand left-auto → push right, NOT centering
+        assert!(!lh.margin_x_auto && lh.margin_l_auto);
+        let two = bx("two"); // two longhands → centering
+        assert!(two.margin_x_auto);
+        // shorthand resets a prior longhand auto (cascade order)
+        let reset = bx("reset");
+        assert!(!reset.margin_l_auto && !reset.margin_x_auto);
+        assert_eq!(reset.margin[3], Len::Px(6.0));
     }
 
     #[test]
