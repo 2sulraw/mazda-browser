@@ -56,12 +56,27 @@ pub struct Turn {
     pub nav: Option<String>,
     /// a listener called `event.preventDefault()` (link navigation veto)
     pub prevent_default: bool,
+    /// `form.submit()` on a POST form: the resolved target + urlencoded
+    /// body (GET form.submit() rides the ordinary `nav` channel — it
+    /// carries no body). The shell executes this worker-side exactly like
+    /// a plain load.
+    pub form_nav: Option<FormNav>,
 }
 
 impl Turn {
     pub fn none() -> Turn {
         Turn::default()
     }
+}
+
+/// A POST submission queued by a script's `element.submit()` native: the
+/// resolved absolute target and the `application/x-www-form-urlencoded`
+/// body. Plain data (no DOM references) so it crosses to the loader's
+/// executor unharmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormNav {
+    pub url: String,
+    pub body: String,
 }
 
 /// What the loader worker needs from whichever engine runs the page.
@@ -332,6 +347,9 @@ pub struct DomHost {
     // ---- side channels, folded by the owning runtime at turn end ----
     /// `location.assign(...)` / reload target (absolute, resolved vs base)
     nav: Option<String>,
+    /// `form.submit()` on a POST form: resolved target + urlencoded body
+    /// (GET submissions ride the `nav` channel — no body to carry)
+    form_nav: Option<FormNav>,
     /// a script mutated the DOM during this turn → re-layout
     dirty: bool,
     /// a listener called `event.preventDefault()` (navigation veto)
@@ -347,6 +365,7 @@ impl DomHost {
             base: base.to_string(),
             storage,
             nav: None,
+            form_nav: None,
             dirty: false,
             prevent_default: false,
             storage_noted: false,
@@ -360,6 +379,7 @@ impl DomHost {
             base: String::new(),
             storage: Rc::default(),
             nav: None,
+            form_nav: None,
             dirty: false,
             prevent_default: false,
             storage_noted: true,
@@ -372,6 +392,13 @@ impl DomHost {
 
     fn dom_ref(&self) -> &Dom {
         unsafe { &*self.dom }
+    }
+
+    /// Crate-wide read handle for shared helpers (the form-submission
+    /// collector in main.rs walks the arena through it; both engines'
+    /// `submit()` natives call the same helper).
+    pub(crate) fn dom(&self) -> &Dom {
+        self.dom_ref()
     }
 
     // ---- reads over the arena (nested-safe, owned results) ----
@@ -574,6 +601,19 @@ impl DomHost {
         self.nav.take()
     }
 
+    /// `form.submit()` on a POST form: only the FIRST request of a turn is
+    /// kept (one turn → at most one navigation, same rule as `request_nav`).
+    pub fn request_form_nav(&mut self, f: FormNav) {
+        if self.form_nav.is_none() {
+            self.form_nav = Some(f);
+        }
+    }
+
+    /// The form-navigation request accumulated this turn (moved out).
+    pub fn take_form_nav(&mut self) -> Option<FormNav> {
+        self.form_nav.take()
+    }
+
     pub fn dirty(&self) -> bool {
         self.dirty
     }
@@ -588,6 +628,37 @@ impl DomHost {
     pub fn note_prevent_default(&mut self, node: u32) {
         eprintln!("[js] event.preventDefault (node {node}) — navigation may be canceled");
         self.prevent_default = true;
+    }
+
+    /// `form.submit()` native body — shared verbatim by both engines' element
+    /// methods (runtime.rs Option B and script.rs Option A). Spec shape:
+    /// collect the form's successful controls and navigate directly, with NO
+    /// `submit` event (listener-side vetoes do not apply). GET rides the
+    /// ordinary `nav` channel (the built `?name=value` URL); POST queues a
+    /// `FormNav` (the loader executes the fetch + render worker-side).
+    pub fn submit_form(&mut self, node: u32) {
+        if self.dom().tag(node) != "form" {
+            eprintln!("[js] form.submit: node {node} is not a <form> (no-op)");
+            return;
+        }
+        let base = self.base.clone();
+        // form.submit() collects from the DOM alone: the typed-value store
+        // lives UI-side and never crosses turns, but every typed value the
+        // shell synced (input/change events) is already in a `value`
+        // attribute on the worker DOM — so this sees the real state.
+        match crate::build_submission(self.dom_ref(), node, &Default::default(), &base) {
+            Some(sub) => match sub.method {
+                crate::SubmitMethod::Post => {
+                    eprintln!("[js] form.submit() → POST {} (body {} bytes)", sub.target, sub.body.len());
+                    self.request_form_nav(FormNav { url: sub.target, body: sub.body });
+                }
+                crate::SubmitMethod::Get => {
+                    eprintln!("[js] form.submit() → GET {}", sub.target);
+                    self.request_nav(&sub.target);
+                }
+            },
+            None => eprintln!("[js] form.submit: form {node} has no successful pairs or unresolvable action"),
+        }
     }
 
     // ---- storage (page RAM; exactly the semantics script.rs documents) ----
@@ -1094,6 +1165,14 @@ pub mod engine_b {
         Ok(JsValue::undefined())
     }
 
+    fn b_el_submit(this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+        let node = this_node(this, ctx)?;
+        // shared native body (exact same submission as Option A's native:
+        // collect → navigate; spec shape = no submit event on this path)
+        host_mut(|h| h.submit_form(node));
+        Ok(JsValue::undefined())
+    }
+
     // ---- natives: location / window / event object ----
 
     fn b_loc_assign(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1364,6 +1443,7 @@ pub mod engine_b {
             ("setValue", 1, b_el_set_value),
             ("setClassName", 1, b_el_set_class),
             ("focus", 0, b_el_focus),
+            ("submit", 0, b_el_submit),
         ];
         for (name, len, f) in methods {
             set_own(&proto, ctx, name, fn_obj(ctx, &format!("Element.{name}"), *len, *f));
@@ -1376,6 +1456,9 @@ pub mod engine_b {
         out.dirty = out.dirty || t.dirty;
         if out.nav.is_none() {
             out.nav = t.nav;
+        }
+        if out.form_nav.is_none() {
+            out.form_nav = t.form_nav;
         }
         out.prevent_default = out.prevent_default || t.prevent_default;
     }
@@ -1486,6 +1569,7 @@ pub mod engine_b {
                 Turn {
                     dirty: host.dirty(),
                     nav: host.take_nav(),
+                    form_nav: host.take_form_nav(),
                     prevent_default: host.prevent_default(),
                 },
             )
@@ -1537,7 +1621,10 @@ pub mod engine_b {
             let t = self.run_due_timers(dom);
             let dirty = out.dirty || t.dirty;
             let nav = if out.nav.is_none() { t.nav } else { out.nav };
-            Turn { dirty, nav, prevent_default: false }
+            if out.form_nav.is_none() {
+                out.form_nav = t.form_nav;
+            }
+            Turn { dirty, nav, form_nav: out.form_nav, prevent_default: false }
         }
 
         /// Dispatch `kinds` (in order, each its own turn) to `node`'s
@@ -1726,6 +1813,31 @@ mod engine_b_tests {
 
         // timers drained; idle wake = None (block on input)
         assert!(rt.next_wake_deadline().is_none(), "queue exhausted after the pass");
+    }
+
+    /// form.submit() parity with engine A: the native bodies share the one
+    /// `DomHost::submit_form` implementation — a POST form queues the
+    /// body-carrying `FormNav` (worker executes it like any load), and the
+    /// plain `nav` channel stays silent. GET forms ride `nav` in both
+    /// engines (see the Option A mirror in script.rs tests).
+    #[test]
+    fn engine_b_form_submit_post_queues_form_nav() {
+        let mut dom = crate::html::parse(
+            r#"<html><body><form id="f" action="/save" method="post">
+                <input name="q" type="text" value="v">
+            </form><script>
+                document.getElementById("f").submit();
+            </script></body></html>"#,
+        );
+        assert!(EngineChoice::B.available(), "feature build must offer B");
+        let mut rt = make_runtime(EngineChoice::B, &mut dom, "https://example.com/");
+        let t = rt.run_scripts(&mut dom);
+        assert_eq!(
+            t.form_nav,
+            Some(FormNav { url: "https://example.com/save".into(), body: "q=v".into() }),
+            "engine B's submit() native queues the exact same navigation"
+        );
+        assert!(t.nav.is_none(), "POST rides the FormNav channel only");
     }
 
     /// A script error is logged, never fatal, and the page survives.
