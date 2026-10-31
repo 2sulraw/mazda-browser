@@ -661,6 +661,53 @@ persists the choice (`mazda.conf` alongside the disk cache), default A. Sequence
 after the language-depth + event-loop waves land (same files). Per-app selection,
 not per-tab (per-tab would double engine RAM — shortcut).
 
+**User decision 2026-10-31: selectable font loading (WOFF2).** Reverses the
+`a182f8f` "WOFF2 permanently unsupported" decision. Option A = WOFF2 webfonts
+(default; site fonts render, ~+8-15 MB/page for a Wikipedia-class page);
+Option B = system fonts only (minimal RAM, today's behavior). The settings page
+presents exactly:
+```
+Font loading:
+  (•) A — WOFF2 webfonts (site fonts, +~10-15 MB/page)
+  ( ) B — System fonts only (minimal RAM)
+```
+Decoder behind cargo feature `woff2` (release built WITH it so A is selectable;
+B costs nothing until chosen); `fonts=` in `mazda.conf`, `--fonts=` >
+`MAZDA_FONTS` > conf > default A; applies on next navigation. A from-scratch
+Brotli + WOFF2 transform decoder is ~4-6 waves; adopting the pure-Rust `wuff`
+crate (see crate policy below) cuts it to ~1-2 integration waves. Per-page
+decoded-font budget (LRU cap, e.g. 32 MB) so one CJK-heavy page can't blow the
+RAM floor. `src/woff.rs` stays the container dispatch (`wOF2` → feature-gated
+decoder, else honest fallback).
+
+**User decision 2026-10-31: crate policy.** "From scratch" = the *engine*
+(DOM, CSS cascade, layout, rasterizer, JS interpreter). General-purpose
+utility codecs/font-decoders are adoptable — must be pure Rust (no FFI), permissively
+licensed (MIT/Apache/BSD), well-download-counted, and must NOT be browser-engine
+projects (keeps the no-third-party-engine-code rule and the git-scrub rule clean).
+Approved for the next waves: `wuff` (WOFF2), `image-webp` (WebP), `brotli-decompressor`
+(WOFF2 fallback path), `symphonia-format-isomp4` + `rusty_h264`/`rust_h265` +
+`rusty-opus`/`rusty_mp3` (media tier, gated), `wreq` (Chrome-shaped TLS/JA3/JA4
+fetch — *decision pending tune-rustls vs wreq*). Each adopted crate gets a RAM
+measurement row; a crate that costs more than it saves gets dropped.
+
+**User decision 2026-10-31: DRM parked (not "impossible").** The honest reasons,
+for the record: (1) an uncertified CDM gets refused or quality-capped by the
+services server-side anyway (reimplementations like pywidevine/openwv exist on
+GitHub but can't be certified); (2) shipping bypass/leaked-key tooling is legally
+exposed (DMCA §1201-class); (3) it's ~5% of page parity. Deferred "later" per user.
+Companion work that IS in scope: a cheap EME fail-fast surface so DRM-protected
+sites show `[media] DRM not supported` instead of an "unsupported browser" wall.
+
+**YouTube = recorded non-goal, with live numbers (2026-10-31).** Baseline ~12% of
+reference-browser parity (video 40%/JS app 30%/shell CSS 15%/images 10%/interaction
+5%). Ladder: +Wikipedia CSS tiers → ~25%; +WebP +TLS +EME → ~35%; +JS app boot
+(20-40 waves, no crate helps) → ~65%; +media tier (revised to ~10-20 waves with
+the approved crates: symphonia demux + rusty_h264 + audio + from-scratch
+presentation) → ~95%; last ~5% = DRM (parked above). VP9/AV1: no pure-Rust decoder
+exists — H.264 fallback quality tiers only. Same class as the google.com-class note
+above: recorded so goalposts don't drift.
+
 ## Environment notes
 
 - Toolchain: rustc 1.96.0, registry mirror rsproxy.cn (had corrupted sources once —
