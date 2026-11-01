@@ -1,10 +1,16 @@
 //! CSS subset (Phase 1b, PLAN Recommendations §2): stylesheet text is parsed
 //! ONCE into a rule list with precompiled selectors — never re-parsed per element.
-//! shortcut: dynamic pseudo-classes (`:hover`, `:focus`, …) and pseudo-elements
-//! drop their whole selector (static ones — `:link`, `:visited`, `:root`,
+//! shortcut: dynamic pseudo-classes (`:hover`, `:focus`, …) drop their whole
+//! selector (static ones — `:link`, `:visited`, `:root`,
 //! `:host(...)` (bound to the component whose `<style>` declared it), `:not(...)`
 //! incl. comma lists, `:is(...)`, `:where(...)`, `:first-child`, `:last-child`,
-//! `:nth-child(...)` — participate in the cascade). `slot[name=X]` also selects
+//! `:nth-child(...)` — participate in the cascade). `::before`/`::after` (and
+//! the legacy single-colon `:before`/`:after`) style a generated box whose
+//! text comes from `content` (`<string>` + `attr()`; counters and other
+//! functions are shortcuts) — their rules cascade separately from the origin
+//! element's (see [`Sheet::resolve_pseudo`]); other pseudo-elements
+//! (`::marker`, `::placeholder`, `::backdrop`) still drop their selector.
+//! `slot[name=X]` also selects
 //! the light-DOM nodes projected into that slot (`[slot=X]`) — a flat-tree
 //! stand-in for shadow distribution, so hiding the slot hides its content.
 //! No @import, no !important
@@ -256,6 +262,12 @@ pub struct BoxStyle {
     /// chrome and a color-less `border:1px solid` renders currentcolor
     /// instead of the UA gray. Zero = nothing declared (plain default box).
     pub declared: u32,
+    /// `content` — the RAW declared value (case preserved), read only when
+    /// synthesizing a `::before`/`::after` box: resolved to generated text
+    /// by [`content_text`] (`attr()` needs the DOM, so it can't resolve at
+    /// cascade time). None = not declared. Real elements ignore it — the
+    /// property only feeds pseudo-element boxes.
+    pub content: Option<String>,
 }
 
 /// Bits for [`BoxStyle::declared`]: one per property UA control chrome fills.
@@ -326,15 +338,16 @@ impl Default for BoxStyle {
             clear: Clear::None,
             valign: VAlign::Baseline,
             declared: 0,
+            content: None,
         }
     }
 }
 
 /// One static pseudo-class the cascade can evaluate without interaction
-/// state. Dynamic/state pseudo-classes (`:hover`, `:focus`, …) and
-/// pseudo-elements are NOT representable — a selector containing one is
-/// dropped at parse time (a `:hover` rule that always matched would paint
-/// hover styles permanently).
+/// state. Dynamic/state pseudo-classes (`:hover`, `:focus`, …) are NOT
+/// representable — a selector containing one is dropped at parse time (a
+/// `:hover` rule that always matched would paint hover styles permanently).
+/// Pseudo-elements ARE: see [`PseudoEl`] on [`Seg`].
 #[derive(Clone)]
 enum Pseudo {
     /// `:link` — an element carrying an `href` (the common case `<a href>`).
@@ -368,6 +381,28 @@ enum Pseudo {
     Host(Box<Seg>, String),
 }
 
+/// A generated pseudo-element: `::before`/`::after`, plus the legacy
+/// single-colon `:before`/`:after` spelling. Recorded on the selector's
+/// LAST segment — the rule styles that pseudo of the matched origin element
+/// (`li::before` targets the `<li>`'s generated box, matched by the segment
+/// itself). Out of scope, dropped at parse: `::marker`, `::placeholder`,
+/// `::backdrop`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PseudoEl {
+    Before,
+    After,
+}
+
+impl PseudoEl {
+    /// Bucket index into `Sheet::pseudo`.
+    fn idx(self) -> usize {
+        match self {
+            PseudoEl::Before => 0,
+            PseudoEl::After => 1,
+        }
+    }
+}
+
 /// One compound step of a selector, e.g. `nav > a.current[href]`.
 #[derive(Clone)]
 struct Seg {
@@ -380,6 +415,11 @@ struct Seg {
     /// `:not(...)` exclusions — the element must match NONE of these simple
     /// selectors (each parsed by `parse_compound`)
     nots: Vec<Seg>,
+    /// `::before`/`::after` (or the legacy `:before`/`:after`) this
+    /// compound closes. Matched against the ORIGIN element (ignored by
+    /// `seg_matches`); only the last segment of a selector may carry one,
+    /// and only `Sheet::resolve_pseudo` reads it.
+    pseudo_el: Option<PseudoEl>,
     /// joined to the left segment by `>` (else descendant)
     child: bool,
 }
@@ -395,6 +435,12 @@ struct Rule {
 pub struct Sheet {
     /// sorted by (spec, order) at parse time; cascade = apply matches in order
     rules: Vec<Rule>,
+    /// pseudo-element rules, bucketed by kind ([0] `::before`, [1] `::after`),
+    /// cascade-sorted like `rules`. Kept OUT of `rules` so the origin
+    /// element's cascade, `class_paint` and the `color-scheme` slice never
+    /// see them — a `p::before` rule must not style the `p` — and so pages
+    /// without pseudo rules pay nothing extra.
+    pseudo: [Vec<Rule>; 2],
     /// cascade-ordered `(selector, value)` pairs for `color-scheme` only.
     /// The property is consulted for every element but declared on very few
     /// rules, so `resolve` walks this tiny slice instead of the full rule list.
@@ -515,8 +561,10 @@ fn parse_font_face(block: &str, base: &str) -> Option<FontFace> {
 }
 
 impl Sheet {
+    /// Total parsed rules — element rules plus the `::before`/`::after`
+    /// buckets.
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rules.len() + self.pseudo[0].len() + self.pseudo[1].len()
     }
 
     /// Wire the loader's shared stack table so `Style::fam_stack` ids resolved
@@ -645,6 +693,7 @@ const KNOWN: &[&str] = &[
     "font-family",
     "text-decoration",
     "display",
+    "content",
     "opacity",
     "text-align",
     "flex-direction",
@@ -810,6 +859,20 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     }
 
     rules.sort_by_key(|r| (r.spec, r.order));
+    // pseudo-element rules cascade SEPARATELY (resolve_pseudo): partition
+    // them out so the origin element's cascade, class_paint and the
+    // color-scheme slice below never see a `p::before` rule. Each bucket
+    // keeps the (spec, order) order — the subset of a sorted list is sorted.
+    let mut pseudo: [Vec<Rule>; 2] = [Vec::new(), Vec::new()];
+    let mut plain = Vec::with_capacity(rules.len());
+    for r in rules {
+        let kind = r.segs.last().and_then(|s| s.pseudo_el);
+        match kind {
+            Some(k) => pseudo[k.idx()].push(r),
+            None => plain.push(r),
+        }
+    }
+    let rules = plain;
     // color-scheme decides light-dark() for every element but is declared on
     // very few rules — keep the (already cascade-ordered) slice so resolve can
     // find a winning value without re-walking the full rule list. Last
@@ -827,6 +890,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     Sheet {
         rules,
         schemes,
+        pseudo,
         vars,
         var_defs,
         root_pol: None,
@@ -1010,6 +1074,65 @@ impl Sheet {
             display_none,
             bx,
         }
+    }
+
+    /// Cascade the `kind` pseudo-element rules over `base` — the origin
+    /// element's computed style, which the pseudo inherits (color, fonts,
+    /// …). Only rules whose selector ends in this pseudo-element
+    /// participate (they're bucketed apart from `rules`, so the origin's
+    /// own cascade never sees them); box properties start at their initial
+    /// values (they don't inherit).
+    /// `None` = the sheet has no such pseudo rules at all — layout skips
+    /// the whole pass then (the common case).
+    /// shortcut: no inline-style targeting (the `style` attribute can't
+    /// select a pseudo-element), and a pseudo's own `color-scheme` doesn't
+    /// flip its `light-dark()` — the origin element's used scheme decides.
+    pub fn resolve_pseudo(
+        &self,
+        dom: &Dom,
+        node: u32,
+        base: Style,
+        kind: PseudoEl,
+    ) -> Option<StyleOutcome> {
+        let rules = &self.pseudo[kind.idx()];
+        if rules.is_empty() {
+            return None;
+        }
+        let mut style = base;
+        let mut bg = None;
+        let mut display_none = false;
+        let mut bx = BoxStyle::default();
+        // the origin element's used scheme decides light-dark() branches
+        // (see resolve_with_parent for the declared/fallback distinction)
+        let scheme = self.declared_dark(dom, node, dom.attr(node, "style"));
+        let dark = scheme.unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK));
+        let mut color_declared = false;
+        for rule in rules {
+            if !matches(dom, node, &rule.segs) {
+                continue;
+            }
+            for d in &rule.decls {
+                color_declared |= d.0 == "color";
+                let sd = self.subst(d);
+                let fs = self.fam_stack_of(&sd);
+                if apply_decl(
+                    &sd, &mut style, &mut bg, &mut bx, base.size, self.vp, dark, fs,
+                ) {
+                    display_none = true;
+                }
+            }
+        }
+        // same scheme-blind default flip as `resolve_with_parent` (the
+        // pseudo inherits the origin's color, which is already flipped)
+        if dark && scheme.is_some() && !color_declared && style.color == 0x00_00_00 {
+            style.color = 0xff_ff_ff;
+        }
+        Some(StyleOutcome {
+            style,
+            bg,
+            display_none,
+            bx,
+        })
     }
 
     /// Substitute `var(--name[, fallback])` references in a decl value.
@@ -1202,7 +1325,11 @@ fn selector_polarity(sel: &str) -> Option<bool> {
 fn sel_applies_to_root(dom: &Dom, html: u32, sel: &str) -> bool {
     split_selectors(sel).iter().any(|p| {
         parse_selector(p)
-            .map(|segs| matches(dom, html, &segs))
+            .map(|segs| {
+                // a pseudo-element rule's custom props live on the
+                // generated box, not the root — it can't set the theme
+                segs.last().is_some_and(|s| s.pseudo_el.is_none()) && matches(dom, html, &segs)
+            })
             .unwrap_or(false)
     })
 }
@@ -1240,12 +1367,14 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         }
         // image URLs are case-sensitive on real servers — a value carrying
         // a url() keeps its raw case (same reason the @font-face scanner
-        // bypasses this function); ascii lowercasing is 1:1 on bytes, so
-        // positions found in the lowered copy index the raw one too
+        // bypasses this function); `content` strings are case-sensitive
+        // text the page authored (`content: "OK"` must not become "ok").
+        // ascii lowercasing is 1:1 on bytes, so positions found in the
+        // lowered copy index the raw one too
         let raw = v.trim();
         let lower = raw.to_ascii_lowercase();
         let imp = lower.find("!important");
-        let mut v = if lower.contains("url(") {
+        let mut v = if lower.contains("url(") || p == "content" {
             raw.to_string()
         } else {
             lower
@@ -1688,9 +1817,106 @@ fn apply_decl(
                 _ => [None; 4],
             };
         }
+        // generated content for a pseudo-element box — stored raw (its
+        // case matters, and `attr()` resolves at box synthesis, which has
+        // the DOM). Real elements ignore it; only `Sheet::resolve_pseudo`
+        // outcomes ever reach a box.
+        "content" => bx.content = Some(d.1.clone()),
         _ => {}
     }
     false
+}
+
+/// Resolve a declared `content` value to the text a pseudo-element box
+/// generates — `None` = no box (`none`/`normal`/empty/malformed value).
+/// Tokens concatenate: quoted strings (case preserved, `\` escapes honored)
+/// and `attr(name)` against the origin element (a missing attribute
+/// contributes nothing — the box, if any, carries empty text).
+/// shortcut: every other token contributes nothing — `counter()`/
+/// `counters()` (so `content: counter(x)` renders an empty string and
+/// list-item markers never appear), quote keywords (`open-quote` …),
+/// `url()`, and `attr()` with a type/fallback argument. `::marker`,
+/// `::placeholder` and `::backdrop` don't parse as selectors at all.
+pub fn content_text(raw: &str, dom: &Dom, node: u32) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let b: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            '"' | '\'' => {
+                let q = b[i];
+                i += 1;
+                let mut t = String::new();
+                while i < b.len() && b[i] != q {
+                    if b[i] == '\\' && i + 1 < b.len() {
+                        t.push(b[i + 1]); // `\"`, `\\`, `\n` → the literal char
+                        i += 2;
+                    } else {
+                        t.push(b[i]);
+                        i += 1;
+                    }
+                }
+                if i >= b.len() {
+                    return None; // unterminated string — malformed value
+                }
+                i += 1; // closing quote
+                out.push_str(&t);
+            }
+            c if c.is_ascii_whitespace() => i += 1,
+            _ => {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '-' || b[i] == '_') {
+                    i += 1;
+                }
+                if st == i {
+                    return None; // junk token — malformed value
+                }
+                let name: String = b[st..i].iter().collect();
+                let mut args = None;
+                if i < b.len() && b[i] == '(' {
+                    let mut depth = 0u32;
+                    let ast = i + 1;
+                    while i < b.len() {
+                        match b[i] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if depth != 0 {
+                        return None; // unbalanced parens — malformed value
+                    }
+                    args = Some(b[ast..i].iter().collect::<String>());
+                    i += 1; // consume ')'
+                }
+                if name.eq_ignore_ascii_case("attr") {
+                    // bare attribute name only (shortcut: `attr(x, "d")`
+                    // fallbacks and type arguments don't resolve)
+                    let a = args.as_deref().unwrap_or("").trim();
+                    if !a.is_empty()
+                        && a.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    {
+                        if let Some(v) = dom.attr(node, a) {
+                            out.push_str(v);
+                        }
+                    }
+                }
+                // any other function/keyword contributes nothing (see doc)
+            }
+        }
+    }
+    Some(out)
 }
 
 /// `border` shorthand value → (width, color); `None` in either slot means
@@ -2632,6 +2858,10 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
     }
     if segs.is_empty() {
         None
+    } else if segs[..segs.len() - 1].iter().any(|s| s.pseudo_el.is_some()) {
+        // a pseudo-element may only CLOSE the selector — `li::before span`
+        // (one before the final compound) is invalid CSS and drops
+        None
     } else {
         Some(segs)
     }
@@ -2645,6 +2875,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
         attrs: Vec::new(),
         pseudos: Vec::new(),
         nots: Vec::new(),
+        pseudo_el: None,
         child: false,
     };
     let b: Vec<char> = s.chars().collect();
@@ -2727,17 +2958,39 @@ fn parse_compound(s: &str) -> Option<Seg> {
                 seg.attrs.push((name, val));
             }
             ':' => {
-                if i + 1 < b.len() && b[i + 1] == ':' {
-                    return None; // pseudo-element (::before) — unsupported, drop
-                }
                 let pstart = i;
-                i += 1;
+                // `::before`/`::after` (double-colon) and the legacy
+                // single-colon spelling record the pseudo-element on the
+                // segment; pseudo-CLASSES may precede it
+                // (`li:first-child::before` — static ones match as always,
+                // dynamic ones still drop the rule below), but nothing may
+                // follow it.
+                let double = i + 1 < b.len() && b[i + 1] == ':';
+                i += if double { 2 } else { 1 };
                 let st = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '-' || b[i] == '_')
-                {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '-' || b[i] == '_') {
                     i += 1;
                 }
                 let name: String = b[st..i].iter().collect::<String>().to_ascii_lowercase();
+                if name == "before" || name == "after" {
+                    // the pseudo-element must CLOSE the compound and a
+                    // compound carries at most one (`li::before.foo`,
+                    // `li::before::after`, `li::before(x)` are invalid)
+                    if seg.pseudo_el.is_some() || i < b.len() {
+                        return None;
+                    }
+                    seg.pseudo_el = Some(if name == "before" {
+                        PseudoEl::Before
+                    } else {
+                        PseudoEl::After
+                    });
+                    break; // compound closed
+                }
+                if double {
+                    // any other pseudo-element (`::marker`, `::placeholder`,
+                    // `::backdrop`, …) is out of scope — drop the selector
+                    return None;
+                }
                 // optional `(args)` with balanced-paren scan
                 let mut args: Option<String> = None;
                 if i < b.len() && b[i] == '(' {
@@ -2800,7 +3053,13 @@ fn parse_compound(s: &str) -> Option<Seg> {
                             // simple-selector members only; anything more
                             // complex (combinators, nested :is()) drops the
                             // rule (shortcut: no complex :not() args)
-                            seg.nots.push(parse_compound(m)?);
+                            let m_seg = parse_compound(m)?;
+                            // a pseudo-element can't appear inside :not()
+                            // (invalid — the whole selector drops)
+                            if m_seg.pseudo_el.is_some() {
+                                return None;
+                            }
+                            seg.nots.push(m_seg);
                         }
                     }
                     // `:host(arg)` — matches the element that declared the
@@ -2814,8 +3073,11 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     // drops — usually `display:contents`, a no-op here anyway
                     ("host", Some(a)) => {
                         let raw = b[pstart..i].iter().collect::<String>();
-                        seg.pseudos
-                            .push(Pseudo::Host(Box::new(parse_compound(a.trim())?), raw));
+                        let arg = parse_compound(a.trim())?;
+                        if arg.pseudo_el.is_some() {
+                            return None; // invalid — see the :not() note
+                        }
+                        seg.pseudos.push(Pseudo::Host(Box::new(arg), raw));
                     }
                     ("host", None) => return None,
                     ("is" | "where", Some(a)) => {
@@ -2827,7 +3089,11 @@ fn parse_compound(s: &str) -> Option<Seg> {
                             // shortcut: compound args only — combinators or
                             // nested comma lists inside :is()/:where() drop
                             // the whole selector
-                            alts.push(parse_compound(part.trim())?);
+                            let alt = parse_compound(part.trim())?;
+                            if alt.pseudo_el.is_some() {
+                                return None; // invalid — see the :not() note
+                            }
+                            alts.push(alt);
                         }
                         seg.pseudos.push(Pseudo::Is(alts, counts));
                     }
@@ -2853,6 +3119,10 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
         }
         cls += s.classes.len() as u16 + s.attrs.len() as u16;
         if s.tag.is_some() {
+            tags += 1;
+        }
+        // a pseudo-element counts like one type on the compound it closes
+        if s.pseudo_el.is_some() {
             tags += 1;
         }
         // pseudo-classes count like classes; :not() takes its argument's
@@ -4041,10 +4311,118 @@ mod tests {
     fn colon_inside_attribute_value_is_not_a_pseudo() {
         assert!(parse_selector(r#"a[href^="http:"]"#).is_some());
         assert!(parse_selector(r#".data-\:x"#).is_some());
-        // dynamic pseudo-classes / pseudo-elements still drop the selector
+        // dynamic pseudo-classes still drop the selector; pseudo-elements
+        // parse (covered by pseudo_element_selectors below)
         assert!(parse_selector("a:hover").is_none());
-        assert!(parse_selector("li::before").is_none());
+        assert!(parse_selector("li::before").is_some());
         assert!(parse_selector(".plain .other").is_some());
+    }
+
+    #[test]
+    fn pseudo_element_selectors() {
+        // double-colon (modern) and legacy single-colon spellings both parse
+        assert!(parse_selector("li::before").is_some());
+        assert!(parse_selector("li:before").is_some());
+        assert!(parse_selector("li::after").is_some());
+        // bare = `*::before`; a pseudo-class may precede the pseudo-element
+        // (static ones match as always; dynamic :hover drops the whole rule)
+        assert!(parse_selector("::before").is_some());
+        assert!(parse_selector("li:first-child::before").is_some());
+        assert!(parse_selector("li:hover::before").is_none());
+        // other pseudo-elements are out of scope and still drop
+        assert!(parse_selector("li::marker").is_none());
+        assert!(parse_selector("li::placeholder").is_none());
+        assert!(parse_selector("li::backdrop").is_none());
+        // the pseudo-element must close the compound and the selector
+        assert!(parse_selector("li::before:hover").is_none());
+        assert!(parse_selector("li::before::after").is_none());
+        assert!(parse_selector("li::before span").is_none());
+        assert!(parse_selector("li::before > span").is_none());
+        // a pseudo-element can't be nested in :not()/:is() either
+        assert!(parse_selector(":not(li::before)").is_none());
+        assert!(parse_selector(":is(li::before)").is_none());
+        // specificity: the pseudo-element adds one type to the compound
+        assert_eq!(
+            spec_of(&parse_selector("li::before").unwrap()),
+            (0, 0, 2),
+            "`li` (0,0,1) + ::before (one type)"
+        );
+        assert_eq!(
+            spec_of(&parse_selector("li:first-child::before").unwrap()),
+            (0, 1, 2),
+            "+ :first-child (one class)"
+        );
+    }
+
+    #[test]
+    fn pseudo_content_declares_and_origin_cascade_ignores_it() {
+        let sheet = parse("li::before { content: \"[1]\" } li { color: #123456 }");
+        let dom = dom_of("<li>x</li><div>y</div>");
+        let li = by_tag(&dom, "li");
+        // the pseudo's cascade carries the raw declared content…
+        let pe = sheet
+            .resolve_pseudo(&dom, li, Style::new(), PseudoEl::Before)
+            .expect("the sheet has a ::before rule");
+        assert_eq!(pe.bx.content.as_deref(), Some("\"[1]\""));
+        // …matched against the ORIGIN element (a div gets no box)
+        let div = by_tag(&dom, "div");
+        let other = sheet
+            .resolve_pseudo(&dom, div, Style::new(), PseudoEl::Before)
+            .expect("bucket non-empty");
+        assert!(other.bx.content.is_none(), "`li::before` doesn't match a div");
+        // a sheet with no ::before rules skips the cascade entirely
+        assert!(sheet.resolve_pseudo(&dom, li, Style::new(), PseudoEl::After).is_none());
+        // and the origin element's own cascade never sees pseudo rules
+        let origin = sheet.resolve(&dom, li, Style::new(), None);
+        assert!(origin.bx.content.is_none(), "no content on the element itself");
+        assert!(!origin.display_none);
+        assert_eq!(origin.style.color, 0x123456, "element rules still apply");
+        // `display:none` on the pseudo kills only the pseudo box
+        let sheet2 = parse("li::before { content: \"x\"; display: none }");
+        assert!(!sheet2.resolve(&dom, li, Style::new(), None).display_none);
+        assert!(
+            sheet2
+                .resolve_pseudo(&dom, li, Style::new(), PseudoEl::Before)
+                .is_some_and(|o| o.display_none)
+        );
+    }
+
+    #[test]
+    fn content_text_strings_attr_and_none() {
+        let dom = dom_of("<p data-x=\"Hi\">x</p>");
+        let p = by_tag(&dom, "p");
+        // quoted strings keep their case (parse_decls skips lowercasing)
+        let sheet = parse("p::before { content: \"MiXeD\" }");
+        let raw = sheet
+            .resolve_pseudo(&dom, p, Style::new(), PseudoEl::Before)
+            .unwrap()
+            .bx
+            .content
+            .unwrap();
+        assert_eq!(content_text(&raw, &dom, p), Some("MiXeD".to_string()));
+        // multiple tokens concatenate: string + attr() + string
+        assert_eq!(
+            content_text("\"a\" attr(data-x) \" —\"", &dom, p),
+            Some("aHi —".to_string())
+        );
+        // a missing attribute contributes nothing (empty text, no crash)
+        let bare = dom_of("<p>x</p>");
+        let p2 = by_tag(&bare, "p");
+        assert_eq!(content_text("attr(data-x)", &bare, p2), Some(String::new()));
+        // `none`/`normal` and counters generate no text — no box
+        assert_eq!(content_text("none", &dom, p), None);
+        assert_eq!(content_text("NONE", &dom, p), None, "case-insensitive keyword");
+        assert_eq!(content_text("normal", &dom, p), None);
+        assert_eq!(content_text("counter(item)", &dom, p), Some(String::new()));
+        // `content: none` is recorded as declared (the flag) but boxes nothing
+        let sheet2 = parse("p::after { content: none }");
+        let after = sheet2
+            .resolve_pseudo(&dom, p, Style::new(), PseudoEl::After)
+            .unwrap();
+        assert_eq!(after.bx.content.as_deref(), Some("none"));
+        assert_eq!(content_text(after.bx.content.as_deref().unwrap(), &dom, p), None);
+        // escapes inside strings
+        assert_eq!(content_text(r#""a\"b""#, &dom, p), Some("a\"b".to_string()));
     }
 
     #[test]

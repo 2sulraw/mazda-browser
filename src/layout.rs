@@ -4,8 +4,8 @@
 //! `block()`); upgrade when a real CSS engine lands (Phase 1b+).
 
 use crate::css::{
-    decl, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Dir, Display, Float, Justify, Len, Pos,
-    Sheet, Track, VAlign,
+    content_text, decl, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Dir, Display, Float,
+    Justify, Len, Pos, PseudoEl, Sheet, Track, VAlign,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -419,7 +419,16 @@ pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) ->
         let ph = bg_placeholder(&u, style, &root.bx);
         root.children.push(ph);
     }
+    // the body's own ::before/::after (the root IS the body's box):
+    // ::before paints over the background placeholder (pushed after it)
+    // and under the content; ::after closes the box
+    if let Some(b) = pseudo_box(sheet, dom, node, style, None, PseudoEl::Before) {
+        root.children.push(b);
+    }
     build_into(dom, node, style, sheet, None, &mut root.children);
+    if let Some(a) = pseudo_box(sheet, dom, node, style, None, PseudoEl::After) {
+        root.children.push(a);
+    }
     root
 }
 
@@ -443,6 +452,71 @@ fn bg_placeholder(url: &str, style: Style, parent: &BoxStyle) -> BoxNode {
     g.bx.bg_pos = parent.bg_pos;
     g.bx.bg_repeat = parent.bg_repeat;
     g
+}
+
+/// True when a box's style paints chrome (background, border, shadow,
+/// horizontal padding) — an INLINE element with chrome gets a real inline
+/// box instead of flattening into the parent flow, and a pseudo-element
+/// box with chrome wraps its generated text in a box rather than a bare
+/// run.
+fn paints_chrome(bx: &BoxStyle) -> bool {
+    let nz = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
+    bx.bg.is_some()
+        || bx.bg_image.is_some()
+        || !bx.shadows.is_empty()
+        || bx.border.iter().any(|&l| nz(l))
+        || nz(bx.pad[1])
+        || nz(bx.pad[3])
+}
+
+/// The `kind` pseudo-element box for `node`, or None when it generates no
+/// box: the sheet has no such rules, `content` is undeclared/`none`/
+/// `normal`, or the pseudo is `display:none`. `base` is the origin
+/// element's computed style — inherited properties (color, fonts) flow
+/// into the pseudo; its own rules cascade over that with initial box
+/// properties (`Sheet::resolve_pseudo`).
+///
+/// The generated box is inline-level: a bare text run that flows with the
+/// surrounding text, or an inline box carrying the pseudo's own style when
+/// it paints chrome (background/border/padding) or declares a box-level
+/// `display` — the same box decision an element with that style gets.
+/// shortcut: generated content is plain text — `counter()` renders as
+/// nothing (list-item markers don't appear), and a `::before` on a
+/// replaced element (`<img>`/`<svg>`) or form control generates no box at
+/// all (those branches return before this is consulted).
+fn pseudo_box(
+    sheet: &Sheet,
+    dom: &Dom,
+    node: u32,
+    base: Style,
+    link: Option<std::rc::Rc<str>>,
+    kind: PseudoEl,
+) -> Option<BoxNode> {
+    let out = sheet.resolve_pseudo(dom, node, base, kind)?;
+    if out.display_none {
+        return None;
+    }
+    let raw = out.bx.content.as_deref()?; // content undeclared → no box
+    let text = content_text(raw, dom, node)?; // none/normal/malformed → no box
+    let chrome = paints_chrome(&out.bx);
+    // same box decision as a tagless element: Auto/Inline flow as bare
+    // text, inline-block and block-level displays get a real box
+    let stacked = matches!(
+        out.bx.display,
+        Display::Block | Display::Flex | Display::Grid
+    );
+    let boxed = stacked || chrome || out.bx.display == Display::InlineBlock;
+    if !boxed && text.is_empty() {
+        return None; // nothing visible (e.g. a lone `content: counter(x)`)
+    }
+    if boxed {
+        let mut g = BoxNode::group(out.style, out.bx);
+        g.inline = !stacked;
+        g.children.push(BoxNode::leaf(out.style, text, false, link));
+        Some(g)
+    } else {
+        Some(BoxNode::leaf(out.style, text, false, link))
+    }
 }
 
 /// `width="85%"` / `width="400"` presentational attribute → [`Len`] — the
@@ -706,6 +780,28 @@ fn build_into(
                     out.push(g);
                     continue;
                 }
+                // ::before/::after generated content — cascaded once here
+                // against this element's computed style (attr() needs the
+                // DOM), inserted as its first/last child in the flow
+                // branches below. The <img>/<svg>/form-control branches
+                // above return before this point: replaced elements and
+                // controls generate no pseudo content (see pseudo_box).
+                let before = pseudo_box(
+                    sheet,
+                    dom,
+                    child,
+                    outcome.style,
+                    child_link.clone(),
+                    PseudoEl::Before,
+                );
+                let after = pseudo_box(
+                    sheet,
+                    dom,
+                    child,
+                    outcome.style,
+                    child_link.clone(),
+                    PseudoEl::After,
+                );
                 // which elements get a box: flex/grid/block/inline-block
                 // always; inline tags only when CSS says so; Auto follows
                 // the tag. Absolutely/fixed positioned elements ALWAYS get
@@ -749,11 +845,17 @@ fn build_into(
                         let ph = bg_placeholder(&u, outcome.style, &g.bx);
                         g.children.push(ph);
                     }
+                    if let Some(b) = before {
+                        g.children.push(b);
+                    }
                     // inline-block: a real box (background/border paint),
                     // but placed ON the surrounding text line by block()'s
                     // inline branch instead of stacking
                     g.inline = g.bx.display == Display::InlineBlock;
                     build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                    if let Some(a) = after {
+                        g.children.push(a);
+                    }
                     out.push(g);
                 } else {
                     // An inline element that PAINTS (background, border,
@@ -762,14 +864,7 @@ fn build_into(
                     // box shrink-wrapping its text + padding is exactly the
                     // band real engines draw (e.g. an inline <a> styled as a
                     // button). Same placement path as author inline-block.
-                    let nz = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
-                    let paints = outcome.bx.bg.is_some()
-                        || outcome.bx.bg_image.is_some()
-                        || !outcome.bx.shadows.is_empty()
-                        || outcome.bx.border.iter().any(|&l| nz(l))
-                        || nz(outcome.bx.pad[1])
-                        || nz(outcome.bx.pad[3]);
-                    if paints {
+                    if paints_chrome(&outcome.bx) {
                         let mut g = BoxNode::group(outcome.style, outcome.bx);
                         g.inline = true;
                         // background-image placeholder (see above)
@@ -777,7 +872,13 @@ fn build_into(
                             let ph = bg_placeholder(&u, outcome.style, &g.bx);
                             g.children.push(ph);
                         }
+                        if let Some(b) = before {
+                            g.children.push(b);
+                        }
                         build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                        if let Some(a) = after {
+                            g.children.push(a);
+                        }
                         out.push(g);
                     } else {
                         // plain inline (no paint chrome): children flatten
@@ -796,10 +897,22 @@ fn build_into(
                         if has_margin(outcome.bx.margin[3]) || has_margin(outcome.bx.margin[1]) {
                             let mut g = BoxNode::group(outcome.style, outcome.bx);
                             g.inline = true;
+                            if let Some(b) = before {
+                                g.children.push(b);
+                            }
                             build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                            if let Some(a) = after {
+                                g.children.push(a);
+                            }
                             out.push(g);
                         } else {
+                            if let Some(b) = before {
+                                out.push(b);
+                            }
                             build_into(dom, child, outcome.style, sheet, child_link, out);
+                            if let Some(a) = after {
+                                out.push(a);
+                            }
                         }
                     }
                 }
@@ -5651,6 +5764,138 @@ line</textarea></div>"#,
         let dom = crate::html::parse(markup);
         let sheet = crate::css::parse(css);
         build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet)
+    }
+
+    // ---- ::before/::after generated content ----
+
+    #[test]
+    fn pseudo_before_is_first_child_and_after_last() {
+        let root = boxes_of(
+            "<div>hi</div>",
+            r#"div::before { content: "[1]" } div::after { content: "[2]" }"#,
+        );
+        let div = &root.children[0];
+        assert_eq!(div.children.len(), 3, "before + content + after");
+        assert!(
+            div.children[0].is_text && div.children[0].text == "[1]",
+            "::before is the first child"
+        );
+        assert!(div.children[1].is_text && div.children[1].text == "hi");
+        assert!(
+            div.children[2].is_text && div.children[2].text == "[2]",
+            "::after is the last child"
+        );
+    }
+
+    #[test]
+    fn legacy_single_colon_pseudo_and_body_root_boxes() {
+        // legacy `:before` spelling — a plain inline span flattens, so its
+        // pseudo joins the parent flow right before the element's own text
+        let root = boxes_of("<span>x</span>", r#"span:before { content: "L" }"#);
+        assert!(root.children[0].is_text && root.children[0].text == "L");
+        assert!(root.children[1].is_text && root.children[1].text == "x");
+        // the body's own box gets them too (root = the real <body> element)
+        let root = boxes_of(
+            "<body>x</body>",
+            r#"body::before { content: "B" } body::after { content: "A" }"#,
+        );
+        assert!(root.children[0].is_text && root.children[0].text == "B");
+        assert!(root.children[1].is_text && root.children[1].text == "x");
+        assert!(root.children[2].is_text && root.children[2].text == "A");
+    }
+
+    #[test]
+    fn pseudo_generates_no_box_without_usable_content() {
+        // a matching rule that never declares `content` → no box
+        let a = boxes_of("<div>hi</div>", "div::before { color: #ff0000 }");
+        assert_eq!(a.children[0].children.len(), 1, "undeclared content → no box");
+        // `content: none` kills the box even when an earlier rule set one
+        let b = boxes_of(
+            "<div>hi</div>",
+            r#"div::before { content: "x" } div::before { content: none }"#,
+        );
+        assert_eq!(b.children[0].children.len(), 1, "content:none → no box");
+        // `display:none` on the pseudo kills it too
+        let c = boxes_of(
+            "<div>hi</div>",
+            r#"div::before { content: "x"; display: none }"#,
+        );
+        assert_eq!(c.children[0].children.len(), 1, "display:none → no box");
+    }
+
+    #[test]
+    fn pseudo_box_carries_its_own_style_not_the_elements() {
+        let root = boxes_of(
+            "<div>hi</div>",
+            r#"div { color: #111111 }
+               div::before { content: "x"; color: #ff0000 }
+               div::after { content: "y"; color: #ff0000; background: #0000ff }"#,
+        );
+        let div = &root.children[0];
+        // no chrome → a bare text run carrying the pseudo's own color
+        let before = &div.children[0];
+        assert!(before.is_text && before.text == "x");
+        assert_eq!(before.style.color, 0xff0000, "the pseudo's color, not the element's");
+        // chrome → an inline box wrapping the generated text
+        let after = &div.children[2];
+        assert!(!after.is_text, "background wraps the run in a box");
+        assert!(after.inline, "inline-level box on the text line");
+        assert_eq!(after.bx.bg, Some(0x0000ff), "the pseudo's own background");
+        assert_eq!(after.style.color, 0xff0000);
+        assert!(after.children[0].is_text && after.children[0].text == "y");
+        // the element's own cascade is untouched by the pseudo rules
+        assert_eq!(div.style.color, 0x111111);
+        assert!(div.children[1].is_text && div.children[1].text == "hi");
+    }
+
+    #[test]
+    fn pseudo_content_flows_with_surrounding_text() {
+        let mut root = boxes_of("<p>hi</p>", r#"p::before { content: "[1]" }"#);
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let joined: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "[1]hi", "generated run joins the paragraph's text");
+        assert!(
+            l.runs.windows(2).all(|w| w[0].y == w[1].y),
+            "same line — the pseudo box doesn't break the flow"
+        );
+    }
+
+    #[test]
+    fn pseudo_rules_without_usable_content_leave_layout_untouched() {
+        // regression guard: pseudo rules that generate no box must lay out
+        // EXACTLY like a sheet without them (BoxNode has no Debug — compare
+        // a structural + geometric dump of the tree and the text runs)
+        fn shape(n: &BoxNode) -> String {
+            let mut s = format!(
+                "{}|{}|{:.2},{:.2},{:.2},{:.2};",
+                n.is_text, n.text, n.x, n.y, n.w, n.h
+            );
+            for c in &n.children {
+                s.push_str(&shape(c));
+            }
+            s.push('|');
+            s
+        }
+        let laid = |css: &str| {
+            let mut root = boxes_of("<p>one <b>two</b></p><span>three</span>", css);
+            let l = layout_tree(&mut root, 1000.0, &m4);
+            let runs: Vec<(String, f32, f32)> =
+                l.runs.iter().map(|r| (r.text.clone(), r.x, r.y)).collect();
+            (shape(&root), runs)
+        };
+        let plain = laid("p { color: #123456 }");
+        // a matched pseudo rule without `content` changes nothing
+        assert_eq!(
+            laid("p { color: #123456 } p::before { color: #654321 }"),
+            plain,
+            "content-less pseudo rule changes nothing"
+        );
+        // and so does an explicit `content: none`
+        assert_eq!(
+            laid("p { color: #123456 } p::before { content: none }"),
+            plain,
+            "content:none generates nothing"
+        );
     }
 
     #[test]
