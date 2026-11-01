@@ -534,6 +534,45 @@ curve matters more than the baseline (near-flat as tabs grow).
   Live: wiki 105.4 MB (+9 MB vs wave 1 — tiled paint entries), CPU 0.5s;
   featured-article text wraps around the floated image, sidebar images float
   right, section headers paint sized backgrounds (`cf18ae4` pushed).
+- [x] **Wave 3 (parallel worktrees) — `::before`/`::after` pseudo-elements + `content`,
+  `z-index` + `transform`** — third wave of the Wikipedia visual-parity plan
+  (2 agents, both branched from `3f20188`):
+  **(a) pseudo-elements + `content`** (`59cd182`, +9 tests) — `parse_selector`
+  accepts `::before`/`::after` AND legacy single-colon `:before`/`:after`
+  (records `PseudoEl` on the last Seg; static pseudo-classes may precede,
+  nothing may follow; `spec_of` adds +1 type; `seg_matches` ignores the field so
+  `li::before` matches the `<li>`); pseudo rules are PARTITIONED at parse into
+  `Sheet::pseudo` buckets so the origin element's `resolve`/`class_paint`/
+  color-scheme never see them (zero hot-path cost; `resolve_pseudo` cascades a
+  bucket over the origin's computed `Style`); `content` parses `none`/
+  string/`attr(name)` raw onto `BoxStyle.content` (attr resolves at box
+  synthesis where the DOM is); layout `pseudo_box` synthesizes an inline
+  text-run/inline-box (bare run unless the pseudo paints chrome or declares
+  box-level display) inserted FIRST (`::before`) / LAST (`::after`), no box
+  for undeclared/`none`/`display:none`/empty. Shortcuts: counters → empty
+  (no list markers), `attr()` bare names only, no inline-style pseudo rules,
+  replaced elements/form controls generate no pseudo box, `::marker`/
+  `::placeholder`/`::backdrop` still drop;
+  **(b) `z-index` + `transform`** (`9db76da`, +11 tests) — `z-index: auto|
+  <integer>` into `BoxStyle.z`; `collect_paint` stamps each rect/image/run
+  with a stacking level (static inherits tree order; an integer-z POSITIONED
+  box switches its whole subtree) and `zsort` stable-sorts the three paint
+  channels by (z, tree order) with an all-equal early-out — pages without
+  z-index are byte-identical; `transform` parses `none|translate[XY]|
+  translate|scale` (rotate/skew/matrix parse but no-op — axis-aligned
+  rasterizer, honest shortcut) and paints through a diagonal `Xf` matrix
+  composed down the tree: whole-subtree paint moves incl. text anchors +
+  clip windows mapped to paint space, layout flow untouched. Shortcuts:
+  stacking-context scoping global, per-channel reordering only (hit-testing
+  stays tree order), transform-origin fixed at center, glyphs not scaled.
+  Merge: A fast-forwarded; B's css.rs conflict was a pure union (both added
+  arms); layout.rs auto-merged — verified by field/arm/symbol presence +
+  full suite. Tests: default **417**, feature **420**.
+  Live: wiki **97.5 MB** (1468 runs — +215 synthesized pseudo boxes; RAM DOWN
+  7.9 MB vs wave 2 despite more runs), CPU 0.8s. Note: the release build
+  transiently crashed rustc (stack-buffer-overrun) under the prior
+  disk-pressure episode; after the disk freed up it built clean in 2m45s
+  with no code changes (`505a98b` pushed).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -614,6 +653,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-10-31 | gap-fix wave (lexer `$` spin fix + JS step budget) | MDN /Web/CSS/margin | 86.4 MB (2877 runs; first successful load — previously hung forever in the lexer, 57s CPU/60s wall; now 1.7s CPU/60s wall) |
 | 2026-11-01 | wave 1 (box-sizing + overflow/clip culling) | Wikipedia Main Page | 96.4 MB (1253 runs), CPU 0.9s; skip-link "Jump to content" no longer renders (closed the documented clip/overflow known-gap) |
 | 2026-11-01 | wave 2 (float/clear/vertical-align + background-size/position/repeat) | Wikipedia Main Page | 105.4 MB (1253 runs), CPU 0.5s; float text-wrap + right-floated sidebar + sized bg headers live (+9 MB vs wave 1 from tiled paint entries) |
+| 2026-11-02 | wave 3 (::before/::after + content, z-index + transform) | Wikipedia Main Page | 97.5 MB (1468 runs, +215 pseudo boxes; RAM down 7.9 MB vs wave 2), CPU 0.8s |
 
 ### Phase 1c (Track A) findings
 
