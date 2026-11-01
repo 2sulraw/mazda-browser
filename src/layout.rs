@@ -1097,9 +1097,32 @@ pub fn layout_in_forms(
     // (after position_all so shifts are final; ranges are complete)
     apply_run_clips(root, None, &mut runs, &mut uls);
     let mut rects = Vec::new();
+    let mut rect_z = Vec::new();
     let mut images = Vec::new();
+    let mut img_z = Vec::new();
     let mut shadows = Vec::new();
-    collect_paint(root, false, None, &mut rects, &mut images, &mut shadows);
+    collect_paint(
+        root,
+        false,
+        Xf::IDENT,
+        0,
+        None,
+        &mut rects,
+        &mut rect_z,
+        &mut images,
+        &mut img_z,
+        &mut shadows,
+    );
+    // stacking levels: each channel paints in (z, tree order) — a stable
+    // sort keyed by the stamped levels (identity when no page sets z-index)
+    zsort(&mut rects, &rect_z);
+    zsort(&mut images, &img_z);
+    // text channel: move runs/underlines through their boxes' transforms
+    // (layout coords never move — transforms are visual-only), stamp their
+    // stacking levels, then stable-sort like the rect/image channels
+    let mut run_z = vec![0i32; runs.len()];
+    transform_runs(root, Xf::IDENT, 0, &mut runs, &mut uls, &mut run_z);
+    zsort(&mut runs, &run_z);
     // form controls: laid rects + focus visuals (caret) + value seeding
     let mut forms = Vec::new();
     let mut form_values = HashMap::new();
@@ -1363,21 +1386,59 @@ fn apply_run_clips(
 /// inherits down — a `position: fixed` subtree paints in viewport
 /// coordinates.
 ///
-/// `clip` = accumulated window (x0, y0, x1, y1, doc coords) from ancestor
-/// `overflow` boxes and `clip: rect()` — intersected into every pushed rect;
+/// `clip` = accumulated window (x0, y0, x1, y1) from ancestor `overflow`
+/// boxes and `clip: rect()`, intersected into every pushed rect;
 /// fully-outside rects are dropped. The element's own background/border/
 /// shadow are NOT clipped by its OWN overflow (only by ancestors' clips and
 /// its own `clip: rect()`, which per spec clips the whole rendering).
+/// Windows arrive in PAINT space (mapped through [`Xf::map_win`] as each
+/// transformed box establishes them), so a clip stays glued to the
+/// rendering it bounds.
+///
+/// `m` = accumulated paint transform ([`Xf`]): a box's own `transform`
+/// composes in before its rendering and is passed to its children, so the
+/// whole subtree paints transformed while layout coords never change
+/// (CSS transforms are visual-only). `z` = inherited stacking level,
+/// stamped on every pushed rect/image for the stable sort in
+/// `layout_in_forms`.
+///
+/// z-index model (simplified — `BoxStyle::z`): static boxes keep the
+/// inherited level; a POSITIONED box with an integer `z-index` switches
+/// its subtree to that level (`auto` keeps it → tree order, the
+/// pre-z-index behavior). shortcut: integer-z boxes act as stacking-
+/// context shortcuts — a nested integer z re-sorts against the whole
+/// page instead of only within its parent's context — and z reorders
+/// WITHIN each paint channel only (shadow < rect < image < text <
+/// underline keep their fixed precedence), so a background never covers
+/// another box's text; `render()`'s fixed pass likewise still draws last
+/// regardless of z. Hit-testing (`hit_test_form`, the link walk in the
+/// shell) still searches in tree order — z-index orders paint only.
 fn collect_paint(
     n: &BoxNode,
     fixed: bool,
+    m: Xf,
+    z: i32,
     clip: Option<(f32, f32, f32, f32)>,
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    out_z: &mut Vec<i32>,
     imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
+    img_z: &mut Vec<i32>,
     shadows: &mut Vec<ShadowRect>,
 ) {
     if !n.is_text {
         let fixed = fixed || n.bx.pos == Pos::Fixed;
+        // this box's transform joins the ancestor chain for its rendering
+        // AND its children's; identity keeps every number below unchanged
+        let m = match box_xf(n) {
+            Some(t) => m.after(t),
+            None => m,
+        };
+        // stacking level: static inherits, positioned takes its integer
+        // z-index (`auto`/unset inherits → tree order — see model above)
+        let z = match n.bx.pos {
+            Pos::Static => z,
+            _ => n.bx.z.unwrap_or(z),
+        };
         let bt = resolve_len(n.bx.border[0], n.w);
         let br = resolve_len(n.bx.border[1], n.w);
         let bb = resolve_len(n.bx.border[2], n.w);
@@ -1388,8 +1449,10 @@ fn collect_paint(
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
         let ring = has_b && r > 0.0 && n.bx.bg.is_some();
         // own `clip: rect()` (positioned boxes) clips this box's WHOLE
-        // rendering incl. its own background — composed with the inherited one
-        let clip = match (clip, clip_rect_window(n)) {
+        // rendering incl. its own background — composed with the inherited
+        // one; the window is recorded in layout coords, so it is mapped
+        // into paint space to stay glued to the transformed box
+        let clip = match (clip, clip_rect_window(n).map(|w| m.map_win(w))) {
             (c, None) => c,
             (None, Some(w)) => Some(w),
             (Some(a), Some(w)) => Some(clip_intersect(a, w)),
@@ -1398,8 +1461,8 @@ fn collect_paint(
         let content_clip = if n.bx.clip {
             let pad = (n.x + bl, n.y + bt, n.x + n.w - br, n.y + n.h - bb);
             Some(match clip {
-                Some(c) => clip_intersect(c, pad),
-                None => pad,
+                Some(c) => clip_intersect(c, m.map_win(pad)),
+                None => m.map_win(pad),
             })
         } else {
             clip
@@ -1409,13 +1472,16 @@ fn collect_paint(
         for s in &n.bx.shadows {
             let sp = s.spread;
             let c = s.color.unwrap_or(n.style.color);
-            let a = s.alpha as u32;
+            let alpha = s.alpha as u32;
             // shortcut: culled against the un-blurred rect — blur may bleed
-            // a few px past a clip edge (approximation, not spec-exact)
+            // a few px past a clip edge (approximation, not spec-exact);
+            // the shadow follows the box's transform but blur and alpha do
+            // NOT scale (blur scaling needs a variable-radius falloff)
             let sx = n.x + s.dx - sp;
             let sy = n.y + s.dy - sp;
             let sw = (n.w + sp * 2.0).max(0.0);
             let sh = (n.h + sp * 2.0).max(0.0);
+            let (sx, sy, sw, sh) = m.map_rect((sx, sy, sw, sh));
             if cull_rect((sx, sy, sw, sh), clip).is_none() {
                 continue;
             }
@@ -1424,9 +1490,9 @@ fn collect_paint(
                 y: sy,
                 w: sw,
                 h: sh,
-                radius: r,
+                radius: r * m.sx.abs(),
                 blur: s.blur,
-                color: (a << 24) | c,
+                color: (alpha << 24) | c,
                 fixed,
             });
         }
@@ -1447,8 +1513,10 @@ fn collect_paint(
                 ));
             }
             for (x, y, w, h, color, rad) in rects {
+                let (x, y, w, h) = m.map_rect((x, y, w, h));
                 if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
-                    out.push((x, y, w, h, color, rad, fixed));
+                    out.push((x, y, w, h, color, rad * m.sx.abs(), fixed));
+                    out_z.push(z);
                 }
             }
         }
@@ -1465,8 +1533,10 @@ fn collect_paint(
                 if !on {
                     continue;
                 }
+                let q = m.map_rect(q);
                 if let Some(q) = cull_rect(q, clip) {
                     out.push((q.0, q.1, q.2, q.3, bc, 0.0, fixed));
+                    out_z.push(z);
                 }
             }
         }
@@ -1512,16 +1582,20 @@ fn collect_paint(
                         // tiles paint only inside the region (the padding
                         // box) ∩ the inherited clip window — edge tiles are
                         // cropped to it, same rect-culling the single-draw
-                        // path uses at clip edges
+                        // path uses at clip edges; both windows are mapped
+                        // into paint space so the tiling travels with the
+                        // transform (tile INDICES stay in layout coords)
+                        let reg = m.map_win(reg);
                         let win = Some(match content_clip {
                             Some(c) => clip_intersect(c, reg),
                             None => reg,
                         });
                         for ky in ky0..ky0 + rows {
                             for kx in kx0..kx0 + cols {
-                                let t = (n.x + kx as f32 * tw, n.y + ky as f32 * th, tw, th);
+                                let t = m.map_rect((n.x + kx as f32 * tw, n.y + ky as f32 * th, tw, th));
                                 if let Some(q) = cull_rect(t, win) {
                                     imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                                    img_z.push(z);
                                 }
                             }
                         }
@@ -1530,15 +1604,17 @@ fn collect_paint(
                         // single draw at (x, y, w, h) — content <img>, a
                         // no-repeat / undeclared-repeat background, or a
                         // de-slotted one (0×0, culled above)
-                        if let Some(q) = cull_rect((n.x, n.y, n.w, n.h), content_clip) {
+                        let q = m.map_rect((n.x, n.y, n.w, n.h));
+                        if let Some(q) = cull_rect(q, content_clip) {
                             imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                            img_z.push(z);
                         }
                     }
                 }
             }
         }
         for ch in &n.children {
-            collect_paint(ch, fixed, content_clip, out, imgs, shadows);
+            collect_paint(ch, fixed, m, z, content_clip, out, out_z, imgs, img_z, shadows);
         }
     }
 }
@@ -1548,6 +1624,200 @@ fn resolve_len(l: Len, avail: f32) -> f32 {
     match l {
         Len::Px(p) => p,
         Len::Pct(p) => p / 100.0 * avail,
+    }
+}
+
+/// Paint-time transform: `p' = (p.x·sx + tx, p.y·sy + ty)` — a scale about
+/// the box's transform-origin plus a translate, composed down the tree so
+/// a transformed box moves/scales its WHOLE subtree's painting. Diagonal
+/// only: `rotate()`/`skew()` never reach here (css.rs `parse_transform`
+/// drops them — the rasterizer draws axis-aligned rects + horizontal glyph
+/// runs, so faking rotated pixels would lie), hence every mapped rect
+/// stays axis-aligned and the existing draw code handles it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Xf {
+    sx: f32,
+    sy: f32,
+    tx: f32,
+    ty: f32,
+}
+
+impl Xf {
+    const IDENT: Xf = Xf { sx: 1.0, sy: 1.0, tx: 0.0, ty: 0.0 };
+
+    fn is_ident(&self) -> bool {
+        *self == Xf::IDENT
+    }
+
+    /// `self` applied AFTER `inner` — the paint position of a point whose
+    /// local position first goes through `inner` (a child box's own
+    /// transform) and then through `self` (its ancestors').
+    fn after(self, inner: Xf) -> Xf {
+        Xf {
+            sx: self.sx * inner.sx,
+            sy: self.sy * inner.sy,
+            tx: self.tx * inner.sx + inner.tx,
+            ty: self.ty * inner.sy + inner.ty,
+        }
+    }
+
+    fn map_pt(&self, x: f32, y: f32) -> (f32, f32) {
+        (x * self.sx + self.tx, y * self.sy + self.ty)
+    }
+
+    /// Map a paint rect (x, y, w, h) — negative scales flip it but keep it
+    /// axis-aligned. Identity returns the input unchanged (byte-identical
+    /// paint on pages without `transform`).
+    fn map_rect(&self, r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        if self.is_ident() {
+            return r;
+        }
+        let (a, b) = self.map_pt(r.0, r.1);
+        let (c, d) = self.map_pt(r.0 + r.2, r.1 + r.3);
+        (a.min(c), b.min(d), (a - c).abs(), (b - d).abs())
+    }
+
+    /// Map a clip window's corners (kept as x0, y0, x1, y1, normalized) —
+    /// clips are recorded in layout coords, so a transformed box's
+    /// `overflow`/`clip: rect()` window travels WITH its rendering.
+    fn map_win(&self, w: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        if self.is_ident() {
+            return w;
+        }
+        let (a, b) = self.map_pt(w.0, w.1);
+        let (c, d) = self.map_pt(w.2, w.3);
+        (a.min(c), b.min(d), a.max(c), b.max(d))
+    }
+}
+
+/// The box's own [`css::Transform`] as an [`Xf`] about its transform
+/// origin — CSS default `center` (shortcut: `transform-origin` isn't
+/// parsed; centering is what `scale()`/`translate()` patterns expect).
+/// `%` translate resolves against the box's own w/h here (layout coords);
+/// None = no transform.
+fn box_xf(n: &BoxNode) -> Option<Xf> {
+    let t = n.bx.transform?;
+    let tx = resolve_len(t.tx, n.w);
+    let ty = resolve_len(t.ty, n.h);
+    // p' = (p − c)·s + c + d  ⇔  p·s + (c(1 − s) + d), c = box center
+    Some(Xf {
+        sx: t.sx,
+        sy: t.sy,
+        tx: (n.x + n.w * 0.5) * (1.0 - t.sx) + tx,
+        ty: (n.y + n.h * 0.5) * (1.0 - t.sy) + ty,
+    })
+}
+
+/// Stable-sort `v` by the parallel stacking-level `keys` (both built in
+/// the same tree walk). Stability keeps TREE order within a level — the
+/// CSS tie-break — and an all-equal key list (no `z-index` anywhere)
+/// permutes to itself, so pages without the property are untouched.
+fn zsort<T>(v: &mut Vec<T>, keys: &[i32]) {
+    debug_assert_eq!(v.len(), keys.len(), "zsort: keys must match entries");
+    if keys.windows(2).all(|w| w[0] == w[1]) {
+        return; // one level (incl. the empty/single-entry case) = tree order
+    }
+    let mut idx: Vec<usize> = (0..v.len()).collect();
+    idx.sort_by_key(|&i| keys[i]); // stable: ties keep tree order
+    let orig = std::mem::take(v);
+    let mut slots: Vec<Option<T>> = orig.into_iter().map(Some).collect();
+    for i in idx {
+        v.push(slots[i].take().unwrap());
+    }
+}
+
+/// Post-layout walk: apply each box's visual transform ([`Xf`]) to the
+/// text runs and underline rects its subtree emitted, and stamp every run
+/// with its stacking level (for [`zsort`] in `layout_in_forms`). Layout
+/// coords never move — CSS transforms are visual-only — so this is the
+/// only place runs shift.
+///
+/// A box maps only the runs of its OWN span (its range minus its
+/// in-flow children's subranges — disjoint and in order; an absolute
+/// child's late range sits outside the parent's and is mapped when the
+/// walk reaches that child), so nested transforms compose exactly once.
+///
+/// shortcut: a run's GLYPHS are not scaled or rotated — only the run's
+/// anchor moves (translate is exact; `scale()` recenters text without
+/// resizing it — scaled glyphs need an affine raster path this engine
+/// doesn't have). A run's clip window moves through the same matrix, so
+/// a clip set above a transformed ancestor shifts with it (spec keeps it
+/// fixed) — visible only when authors combine overflow clipping with a
+/// transform between the clipper and the text. `underline_rects` are
+/// mapped but not z-sorted (that channel paints last within a pass
+/// anyway — caret/underline over text is the existing look).
+fn transform_runs(
+    n: &BoxNode,
+    m: Xf,
+    z: i32,
+    runs: &mut [PositionedRun],
+    uls: &mut [UR],
+    run_z: &mut [i32],
+) {
+    if n.is_text {
+        return;
+    }
+    let m = match box_xf(n) {
+        Some(t) => m.after(t),
+        None => m,
+    };
+    let z = match n.bx.pos {
+        Pos::Static => z,
+        _ => n.bx.z.unwrap_or(z),
+    };
+    // own run span = [run_range) minus in-flow children's subranges
+    let (a, b) = (n.run_range.0 as usize, n.run_range.1 as usize);
+    let mut cur = a;
+    for ch in &n.children {
+        let (ca, cb) = (ch.run_range.0 as usize, ch.run_range.1 as usize);
+        if ca >= a && cb <= b && ca >= cur {
+            map_runs(m, z, cur, ca, runs, run_z);
+            cur = cb;
+        }
+    }
+    map_runs(m, z, cur, b, runs, run_z);
+    // the underline channel has its own parallel ranges
+    let (ua, ub) = (n.ul_range.0 as usize, n.ul_range.1 as usize);
+    let mut ucur = ua;
+    for ch in &n.children {
+        let (ca, cb) = (ch.ul_range.0 as usize, ch.ul_range.1 as usize);
+        if ca >= ua && cb <= ub && ca >= ucur {
+            map_uls(m, ucur, ca, uls);
+            ucur = cb;
+        }
+    }
+    map_uls(m, ucur, ub, uls);
+    for ch in &n.children {
+        transform_runs(ch, m, z, runs, uls, run_z);
+    }
+}
+
+/// Map one run span through `m` and stamp its stacking level.
+fn map_runs(m: Xf, z: i32, lo: usize, hi: usize, runs: &mut [PositionedRun], run_z: &mut [i32]) {
+    debug_assert!(lo <= hi);
+    if !m.is_ident() {
+        for r in &mut runs[lo..hi] {
+            r.x = r.x * m.sx + m.tx;
+            r.y = r.y * m.sy + m.ty;
+            r.clip = r.clip.map(|c| m.map_win(c));
+        }
+    }
+    for k in &mut run_z[lo..hi] {
+        *k = z;
+    }
+}
+
+/// Map one underline-rect span through `m` (no z key — see
+/// [`transform_runs`]).
+fn map_uls(m: Xf, lo: usize, hi: usize, uls: &mut [UR]) {
+    debug_assert!(lo <= hi);
+    if m.is_ident() {
+        return;
+    }
+    for u in &mut uls[lo..hi] {
+        let (x, y, w, h, color, fixed) = *u;
+        let (x, y, w, h) = m.map_rect((x, y, w, h));
+        *u = (x, y, w, h, color, fixed);
     }
 }
 
@@ -5755,6 +6025,249 @@ line</textarea></div>"#,
             shown.chars().count()
         );
         assert!(shown.chars().count() < 200, "tail was cut");
+    }
+
+    // ---- z-index (stacking) + transform (paint-only) ----
+
+    #[test]
+    fn z_index_orders_positioned_backgrounds() {
+        // three stacked overlays whose document order runs AGAINST their
+        // z order: paint must follow ascending z, not tree order
+        let mut root = boxes_of(
+            "<div class=hi>a</div><div class=mid>b</div><div class=lo>c</div>",
+            ".hi{position:absolute;z-index:10;background:#333333}\
+             .mid{position:relative;z-index:5;background:#222222}\
+             .lo{position:absolute;z-index:2;background:#111111}",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let idx = |c: u32| l.rects.iter().position(|r| r.4 == c).expect("rect");
+        // relative boxes with an integer z stack too (mid stays in flow but
+        // paints at level 5 — above lo's 2, below hi's 10)
+        assert!(idx(0x111111) < idx(0x222222), "z:2 under z:5");
+        assert!(idx(0x222222) < idx(0x333333), "z:5 under z:10");
+    }
+
+    #[test]
+    fn z_index_auto_and_static_stay_in_tree_order() {
+        // `z-index: auto` (and a z-index on a STATIC box, which spec
+        // ignores) keeps the long-standing tree-order paint: earlier in
+        // the document paints first
+        let mut root = boxes_of(
+            "<div class=first>a</div><div class=second>b</div>",
+            ".first{position:absolute;background:#aaaaaa}\
+             .second{position:absolute;z-index:auto;background:#bbbbbb}\
+             .stat{z-index:99}",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let idx = |c: u32| l.rects.iter().position(|r| r.4 == c).expect("rect");
+        assert!(idx(0xaaaaaa) < idx(0xbbbbbb), "auto → tree order");
+        // z on a static box never lifts it: append a static bg AFTER the
+        // absolute one — it still paints at level 0, i.e. FIRST
+        let mut root = boxes_of(
+            "<div class=abs>a</div><div class=stat>b</div>",
+            ".abs{position:absolute;z-index:2;background:#cccccc}\
+             .stat{z-index:99;background:#dddddd}",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let idx = |c: u32| l.rects.iter().position(|r| r.4 == c).expect("rect");
+        assert!(idx(0xdddddd) < idx(0xcccccc), "static z ignored → level 0");
+    }
+
+    #[test]
+    fn negative_z_index_paints_under_inflow_content() {
+        // the classic decoration-layer pattern: a negative z paints BELOW
+        // the in-flow content of the stacking root — even when the
+        // decoration comes LATER in the document (documented model: it
+        // sorts at the root level, under level-0 backgrounds)
+        let mut root = boxes_of(
+            "<div class=flow>f</div><div class=under>u</div>",
+            ".under{position:absolute;z-index:-1;background:#333333}\
+             .flow{background:#cccccc}",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let idx = |c: u32| l.rects.iter().position(|r| r.4 == c).expect("rect");
+        assert!(idx(0x333333) < idx(0xcccccc), "negative z under in-flow bg");
+    }
+
+    #[test]
+    fn z_index_orders_text_runs_and_images() {
+        // the text/image channels carry the same stamped levels as rects:
+        // a z:10 header FIRST in the document paints LAST among the
+        // absolutely positioned boxes (tree order would paint it first)
+        let mut root = boxes_of(
+            "<div class=hi>head</div><div class=lo>other</div>",
+            ".hi{position:absolute;z-index:10;top:0;background:#eeeeee}\
+             .lo{position:absolute;z-index:2;top:30px;background:#dddddd}",
+        );
+        // slot a content <img> into each subtree (Ready → image channel)
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, 1, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[255, 0, 0, 255]).unwrap();
+        }
+        let px = std::rc::Rc::new(crate::image::decode(&bytes).expect("png decodes"));
+        for i in 0..2 {
+            let mut g = BoxNode::group(Style::new(), BoxStyle::default());
+            g.img = Some(ImgSlot::Ready(px.clone()));
+            root.children[i].children.push(g);
+        }
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // header text paints after the lower-z box's text
+        let run_idx = |t: &str| l.runs.iter().position(|r| r.text == t).expect("run");
+        assert!(run_idx("head") > run_idx("other"), "z:10 text after z:2 text");
+        // ...and its image too: the z:2 box sits at y=30, the z:10 one at
+        // y=0, so a z-sorted list ENDS with the y=0 image (tree order
+        // would start with it)
+        assert_eq!(l.images.len(), 2);
+        assert!(
+            l.images[0].1 > l.images[1].1,
+            "z:10 image paints last: first y={} > second y={}",
+            l.images[0].1,
+            l.images[1].1
+        );
+    }
+
+    #[test]
+    fn transform_translate_moves_paint_not_layout() {
+        // the header hide/show pattern: translateY(-100%) moves the box's
+        // WHOLE subtree's painting (bg, children, text) while layout
+        // positions — the box's flow slot and its sibling — never move
+        let build = |css: &str| {
+            let mut root = boxes_of(
+                "<div class=t><div class=kid>k</div></div><div class=s>sib</div>",
+                css,
+            );
+            let l = layout_tree(&mut root, 300.0, &m4);
+            (root, l)
+        };
+        let t_css = ".t{min-height:50px;background:#aabbcc;transform:translateY(-100%)}\
+                     .kid{background:#ddeeff}";
+        let (root, l) = build(t_css);
+        // flow: the box and its sibling sit exactly where they would
+        // without the transform
+        assert!((root.children[0].y - 0.0).abs() < 0.01, "t stays at y=0 in flow");
+        assert!((root.children[1].y - 50.0).abs() < 0.01, "sib still at y=50");
+        // paint: both the box's bg and its CHILD's bg moved up 50px
+        let rect = |c: u32| l.rects.iter().find(|r| r.4 == c).expect("rect");
+        assert!((rect(0xaabbcc).1 - -50.0).abs() < 0.01, "bg painted at y=-50");
+        assert!((rect(0xddeeff).1 - -50.0).abs() < 0.01, "child bg moved with the box");
+        // text: the run moved too (translate is exact for glyphs)
+        let kid_run = l.runs.iter().find(|r| r.text == "k").expect("kid run");
+        let (plain_root, plain) = build(
+            ".t{min-height:50px;background:#aabbcc}.kid{background:#ddeeff}",
+        );
+        let plain_run = plain.runs.iter().find(|r| r.text == "k").expect("kid run");
+        assert!(
+            (kid_run.y - (plain_run.y - 50.0)).abs() < 0.01,
+            "run moved by exactly the translate ({} vs {})",
+            kid_run.y,
+            plain_run.y
+        );
+        let _ = plain_root;
+    }
+
+    #[test]
+    fn transform_scale_doubles_painted_rect_about_center() {
+        // scale(2) about the default origin (box center): the painted rect
+        // doubles in size and recenters; layout w/h and the sibling stay
+        // put (compare against a plain twin — flow is byte-identical).
+        // glyph size does NOT scale (documented shortcut) — only the anchor
+        let build = |css: &str| {
+            let mut root = boxes_of("<div class=t>head</div><div class=s>sib</div>", css);
+            let l = layout_tree(&mut root, 400.0, &m4);
+            (root, l)
+        };
+        let (root, l) = build(".t{width:100px;min-height:50px;background:#aabbcc;transform:scale(2)}");
+        let (plain, plain_l) = build(".t{width:100px;min-height:50px;background:#aabbcc}");
+        assert!((root.children[0].w - 100.0).abs() < 0.01, "layout w unchanged");
+        assert!(
+            (root.children[1].y - plain.children[1].y).abs() < 0.01,
+            "sibling unmoved"
+        );
+        let r = l.rects.iter().find(|r| r.4 == 0xaabbcc).expect("bg");
+        assert!(
+            (r.0 - -50.0).abs() < 0.01
+                && (r.1 - -25.0).abs() < 0.01
+                && (r.2 - 200.0).abs() < 0.01
+                && (r.3 - 100.0).abs() < 0.01,
+            "painted rect = scaled about center: {r:?}"
+        );
+        // text anchor recenters with the scale; glyphs keep their size
+        let run = l.runs.iter().find(|r| r.text == "head").expect("run");
+        let plain_run = plain_l.runs.iter().find(|r| r.text == "head").expect("run");
+        assert!(
+            (run.x - (plain_run.x * 2.0 - 50.0)).abs() < 0.01,
+            "run anchor scaled: {} (plain {})",
+            run.x,
+            plain_run.x
+        );
+        assert!(
+            (run.style.size - plain_run.style.size).abs() < 0.01,
+            "glyph size unchanged"
+        );
+    }
+
+    #[test]
+    fn transform_none_and_absent_paint_identically() {
+        // regression guard: an explicit `transform:none` and a page with
+        // no transform at all produce byte-identical paint lists
+        let build = |css: &str| {
+            let mut root = boxes_of(
+                "<div class=t>head</div><div class=s>sib</div>",
+                css,
+            );
+            layout_tree(&mut root, 300.0, &m4)
+        };
+        let none = build(".t{min-height:50px;background:#aabbcc;transform:none}.s{min-height:30px}");
+        let absent = build(".t{min-height:50px;background:#aabbcc}.s{min-height:30px}");
+        assert_eq!(none.rects.len(), 1);
+        assert_eq!(none.rects, absent.rects);
+        let runs = |l: &Layout| {
+            l.runs
+                .iter()
+                .map(|r| (r.text.clone(), r.x, r.y, r.width))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(runs(&none), runs(&absent));
+    }
+
+    #[test]
+    fn transform_rotate_and_skew_are_documented_noops() {
+        // rotate()/skew() parse but never rasterize (affine glyph/rect
+        // sampling is out of scope) — a rotate/skew-only value paints
+        // exactly like none; a co-listed translate still applies
+        let build = |css: &str| {
+            let mut root = boxes_of("<div class=t>x</div>", css);
+            layout_tree(&mut root, 300.0, &m4)
+        };
+        let plain = build(".t{min-height:40px;background:#aabbcc}");
+        let rot = build(".t{min-height:40px;background:#aabbcc;transform:rotate(45deg) skew(3deg, 2deg)}");
+        assert_eq!(rot.rects, plain.rects, "rotate/skew-only = no transform");
+        let tx = build(".t{min-height:40px;background:#aabbcc;transform:rotate(45deg) translateX(10px)}");
+        assert!((tx.rects[0].0 - 10.0).abs() < 0.01, "co-listed translate still applies");
+    }
+
+    #[test]
+    fn transformed_overflow_clip_travels_with_the_box() {
+        // the box's overflow clip window is mapped through its transform,
+        // so its child's painting is clipped to the SHIFTED padding box —
+        // the child rides the transform but stays cut at the box edge
+        let mut root = boxes_of(
+            "<div class=t><div class=c>k</div></div>",
+            ".t{width:100px;min-height:100px;overflow:hidden;transform:translateX(30px);background:#aabbcc}\
+             .c{width:200px;min-height:20px;background:#ddeeff}",
+        );
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let t = l.rects.iter().find(|r| r.4 == 0xaabbcc).expect("own bg");
+        assert!((t.0 - 30.0).abs() < 0.01, "own bg shifted: {t:?}");
+        let c = l.rects.iter().find(|r| r.4 == 0xddeeff).expect("child bg");
+        assert!(
+            (c.0 - 30.0).abs() < 0.01 && (c.2 - 100.0).abs() < 0.01,
+            "child clipped to the shifted padding box: {c:?}"
+        );
     }
 
     // ---- background-image (url() painting) ----
