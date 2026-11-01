@@ -158,6 +158,28 @@ pub enum BgRepeat {
     NoRepeat,
 }
 
+/// Resolved `transform`: a translate + scale composite that layout applies
+/// at PAINT time only (CSS transforms are visual — layout flow size and
+/// sibling positions never change). `tx`/`ty` stay symbolic [`Len`]s:
+/// `%` resolves against the box's OWN width/height when painted.
+/// shortcut: the function list composes into ONE translate + ONE scale —
+/// later translate functions add (translations compose exactly), later
+/// scale functions multiply, and a mixed `translate() scale()` list keeps
+/// that order while `scale() translate()` is folded the same way (the
+/// reverse order is dropped — real sites use single-function or
+/// same-axis lists). `rotate()`/`skew()`/`matrix()`/`perspective()`/3D
+/// functions parse but contribute nothing: the rasterizer draws
+/// axis-aligned rects + horizontal glyph runs, and inventing rotated
+/// pixels would lie about coverage. A value whose functions reduce to
+/// the identity stores `None` — byte-identical to `transform: none`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Transform {
+    pub tx: Len,
+    pub ty: Len,
+    pub sx: f32,
+    pub sy: f32,
+}
+
 /// Per-element box layout properties — the non-inherited half of CSS.
 /// Default = plain block flow (matches pre-flex rendering).
 #[derive(Clone, PartialEq, Debug)]
@@ -249,6 +271,13 @@ pub struct BoxStyle {
     pub clear: Clear,
     /// CSS `vertical-align` — inline box placement within its line
     pub valign: VAlign,
+    /// CSS `z-index` — stacking level of a POSITIONED box (honored only
+    /// when `pos` ≠ static, spec); `auto`/undeclared/invalid = None =
+    /// paint in tree order. See layout.rs `collect_paint` for the model.
+    pub z: Option<i32>,
+    /// CSS `transform` — visual-only paint transform of this box's
+    /// rendering (see [`Transform`]); None = no transform
+    pub transform: Option<Transform>,
     /// Bitmask of [`decl`] flags: which box properties the author CSS
     /// actually declared. Lets UA control chrome (`control_chrome` in
     /// layout.rs) fill only the properties the author left initial, so an
@@ -325,6 +354,8 @@ impl Default for BoxStyle {
             float: Float::None,
             clear: Clear::None,
             valign: VAlign::Baseline,
+            z: None,
+            transform: None,
             declared: 0,
         }
     }
@@ -699,6 +730,8 @@ const KNOWN: &[&str] = &[
     "float",
     "clear",
     "vertical-align",
+    "z-index",
+    "transform",
     // SVG paint properties — the rasterizer supports these; kept in decls so
     // Sheet::class_paint can resolve class-colored inline-SVG children
     // (fill/stroke/… on <path>/<rect>), which the text cascade never reaches
@@ -1688,6 +1721,14 @@ fn apply_decl(
                 _ => [None; 4],
             };
         }
+        // stacking level of a POSITIONED box (layout.rs `collect_paint`
+        // ignores it on static boxes, spec). `auto` and garbage → None =
+        // paint in tree order (the pre-z-index behavior)
+        "z-index" => {
+            let v = d.1.trim();
+            bx.z = if v == "auto" { None } else { v.parse::<i32>().ok() };
+        }
+        "transform" => bx.transform = parse_transform(&d.1, vp),
         _ => {}
     }
     false
@@ -1747,6 +1788,90 @@ fn parse_clip_rect(v: &str, vp: (f32, f32)) -> Option<[Len; 4]> {
         out[i] = parse_len(p, vp)?;
     }
     Some(out)
+}
+
+/// `transform: none | <function>+` → the translate + scale composite in
+/// [`Transform`] (its doc comment carries the composition shortcuts).
+/// Scans `name(args)` spans; `none`, garbage, or a list whose functions
+/// all reduce to the identity → None = no transform (byte-identical
+/// paint). `rotate()`/`skew()`/3D functions are consumed but contribute
+/// nothing (rasterizer is axis-aligned — see [`Transform`]).
+fn parse_transform(v: &str, vp: (f32, f32)) -> Option<Transform> {
+    let mut t = Transform { tx: Len::Px(0.0), ty: Len::Px(0.0), sx: 1.0, sy: 1.0 };
+    // additive accumulation for a translate axis: translations compose by
+    // addition; shortcut: a MIXED px+% pair keeps the later value (summing
+    // them needs the box size, unknown at parse time)
+    let add = |a: Len, b: Len| match (a, b) {
+        (Len::Px(x), Len::Px(y)) => Len::Px(x + y),
+        (Len::Pct(x), Len::Pct(y)) => Len::Pct(x + y),
+        (Len::Px(x), o) if x == 0.0 => o,
+        (o, Len::Px(y)) if y == 0.0 => o,
+        (_, b) => b, // mixed kinds: later wins
+    };
+    let b = v.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !b[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        let name = v[start..i].to_ascii_lowercase();
+        while i < b.len() && b[i] != b'(' {
+            i += 1;
+        }
+        if i >= b.len() {
+            break; // trailing keyword without '(' — nothing to parse
+        }
+        i += 1; // past '('
+        let arg0 = i;
+        while i < b.len() && b[i] != b')' {
+            i += 1;
+        }
+        let args: Vec<&str> = v[arg0..i.min(b.len())].split(',').map(str::trim).collect();
+        if i < b.len() {
+            i += 1; // past ')'
+        }
+        // a translate argument: length or % (bare number = px, like CSS)
+        let len_at = |k: usize| args.get(k).and_then(|a| parse_len(a, vp));
+        // a scale argument: plain factor
+        let num_at = |k: usize| args.get(k).and_then(|a| a.parse::<f32>().ok());
+        match name.as_str() {
+            "translate" => {
+                if let Some(l) = len_at(0) {
+                    t.tx = add(t.tx, l);
+                }
+                if let Some(l) = len_at(1) {
+                    t.ty = add(t.ty, l);
+                }
+            }
+            "translatex" => {
+                if let Some(l) = len_at(0) {
+                    t.tx = add(t.tx, l);
+                }
+            }
+            "translatey" => {
+                if let Some(l) = len_at(0) {
+                    t.ty = add(t.ty, l);
+                }
+            }
+            "scale" => {
+                if let Some(x) = num_at(0) {
+                    t.sx *= x;
+                    t.sy *= num_at(1).unwrap_or(x);
+                }
+            }
+            // consumed and ignored: rotate/skew would need affine glyph +
+            // rect rasterization this engine doesn't have (see [`Transform`]);
+            // matrix()/perspective()/3D forms likewise
+            _ => {}
+        }
+    }
+    let identity = t.tx == Len::Px(0.0) && t.ty == Len::Px(0.0) && t.sx == 1.0 && t.sy == 1.0;
+    (!identity).then_some(t)
 }
 
 /// `url(…)` / `url("…")` / `url('…')` → the raw target (unresolved — the
@@ -4883,6 +5008,82 @@ mod tests {
         assert_eq!(bx("j").float, Float::None);
         assert_eq!(bx("j").clear, Clear::None);
         assert_eq!(bx("j").valign, VAlign::Baseline);
+    }
+
+    // ---- z-index / transform parse ----
+
+    #[test]
+    fn z_index_parse_into_box_style() {
+        // kept at parse time (in KNOWN) and carried into BoxStyle: signed
+        // integers, `auto` and garbage → None (= paint in tree order)
+        let sheet = parse(
+            ".a{z-index:10}.b{z-index:-3}.c{z-index:auto}\
+             .d{z-index:0}.e{z-index:bogus}.f{z-index:+2}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let bx = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx
+        };
+        assert_eq!(bx("a").z, Some(10));
+        assert_eq!(bx("b").z, Some(-3));
+        assert_eq!(bx("c").z, None); // auto
+        assert_eq!(bx("d").z, Some(0));
+        assert_eq!(bx("e").z, None); // invalid → auto
+        assert_eq!(bx("f").z, Some(2));
+    }
+
+    #[test]
+    fn transform_parse_into_box_style() {
+        let sheet = parse(
+            ".a{transform:none}.b{transform:translateY(-100%)}\
+             .c{transform:translateX(12px)}.d{transform:scale(2)}\
+             .e{transform:translateX(10px) scale(1.5)}\
+             .f{transform:translate(4px, 8px)}.g{transform:rotate(45deg)}\
+             .h{transform:bogus}.i{transform:scale(2, 4)}\
+             .j{transform:translateY(50%) translateY(10%)}\
+             .k{transform:rotate(10deg) translateX(7px)}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>\
+             <div class=j></div><div class=k></div>",
+        );
+        let bx = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx
+        };
+        // `none` / garbage / rotate-only (dropped, see Transform) = no transform
+        assert_eq!(bx("a").transform, None);
+        assert_eq!(bx("h").transform, None);
+        assert_eq!(bx("g").transform, None, "rotate alone reduces to identity");
+        assert_eq!(
+            bx("b").transform,
+            Some(Transform { tx: Len::Px(0.0), ty: Len::Pct(-100.0), sx: 1.0, sy: 1.0 })
+        );
+        assert_eq!(
+            bx("c").transform,
+            Some(Transform { tx: Len::Px(12.0), ty: Len::Px(0.0), sx: 1.0, sy: 1.0 })
+        );
+        let d = bx("d").transform.expect("scale(2)");
+        assert_eq!((d.sx, d.sy), (2.0, 2.0));
+        let e = bx("e").transform.expect("translateX + scale");
+        assert_eq!((e.tx, e.sx, e.sy), (Len::Px(10.0), 1.5, 1.5));
+        let f = bx("f").transform.expect("translate(x, y)");
+        assert_eq!((f.tx, f.ty), (Len::Px(4.0), Len::Px(8.0)));
+        let i = bx("i").transform.expect("scale(2, 4)");
+        assert_eq!((i.sx, i.sy), (2.0, 4.0));
+        // repeated translates compose by addition
+        assert_eq!(bx("j").transform.expect("two translates").ty, Len::Pct(60.0));
+        // a dropped rotate doesn't cancel a co-listed translate
+        assert_eq!(
+            bx("k").transform.expect("rotate + translate").tx,
+            Len::Px(7.0)
+        );
     }
 
     // ---- background-size / background-position / background-repeat ----
