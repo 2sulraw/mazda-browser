@@ -20,7 +20,7 @@
 //! layout.rs consumes it. Upgrade when the CSS engine grows (Phase 1c+).
 
 use crate::html::{Dom, NodeKind};
-use crate::layout::{Fam, Style};
+use crate::layout::{Fam, Style, Tt, Ws};
 
 pub type Decl = (String, String);
 
@@ -284,6 +284,13 @@ pub struct BoxStyle {
     /// CSS `transform` — visual-only paint transform of this box's
     /// rendering (see [`Transform`]); None = no transform
     pub transform: Option<Transform>,
+    /// `text-indent` — the block's FIRST line starts this far right
+    /// (negative shifts left; `%` of the block's content width, resolved
+    /// in `block()`). Stored on the DECLARING block only: spec
+    /// text-indent inherits into nested blocks — shortcut: not modeled
+    /// (see block()'s `indent_left`), undeclared/invalid = 0 = today's
+    /// flush-left first line.
+    pub text_indent: Len,
     /// Bitmask of [`decl`] flags: which box properties the author CSS
     /// actually declared. Lets UA control chrome (`control_chrome` in
     /// layout.rs) fill only the properties the author left initial, so an
@@ -368,6 +375,7 @@ impl Default for BoxStyle {
             valign: VAlign::Baseline,
             z: None,
             transform: None,
+            text_indent: Len::Px(0.0),
             declared: 0,
             content: None,
         }
@@ -781,6 +789,10 @@ const KNOWN: &[&str] = &[
     "vertical-align",
     "z-index",
     "transform",
+    "text-transform",
+    "letter-spacing",
+    "word-spacing",
+    "text-indent",
     // SVG paint properties — the rasterizer supports these; kept in decls so
     // Sheet::class_paint can resolve class-colored inline-SVG children
     // (fill/stroke/… on <path>/<rect>), which the text cascade never reaches
@@ -1573,9 +1585,29 @@ fn apply_decl(
                 _ => 0, // left/start; shortcut: justify renders as left
             }
         }
+        // white-space → the inherited Ws mode (see layout.rs): unknown
+        // keywords and `normal` → the initial Normal (fold + wrap)
         "white-space" => {
-            style.nowrap = matches!(d.1.as_str(), "nowrap" | "pre" | "pre-line")
+            style.ws = match d.1.as_str() {
+                "nowrap" => Ws::Nowrap,
+                "pre" => Ws::Pre,
+                "pre-wrap" => Ws::PreWrap,
+                "pre-line" => Ws::PreLine,
+                _ => Ws::Normal,
+            }
         }
+        // case mapping, applied once when text boxes are built
+        // (layout.rs transform_text); `none`/garbage → initial None
+        "text-transform" => {
+            style.text_transform = match d.1.as_str() {
+                "uppercase" => Tt::Uppercase,
+                "lowercase" => Tt::Lowercase,
+                "capitalize" => Tt::Capitalize,
+                _ => Tt::None,
+            }
+        }
+        "letter-spacing" => style.letter_spacing = tracking(&d.1, vp, style.size, style.letter_spacing),
+        "word-spacing" => style.word_spacing = tracking(&d.1, vp, style.size, style.word_spacing),
         "flex-direction" => {
             bx.dir = if d.1.contains("column") { Dir::Column } else { Dir::Row }
         }
@@ -1863,6 +1895,9 @@ fn apply_decl(
             bx.z = if v == "auto" { None } else { v.parse::<i32>().ok() };
         }
         "transform" => bx.transform = parse_transform(&d.1, vp),
+        // first-line indent of the DECLARING block (see BoxStyle::text_indent);
+        // `auto`/garbage → initial 0 (a flush first line)
+        "text-indent" => bx.text_indent = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         _ => {}
     }
     false
@@ -2394,6 +2429,32 @@ fn len_px(l: Len, container: f32) -> f32 {
     match l {
         Len::Px(p) => p,
         Len::Pct(p) => p / 100.0 * container,
+    }
+}
+
+/// `letter-spacing`/`word-spacing` → px. `normal`/`initial`/garbage → 0
+/// (the initial value); `inherit`/`unset` keep `inherited` — the base
+/// style already carries the parent's value for these inherited props.
+/// shortcut: `em` resolves against the element's OWN font-size as of this
+/// declaration (a `font-size` declared later in the same rule doesn't
+/// re-scale the tracking); `%` is invalid for tracking → 0.
+fn tracking(v: &str, vp: (f32, f32), size: f32, inherited: f32) -> f32 {
+    let v = v.trim();
+    match v {
+        "normal" | "initial" => 0.0,
+        "inherit" | "unset" => inherited,
+        _ => {
+            // `em` = the element's own font-size (parse_len would read it
+            // as a fixed 16px root — wrong for tracking); `rem` keeps that
+            // root-16px meaning via parse_len below
+            if let Some(n) = v.strip_suffix("em").filter(|_| !v.ends_with("rem")) {
+                return n.trim().parse::<f32>().map(|f| f * size).unwrap_or(0.0);
+            }
+            match parse_len(v, vp) {
+                Some(Len::Px(p)) => p,
+                _ => 0.0, // % invalid for tracking; garbage → initial
+            }
+        }
     }
 }
 
@@ -5548,6 +5609,111 @@ mod tests {
         assert_eq!(d.bg_repeat, None);
         assert_eq!(d.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
         assert_eq!(d.bg_size, BgSize::Auto);
+    }
+
+    // ---- typography: text-transform / letter-spacing / word-spacing /
+    // white-space / text-indent ----
+
+    #[test]
+    fn text_transform_parses_keywords_and_invalid_to_initial() {
+        let sheet = parse(
+            ".u { text-transform: uppercase } .l { text-transform: lowercase } \
+             .c { text-transform: capitalize } .n { text-transform: none } \
+             .x { text-transform: uppercase-ligatures }",
+        );
+        let dom = dom_of(
+            "<div class=u></div><div class=l></div><div class=c></div>\
+             <div class=n></div><div class=x></div>",
+        );
+        let tt = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        assert_eq!(tt("u").text_transform, Tt::Uppercase);
+        assert_eq!(tt("l").text_transform, Tt::Lowercase);
+        assert_eq!(tt("c").text_transform, Tt::Capitalize);
+        assert_eq!(tt("n").text_transform, Tt::None, "none → initial");
+        assert_eq!(tt("x").text_transform, Tt::None, "invalid keyword → initial");
+        assert_eq!(
+            Style::new().text_transform,
+            Tt::None,
+            "initial value is none"
+        );
+    }
+
+    #[test]
+    fn letter_and_word_spacing_parse_lengths_and_invalid_to_initial() {
+        let sheet = parse(
+            ".a { letter-spacing: 2px } .b { letter-spacing: 0.5em } \
+             .c { letter-spacing: normal } .d { letter-spacing: 50% } \
+             .e { letter-spacing: inherit } \
+             .f { word-spacing: 3px } .g { word-spacing: -1px } \
+             .h { word-spacing: normal } .i { word-spacing: bogus }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        assert_eq!(get("a").letter_spacing, 2.0, "px kept");
+        assert_eq!(get("b").letter_spacing, 7.5, "0.5em × 15px initial size");
+        assert_eq!(get("c").letter_spacing, 0.0, "normal → 0");
+        assert_eq!(get("d").letter_spacing, 0.0, "% invalid for tracking → initial");
+        // inherit keeps whatever the base style carries (initial 0 here)
+        assert_eq!(get("e").letter_spacing, 0.0, "inherit from initial base");
+        assert_eq!(get("f").word_spacing, 3.0, "px kept");
+        assert_eq!(get("g").word_spacing, -1.0, "negative delta allowed");
+        assert_eq!(get("h").word_spacing, 0.0, "normal → 0");
+        assert_eq!(get("i").word_spacing, 0.0, "garbage → initial");
+        assert_eq!((Style::new().letter_spacing, Style::new().word_spacing), (0.0, 0.0));
+        // inherit carries the PARENT's tracking down, not 0
+        let parent = Style {
+            letter_spacing: 5.0,
+            word_spacing: 2.0,
+            ..Style::new()
+        };
+        let carried = sheet.resolve(&dom, by_attr(&dom, "class", "e"), parent, None).style;
+        assert_eq!(carried.letter_spacing, 5.0, "inherit reads the base style");
+    }
+
+    #[test]
+    fn white_space_parses_all_modes_and_invalid_to_initial() {
+        let sheet = parse(
+            ".n { white-space: nowrap } .p { white-space: pre } \
+             .w { white-space: pre-wrap } .l { white-space: pre-line } \
+             .o { white-space: normal } .x { white-space: pre-lines }",
+        );
+        let dom = dom_of(
+            "<div class=n></div><div class=p></div><div class=w></div>\
+             <div class=l></div><div class=o></div><div class=x></div>",
+        );
+        let ws = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        assert_eq!(ws("n").ws, Ws::Nowrap);
+        assert_eq!(ws("p").ws, Ws::Pre);
+        assert_eq!(ws("w").ws, Ws::PreWrap);
+        assert_eq!(ws("l").ws, Ws::PreLine);
+        assert_eq!(ws("o").ws, Ws::Normal, "normal → initial");
+        assert_eq!(ws("x").ws, Ws::Normal, "invalid keyword → initial");
+        assert_eq!(Style::new().ws, Ws::Normal, "initial value is normal");
+    }
+
+    #[test]
+    fn text_indent_parses_lengths_and_invalid_to_initial() {
+        let sheet = parse(
+            ".a { text-indent: 20px } .b { text-indent: -10px } \
+             .c { text-indent: 2em } .d { text-indent: 50% } \
+             .e { text-indent: auto } .f { }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let ind = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).bx;
+        assert_eq!(ind("a").text_indent, Len::Px(20.0), "px kept");
+        assert_eq!(ind("b").text_indent, Len::Px(-10.0), "negative indent allowed");
+        assert_eq!(ind("c").text_indent, Len::Px(32.0), "2em × root 16px (parse_len rule)");
+        assert_eq!(ind("d").text_indent, Len::Pct(50.0), "% stays symbolic");
+        assert_eq!(ind("e").text_indent, Len::Px(0.0), "non-length → initial 0");
+        assert_eq!(ind("f").text_indent, Len::Px(0.0), "undeclared → initial 0");
+        assert_eq!(BoxStyle::default().text_indent, Len::Px(0.0), "initial value is 0");
     }
 }
 

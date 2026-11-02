@@ -20,6 +20,58 @@ pub enum Fam {
     Mono,
 }
 
+/// `white-space` — inherited. The engine's model is collapse + wrap, so
+/// each keyword maps onto those two axes:
+/// - `normal`: fold every whitespace run to one separator, wrap (unchanged
+///   since forever — byte-identical when no `white-space` is declared)
+/// - `nowrap`: fold, but never wrap (a run may exceed the box; it is only
+///   clipped if an ancestor's `overflow` says so)
+/// - `pre`: keep every space/tab verbatim, `\n` is a hard break
+///   ([`BoxNode::hard_break`]), never wrap at spaces
+/// - `pre-wrap`: keep whitespace AND wrap
+/// - `pre-line`: fold spaces (like normal) but honor `\n` and wrap
+///
+/// shortcut: `white-space` is per TEXT NODE — no propagation out of a
+/// `<pre>` element's inline descendants with mixed normal siblings (the
+/// UA default on `<pre>` itself is `Ws::Pre`, see `style_for`, so plain
+/// `<pre>` content works; an inline child that redeclares gets its own
+/// mode). `break-word`/`overflow-wrap` are out of scope (this batch only
+/// breaks where the old breaker already broke: whitespace).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Ws {
+    Normal,
+    Nowrap,
+    Pre,
+    PreWrap,
+    PreLine,
+}
+
+impl Ws {
+    /// soft wrapping allowed — only `nowrap` and `pre` never wrap
+    pub fn wrap(self) -> bool {
+        matches!(self, Ws::Normal | Ws::PreWrap | Ws::PreLine)
+    }
+    /// whitespace runs keep their exact text (no folding)
+    pub fn preserve(self) -> bool {
+        matches!(self, Ws::Pre | Ws::PreWrap)
+    }
+    /// `\n` inside the text is a line break (split into hard breaks)
+    pub fn honors_newline(self) -> bool {
+        matches!(self, Ws::Pre | Ws::PreWrap | Ws::PreLine)
+    }
+}
+
+/// `text-transform` — inherited, applied ONCE when a text box is built
+/// (see [`transform_text`]): runs, wrapping, measurement and drawing all
+/// see the final string, so nothing downstream needs to know about it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tt {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct Style {
     pub size: f32,
@@ -32,9 +84,16 @@ pub struct Style {
     pub text_align: u8,
     /// line-height in px; 0 = default (size * 1.35) — inherited
     pub lh: f32,
-    /// `white-space: nowrap` — never wrap to a new line (truncate/ellipsis
-    /// buttons, single-line labels)
-    pub nowrap: bool,
+    /// `white-space` — inherited, see [`Ws`]
+    pub ws: Ws,
+    /// `text-transform` — inherited, see [`Tt`]
+    pub text_transform: Tt,
+    /// `letter-spacing` in px — inherited; extra advance between each pair
+    /// of glyphs. Layout and draw_text both add it via [`spacing_extra`]
+    pub letter_spacing: f32,
+    /// `word-spacing` in px — inherited; extra advance on every whitespace
+    /// char. Same [`spacing_extra`] rule on both sides of the pipeline
+    pub word_spacing: f32,
     /// interned id of the full `font-family` comma stack (0 = none → generic
     /// pick); the names live in the shared table Fonts reads at pick time
     pub fam_stack: u16,
@@ -51,7 +110,10 @@ impl Style {
             fam: Fam::Sans,
             text_align: 0,
             lh: 0.0,
-            nowrap: false,
+            ws: Ws::Normal,
+            text_transform: Tt::None,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
             fam_stack: 0,
         }
     }
@@ -69,6 +131,69 @@ impl Style {
 impl Default for Style {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The tracking delta layout adds on top of raw glyph advances for one
+/// string: letter-spacing after EVERY glyph (count × spacing — the spec
+/// adds it after the last glyph too, which is why a tracked run is
+/// `spacing × count` wider than the plain one) plus word-spacing on every
+/// whitespace char. This is THE shared rule — `layout_from`'s line builder,
+/// `natural_w` and the form-caret measure all add it to `measure(...)`
+/// results, and `draw_text` (main.rs) replays the exact same per-glyph
+/// arithmetic so painted ink and the measured `PositionedRun::width` never
+/// diverge (both sides comment the coupling).
+///
+/// shortcut: no script-specific spacing rules (CJK inter-character
+/// spacing, justification interplay); the trailing letter-space past the
+/// last glyph counts toward the run width even though it paints no ink
+/// (line ends thus sit one spacing wider — matches how the draw side
+/// advances its cursor).
+pub fn spacing_extra(text: &str, style: &Style) -> f32 {
+    let n = text.chars().count();
+    let ls = style.letter_spacing * n as f32;
+    let ws = text.chars().filter(|c| c.is_whitespace()).count() as f32 * style.word_spacing;
+    ls + ws
+}
+
+/// `text-transform` applied ONCE when a text box is built (build_into's
+/// text branch and pseudo generated content), so runs, wrapping,
+/// measurement and drawing all see the final string with zero render
+/// changes.
+///
+/// shortcut: ASCII-only case mapping — non-ASCII letters pass through
+/// unchanged (no locale forms such as Turkish dotless i, no ß→SS
+/// expansion, no `full-width`/`wide` forms); `capitalize` uppercases the
+/// first ASCII letter of each whitespace-separated word WITHIN this text
+/// node (a word split across inline elements transforms per fragment) and
+/// the rest of the word keeps its authored case.
+pub fn transform_text(t: &str, tt: Tt) -> std::borrow::Cow<'_, str> {
+    match tt {
+        Tt::None => std::borrow::Cow::Borrowed(t),
+        Tt::Uppercase => std::borrow::Cow::Owned(t.to_ascii_uppercase()),
+        Tt::Lowercase => std::borrow::Cow::Owned(t.to_ascii_lowercase()),
+        Tt::Capitalize => {
+            let mut out = String::with_capacity(t.len());
+            // still at a word start until the first ASCII LETTER lands —
+            // digits/symbols before it don't consume the titlecasing
+            let mut word = true;
+            for c in t.chars() {
+                if c.is_ascii_whitespace() {
+                    word = true;
+                    out.push(c);
+                } else if word {
+                    if c.is_ascii_alphabetic() {
+                        word = false;
+                        out.push(c.to_ascii_uppercase());
+                    } else {
+                        out.push(c);
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            std::borrow::Cow::Owned(out)
+        }
     }
 }
 
@@ -104,9 +229,21 @@ fn style_for(tag: &str, base: Style) -> Style {
         "b" | "strong" | "th" => s.bold = true,
         "i" | "em" | "cite" | "var" => s.italic = true,
         "u" | "ins" => s.underline = true,
-        "code" | "kbd" | "samp" | "pre" | "tt" => {
+        "code" | "kbd" | "samp" | "tt" => {
             s.fam = Fam::Mono;
             s.size = base.size - 1.0;
+        }
+        // <pre>: same mono UA default plus white-space: pre — the parser
+        // keeps the raw text (html.rs never folds whitespace), so hooking
+        // the Style here is what makes <pre> blocks actually preserve their
+        // spaces and line breaks; author CSS cascades over this base and
+        // can still override (shortcut: the newline right after the tag
+        // isn't stripped — spec does — but a LEADING hard break is a no-op
+        // in layout, so it renders like the stripped version)
+        "pre" => {
+            s.fam = Fam::Mono;
+            s.size = base.size - 1.0;
+            s.ws = Ws::Pre;
         }
         "a" => {
             s.color = 0x00_6a_b3_ff;
@@ -498,6 +635,8 @@ fn pseudo_box(
     }
     let raw = out.bx.content.as_deref()?; // content undeclared → no box
     let text = content_text(raw, dom, node)?; // none/normal/malformed → no box
+    // generated content transforms like any other built text box
+    let text = transform_text(&text, out.style.text_transform).into_owned();
     let chrome = paints_chrome(&out.bx);
     // same box decision as a tagless element: Auto/Inline flow as bare
     // text, inline-block and block-level displays get a real box
@@ -552,7 +691,11 @@ fn build_into(
             NodeKind::Text(t) => {
                 let t = t.trim_matches('\u{a0}');
                 if !t.is_empty() {
-                    out.push(BoxNode::leaf(style, t.to_string(), false, link.clone()));
+                    // text-transform lands HERE, when the text box is
+                    // built: runs, wrapping, measurement and draw_text all
+                    // see the final string (see transform_text)
+                    let t = transform_text(t, style.text_transform);
+                    out.push(BoxNode::leaf(style, t.into_owned(), false, link.clone()));
                 }
             }
             NodeKind::Element(..) => {
@@ -775,6 +918,9 @@ fn build_into(
                         if centered {
                             st.text_align = 1;
                         }
+                        // shortcut: form labels/values skip text-transform
+                        // (they show live user input; case-mapping a value
+                        // the user typed would fight the control itself)
                         g.children.push(BoxNode::leaf(st, t, false, child_link.clone()));
                     }
                     out.push(g);
@@ -1196,7 +1342,12 @@ fn apply_form_state(
                         - resolve_len(n.bx.border[3], w)
                 };
                 if let Some(leaf) = n.children.iter_mut().find(|c| c.is_text) {
-                    while !leaf.text.is_empty() && measure(&leaf.text, &leaf.style) > content {
+                    // + tracking so a letter-spaced value clips at the same
+                    // edge it paints (spacing_extra = the draw-side rule)
+                    while !leaf.text.is_empty()
+                        && measure(&leaf.text, &leaf.style) + spacing_extra(&leaf.text, &leaf.style)
+                            > content
+                    {
                         leaf.text.pop();
                     }
                 }
@@ -1252,7 +1403,8 @@ fn collect_forms(
                     .children
                     .iter()
                     .find(|c| c.is_text)
-                    .map(|c| measure(&c.text, &c.style))
+                    // + tracking: the caret sits after the painted ink
+                    .map(|c| measure(&c.text, &c.style) + spacing_extra(&c.text, &c.style))
                     .unwrap_or(0.0);
                 let caret_h = (n.h - bt - resolve_len(n.bx.border[2], n.w) - pt - pb).max(1.0);
                 uls.push((
@@ -2332,7 +2484,9 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
         return if n.hard_break {
             0.0
         } else {
-            measure(&n.text, &n.style)
+            // + tracking: shrink-to-fit widths count letter/word spacing
+            // (same spacing_extra rule as line layout and draw_text)
+            measure(&n.text, &n.style) + spacing_extra(&n.text, &n.style)
         };
     }
     if let Some(l) = n.bx.width {
@@ -2779,6 +2933,14 @@ fn block(
     // n.x); y mirrors line_top + line_h.
     let mut y = n.y;
     let mut cont: Option<(f32, f32, f32)> = None;
+    // text-indent: the block's FIRST line starts `indent` px right
+    // (negative shifts left; % resolves against this block's content
+    // width). Consumed by whatever lays that first line — once per block().
+    // shortcut: BoxStyle is per DECLARING block (spec text-indent inherits
+    // into nested blocks — not modeled), a first line already carrying an
+    // inline box isn't re-flowed (cont is Some → no indent), and floats/
+    // out-of-flow boxes don't consume it (they lay no text line).
+    let mut indent_left = true;
     let mut i = 0;
     while i < n.children.len() {
         if n.children[i].is_text {
@@ -2786,6 +2948,13 @@ fn block(
                 Some((top, _, x)) => (x, top),
                 None => (0.0, y),
             };
+            let mut indent = 0.0;
+            if indent_left {
+                indent_left = false;
+                if cont.is_none() {
+                    indent = resolve_len(n.bx.text_indent, n.w);
+                }
+            }
             let mut atoms = Vec::new();
             while i < n.children.len() && n.children[i].is_text {
                 atoms.push(leaf_atom(&n.children[i]));
@@ -2793,7 +2962,8 @@ fn block(
             }
             // exclusion origin: runs are pushed at (n.x, seg_top), so
             // layout_from's local coords map to doc space by that offset
-            let (mut l, end_x) = layout_from(&atoms, x0, n.w, measure, &floats, n.x, seg_top);
+            let (mut l, end_x) =
+                layout_from(&atoms, x0, indent, n.w, measure, &floats, n.x, seg_top);
             // this batch's first-line height + last-line top (original run
             // coords, before the continuation shifts below)
             let f = l
@@ -2922,6 +3092,9 @@ fn block(
             });
             i += 1;
         } else if n.children[i].inline {
+            // this inline box starts (or continues) the block's first line
+            // — the indent slot is spent either way
+            indent_left = false;
             // inline-level box (form control / author inline-block /
             // promoted background inline): shrink-to-fit, joins the
             // current line. shortcut: not re-flowed around floats — only
@@ -3019,6 +3192,9 @@ fn block(
             i += 1;
         } else {
             // regular child box: close the open line + paragraph gap first
+            // (a nested block occupies the block's top — text below it is
+            // not the first line, so the indent slot is spent)
+            indent_left = false;
             if let Some((top, h, _)) = cont.take() {
                 y = top + h + n.style.size * 0.6;
             }
@@ -3442,12 +3618,14 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     n.open = last_open;
 }
 pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> f32) -> Layout {
-    layout_from(atoms, 0.0, max_width, measure, &[], 0.0, 0.0).0
+    layout_from(atoms, 0.0, 0.0, max_width, measure, &[], 0.0, 0.0).0
 }
 
 /// [`layout`], but the first line starts at `x0` — text continuing on a
-/// line that already holds an inline box. Returns the layout plus the
-/// line's end x (the continuation cursor for the next inline content).
+/// line that already holds an inline box — and `indent` shifts a FRESH
+/// first line right by that many px (text-indent; 0 for every caller
+/// except block()'s first line). Returns the layout plus the line's end x
+/// (the continuation cursor for the next inline content).
 ///
 /// `flt`/`ox`/`oy` = floats to wrap around and the doc offset of this
 /// batch's local origin (block() passes them; `layout()` passes none).
@@ -3456,9 +3634,11 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
 /// and `text-align` still centers against the full `max_width`, so a
 /// centered/right-aligned line beside a float may overlap it (left-aligned
 /// text, the default, is exact).
+#[allow(clippy::too_many_arguments)]
 fn layout_from(
     atoms: &[Atom],
     x0: f32,
+    indent: f32,
     max_width: f32,
     measure: &dyn Fn(&str, &Style) -> f32,
     flt: &[Flt],
@@ -3468,63 +3648,134 @@ fn layout_from(
     let mut runs = Vec::new();
     let mut underline_rects = Vec::new();
     let mut y = 0.0f32;
-    let mut x = x0;
+    let mut x = x0 + indent;
     let mut line_height = 0.0f32;
 
-    // split text into word atoms first so wrapping is per-word
-    let mut words: Vec<Atom> = Vec::new();
-    for a in atoms {
-        if a.hard_break {
-            words.push(Atom {
-                text: String::new(),
-                style: a.style,
-                hard_break: true,
-                link: None,
-            });
-            continue;
+    fn word(text: &str, style: Style, link: &Option<std::rc::Rc<str>>) -> Atom {
+        Atom {
+            text: text.into(),
+            style,
+            hard_break: false,
+            link: link.clone(),
         }
-        // split on any whitespace, remembering which had a trailing space
-        // (empty split pieces at the boundaries ARE meaningful: they mean
-        // this atom starts/ends with whitespace that must separate it from
-        // the neighboring inline element's text)
+    }
+
+    fn br(style: Style) -> Atom {
+        Atom {
+            text: String::new(),
+            style,
+            hard_break: true,
+            link: None,
+        }
+    }
+
+    // collapse path: split on any whitespace, remembering which had a
+    // trailing space (empty split pieces at the boundaries ARE meaningful:
+    // they mean this atom starts/ends with whitespace that must separate it
+    // from the neighboring inline element's text). The long-standing
+    // normal/nowrap/pre-line behavior — byte-identical when no
+    // `white-space` value is declared.
+    fn push_words(text: &str, style: Style, link: &Option<std::rc::Rc<str>>, out: &mut Vec<Atom>) {
         let mut first = true;
         let mut pending_ws = false;
-        for w in a.text.split(|c: char| c.is_whitespace()) {
+        for w in text.split(|c: char| c.is_whitespace()) {
             if w.is_empty() {
                 pending_ws = true;
                 continue;
             }
             if !first || pending_ws {
-                words.push(Atom {
-                    text: " ".into(),
-                    style: a.style,
-                    hard_break: false,
-                    link: a.link.clone(),
-                });
+                out.push(word(" ", style, link));
             }
             first = false;
             pending_ws = false;
-            words.push(Atom {
-                text: w.to_string(),
-                style: a.style,
-                hard_break: false,
-                link: a.link.clone(),
-            });
+            out.push(word(w, style, link));
         }
-        // atom ends with whitespace → separator before the next atom's text
+        // text ends with whitespace → separator before the next atom's text
         // (a space atom at line start is a no-op: the draw loop only
-        // advances x when x > 0)
+        // advances x when x > line_x0)
         if pending_ws {
-            words.push(Atom {
-                text: " ".into(),
-                style: a.style,
-                hard_break: false,
-                link: a.link.clone(),
-            });
+            out.push(word(" ", style, link));
         }
     }
 
-    let space_w = |s: &Style| measure(" ", s);
+    // preserve path (pre-wrap): words + EXACT whitespace runs kept as
+    // their own atoms ("a  b" → "a", "  ", "b") — nothing is folded, so
+    // double spaces survive into the runs and the drawing
+    fn push_preserved(
+        text: &str,
+        style: Style,
+        link: &Option<std::rc::Rc<str>>,
+        out: &mut Vec<Atom>,
+    ) {
+        let mut it = text.char_indices().peekable();
+        while let Some((s, c)) = it.next() {
+            let is_ws = c.is_whitespace();
+            let mut e = s + c.len_utf8();
+            while let Some(&(n, nc)) = it.peek() {
+                if nc.is_whitespace() != is_ws {
+                    break;
+                }
+                e = n + nc.len_utf8();
+                it.next();
+            }
+            out.push(word(&text[s..e], style, link));
+        }
+    }
+
+    // Whitespace text for a `pre`/`pre-wrap` atom: spaces kept, `\t` → one
+    // space (no tab stops in this engine — a raw tab would measure/draw a
+    // .notdef box glyph), `\r` dropped (the CR half of a CRLF pair; the
+    // paired `\n` already made the line break — a LONE `\r` renders as
+    // nothing, shortcut). Other Unicode whitespace passes through.
+    fn pre_ws(t: &str) -> String {
+        let mut s = String::with_capacity(t.len());
+        for c in t.chars() {
+            match c {
+                '\r' => {}
+                '\t' => s.push(' '),
+                c => s.push(c),
+            }
+        }
+        s
+    }
+
+    // split text into word atoms first so wrapping is per-word; the
+    // element's white-space mode picks the splitter (see [`Ws`]):
+    // normal/nowrap fold every whitespace run into one separator like
+    // before, pre-line folds but breaks at `\n`, pre keeps each
+    // `\n`-separated line as ONE un-wrappable atom with its spaces intact,
+    // pre-wrap keeps the spaces AND wraps at them
+    let mut words: Vec<Atom> = Vec::new();
+    for a in atoms {
+        if a.hard_break {
+            words.push(br(a.style));
+            continue;
+        }
+        if a.style.ws.honors_newline() {
+            // `\n` becomes a hard break — split first, then each segment
+            // through its mode's splitter (existing hard_break machinery;
+            // a LEADING break stays the documented no-op)
+            for (k, seg) in a.text.split('\n').enumerate() {
+                if k > 0 {
+                    words.push(br(a.style));
+                }
+                match a.style.ws {
+                    Ws::Pre => {
+                        let seg = pre_ws(seg);
+                        if !seg.is_empty() {
+                            words.push(word(&seg, a.style, &a.link));
+                        }
+                    }
+                    Ws::PreWrap => push_preserved(&pre_ws(seg), a.style, &a.link, &mut words),
+                    _ => push_words(seg, a.style, &a.link, &mut words), // pre-line
+                }
+            }
+        } else {
+            push_words(&a.text, a.style, &a.link, &mut words);
+        }
+    }
+
+    let space_w = |s: &Style| measure(" ", s) + spacing_extra(" ", s);
 
     // `<br>` advances exactly ONE line at the current line-height - no
     // paragraph gap (a 0.6*size gap here spaced e.g. a hero h1's lines ~2x
@@ -3536,14 +3787,22 @@ fn layout_from(
     // usable x-range of the line being built. The empty-float list keeps
     // both at the old full-width values forever (`line_x0` = 0 ≡ the old
     // `x > 0.0` guards), so pages without floats lay out byte-identically.
-    let mut line_x0 = 0.0;
+    // An indented first line's left edge IS the indent: leading source
+    // whitespace drops there like at any line start, and after a wrap/hard
+    // break line_x0 returns to 0 (text-indent is first-line only).
+    let mut line_x0 = if indent != 0.0 { indent } else { 0.0 };
     let mut line_max = max_width;
 
     for w in &words {
         if w.hard_break {
-            if x > 0.0 {
+            // "the line has content" = the cursor sits past the line's
+            // left edge — identical to the old `x > 0.0` whenever
+            // line_x0 is 0 (no indent/floats), and it also closes a
+            // NEGATIVE-indented line whose cursor never reaches 0
+            if x > line_x0 {
                 y += line_height;
                 x = 0.0;
+                line_x0 = 0.0;
                 line_height = 0.0;
                 after_br = true;
             } else if after_br {
@@ -3552,16 +3811,25 @@ fn layout_from(
             }
             continue;
         }
-        if w.text == " " {
+        // Collapsed separator (normal/nowrap/pre-line): advance only when
+        // the line already has content to its left — a space at line start
+        // is dropped. pre/pre-wrap whitespace is CONTENT, not a separator:
+        // it falls through as a real run below, preserved even at line
+        // start (that is the point of `pre`).
+        if w.text == " " && !w.style.ws.preserve() {
             if x > line_x0 {
                 x += space_w(&w.style);
             }
             continue;
         }
-        let ww = measure(&w.text, &w.style);
-        if x > line_x0 && x + ww > line_max && !w.style.nowrap {
+        // measured width + tracking in ONE number: spacing_extra is the
+        // same rule draw_text replays per glyph (main.rs), so what wraps
+        // here is exactly what paints there
+        let ww = measure(&w.text, &w.style) + spacing_extra(&w.text, &w.style);
+        if x > line_x0 && x + ww > line_max && w.style.ws.wrap() {
             y += line_height;
             x = 0.0;
+            line_x0 = 0.0; // wrapped line starts at the box edge (indent is first-line only)
             line_height = 0.0;
         }
         after_br = false; // real content ends the <br> run
@@ -3642,7 +3910,7 @@ fn layout_from(
             rects: Vec::new(),
             images: Vec::new(),
             shadows: Vec::new(),
-            open_line: x > 0.0,
+            open_line: x > line_x0,
             // text-only path (inline continuation): no box tree was laid
             // → no form controls, no focus, no values
             forms: Vec::new(),
@@ -3860,7 +4128,7 @@ mod tests {
         let a = Atom {
             text: "Ask AI".into(),
             style: Style {
-                nowrap: true,
+                ws: Ws::Nowrap,
                 ..Style::new()
             },
             hard_break: false,
@@ -6735,5 +7003,166 @@ line</textarea></div>"#,
         let t = &styled.children[0];
         assert_eq!(t.w, 400.0, "author width wins over the attribute");
         assert_eq!(t.x, 10.0, "author margin wins over align=center");
+    }
+
+    // ---- typography: text-transform / letter-spacing / word-spacing /
+    // white-space / text-indent ----
+
+    #[test]
+    fn text_transform_applies_when_text_boxes_are_built() {
+        // the transform lands on the BoxNode text itself, so runs, wrapping
+        // and draw all see the final string (nothing downstream re-cases)
+        let mut up = boxes_of(r#"<div style="text-transform:uppercase">abc</div>"#, "");
+        assert_eq!(
+            up.children[0].children[0].text, "ABC",
+            "box text transformed at build time"
+        );
+        let l = layout_tree(&mut up, 500.0, &m4);
+        assert_eq!(l.runs[0].text, "ABC", "run carries the transformed text");
+
+        let mut low = boxes_of(r#"<div style="text-transform:lowercase">AbC</div>"#, "");
+        let l = layout_tree(&mut low, 500.0, &m4);
+        assert_eq!(l.runs[0].text, "abc");
+
+        // capitalize = first ASCII letter of each whitespace-separated word,
+        // the rest of the word keeps its authored case
+        let mut cap = boxes_of(r#"<div style="text-transform:capitalize">hello bIG world</div>"#, "");
+        let l = layout_tree(&mut cap, 500.0, &m4);
+        let texts: Vec<&str> = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["Hello", "BIG", "World"]);
+    }
+
+    #[test]
+    fn letter_spacing_widens_run_and_wraps_earlier() {
+        // run width = measure + spacing × char count (spec: a space after
+        // EVERY glyph, incl. the last — 4 glyphs × 4px on top of 16px)
+        let mut root = boxes_of(r#"<div style="letter-spacing:4px">abcd</div>"#, "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.runs[0].width, 16.0 + 4.0 * 4.0, "spacing × count added");
+
+        // same 24px box: plain "aa bb" = 8 + 4 + 8 = 20 fits one line …
+        let mut plain = boxes_of(r#"<div style="width:24px">aa bb</div>"#, "");
+        let lp = layout_tree(&mut plain, 500.0, &m4);
+        assert_eq!(lp.runs.len(), 2);
+        assert_eq!(lp.runs[0].y, lp.runs[1].y, "plain text fits on one line");
+
+        // … tracked: "aa" = 8 + 8 = 16, the space = 4 + 4 = 8 → the cursor
+        // sits AT the 24px edge before "bb" even starts → it must wrap
+        let mut tracked =
+            boxes_of(r#"<div style="letter-spacing:4px; width:24px">aa bb</div>"#, "");
+        let lt = layout_tree(&mut tracked, 500.0, &m4);
+        assert_eq!(lt.runs.len(), 2);
+        assert!(lt.runs[1].y > lt.runs[0].y, "letter-spacing wraps earlier");
+        assert_eq!(lt.runs[0].width, 16.0, "aa = 8px + 4×2");
+    }
+
+    #[test]
+    fn word_spacing_adds_delta_to_every_inter_word_space() {
+        let mut root = boxes_of(r#"<div style="word-spacing:10px">a b c</div>"#, "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.runs.len(), 3, "collapsed spaces are not runs");
+        // each gap = one collapsed space (4px) + the 10px delta, on BOTH
+        // spaces (layout line builder and draw_text share spacing_extra)
+        let gap1 = l.runs[1].x - (l.runs[0].x + l.runs[0].width);
+        let gap2 = l.runs[2].x - (l.runs[1].x + l.runs[1].width);
+        assert_eq!(gap1, 14.0, "space 4px + word-spacing 10px");
+        assert_eq!(gap2, 14.0, "same delta on the second space");
+        // the shared rule counts every whitespace char of the string
+        let st = Style {
+            word_spacing: 10.0,
+            ..Style::new()
+        };
+        assert_eq!(spacing_extra("a b c", &st), 20.0, "2 spaces × 10px");
+    }
+
+    #[test]
+    fn white_space_pre_preserves_double_spaces_and_breaks_at_newline() {
+        // html.rs never folds text, so the raw "a  b\nc" reaches the box
+        // tree; the UA Ws::Pre on <pre> (style_for) is what keeps it — real
+        // newline below, double space intact, one hard break between lines
+        let mut root = boxes_of("<pre>a  b\nc</pre>", "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.runs.len(), 2, "one run per pre line");
+        assert_eq!(l.runs[0].text, "a  b", "double space preserved");
+        assert_eq!(l.runs[0].width, 16.0, "4 chars × 4px (folded would be 12)");
+        assert_eq!(l.runs[1].text, "c");
+        assert!(l.runs[1].y > l.runs[0].y, "\\n became a hard break");
+
+        // explicit `normal` still folds (and ignores \n like it always did)
+        let mut n = boxes_of(r#"<div style="white-space:normal">aa  bb</div>"#, "");
+        let ln = layout_tree(&mut n, 500.0, &m4);
+        assert_eq!(ln.runs.len(), 2, "double space collapses to one separator");
+        assert_eq!(ln.runs[1].x, 12.0, "aa(8) + ONE space(4)");
+    }
+
+    #[test]
+    fn white_space_nowrap_keeps_line_wider_than_box_unclipped() {
+        // 10px box fits only "aa"; nowrap keeps both words on one line
+        // (a run may exceed the box — clipping is overflow's job, and no
+        // overflow is declared here)
+        let mut root = boxes_of(r#"<div style="white-space:nowrap; width:10px">aa bb</div>"#, "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.runs.len(), 2);
+        assert_eq!(l.runs[0].y, l.runs[1].y, "nowrap never wraps");
+        assert!(
+            l.runs[1].x + l.runs[1].width > 10.0,
+            "run extends past the 10px box (unclipped)"
+        );
+        assert!(l.runs.iter().all(|r| r.clip.is_none()), "no clip without overflow");
+
+        // the same box with normal white-space wraps at the same width
+        let mut plain = boxes_of(r#"<div style="width:10px">aa bb</div>"#, "");
+        let lp = layout_tree(&mut plain, 500.0, &m4);
+        assert!(lp.runs[1].y > lp.runs[0].y, "normal wraps at 10px");
+    }
+
+    #[test]
+    fn text_indent_first_line_only_negative_and_absent() {
+        // first line starts 20px in; the WRAPPED line returns to x=0
+        let mut root =
+            boxes_of(r#"<div style="width:60px; text-indent:20px">aa bb cc dd</div>"#, "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.runs[0].x, 20.0, "first line starts at the indent");
+        assert!(l.runs[3].y > l.runs[0].y, "text wrapped to a second line");
+        assert_eq!(l.runs[3].x, 0.0, "second line ignores text-indent");
+
+        // negative indent shifts the first line LEFT of the box edge
+        let mut neg = boxes_of(r#"<div style="width:100px; text-indent:-10px">aa bb</div>"#, "");
+        let ln = layout_tree(&mut neg, 500.0, &m4);
+        assert_eq!(ln.runs[0].x, -10.0, "negative indent shifts left");
+
+        // undeclared → initial 0: first run at the box edge
+        let mut none = boxes_of(r#"<div style="width:100px">aa bb</div>"#, "");
+        let l0 = layout_tree(&mut none, 500.0, &m4);
+        assert_eq!(l0.runs[0].x, 0.0, "no text-indent → x=0");
+    }
+
+    #[test]
+    fn no_typography_property_declared_lays_out_byte_identically() {
+        // regression guard: a fixture declaring NONE of text-transform /
+        // letter-spacing / word-spacing / white-space / text-indent must
+        // lay out byte-identically — the run dump below is the pre-batch
+        // geometry (the double space AND the \n prove normal still folds
+        // whitespace and still ignores newlines)
+        let mut root = boxes_of(
+            "<div style=\"width:40px\">aa bb  cc\ndd</div>",
+            "div { color: #123456 }",
+        );
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let dump: Vec<(String, f32, f32, f32)> = l
+            .runs
+            .iter()
+            .map(|r| (r.text.clone(), r.x, r.y, r.width))
+            .collect();
+        let want: Vec<(String, f32, f32, f32)> = vec![
+            ("aa".into(), 0.0, 0.0, 8.0),
+            ("bb".into(), 12.0, 0.0, 8.0),
+            ("cc".into(), 24.0, 0.0, 8.0),
+            ("dd".into(), 0.0, 15.0 * 1.35, 8.0),
+        ];
+        assert_eq!(
+            dump, want,
+            "undeclared typography must not move a single pixel"
+        );
     }
 }
