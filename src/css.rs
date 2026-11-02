@@ -666,6 +666,12 @@ enum Pseudo {
     /// `:nth-child(an+b)` — 1-based element-sibling index satisfies the
     /// formula for some whole n >= 0.
     NthChild(i32, i32),
+    /// `:nth-last-child(an+b)` — same, counted from the last element sibling.
+    NthLastChild(i32, i32),
+    /// `:nth-of-type(an+b)` — position among same-tag element siblings.
+    NthOfType(i32, i32),
+    /// `:nth-last-of-type(an+b)` — same, from the last of that tag.
+    NthLastOfType(i32, i32),
     /// `:is(...)`/`:where(...)` — the element may match ANY of the alternate
     /// selectors (each a full descendant/child chain, e.g.
     /// `:is(.toc a):not(:hover)`). The flag is `counts`: `:is` contributes its
@@ -4335,6 +4341,18 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         let (a_, b_) = parse_nth(&a)?;
                         seg.pseudos.push(Pseudo::NthChild(a_, b_));
                     }
+                    ("nth-last-child", Some(a)) => {
+                        let (a_, b_) = parse_nth(&a)?;
+                        seg.pseudos.push(Pseudo::NthLastChild(a_, b_));
+                    }
+                    ("nth-of-type", Some(a)) => {
+                        let (a_, b_) = parse_nth(&a)?;
+                        seg.pseudos.push(Pseudo::NthOfType(a_, b_));
+                    }
+                    ("nth-last-of-type", Some(a)) => {
+                        let (a_, b_) = parse_nth(&a)?;
+                        seg.pseudos.push(Pseudo::NthLastOfType(a_, b_));
+                    }
                     ("not", Some(a)) => {
                         // the argument may be a selector LIST — `:not(A, B)`
                         // excludes a match against any member, so each member
@@ -4596,13 +4614,25 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
             let Some(idx) = element_sibling_index(dom, node) else {
                 return false;
             };
-            let idx = idx as i32;
-            if *a == 0 {
-                idx == *b
-            } else {
-                let d = idx - *b;
-                d % *a == 0 && d / *a >= 0
-            }
+            nth_ok(idx as i32, *a, *b)
+        }
+        Pseudo::NthLastChild(a, b) => {
+            let Some((idx, total)) = element_children(dom, node) else {
+                return false;
+            };
+            nth_ok((total - idx + 1) as i32, *a, *b)
+        }
+        Pseudo::NthOfType(a, b) => {
+            let Some((idx, _)) = element_type_index(dom, node) else {
+                return false;
+            };
+            nth_ok(idx as i32, *a, *b)
+        }
+        Pseudo::NthLastOfType(a, b) => {
+            let Some((idx, total)) = element_type_index(dom, node) else {
+                return false;
+            };
+            nth_ok((total - idx + 1) as i32, *a, *b)
         }
         // ANY alternate compound selector matches
         Pseudo::Is(alts, _) => alts.iter().any(|alt| matches(dom, node, alt, hover)),
@@ -4681,6 +4711,16 @@ fn element_children(dom: &Dom, node: u32) -> Option<(usize, usize)> {
 
 fn element_sibling_index(dom: &Dom, node: u32) -> Option<usize> {
     element_children(dom, node).map(|(idx, _)| idx)
+}
+
+/// Does 1-based `idx` satisfy `a*n + b` for some whole n >= 0?
+fn nth_ok(idx: i32, a: i32, b: i32) -> bool {
+    if a == 0 {
+        idx == b
+    } else {
+        let d = idx - b;
+        d % a == 0 && d / a >= 0
+    }
 }
 
 /// 1-based (position, total) among ELEMENT siblings carrying this element's
@@ -5257,6 +5297,33 @@ mod tests {
         assert_eq!(col("c"), 0x333333, "only child");
         assert_eq!(col("d"), 0x444444, "first span of its type");
         assert_eq!(col("e"), 0x000000, "neither first nor only");
+    }
+
+    #[test]
+    fn nth_last_child_and_of_type_variants() {
+        // MDN breadcrumbs hide all but the last two with
+        // `.breadcrumbs li:not(:nth-last-child(-n+2))` — without
+        // :nth-last-child the :not() member dropped and every crumb showed.
+        let sheet = parse(
+            "li:nth-last-child(-n+2) { color: #111111 } \
+             p:nth-of-type(2) { color: #222222 } \
+             span:nth-last-of-type(1) { color: #333333 }",
+        );
+        let dom = dom_of(
+            "<ul><li id=a>a</li><li id=b>b</li><li id=c>c</li><li id=d>d</li></ul>\
+             <div><p id=e>e</p><p id=f>f</p><p id=g>g</p></div>\
+             <div><span id=h>h</span><span id=i>i</span></div>",
+        );
+        let col = |id: &str| sheet.resolve(&dom, by_attr(&dom, "id", id), Style::new(), None).style.color;
+        assert_eq!(col("a"), 0x000000, "1st of 4 is not in -n+2");
+        assert_eq!(col("b"), 0x000000);
+        assert_eq!(col("c"), 0x111111, "3rd of 4 is");
+        assert_eq!(col("d"), 0x111111);
+        assert_eq!(col("e"), 0x000000);
+        assert_eq!(col("f"), 0x222222, "2nd p of its type");
+        assert_eq!(col("g"), 0x000000);
+        assert_eq!(col("h"), 0x000000);
+        assert_eq!(col("i"), 0x333333, "last span of its type");
     }
 
     #[test]
