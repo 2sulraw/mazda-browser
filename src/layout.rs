@@ -108,6 +108,11 @@ pub struct Style {
     pub italic: bool,
     pub color: u32,
     pub underline: bool,
+    /// `text-decoration: line-through` — struck out (UA default for
+    /// `<del>`/`<s>`/`<strike>`)
+    pub strike: bool,
+    /// `text-decoration: overline` — a rule above the line box
+    pub overline: bool,
     pub fam: Fam,
     /// 0 = left, 1 = center, 2 = right (inherited, text-align)
     pub text_align: u8,
@@ -140,6 +145,8 @@ impl Style {
             italic: false,
             color: 0x00_00_00_00, // UA default = black (matches every browser)
             underline: false,
+            strike: false,
+            overline: false,
             fam: Fam::Sans,
             text_align: 0,
             lh: 0.0,
@@ -282,6 +289,12 @@ fn style_for(tag: &str, base: Style) -> Style {
         "button" => s.text_align = 1,
         "i" | "em" | "cite" | "var" => s.italic = true,
         "u" | "ins" => s.underline = true,
+        // UA `del`/`s`/`strike` are struck through; `del` keeps the reddish
+        // tint this engine has always given it (author CSS overrides both)
+        "del" | "s" | "strike" => s.strike = true,
+        // UA `sub`/`sup` use `font-size: smaller` (~0.83em) plus the
+        // baseline shift declared in ua_box (VAlign::Sub/Super)
+        "sub" | "sup" => s.size = base.size * 0.83,
         "code" | "kbd" | "samp" | "tt" => {
             s.fam = Fam::Mono;
             s.size = base.size - 1.0;
@@ -804,6 +817,9 @@ fn paints_chrome(bx: &BoxStyle) -> bool {
         // that declares one needs a real box (plain inline flow would
         // flatten it away and lose the clip)
         || bx.clip_path.is_some()
+        // a baseline shift (`<sub>`/`<sup>`, numeric vertical-align) is
+        // applied by inline placement, which only sees real inline boxes
+        || matches!(bx.valign, VAlign::Sub | VAlign::Super | VAlign::Len(_))
 }
 
 /// The `kind` pseudo-element box for `node`, or None when it generates no
@@ -5779,6 +5795,13 @@ fn layout_from(
         if w.style.underline {
             underline_rects.push((x, y + lh - 2.0, ww, 1.0, w.style.color, false));
         }
+        if w.style.strike {
+            // mid-x-height: a hair above the vertical middle of the line box
+            underline_rects.push((x, y + lh * 0.5, ww, 1.0, w.style.color, false));
+        }
+        if w.style.overline {
+            underline_rects.push((x, y + 1.0, ww, 1.0, w.style.color, false));
+        }
         x += ww;
         line_height = line_height.max(lh);
     }
@@ -7360,6 +7383,54 @@ mod tests {
             l.runs[0].y
         );
         assert!((l.runs[0].x - 0.0).abs() < 0.01, "x={}", l.runs[0].x);
+    }
+
+    #[test]
+    fn sub_and_sup_shift_the_baseline_and_shrink() {
+        // UA: `sub`/`sup` are `font-size: smaller` (~0.83em) plus a
+        // vertical-align shift. Both used to render as ordinary inline text.
+        let dom = crate::html::parse("<p>H<sub>2</sub>O x<sup>3</sup></p>");
+        let sheet = crate::css::parse("");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let find = |t: &str| l.runs.iter().find(|r| r.text == t).unwrap();
+        let (h, two, sup) = (find("H"), find("2"), find("3"));
+        assert!(two.style.size < h.style.size, "sub is smaller: {} vs {}", two.style.size, h.style.size);
+        assert!(two.y > h.y, "sub sits below the baseline: {} vs {}", two.y, h.y);
+        assert!(sup.style.size < h.style.size, "sup is smaller");
+        assert!(sup.y < h.y, "sup sits above the baseline: {} vs {}", sup.y, h.y);
+        // the shift is a fraction of the PARENT size, not a whole line
+        let line = h.style.line_height();
+        assert!(
+            two.y - h.y < line && sup.y - h.y > -line,
+            "both stay on the same line (line height {line})"
+        );
+    }
+
+    #[test]
+    fn del_and_s_paint_a_strike_line() {
+        let dom = crate::html::parse("<p>keep <del>gone</del> and <s>old</s></p>");
+        let sheet = crate::css::parse("");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "gone").expect("del run");
+        let lh = run.style.line_height();
+        // one decoration rect per struck run, mid-line (between the run's
+        // top and its underline position)
+        let strikes: Vec<_> = l
+            .underline_rects
+            .iter()
+            .filter(|r| (r.0 - run.x).abs() < 0.01 && r.3 == 1.0)
+            .collect();
+        assert_eq!(strikes.len(), 1, "one line-through rect for `gone`");
+        let y = strikes[0].1;
+        assert!(y > run.y && y < run.y + lh - 2.0, "strike y={y} sits mid-line");
+        // `keep` is untouched
+        let keep = l.runs.iter().find(|r| r.text == "keep").unwrap();
+        assert!(
+            !l.underline_rects.iter().any(|r| (r.0 - keep.x).abs() < 0.01),
+            "no decoration on plain text"
+        );
     }
 
     #[test]

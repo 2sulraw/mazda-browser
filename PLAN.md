@@ -993,6 +993,26 @@ curve matters more than the baseline (near-flat as tabs grow).
   Tests: default **560**, `engine-b + woff2` **564**
   (`clip_path_inset_parses_edges`, `clip_path_inset_hides_visually_hidden_labels`,
   `clip_path_inset_maps_each_edge`).
+  **(n) `<sub>`/`<sup>` + the rest of `text-decoration`** — `sub`/`sup`
+  rendered as ordinary inline text (no shift, no size change) and only
+  `underline` existed, so `<del>`/`<s>` showed no strike. UA now gives
+  `sub`/`sup` `font-size: smaller` (~0.83em) plus `VAlign::Sub/Super`
+  (`ua_box`), and an inline that declares a baseline shift forces a real
+  inline box — plain inline flow flattened it away and the shift was lost.
+  `text-decoration` gained `line-through`/`overline` (and the
+  `text-decoration-line` longhand); the decoration rect channel paints
+  them at mid-line / 1px below the line top.
+  Live: a probe page renders H₂O, mc², `[1]`, struck `$99`/`$49`,
+  overline and a combined strike+underline run; Wikipedia's Rust article
+  is unchanged (1646 rules, 14973 runs, 315 images, 96–116 MB debug) and
+  its `[n]` markers are now raised and smaller.
+  shortcut: decoration `color`/`thickness`/`offset` are not modeled (the
+  text color and 1px are used), and `text-decoration` still does not
+  propagate to descendant inline boxes the way the spec's decoration
+  propagation does.
+  Tests: default **563**, `engine-b + woff2` **567**
+  (`sub_and_sup_shift_the_baseline_and_shrink`, `del_and_s_paint_a_strike_line`,
+  `text_decoration_line_parses_through_the_cascade`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -1090,6 +1110,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 8l (`<button>` container) | Wikipedia Rust article | 106.7 MB (14973 runs, 315 images; pixel-unchanged) |
 | 2026-11-03 | wave 8m (`clip-path: inset()`) | data: URL `sr-only` probe | 54.7 MB (4 runs; both hidden labels clipped away, both visible strings paint) |
 | 2026-11-03 | wave 8m (`clip-path: inset()`) | MDN `/Web/CSS/list-style-type` | 76.1–80.0 MB (2773 runs, 11 images; unchanged) |
+| 2026-11-03 | wave 8n (sub/sup + line-through/overline) | data: URL decoration probe | 54.7 MB (28 runs; H₂O, mc², struck and overlined runs all paint) |
+| 2026-11-03 | wave 8n (sub/sup + line-through/overline) | Wikipedia Rust article | 96.3–116.1 MB (14973 runs, 315 images; layout identical, `[n]` markers raised) |
 
 ### Phase 1c (Track A) findings
 

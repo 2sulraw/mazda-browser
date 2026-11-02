@@ -631,6 +631,11 @@ fn ua_box(tag: &str) -> BoxStyle {
             // all four slots for the shorthand
             b.pad = [Len::Px(1.0); 4];
         }
+        // UA `sub { vertical-align: sub }` / `sup { vertical-align: super }`
+        // — the baseline shift itself happens in inline placement
+        // (layout.rs, VAlign::Sub/Super); `style_for` makes the font smaller
+        "sub" => b.valign = VAlign::Sub,
+        "sup" => b.valign = VAlign::Super,
         _ => {}
     }
     b
@@ -1103,6 +1108,7 @@ const KNOWN: &[&str] = &[
     "font-style",
     "font-family",
     "text-decoration",
+    "text-decoration-line",
     "display",
     "content",
     "opacity",
@@ -2166,7 +2172,13 @@ fn apply_decl(
                 style.fam_stack = fam_stack;
             }
         },
-        "text-decoration" => style.underline = d.1.contains("underline"),
+        // `text-decoration` is a shorthand list; `text-decoration-line` is
+        // the longhand sites actually use. `none` clears every line.
+        "text-decoration" | "text-decoration-line" => {
+            style.underline = d.1.contains("underline");
+            style.strike = d.1.contains("line-through");
+            style.overline = d.1.contains("overline");
+        }
         "line-height" => {
             // unitless = multiplier of font-size; px/rem/% absolute (of size)
             style.lh = if let Some(n) = d.1.strip_suffix('%') {
@@ -6013,6 +6025,24 @@ mod tests {
         assert_eq!(get("none").clip_path, None, "none → no clip");
         assert_eq!(get("circle").clip_path, None, "non-inset shapes are ignored (shortcut)");
         assert_eq!(get("junk").clip_path, None, "unparseable → no clip");
+    }
+
+    #[test]
+    fn text_decoration_line_parses_through_the_cascade() {
+        let dom = dom_of("<p class=x>a</p>");
+        let sheet = parse(".x { text-decoration-line: line-through overline }");
+        let s = sheet
+            .resolve(&dom, by_attr(&dom, "class", "x"), Style::new(), None)
+            .style;
+        assert!(s.strike && s.overline && !s.underline);
+        // `none` clears all three
+        let sheet = parse(".x { text-decoration: none }");
+        let mut base = Style::new();
+        base.underline = true;
+        base.strike = true;
+        base.overline = true;
+        let s = sheet.resolve(&dom, by_attr(&dom, "class", "x"), base, None).style;
+        assert!(!s.underline && !s.strike && !s.overline);
     }
 
     #[test]
