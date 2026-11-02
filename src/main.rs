@@ -2505,7 +2505,7 @@ fn layout_page(
     let mut laid = layout::layout_in_forms(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st), state);
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
-    let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget, false);
+    let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget, false, None, false);
     if n_px > 0 {
         eprintln!("[img] {n_px} decoded at display size");
     }
@@ -2608,16 +2608,29 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
 /// full-size buffer is alive at a time. `budget` caps the display pixels that
 /// stay in RAM — over-budget images keep their `Probed` dims (space reserved,
 /// nothing drawn).
+///
+/// `parent_bg` / `parent_masked` describe the ENCLOSING box: its bg color
+/// tints a mask placeholder's pixels (RGB replaced, alpha kept — layout's
+/// `tint_masks` covers slots that were already decoded, main decodes after
+/// layout so the tint happens right here), and a live mask placeholder on
+/// that box means `collect_paint` already suppressed its background image —
+/// decoding it would draw what paint deliberately dropped (mask wins).
 fn decode_images(
     n: &mut layout::BoxNode,
     base: &str,
     laid: &mut Layout,
     budget: &mut usize,
     fixed: bool,
+    parent_bg: Option<u32>,
+    parent_masked: bool,
 ) -> usize {
     let fixed = fixed || n.bx.pos == css::Pos::Fixed;
     let mut count = 0usize;
-    if let Some(layout::ImgSlot::Probed { src, .. }) = &n.img {
+    // the box's own background image loses to a live mask on the same box:
+    // skip the whole decode (no pixels fetched, no budget charged)
+    let bg_lost = n.is_bg && parent_masked;
+    let own = if bg_lost { None } else { n.img.as_ref() };
+    if let Some(layout::ImgSlot::Probed { src, .. }) = own {
         let src = src.to_string();
         let inline = src.starts_with('<'); // inline <svg> markup — no URL
         let dw = n.w.round().max(1.0) as u32;
@@ -2644,6 +2657,12 @@ fn decode_images(
                     })
                     .or_else(|| svg::render(&bytes, dw, dh));
                 if let Some(img) = img {
+                    // a mask draws tinted with its box's background color
+                    // (RGB replaced, alpha kept) — no bg color, no tint
+                    let img = match (n.is_mask, parent_bg) {
+                        (true, Some(c)) => layout::tint_image(&img, c),
+                        _ => img,
+                    };
                     laid.images
                         .push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img), fixed));
                     count += 1;
@@ -2651,8 +2670,13 @@ fn decode_images(
             }
         }
     }
+    // context for the children: this box's bg color (mask tint) and whether
+    // a live mask lives on it (suppresses its bg-image child) — computed
+    // before the mutable walk over the same field
+    let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
+    let bg = n.bx.bg;
     for c in &mut n.children {
-        count += decode_images(c, base, laid, budget, fixed);
+        count += decode_images(c, base, laid, budget, fixed, bg, masked);
     }
     count
 }

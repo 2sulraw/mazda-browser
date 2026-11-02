@@ -315,6 +315,13 @@ pub struct BoxNode {
     /// positions it per the element's `background-size`/`background-
     /// position` inside the padding box, reserves no flow space
     pub is_bg: bool,
+    /// synthetic mask-image placeholder (child of the element its
+    /// `mask-image` targets): same pipeline and geometry mechanics as
+    /// [`is_bg`], but flagged so a live one REPLACES its box's own
+    /// background at paint (`collect_paint` drops the bg-color rect and
+    /// the background image, the mask draws tinted with the bg color —
+    /// see `BoxStyle::mask_image` for the shortcuts)
+    pub is_mask: bool,
     /// tiling region for a REPEATING background placeholder: the parent's
     /// padding box (x0, y0, x1, y1) in document coords, recorded by
     /// `place()`; `collect_paint` emits one entry per tile over it. None =
@@ -358,6 +365,7 @@ impl BoxNode {
         BoxNode {
             is_text: false,
             is_bg: false,
+            is_mask: false,
             bg_tile_region: None,
             style,
             bx,
@@ -382,6 +390,7 @@ impl BoxNode {
         BoxNode {
             is_text: true,
             is_bg: false,
+            is_mask: false,
             bg_tile_region: None,
             style,
             bx: BoxStyle::default(),
@@ -419,6 +428,12 @@ pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) ->
         let ph = bg_placeholder(&u, style, &root.bx);
         root.children.push(ph);
     }
+    // body's own mask-image: second placeholder, same pipeline — a live
+    // one replaces the body's own background at paint (mask wins)
+    if let Some(u) = root.bx.mask_image.clone() {
+        let ph = mask_placeholder(&u, style, &root.bx);
+        root.children.push(ph);
+    }
     // the body's own ::before/::after (the root IS the body's box):
     // ::before paints over the background placeholder (pushed after it)
     // and under the content; ::after closes the box
@@ -451,6 +466,23 @@ fn bg_placeholder(url: &str, style: Style, parent: &BoxStyle) -> BoxNode {
     g.bx.bg_size = parent.bg_size;
     g.bx.bg_pos = parent.bg_pos;
     g.bx.bg_repeat = parent.bg_repeat;
+    g
+}
+
+/// Synthetic child for `mask-image` — [`bg_placeholder`] mechanics (same
+/// shared `<img>` pipeline, same `place()` sizing/positioning/tiling math
+/// against the padding box, no flow space), flagged `is_mask` so paint
+/// treats it as the mask: it carries the MASK geometry longhands, and a
+/// live one replaces its box's own background (see `BoxNode::is_mask`).
+/// shortcut: one layer only — a multi-layer `mask:` list took its first
+/// url at parse time.
+fn mask_placeholder(url: &str, style: Style, parent: &BoxStyle) -> BoxNode {
+    let mut g = bg_placeholder(url, style, parent);
+    g.is_bg = false;
+    g.is_mask = true;
+    g.bx.bg_size = parent.mask_size;
+    g.bx.bg_pos = parent.mask_pos;
+    g.bx.bg_repeat = parent.mask_repeat;
     g
 }
 
@@ -845,6 +877,12 @@ fn build_into(
                         let ph = bg_placeholder(&u, outcome.style, &g.bx);
                         g.children.push(ph);
                     }
+                    // mask-image: second placeholder on the same pipeline;
+                    // a live one replaces this box's own background at paint
+                    if let Some(u) = g.bx.mask_image.clone() {
+                        let ph = mask_placeholder(&u, outcome.style, &g.bx);
+                        g.children.push(ph);
+                    }
                     if let Some(b) = before {
                         g.children.push(b);
                     }
@@ -870,6 +908,11 @@ fn build_into(
                         // background-image placeholder (see above)
                         if let Some(u) = g.bx.bg_image.clone() {
                             let ph = bg_placeholder(&u, outcome.style, &g.bx);
+                            g.children.push(ph);
+                        }
+                        // mask placeholder (see above)
+                        if let Some(u) = g.bx.mask_image.clone() {
+                            let ph = mask_placeholder(&u, outcome.style, &g.bx);
                             g.children.push(ph);
                         }
                         if let Some(b) = before {
@@ -1000,11 +1043,13 @@ const BG_PIXEL_BUDGET: usize = 256 * 1024;
 /// pattern strips are far under this.
 const BG_TILE_CAP: i64 = 512;
 
-/// Drop (de-slot) background-image placeholders whose probed intrinsic
-/// pixels don't fit the remaining [`BG_PIXEL_BUDGET`]. Content `<img>`
-/// boxes are never touched — they keep main's shared budget discipline.
+/// Drop (de-slot) background-image and mask placeholders whose probed
+/// intrinsic pixels don't fit the remaining [`BG_PIXEL_BUDGET`] (both ride
+/// the same budget — mask pixels are decorative like background pixels).
+/// Content `<img>` boxes are never touched — they keep main's shared
+/// budget discipline.
 fn cap_bg_images(n: &mut BoxNode, budget: &mut usize) {
-    if n.is_bg {
+    if n.is_bg || n.is_mask {
         if let Some(ImgSlot::Probed { w, h, .. }) = &n.img {
             let px = (*w as usize).saturating_mul(*h as usize);
             if px > *budget {
@@ -1017,6 +1062,43 @@ fn cap_bg_images(n: &mut BoxNode, budget: &mut usize) {
     }
     for c in &mut n.children {
         cap_bg_images(c, budget);
+    }
+}
+
+/// Copy of `img` with every pixel's RGB replaced by `c` (0xRRGGBB) and the
+/// alpha channel kept — the mask's shape painted in the box's background
+/// color. Shared by the layout-time tint pass and main's decode path.
+pub fn tint_image(img: &ImageData, c: u32) -> ImageData {
+    let rep = c & 0x00FF_FFFF;
+    ImageData {
+        w: img.w,
+        h: img.h,
+        px: img.px.iter().map(|&p| (p & 0xFF00_0000) | rep).collect(),
+    }
+}
+
+/// Tint every DECODED mask placeholder with its box's background color
+/// (RGB replaced, alpha kept; no bg color → the mask stays untinted) and
+/// cache the result back over the Ready slot — paint then reuses the
+/// tinted pixels instead of re-tinting per frame, and the original buffer
+/// is dropped with the overwritten Rc. Re-running is idempotent (the RGB
+/// is replaced with the same color), so a re-layout is safe. Production
+/// fills its slots post-layout, so main's `decode_images` applies the
+/// same tint at the moment it decodes (see `tint_image`).
+fn tint_masks(n: &mut BoxNode) {
+    let tint = n.bx.bg;
+    if let Some(c) = tint {
+        for ch in &mut n.children {
+            if ch.is_mask {
+                if let Some(ImgSlot::Ready(d)) = &ch.img {
+                    let tinted = tint_image(d, c);
+                    ch.img = Some(ImgSlot::Ready(std::rc::Rc::new(tinted)));
+                }
+            }
+        }
+    }
+    for ch in &mut n.children {
+        tint_masks(ch);
     }
 }
 
@@ -1084,6 +1166,9 @@ pub fn layout_in_forms(
     // before anything is sized or painted (probe already ran in main)
     let mut bg_budget = BG_PIXEL_BUDGET;
     cap_bg_images(root, &mut bg_budget);
+    // mask placeholders that already carry pixels get tinted with their
+    // box's background color once, cached over the slot (see tint_masks)
+    tint_masks(root);
     // apply the live form state to the control boxes BEFORE layout so the
     // shown text (value override, password mask, tail clip) sizes lines
     apply_form_state(root, state, measure);
@@ -1447,7 +1532,17 @@ fn collect_paint(
         // currentcolor: unspecified border color = the element's text color
         let bc = n.bx.bcolor.unwrap_or(n.style.color);
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
-        let ring = has_b && r > 0.0 && n.bx.bg.is_some();
+        // a LIVE mask placeholder on this box (slot not de-slotted — the
+        // budget cap may have dropped it) REPLACES the box's own
+        // background: the bg-color rect below and the background-image
+        // child are suppressed, and the mask paints in their place
+        // (tinted with this box's bg color by `tint_masks`, cached in the
+        // placeholder's slot). shortcut: the mask affects only the box's
+        // OWN background — text and children are never masked; the border
+        // (rounded or not) still paints over the mask, as the border is
+        // chrome, not background.
+        let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
+        let ring = has_b && r > 0.0 && n.bx.bg.is_some() && !masked;
         // own `clip: rect()` (positioned boxes) clips this box's WHOLE
         // rendering incl. its own background — composed with the inherited
         // one; the window is recorded in layout coords, so it is mapped
@@ -1496,7 +1591,7 @@ fn collect_paint(
                 fixed,
             });
         }
-        if let Some(c) = n.bx.bg {
+        if let Some(c) = n.bx.bg.filter(|_| !masked) {
             let mut rects = vec![(n.x, n.y, n.w, n.h, c, r)];
             if ring {
                 // rounded ring: fill the border-box with the border color,
@@ -1548,7 +1643,7 @@ fn collect_paint(
                     // over the region, each culled against the inherited
                     // clip window (ancestor overflow/clip from wave 1)
                     (Some(rep), Some(reg))
-                        if n.is_bg
+                        if (n.is_bg || n.is_mask)
                             && matches!(
                                 rep,
                                 BgRepeat::Repeat | BgRepeat::RepeatX | BgRepeat::RepeatY
@@ -1614,6 +1709,11 @@ fn collect_paint(
             }
         }
         for ch in &n.children {
+            // mask wins over the box's own background image: the bg
+            // placeholder never reaches its draw branch while masked
+            if masked && ch.is_bg {
+                continue;
+            }
             collect_paint(ch, fixed, m, z, content_clip, out, out_z, imgs, img_z, shadows);
         }
     }
@@ -2031,7 +2131,10 @@ fn place(
     let (pbx, pby) = (n.x + bl, n.y + bt);
     let (pbw, pbh) = (n.w - bl - br, n.h - bt - bb);
     for ch in &mut n.children {
-        if !ch.is_bg {
+        // both placeholders are sized/positioned by the same math against
+        // this box's padding box (mask geometry rides `ch.bx.bg_*` too —
+        // mask_placeholder copied the mask longhands there)
+        if !ch.is_bg && !ch.is_mask {
             continue;
         }
         let Some((iw, ih)) = ch.img.as_ref().and_then(ImgSlot::dims) else {
@@ -2285,9 +2388,10 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
             }
             out.push(Item::Text(start, i));
         } else if children[i].is_bg
+            || children[i].is_mask
             || matches!(children[i].bx.pos, Pos::Absolute | Pos::Fixed)
         {
-            i += 1; // background placeholder / out of flow: not a layout item
+            i += 1; // background/mask placeholder / out of flow: not a layout item
         } else {
             out.push(Item::Grp(i));
             i += 1;
@@ -2370,7 +2474,7 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
             .children
             .iter()
             .filter(|c| {
-                !c.is_bg && !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed)
+                !c.is_bg && !c.is_mask && !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed)
             })
             .map(|c| natural_w(c, avail, measure))
             .fold(0.0f32, f32::max),
@@ -2386,7 +2490,10 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
             let mut m = 0.0f32;
             let mut run = 0.0f32;
             for c in &n.children {
-                if c.is_bg || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
+                if c.is_bg
+                    || c.is_mask
+                    || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed)
+                {
                     continue; // out of flow: no contribution to shrink-to-fit
                 }
                 if c.is_text {
@@ -2846,8 +2953,8 @@ fn block(
                 y = top + h + n.style.size * 0.6;
             }
             i += 1;
-        } else if n.children[i].is_bg {
-            // background-image placeholder: anchored by place(), no advance
+        } else if n.children[i].is_bg || n.children[i].is_mask {
+            // background/mask placeholder: anchored by place(), no advance
             i += 1;
         } else if let Some(left) = match n.children[i].bx.float {
             Float::Left => Some(true),
@@ -6693,6 +6800,219 @@ line</textarea></div>"#,
         assert_eq!(
             (l.images[0].0, l.images[0].1, l.images[0].2, l.images[0].3),
             (2.0, 2.0, 2.0, 1.0)
+        );
+    }
+
+    // ---- mask-image (mask placeholder + background replacement) ----
+
+    #[test]
+    fn mask_image_builds_flagged_placeholder_and_flows_nothing() {
+        let mut root = boxes_of(
+            r#"<div style="background-image:url(b.png);mask-image:url(m.png)">x</div>"#,
+            "",
+        );
+        let div = &root.children[0];
+        assert_eq!(
+            div.children.len(),
+            3,
+            "bg placeholder + mask placeholder + the text run"
+        );
+        assert!(div.children[0].is_bg && !div.children[0].is_mask);
+        let m = &div.children[1];
+        assert!(m.is_mask && !m.is_bg, "second child is the mask placeholder");
+        match &m.img {
+            Some(ImgSlot::Pending(src)) => assert_eq!(&**src, "m.png"),
+            _ => panic!("the mask rides the shared <img> pipeline as a Pending slot"),
+        }
+        // the mask geometry longhands ride onto the placeholder (place()
+        // reads them through the bg_* fields) — undeclared stays initial
+        assert_eq!(m.bx.bg_size, BgSize::Auto);
+        assert_eq!(m.bx.bg_repeat, None);
+        // out of flow like the bg placeholder: reserves no space, so the
+        // box's height matches the same box with no mask at all
+        let mut with_mask = boxes_of(
+            r#"<div style="width:200px;mask-image:url(m.png)">hello</div>"#,
+            "",
+        );
+        let mut without = boxes_of(r#"<div style="width:200px">hello</div>"#, "");
+        let a = layout_tree(&mut with_mask, 500.0, &m4);
+        let b = layout_tree(&mut without, 500.0, &m4);
+        assert_eq!(
+            a.height, b.height,
+            "the mask placeholder contributes no flow space"
+        );
+    }
+
+    #[test]
+    fn decoded_mask_replaces_background_and_tints_with_bg_color() {
+        // bg-color + decoded mask: NO bg-color rect, and the mask image is
+        // the only draw entry — its RGB replaced by the bg color, alpha
+        // kept (the 0x80 alpha here must survive), cached over the slot so
+        // paint reuses the tinted buffer instead of re-tinting per frame
+        let mut root = boxes_of(
+            r#"<div style="width:60px;min-height:40px;background:#ff8000;mask-image:url(m.png)">x</div>"#,
+            "",
+        );
+        let div = &mut root.children[0];
+        let m = div
+            .children
+            .iter_mut()
+            .find(|c| c.is_mask)
+            .expect("mask child");
+        m.img = Some(ImgSlot::Ready(std::rc::Rc::new(crate::image::ImageData {
+            w: 2,
+            h: 2,
+            px: vec![0x80CC0000; 4],
+        })));
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert!(
+            l.rects.is_empty(),
+            "the bg-color rect is suppressed by the mask"
+        );
+        assert_eq!(l.images.len(), 1, "the mask image is the only draw entry");
+        assert_eq!(
+            l.images[0].4.px[0],
+            0x80FF8000,
+            "RGB replaced by the bg color (#ff8000), alpha kept"
+        );
+        // tint cached in the placeholder's Ready slot — the entry reuses
+        // that exact buffer (one tint, no per-frame re-tint, nothing leaked)
+        let slot = root.children[0]
+            .children
+            .iter()
+            .find(|c| c.is_mask)
+            .expect("mask child");
+        match &slot.img {
+            Some(ImgSlot::Ready(d)) => {
+                assert_eq!(d.px[0], 0x80FF8000, "tinted pixels cached in the slot");
+                assert!(
+                    std::rc::Rc::ptr_eq(d, &l.images[0].4),
+                    "the entry IS the cached Rc"
+                );
+            }
+            _ => panic!("the slot stays Ready after the tint pass"),
+        }
+    }
+
+    #[test]
+    fn mask_without_background_color_paints_untinted() {
+        let mut root = boxes_of(r#"<div style="mask-image:url(m.png)">x</div>"#, "");
+        let div = &mut root.children[0];
+        let m = div
+            .children
+            .iter_mut()
+            .find(|c| c.is_mask)
+            .expect("mask child");
+        m.img = Some(ImgSlot::Ready(std::rc::Rc::new(crate::image::ImageData {
+            w: 2,
+            h: 2,
+            px: vec![0x80CC0000; 4],
+        })));
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert_eq!(l.images.len(), 1, "the untinted mask still draws once");
+        assert_eq!(
+            l.images[0].4.px[0], 0x80CC0000,
+            "no bg color on the box → the mask keeps its own pixels"
+        );
+        assert!(l.rects.is_empty(), "nothing else to paint");
+    }
+
+    #[test]
+    fn mask_size_halves_the_drawn_tile() {
+        // `mask-size: 50%` on the 200px padding box with a 20×10 intrinsic
+        // → a 100×50 tile, `center` offsets it (50, 25) — the same math
+        // background-size gets, against the padding box
+        let css = "width:200px;min-height:100px;mask-image:url(m.png);\
+                   mask-size:50%;mask-position:center;mask-repeat:no-repeat";
+        let mut root = boxes_of(&format!(r#"<div style="{css}">x</div>"#), "");
+        let div = &mut root.children[0];
+        let m = div
+            .children
+            .iter_mut()
+            .find(|c| c.is_mask)
+            .expect("mask child");
+        m.img = Some(ImgSlot::Ready(blank_img(20, 10)));
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let m = root.children[0]
+            .children
+            .iter()
+            .find(|c| c.is_mask)
+            .expect("mask child");
+        assert_eq!(
+            (m.w, m.h),
+            (100.0, 50.0),
+            "50% of the padding box, height follows the aspect ratio"
+        );
+        assert_eq!((m.x, m.y), (50.0, 25.0), "centered in the padding box");
+        assert_eq!(l.images.len(), 1, "no-repeat draws the tile once");
+        assert_eq!(
+            (l.images[0].0, l.images[0].1, l.images[0].2, l.images[0].3),
+            (50.0, 25.0, 100.0, 50.0),
+            "the entry is the halved tile at its centered spot"
+        );
+    }
+
+    #[test]
+    fn undecoded_mask_paints_nothing() {
+        // the slot never fills (fetch failed / decode not run yet): the
+        // mask-only box paints NOTHING — no image entry, no rect — while
+        // its text flows as usual
+        let mut root = boxes_of(r#"<div style="mask-image:url(m.png)">x</div>"#, "");
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert!(l.images.is_empty(), "no decoded mask, no draw entry");
+        assert!(l.rects.is_empty(), "no bg color either — nothing to paint");
+        assert!(!l.runs.is_empty(), "text unaffected");
+        // with a bg color the suppression holds while the mask is only
+        // Pending (production lays out BEFORE it decodes): the rect the box
+        // would have drawn is gone too — the mask entry arrives at decode
+        let mut root = boxes_of(
+            r#"<div style="background:#3366ff;mask-image:url(m.png)">x</div>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 500.0, &m4);
+        assert!(
+            l.rects.is_empty(),
+            "bg-color rect suppressed while the mask is undecoded"
+        );
+        assert!(l.images.is_empty(), "and the mask draws nothing yet");
+    }
+
+    #[test]
+    fn box_without_mask_emits_exact_paint_entries() {
+        // regression guard: a box with no mask property emits exactly the
+        // entries it always has — the bg-color rect, the four border strips
+        // in their fixed order, and one bg image at the padding-box origin
+        let css = "width:100px;min-height:60px;background:#3366ff;\
+                   border:2px solid #000;background-image:url(t.png);\
+                   background-repeat:no-repeat";
+        let mut root = boxes_of(&format!(r#"<div style="{css}">x</div>"#), "");
+        root.children[0].children[0].img = Some(ImgSlot::Ready(blank_img(10, 10)));
+        let l = layout_tree(&mut root, 500.0, &m4);
+        let rects: Vec<(f32, f32, f32, f32, u32)> = l
+            .rects
+            .iter()
+            .map(|r| (r.0, r.1, r.2, r.3, r.4))
+            .collect();
+        assert_eq!(
+            rects,
+            vec![
+                (0.0, 0.0, 100.0, 64.0, 0x3366ff), // bg-color rect
+                (0.0, 0.0, 100.0, 2.0, 0x000000),  // strips: top
+                (0.0, 62.0, 100.0, 2.0, 0x000000), // bottom
+                (0.0, 2.0, 2.0, 60.0, 0x000000),   // left
+                (98.0, 2.0, 2.0, 60.0, 0x000000),  // right
+            ],
+            "rect channel byte-identical to the pre-mask build"
+        );
+        let imgs: Vec<(f32, f32, f32, f32)> = l
+            .images
+            .iter()
+            .map(|i| (i.0, i.1, i.2, i.3))
+            .collect();
+        assert_eq!(
+            imgs,
+            vec![(2.0, 2.0, 10.0, 10.0)],
+            "bg image entry byte-identical too"
         );
     }
 
