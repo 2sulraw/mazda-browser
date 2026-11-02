@@ -1434,6 +1434,10 @@ pub struct ShadowRect {
     /// packed alpha × color
     pub color: u32,
     pub fixed: bool,
+    /// the element's own border box `(x, y, w, h)` in the same space — an
+    /// outer shadow is clipped to the OUTSIDE of this box, so a transparent
+    /// element must not show its own shadow through itself
+    pub hole: (f32, f32, f32, f32),
 }
 
 pub struct PositionedRun {
@@ -2365,6 +2369,7 @@ fn collect_paint(
                 blur: s.blur,
                 color: (alpha << 24) | c,
                 fixed,
+                hole: m.map_rect((n.x, n.y, n.w, n.h)),
             });
         }
         if let Some(c) = n.bx.bg.filter(|_| !masked) {
@@ -7230,6 +7235,9 @@ mod tests {
         assert_eq!(s.blur, 10.0);
         assert_eq!(s.color, (128u32 << 24) | 0x000000, "alpha packed in");
         assert!(!s.fixed, "in-flow box");
+        // the hole is the box's own border box: shadow pixels inside it are
+        // culled at paint (CSS clips an outer shadow to the outside)
+        assert_eq!(s.hole, (0.0, 0.0, 100.0, l.rects[0].3), "hole = border box");
         // currentcolor: no shadow color → the element's text color
         let mut m2 = BoxNode::group(
             Style::new(),

@@ -3901,6 +3901,13 @@ fn render(
             let a = (s.color >> 24) as u8;
             let half = (s.blur * 0.5).max(0.01);
             let (cx, cy) = (s.w * 0.5 + pad, s.h * 0.5 + pad);
+            // the element's own border box in buffer coords: an outer shadow
+            // is clipped to the outside of it (CSS), so a transparent box
+            // never shows the shadow through itself
+            let hy = if s.fixed { s.hole.1 } else { s.hole.1 - scroll };
+            let (hx0, hy0) = (PADDING as f32 + s.hole.0, PADDING as f32 + top + hy);
+            let (hw, hh) = (s.hole.2, s.hole.3);
+            let hr = s.radius.min(hw * 0.5).min(hh * 0.5);
             for dy in 0..bh.max(0.0) as usize {
                 let py = sy as i32 + dy as i32;
                 if py < 0 || py >= height as i32 {
@@ -3910,6 +3917,16 @@ fn render(
                     let px = sx as i32 + dx as i32;
                     if px < 0 || px >= width as i32 {
                         continue;
+                    }
+                    // hole: inside the rounded border box → not shadow
+                    let ox = px as f32 + 0.5 - hx0;
+                    let oy = py as f32 + 0.5 - hy0;
+                    if ox >= 0.0 && ox < hw && oy >= 0.0 && oy < hh {
+                        let ex = ox.min(hw - ox);
+                        let ey = oy.min(hh - oy);
+                        if ex >= hr || ey >= hr || (hr - ex).powi(2) + (hr - ey).powi(2) <= hr * hr {
+                            continue;
+                        }
                     }
                     // signed distance to the (rounded) rect, then smoothstep
                     let lx = dx as f32 + pad;
@@ -4647,6 +4664,7 @@ mod tests {
                 blur: 2.0,
                 color: 0x33000000,
                 fixed: false,
+                hole: (0.0, 0.0, 0.0, 0.0),
             }],
             open_line: true,
             forms: Vec::new(),
