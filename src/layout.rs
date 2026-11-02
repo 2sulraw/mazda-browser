@@ -2270,6 +2270,7 @@ fn collect_paint(
                 top: match n.bx.inset[0].unwrap() {
                     Len::Px(v) => v,
                     Len::Pct(p) => p / 100.0 * (container.1 - container.0),
+                    Len::Calc { px, pct } => px + pct / 100.0 * (container.1 - container.0),
                 },
                 container_y1: container.1,
                 fixed,
@@ -2513,6 +2514,8 @@ fn resolve_len(l: Len, avail: f32) -> f32 {
     match l {
         Len::Px(p) => p,
         Len::Pct(p) => p / 100.0 * avail,
+        // mixed math result: px part + % of the containing block
+        Len::Calc { px, pct } => px + pct / 100.0 * avail,
     }
 }
 

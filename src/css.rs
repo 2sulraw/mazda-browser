@@ -35,6 +35,10 @@ pub type Decl = (String, String);
 pub enum Len {
     Px(f32),
     Pct(f32),
+    /// A `calc()`/`min()`/`max()`/`clamp()` result that mixes px and %:
+    /// the used length is `px + pct% of the containing block`, resolved by
+    /// layout.rs `resolve_len` (the containing block isn't known at parse).
+    Calc { px: f32, pct: f32 },
 }
 
 /// One `grid-template-columns` track.
@@ -2092,12 +2096,13 @@ fn apply_decl(
         // one auto → the auto margin absorbs free space on ITS side, so the
         // box hugs the opposite edge (layout reads margin_l/r_auto)
         "margin" => {
-            let tok: Vec<&str> = d.1.split_whitespace().collect();
+            // `joined_tokens` keeps `min(…)/clamp(…)` groups whole
+            let tok = joined_tokens(&d.1);
             let slots: [&str; 4] = match tok.len() {
-                1 => [tok[0]; 4],
-                2 => [tok[0], tok[1], tok[0], tok[1]],
-                3 => [tok[0], tok[1], tok[2], tok[1]],
-                4 => [tok[0], tok[1], tok[2], tok[3]],
+                1 => [tok[0].as_str(); 4],
+                2 => [tok[0].as_str(), tok[1].as_str(), tok[0].as_str(), tok[1].as_str()],
+                3 => [tok[0].as_str(), tok[1].as_str(), tok[2].as_str(), tok[1].as_str()],
+                4 => [tok[0].as_str(), tok[1].as_str(), tok[2].as_str(), tok[3].as_str()],
                 _ => ["0"; 4], // includes >4 garbage slots
             };
             // shorthand resets all four sides (a prior longhand `auto` is
@@ -2160,7 +2165,7 @@ fn apply_decl(
         }
         // first value only (per-corner radii: shortcut)
         "border-radius" | "border-top-left-radius" => {
-            if let Some(v) = d.1.split_whitespace().next().and_then(|t| parse_len(t, vp)) {
+            if let Some(v) = joined_tokens(&d.1).first().and_then(|t| parse_len(t, vp)) {
                 bx.radius = v;
                 bx.declared |= decl::RADIUS;
             }
@@ -2217,7 +2222,7 @@ fn apply_decl(
         // affects the separate model; `%` resolves against the table width
         // at layout time like every other stored length.
         "border-spacing" => {
-            let vals: Vec<&str> = d.1.split_whitespace().collect();
+            let vals = joined_tokens(&d.1);
             if let Some(h) = vals.first().and_then(|t| parse_len(t, vp)) {
                 let v = vals.get(1).and_then(|t| parse_len(t, vp)).unwrap_or(h);
                 bx.border_spacing = [h, v];
@@ -2280,7 +2285,10 @@ fn apply_decl(
         // inset shorthand: 1–4 values, `auto` slots stay None (unlike
         // margin/padding where 0 is the fallback — None means "unset edge")
         "inset" => {
-            let vals: Vec<Option<Len>> = d.1.split_whitespace().map(|t| parse_len(t, vp)).collect();
+            let vals: Vec<Option<Len>> = joined_tokens(&d.1)
+                .iter()
+                .map(|t| parse_len(t, vp))
+                .collect();
             bx.inset = match vals.len() {
                 1 => [vals[0]; 4],
                 2 => [vals[0], vals[1], vals[0], vals[1]],
@@ -2575,7 +2583,10 @@ fn border_parts(v: &str, dark: bool, vp: (f32, f32)) -> (Option<Len>, Option<u32
 /// → [top, right, bottom, left].
 fn parse_sides(v: &str, vp: (f32, f32)) -> [Len; 4] {
     let z = Len::Px(0.0);
-    let vals: Vec<Len> = v.split_whitespace().filter_map(|t| parse_len(t, vp)).collect();
+    let vals: Vec<Len> = joined_tokens(v)
+        .iter()
+        .filter_map(|t| parse_len(t, vp))
+        .collect();
     match vals.len() {
         1 => [vals[0], vals[0], vals[0], vals[0]],
         2 => [vals[0], vals[1], vals[0], vals[1]],
@@ -2778,6 +2789,8 @@ fn parse_bg_pos(v: &str, vp: (f32, f32)) -> [BgPos; 2] {
             _ => match parse_len(&t, vp) {
                 Some(Len::Pct(p)) => (free(&out), BgPos::Pct(p), false),
                 Some(Len::Px(p)) => (free(&out), BgPos::Px(p), false),
+                // shortcut: BgPos has no mixed px+% form — use the px part
+                Some(Len::Calc { px, .. }) => (free(&out), BgPos::Px(px), false),
                 None => continue, // junk token — skipped
             },
         };
@@ -2902,14 +2915,339 @@ fn bg_shorthand_geom(v: &str, vp: (f32, f32)) -> (Option<BgRepeat>, [BgPos; 2], 
     (rep, pos, size)
 }
 
-/// `200px` / `50%` / `1.5rem` / `25vh` → [`Len`]. Bare numbers are lenient px
-/// (matches `parse_size`); `em`≈rem shortcut (needs element font size).
+/// One value from the CSS math grammar: `px + pct%` of a containing block,
+/// plus a flag for a bare number (a pure multiplier). Internal to
+/// [`parse_len`] / [`parse_size`] / [`tracking`].
+#[derive(Clone, Copy, Default)]
+struct MathVal {
+    px: f32,
+    pct: f32,
+    /// bare number (`2`, no unit) — a multiplier, not a length
+    num: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MathCtx {
+    vp: (f32, f32),
+    /// px per `em`: parse_len reads 16 (the root), font-size the parent size
+    em: f32,
+    /// Some(px) resolves `%` now (font-size: % of the parent size); None
+    /// keeps `%` symbolic for layout (the containing block is unknown here)
+    pct_base: Option<f32>,
+}
+
+impl MathVal {
+    fn length(px: f32) -> MathVal {
+        MathVal { px, pct: 0.0, num: false }
+    }
+
+    fn finite(self) -> Option<MathVal> {
+        (self.px.is_finite() && self.pct.is_finite()).then_some(self)
+    }
+
+    /// Collapse to a [`Len`] (`None` on a non-finite result).
+    fn to_len(self) -> Option<Len> {
+        if self.pct == 0.0 {
+            self.px.is_finite().then(|| Len::Px(self.px))
+        } else if self.px == 0.0 {
+            self.pct.is_finite().then(|| Len::Pct(self.pct))
+        } else if self.px.is_finite() && self.pct.is_finite() {
+            Some(Len::Calc { px: self.px, pct: self.pct })
+        } else {
+            None
+        }
+    }
+}
+
+fn m_skip(b: &[u8], i: &mut usize) {
+    while *i < b.len() && b[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+}
+
+/// `%` → symbolic pct, or px when the context supplies a base (font-size).
+fn m_pct(n: f32, ctx: &MathCtx) -> MathVal {
+    match ctx.pct_base {
+        Some(base) => MathVal::length(n / 100.0 * base),
+        None => MathVal { px: 0.0, pct: n, num: false },
+    }
+}
+
+fn m_unit(b: &[u8], s: &str, i: &mut usize, n: f32, ctx: &MathCtx) -> Option<MathVal> {
+    m_skip(b, i);
+    if *i < b.len() && b[*i] == b'%' {
+        *i += 1;
+        return Some(m_pct(n, ctx).finite()?);
+    }
+    let start = *i;
+    while *i < b.len() && b[*i].is_ascii_alphabetic() {
+        *i += 1;
+    }
+    let vp = ctx.vp;
+    let px = match &s[start..*i] {
+        "" => return MathVal { px: n, pct: 0.0, num: true }.finite(), // multiplier
+        "px" => n,
+        "em" => n * ctx.em,
+        "rem" => n * 16.0,
+        "vh" | "lvh" | "svh" | "dvh" => n / 100.0 * vp.1,
+        "vw" | "lvw" | "svw" | "dvw" => n / 100.0 * vp.0,
+        "vmin" => n / 100.0 * vp.0.min(vp.1),
+        "vmax" => n / 100.0 * vp.0.max(vp.1),
+        // shortcut: `ch`/`ex`/`lh`/`cq*` and every other unit → invalid, so
+        // the declaration drops rather than guessing a conversion
+        _ => return None,
+    };
+    MathVal::length(px).finite()
+}
+
+fn m_times(a: MathVal, b: MathVal) -> Option<MathVal> {
+    let out = if a.num {
+        MathVal { px: b.px * a.px, pct: b.pct * a.px, num: b.num }
+    } else if b.num {
+        MathVal { px: a.px * b.px, pct: a.pct * b.px, num: a.num }
+    } else if a.pct == 0.0 && b.pct == 0.0 {
+        // px × px multiplies the numbers (lenient, like the old evaluator)
+        MathVal::length(a.px * b.px)
+    } else {
+        return None; // % × length has no meaning here
+    };
+    out.finite()
+}
+
+fn m_div(a: MathVal, b: MathVal) -> Option<MathVal> {
+    // divisor: a bare number, or a px length (lenient, old behavior). A %
+    // divisor is invalid; zero and non-finite divisors drop the declaration
+    // instead of producing inf/NaN.
+    let k = if b.num || b.pct == 0.0 { b.px } else { return None };
+    if k == 0.0 || !k.is_finite() {
+        return None;
+    }
+    MathVal { px: a.px / k, pct: a.pct / k, num: a.num }.finite()
+}
+
+fn m_primary(b: &[u8], s: &str, i: &mut usize, ctx: &MathCtx, depth: u8) -> Option<MathVal> {
+    // recursion cap: a hostile `((((…` must fail to parse, never overflow
+    if depth > 32 {
+        return None;
+    }
+    m_skip(b, i);
+    if *i < b.len() && b[*i] == b'(' {
+        *i += 1;
+        let v = m_add(b, s, i, ctx, depth + 1)?;
+        m_skip(b, i);
+        if *i >= b.len() || b[*i] != b')' {
+            return None;
+        }
+        *i += 1;
+        return Some(v);
+    }
+    if *i < b.len() && b[*i].is_ascii_alphabetic() {
+        let start = *i;
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'-') {
+            *i += 1;
+        }
+        let name = s[start..*i].to_ascii_lowercase();
+        m_skip(b, i);
+        if *i >= b.len() || b[*i] != b'(' {
+            return None; // a bare ident (`auto`, `bogus`) is not a length
+        }
+        *i += 1;
+        let args = m_args(b, s, i, ctx, depth + 1)?;
+        return m_fold(&name, args);
+    }
+    let start = *i;
+    while *i < b.len() && (b[*i].is_ascii_digit() || b[*i] == b'.') {
+        *i += 1;
+    }
+    if start == *i {
+        return None;
+    }
+    let n: f32 = s[start..*i].parse().ok()?;
+    m_unit(b, s, i, n, ctx)
+}
+
+fn m_unary(b: &[u8], s: &str, i: &mut usize, ctx: &MathCtx, depth: u8) -> Option<MathVal> {
+    m_skip(b, i);
+    let mut sign = 1.0f32;
+    while *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
+        if b[*i] == b'-' {
+            sign = -sign;
+        }
+        *i += 1;
+        m_skip(b, i);
+    }
+    let v = m_primary(b, s, i, ctx, depth)?;
+    MathVal { px: v.px * sign, pct: v.pct * sign, num: v.num }.finite()
+}
+
+fn m_mul(b: &[u8], s: &str, i: &mut usize, ctx: &MathCtx, depth: u8) -> Option<MathVal> {
+    let mut lhs = m_unary(b, s, i, ctx, depth)?;
+    loop {
+        m_skip(b, i);
+        if *i >= b.len() || (b[*i] != b'*' && b[*i] != b'/') {
+            break;
+        }
+        let op = b[*i];
+        *i += 1;
+        let rhs = m_unary(b, s, i, ctx, depth)?;
+        lhs = if op == b'*' { m_times(lhs, rhs)? } else { m_div(lhs, rhs)? };
+    }
+    Some(lhs)
+}
+
+fn m_add(b: &[u8], s: &str, i: &mut usize, ctx: &MathCtx, depth: u8) -> Option<MathVal> {
+    let mut lhs = m_mul(b, s, i, ctx, depth)?;
+    loop {
+        m_skip(b, i);
+        if *i >= b.len() || (b[*i] != b'+' && b[*i] != b'-') {
+            break;
+        }
+        let op = b[*i];
+        *i += 1;
+        let rhs = m_mul(b, s, i, ctx, depth)?;
+        let (a, b2) = (lhs, rhs);
+        lhs = MathVal {
+            px: if op == b'+' { a.px + b2.px } else { a.px - b2.px },
+            pct: if op == b'+' { a.pct + b2.pct } else { a.pct - b2.pct },
+            num: false,
+        }
+        .finite()?;
+    }
+    Some(lhs)
+}
+
+/// Comma-separated argument list; cursor sits just after `(`. Consumes the
+/// closing `)`. Args are pieces of one call, so a comma is authoritative.
+fn m_args(b: &[u8], s: &str, i: &mut usize, ctx: &MathCtx, depth: u8) -> Option<Vec<MathVal>> {
+    let mut args = Vec::new();
+    loop {
+        args.push(m_add(b, s, i, ctx, depth)?);
+        m_skip(b, i);
+        if *i < b.len() && b[*i] == b',' {
+            *i += 1;
+            continue;
+        }
+        break;
+    }
+    m_skip(b, i);
+    if *i >= b.len() || b[*i] != b')' {
+        return None;
+    }
+    *i += 1;
+    Some(args)
+}
+
+/// One unit kind per comparison: all px (unitless counts as px) or all %.
+/// Mixing px with % across arguments needs the containing block, which the
+/// parser doesn't have → None. shortcut: `min(100%, 1200px)`-style mixed
+/// comparisons are dropped (a `calc()` can still carry a px+% SUM).
+fn m_same_kind(args: &[MathVal]) -> Option<bool> {
+    let all_px = args.iter().all(|a| a.pct == 0.0);
+    let all_pct = args.iter().all(|a| a.px == 0.0);
+    if all_pct {
+        Some(true)
+    } else if all_px {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn m_key(a: &MathVal, pct: bool) -> f32 {
+    if pct {
+        a.pct
+    } else {
+        a.px
+    }
+}
+
+fn m_extreme(min: bool, args: &[MathVal]) -> Option<MathVal> {
+    if args.len() == 1 {
+        return args[0].finite();
+    }
+    let pct = m_same_kind(args)?;
+    let mut best = args[0];
+    for a in &args[1..] {
+        let (x, y) = (m_key(a, pct), m_key(&best, pct));
+        if (min && x < y) || (!min && x > y) {
+            best = *a;
+        }
+    }
+    best.finite()
+}
+
+fn m_clamp(args: &[MathVal]) -> Option<MathVal> {
+    if args.len() != 3 {
+        return None;
+    }
+    let pct = m_same_kind(args)?;
+    let (lo, val, hi) = (args[0], args[1], args[2]);
+    // CSS: clamp() is max(min, min(val, max)); when min > max the MIN wins
+    // (not a parse error — f32::clamp would panic here)
+    if m_key(&lo, pct) > m_key(&hi, pct) {
+        return lo.finite();
+    }
+    let out = if m_key(&val, pct) < m_key(&lo, pct) {
+        lo
+    } else if m_key(&val, pct) > m_key(&hi, pct) {
+        hi
+    } else {
+        val
+    };
+    out.finite()
+}
+
+fn m_fold(name: &str, args: Vec<MathVal>) -> Option<MathVal> {
+    match name {
+        "calc" if args.len() == 1 => args[0].finite(),
+        "min" | "max" if !args.is_empty() => m_extreme(name == "min", &args),
+        "clamp" => m_clamp(&args),
+        // shortcut: `round()`/`mod()`/`abs()`/`sign()`/trig are not
+        // implemented — an unknown function fails the parse (declaration
+        // dropped, initial value)
+        _ => None,
+    }
+}
+
+/// Evaluate one whole math function value (`calc`/`min`/`max`/`clamp`,
+/// `var()` already substituted upstream). Returns None for anything else —
+/// plain values keep flowing through the normal suffix parsers.
+///
+/// Grammar: `+ -` (lowest) → `* /` → unary signs → parenthesized expression
+/// or number-with-unit or a nested math function. `vw`/`vh`/`vmin`/`vmax`
+/// (+ `l/s/d` aliases) resolve against `vp`; `em` against `ctx.em`; `%` stays
+/// symbolic unless `ctx.pct_base` is set (font-size). Arguments of
+/// `min`/`max`/`clamp` must share one unit kind (all px or all %).
+fn eval_math(v: &str, ctx: &MathCtx) -> Option<MathVal> {
+    let b = v.as_bytes();
+    let open = v.find('(')?;
+    let name = v[..open].trim().to_ascii_lowercase();
+    if !matches!(name.as_str(), "calc" | "min" | "max" | "clamp") {
+        return None;
+    }
+    let mut i = open + 1;
+    let args = m_args(b, v, &mut i, ctx, 1)?;
+    m_skip(b, &mut i);
+    if i != b.len() {
+        return None; // trailing junk (`calc(1px) foo`) → invalid
+    }
+    m_fold(&name, args)
+}
+
+/// `200px` / `50%` / `1.5rem` / `25vh` / `min(10px, 2vw)` → [`Len`]. Bare
+/// numbers are lenient px (matches `parse_size`); `em` = 16px root at parse
+/// time (the element's own font size isn't known here — properties that do
+/// know it use [`parse_size`]/[`tracking`]).
 /// Viewport units (`vh`/`vw`/`vmin`/`vmax` + the `l/s/d`-prefixed aliases,
 /// all mapped to the static viewport — shortcut: no dynamic-viewport
 /// tracking) resolve NOW against `vp` = (w, h); `%` stays symbolic — it's
-/// % of the CONTAINING BLOCK at layout, not of the viewport.
+/// % of the CONTAINING BLOCK at layout, not of the viewport. A math result
+/// that mixes px and % is kept as [`Len::Calc`] and resolved by layout.
 fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
     let v = v.trim();
+    if let Some(m) = eval_math(v, &MathCtx { vp, em: 16.0, pct_base: None }) {
+        return m.to_len();
+    }
     if let Some(n) = v.strip_suffix('%') {
         return n.trim().parse::<f32>().ok().map(Len::Pct);
     }
@@ -2933,12 +3271,6 @@ fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
             return Some(Len::Px(f / 100.0 * px_per));
         }
     }
-    // `calc(<arith>)` — var() already substituted upstream; evaluate the
-    // arithmetic to px. `%` terms need a containing block that parse_len
-    // doesn't have, so they stay unresolvable (None → unset).
-    if let Some(inner) = v.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
-        return eval_calc(inner, vp).map(Len::Px);
-    }
     if let Some(n) = v.strip_suffix("rem") {
         return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
     }
@@ -2951,105 +3283,12 @@ fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
     v.parse::<f32>().ok().map(Len::Px)
 }
 
-/// Evaluate `calc()` arithmetic (already `var()`-substituted) to px.
-/// Grammar: `+ -` at the lowest precedence, then `* /`, then a signed factor
-/// (parenthesized sub-expression or a number with an optional px/em/rem/
-/// viewport unit; unitless numbers act as multipliers). `vw`/`vh`/`vmin`/
-/// `vmax` (+ aliases) resolve against the viewport `vp`; `%` and other units
-/// need a containing block → None. shortcut: no nested `calc(` inside the
-/// expression.
-fn eval_calc(s: &str, vp: (f32, f32)) -> Option<f32> {
-    fn skip_ws(b: &[u8], i: &mut usize) {
-        while *i < b.len() && b[*i].is_ascii_whitespace() {
-            *i += 1;
-        }
-    }
-    fn factor(b: &[u8], s: &str, i: &mut usize, vp: (f32, f32)) -> Option<f32> {
-        skip_ws(b, i);
-        let mut sign = 1.0f32;
-        while *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
-            if b[*i] == b'-' {
-                sign = -sign;
-            }
-            *i += 1;
-            skip_ws(b, i);
-        }
-        if *i < b.len() && b[*i] == b'(' {
-            *i += 1;
-            let v = additive(b, s, i, vp)?;
-            skip_ws(b, i);
-            if *i < b.len() && b[*i] == b')' {
-                *i += 1;
-            }
-            return Some(sign * v);
-        }
-        let start = *i;
-        while *i < b.len() && (b[*i].is_ascii_digit() || b[*i] == b'.') {
-            *i += 1;
-        }
-        if start == *i {
-            return None; // not a number — unresolvable
-        }
-        let n: f32 = s[start..*i].parse().ok()?;
-        skip_ws(b, i);
-        let ustart = *i;
-        while *i < b.len() && b[*i].is_ascii_alphabetic() {
-            *i += 1;
-        }
-        let px = match &s[ustart..*i] {
-            "" | "px" => n, // unitless = multiplier; px = identity
-            "em" | "rem" => n * 16.0,
-            "vh" | "lvh" | "svh" | "dvh" => n / 100.0 * vp.1,
-            "vw" | "lvw" | "svw" | "dvw" => n / 100.0 * vp.0,
-            "vmin" => n / 100.0 * vp.0.min(vp.1),
-            "vmax" => n / 100.0 * vp.0.max(vp.1),
-            _ => return None, // %, … need a containing block
-        };
-        Some(sign * px)
-    }
-    fn multiplicative(b: &[u8], s: &str, i: &mut usize, vp: (f32, f32)) -> Option<f32> {
-        let mut lhs = factor(b, s, i, vp)?;
-        loop {
-            skip_ws(b, i);
-            if *i >= b.len() || (b[*i] != b'*' && b[*i] != b'/') {
-                break;
-            }
-            let op = b[*i];
-            *i += 1;
-            let rhs = factor(b, s, i, vp)?;
-            lhs = if op == b'*' { lhs * rhs } else { lhs / rhs };
-        }
-        Some(lhs)
-    }
-    fn additive(b: &[u8], s: &str, i: &mut usize, vp: (f32, f32)) -> Option<f32> {
-        let mut lhs = multiplicative(b, s, i, vp)?;
-        loop {
-            skip_ws(b, i);
-            if *i >= b.len() || (b[*i] != b'+' && b[*i] != b'-') {
-                break;
-            }
-            let op = b[*i];
-            *i += 1;
-            let rhs = multiplicative(b, s, i, vp)?;
-            lhs = if op == b'+' { lhs + rhs } else { lhs - rhs };
-        }
-        Some(lhs)
-    }
-    let b = s.as_bytes();
-    let mut i = 0;
-    let v = additive(b, s, &mut i, vp)?;
-    skip_ws(b, &mut i);
-    if i != b.len() {
-        return None; // trailing junk → unresolvable
-    }
-    Some(v)
-}
-
 /// Symbolic length → px against a known container width (Pct resolves here).
 fn len_px(l: Len, container: f32) -> f32 {
     match l {
         Len::Px(p) => p,
         Len::Pct(p) => p / 100.0 * container,
+        Len::Calc { px, pct } => px + pct / 100.0 * container,
     }
 }
 
@@ -3065,6 +3304,15 @@ fn tracking(v: &str, vp: (f32, f32), size: f32, inherited: f32) -> f32 {
         "normal" | "initial" => 0.0,
         "inherit" | "unset" => inherited,
         _ => {
+            // math functions use the element's own font size for `em` (same
+            // convention as the plain `em` branch below); `%` is invalid for
+            // tracking → 0
+            if let Some(m) = eval_math(v, &MathCtx { vp, em: size, pct_base: None }) {
+                return match m.to_len() {
+                    Some(Len::Px(p)) => p,
+                    _ => 0.0,
+                };
+            }
             // `em` = the element's own font-size (parse_len would read it
             // as a fixed 16px root — wrong for tracking); `rem` keeps that
             // root-16px meaning via parse_len below
@@ -3118,15 +3366,24 @@ fn parse_tracks(v: &str, vp: (f32, f32)) -> (Vec<Track>, Vec<(String, usize)>) {
                 s.push(' ');
             }
             i = close + 1;
-        } else if v[i..].starts_with("calc(") || v[i..].starts_with("max(") || v[i..].starts_with("min(") {
-            // math groups skip whole — max()/min() have no evaluator, and
-            // cutting inside the parens used to leak inner literals (e.g.
-            // `calc(50vw - 720px)` minted a phantom 720px track that zeroed
-            // the 1fr tracks). shortcut: a bare `calc(…)` track COULD resolve
-            // now that the viewport is available, but one skip path for all
-            // three functions keeps the phantom fix simple.
+        } else if ["calc(", "max(", "min(", "clamp("]
+            .iter()
+            .any(|p| v[i..].starts_with(p))
+        {
+            // math groups are taken WHOLE (never cut inside the parens — that
+            // used to leak inner literals, e.g. `calc(50vw - 720px)` minted a
+            // phantom 720px track that zeroed the 1fr tracks). A result that
+            // resolves to ONE px/pct value becomes a real track token; a
+            // px+% mix still skips (Track has no mixed form). shortcut: math
+            // inside `repeat()`/`minmax()` args is not expanded (the parallel
+            // track parser owns those forms).
             let open = v[i..].find('(').unwrap();
             let Some(close) = match_paren(b, i + open) else { break };
+            match parse_len(&v[i..=close], vp) {
+                Some(Len::Px(p)) => s.push_str(&format!("{p}px")),
+                Some(Len::Pct(p)) => s.push_str(&format!("{p}%")),
+                _ => {} // mixed px+% / unresolvable: skip
+            }
             s.push(' '); // keep neighbors separated
             i = close + 1;
         } else {
@@ -3156,6 +3413,9 @@ fn parse_tracks(v: &str, vp: (f32, f32)) -> (Vec<Track>, Vec<(String, usize)>) {
             out.push(match l {
                 Len::Px(p) => Track::Px(p),
                 Len::Pct(p) => Track::Pct(p),
+                // mixed px+% has no Track form — math groups take the
+                // dedicated branch above; anything left here is skipped
+                Len::Calc { .. } => continue,
             });
         }
         // other unknown tokens are skipped
@@ -3185,24 +3445,11 @@ fn match_paren(b: &[u8], open: usize) -> Option<usize> {
 /// bare number (lenient px).
 fn parse_size(v: &str, current: f32, vp: (f32, f32)) -> Option<f32> {
     let v = v.trim();
-    // clamp(min, val, max) — common for responsive font sizes; resolve the
-    // inner values (px/rem/%/viewport units; % is % of the current font-size)
-    if let Some(inner) = v
-        .strip_prefix("clamp(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
-        if parts.len() == 3 {
-            let (Some(lo), Some(hi)) = (
-                parse_size(parts[0], current, vp),
-                parse_size(parts[2], current, vp),
-            ) else {
-                return None;
-            };
-            let val = parse_size(parts[1], current, vp).unwrap_or(lo);
-            return Some(val.clamp(lo, hi));
-        }
-        return None;
+    // calc()/min()/max()/clamp() — font-size has no containing block, so
+    // `%` AND `em` resolve against the PARENT size (`current`) right here
+    // (the same base the plain `em`/`%` branches below use)
+    if let Some(m) = eval_math(v, &MathCtx { vp, em: current, pct_base: Some(current) }) {
+        return m.to_len().map(|l| len_px(l, current));
     }
     // viewport units resolve against the sheet viewport (font-size is an
     // absolute used value after the cascade — no containing-block step);
@@ -3522,7 +3769,9 @@ fn parse_shadow(v: &str, dark: bool, vp: (f32, f32)) -> Option<Shadow> {
             if n_lens < 4 {
                 lens[n_lens] = match l {
                     Len::Px(p) => p,
-                    Len::Pct(_) => 0.0, // % of what? no resolved width here — ignore
+                    // shortcut: no resolved width here — ignore the % part
+                    Len::Pct(_) => 0.0,
+                    Len::Calc { px, .. } => px,
                 };
                 n_lens += 1;
             }
@@ -5569,10 +5818,118 @@ mod tests {
         assert_eq!(parse_len("calc(10vh + 20px)", VP), Some(Len::Px(90.0)), "70 + 20");
         assert_eq!(parse_len("calc(50vw - 720px)", VP), Some(Len::Px(-220.0)), "MDN grid math");
         assert_eq!(parse_len("calc(2 * 5vmin)", VP), Some(Len::Px(70.0)), "2 × 35");
-        // % needs a containing block → stays unresolvable (unset)
-        assert_eq!(parse_len("calc(100% - 20px)", VP), None);
+        // % now stays symbolic as a mixed length: the px part is known, the
+        // % part resolves against the containing block at layout
+        assert_eq!(
+            parse_len("calc(100% - 20px)", VP),
+            Some(Len::Calc { px: -20.0, pct: 100.0 })
+        );
         // trailing junk / malformed → unresolvable
         assert_eq!(parse_len("calc(10px +)", VP), None);
+    }
+
+    #[test]
+    fn min_max_clamp_evaluate_and_nest() {
+        assert_eq!(parse_len("min(10px, 20px)", VP), Some(Len::Px(10.0)));
+        assert_eq!(parse_len("max(10px, 20px)", VP), Some(Len::Px(20.0)));
+        assert_eq!(parse_len("clamp(10px, 20px, 30px)", VP), Some(Len::Px(20.0)));
+        // 50vw = 500px at the 1000px test viewport → capped at 30
+        assert_eq!(parse_len("clamp(10px, 50vw, 30px)", VP), Some(Len::Px(30.0)));
+        // min > max is NOT a parse error: the MIN wins
+        assert_eq!(parse_len("clamp(30px, 10px, 20px)", VP), Some(Len::Px(30.0)));
+        // percentages stay symbolic when every argument is a percentage
+        assert_eq!(parse_len("min(50%, 60%)", VP), Some(Len::Pct(50.0)));
+        // nested functions: 3 - max(1,2) = 1 → min(2,1) = 1 → 1 + 1 = 2
+        assert_eq!(
+            parse_len("calc(1px + min(2px, calc(3px - max(1px, 2px))))", VP),
+            Some(Len::Px(2.0))
+        );
+        // `em` at parse time = the 16px root, same as plain `2em` in parse_len
+        assert_eq!(
+            parse_len("calc(100px - clamp(10px, 2em, 30px))", VP),
+            Some(Len::Px(70.0))
+        );
+        // invalid argument / division by zero → dropped (initial), no NaN
+        assert_eq!(parse_len("min(10px, bogus)", VP), None);
+        assert_eq!(parse_len("calc(10px / 0)", VP), None);
+        assert_eq!(parse_len("calc(10px / (2 - 2))", VP), None);
+        assert_eq!(parse_len("clamp(1px, 2px)", VP), None);
+        // shortcut: min/max over a px AND a % argument needs the containing
+        // block, which parse_len doesn't have → dropped; a `calc()` can keep
+        // that mix symbolically instead (Len::Calc)
+        assert_eq!(parse_len("min(100%, 1200px)", VP), None);
+    }
+
+    #[test]
+    fn calc_keeps_mixed_px_percent_for_layout() {
+        let l = parse_len("calc(100% - clamp(10px, 2em, 30px))", VP).unwrap();
+        assert_eq!(l, Len::Calc { px: -30.0, pct: 100.0 }, "2em = 32 → clamp 30");
+        // resolved against a containing block by layout.rs `resolve_len`
+        assert_eq!(len_px(l, 530.0), 500.0);
+        assert_eq!(
+            parse_len("calc(min(10px, 20px) + 50%)", VP),
+            Some(Len::Calc { px: 10.0, pct: 50.0 })
+        );
+    }
+
+    #[test]
+    fn math_functions_reach_box_properties() {
+        let sheet = parse(
+            ".a { width: max(10px, 30px); padding: min(10px, 2vw); \
+                  font-size: max(10px, 2vw); letter-spacing: clamp(1px, 2px, 5px); \
+                  text-indent: min(4px, 8px); top: max(3px, 1px); \
+                  margin: 0 clamp(4px, 2vw, 8px) } \
+             .bad { width: min(10px, bogus); font-size: min(10px, bogus); \
+                    padding: clamp(1px, 2px) }",
+        );
+        let dom = dom_of("<div class=a></div><div class=bad></div>");
+        let a = sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None);
+        assert_eq!(a.bx.width, Some(Len::Px(30.0)), "max");
+        assert_eq!(a.bx.pad, [Len::Px(10.0); 4], "min(10, 2vw=20)");
+        assert_eq!(a.style.size, 20.0, "font-size: max(10, 2vw=20)");
+        assert_eq!(a.style.letter_spacing, 2.0, "clamp mid value");
+        assert_eq!(a.bx.text_indent, Len::Px(4.0), "min");
+        assert_eq!(a.bx.inset[0], Some(Len::Px(3.0)), "top: max");
+        assert_eq!(a.bx.margin[0], Len::Px(0.0));
+        assert_eq!(a.bx.margin[1], Len::Px(8.0), "margin shorthand keeps the group");
+        assert_eq!(a.bx.margin[3], Len::Px(8.0));
+        // invalid math drops the declaration → initial value
+        let bad = sheet.resolve(&dom, by_attr(&dom, "class", "bad"), Style::new(), None);
+        assert_eq!(bad.bx.width, None, "min(10px, bogus) dropped");
+        assert_eq!(bad.style.size, 15.0, "invalid font-size keeps the initial 15px");
+        assert_eq!(bad.bx.pad, [Len::Px(0.0); 4], "invalid clamp drops padding");
+    }
+
+    #[test]
+    fn plain_lengths_parse_unchanged_without_math() {
+        // guard: the math grammar must not touch non-math values
+        for (v, want) in [
+            ("12px", Len::Px(12.0)),
+            ("-3px", Len::Px(-3.0)),
+            ("50%", Len::Pct(50.0)),
+            ("1.5rem", Len::Px(24.0)),
+            ("2em", Len::Px(32.0)),
+            ("25", Len::Px(25.0)),
+            ("50vh", Len::Px(350.0)),
+            ("25vw", Len::Px(250.0)),
+        ] {
+            assert_eq!(parse_len(v, VP), Some(want), "{v}");
+        }
+        assert_eq!(parse_len("auto", VP), None);
+        let sheet = parse(
+            ".p { width: 40px; height: 20px; padding: 1px 2px; margin: 0 auto; \
+                  top: 10%; text-indent: 2em; letter-spacing: 1px; font-size: 18px }",
+        );
+        let dom = dom_of("<div class=p></div>");
+        let r = sheet.resolve(&dom, by_attr(&dom, "class", "p"), Style::new(), None);
+        assert_eq!(r.bx.width, Some(Len::Px(40.0)));
+        assert_eq!(r.bx.height, Some(Len::Px(20.0)));
+        assert_eq!(r.bx.pad, [Len::Px(1.0), Len::Px(2.0), Len::Px(1.0), Len::Px(2.0)]);
+        assert!(r.bx.margin_x_auto);
+        assert_eq!(r.bx.inset[0], Some(Len::Pct(10.0)));
+        assert_eq!(r.bx.text_indent, Len::Px(32.0));
+        assert_eq!(r.style.letter_spacing, 1.0);
+        assert_eq!(r.style.size, 18.0);
     }
 
     #[test]
@@ -5583,7 +5940,29 @@ mod tests {
             "[s] max(1rem,calc(50vw - 720px + 1rem)) [c0] 1fr [c1] minmax(0,48rem) [c2] 1fr [e]",
             VP,
         );
-        assert_eq!(cols, vec![Track::Fr(1.0), Track::Px(768.0), Track::Fr(1.0)]);
+        assert_eq!(
+            cols,
+            vec![Track::Px(16.0), Track::Fr(1.0), Track::Px(768.0), Track::Fr(1.0)],
+            "the max() track now resolves to its single 1rem value"
+        );
+    }
+
+    #[test]
+    fn math_track_resolves_only_when_single_valued() {
+        // a math group with ONE px result becomes a real fixed track
+        assert_eq!(
+            parse_tracks("clamp(10px, 5vw, 20px) 1fr", VP).0,
+            vec![Track::Px(20.0), Track::Fr(1.0)]
+        );
+        assert_eq!(
+            parse_tracks("min(10px, 20px) [b] 2fr", VP).0,
+            vec![Track::Px(10.0), Track::Fr(2.0)]
+        );
+        // mixed px+% has no Track form → skipped, neighbors stay intact
+        assert_eq!(
+            parse_tracks("calc(100% - 20px) 1fr", VP).0,
+            vec![Track::Fr(1.0)]
+        );
     }
 
     #[test]
