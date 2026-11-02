@@ -5,7 +5,8 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor,
-    Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track, VAlign,
+    Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track,
+    TrackBreadth, VAlign,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -3957,6 +3958,59 @@ fn item_natural(
     }
 }
 
+/// Min-content OUTER width of one grid item: the widest unbreakable word of
+/// an anonymous text run, or a box's own intrinsic minimum (see
+/// [`min_content_w`]), plus horizontal margins. A declared px width is the
+/// item's border-box width and stays its floor.
+fn item_min_content(
+    parent: &BoxNode,
+    it: &Item,
+    avail: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> f32 {
+    match it {
+        Item::Text(a, b) => parent.children[*a..*b]
+            .iter()
+            .map(|c| min_content_w(c, avail, measure))
+            .fold(0.0f32, f32::max),
+        Item::Grp(i) => {
+            let c = &parent.children[*i];
+            // a declared px width is the border-box contribution; content
+            // wider than it overflows (same model as the max-content side)
+            let w = match c.bx.width {
+                Some(Len::Px(p)) => p,
+                _ => min_content_w(c, avail, measure),
+            };
+            w + resolve_len(c.bx.margin[3], avail) + resolve_len(c.bx.margin[1], avail)
+        }
+    }
+}
+
+/// Max-content OUTER width of one grid item: all inline content on one line
+/// (see [`cell_max_content`]), plus horizontal margins. A declared px width
+/// wins (the box does not grow past it).
+fn item_max_content(
+    parent: &BoxNode,
+    it: &Item,
+    avail: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> f32 {
+    match it {
+        Item::Text(a, b) => parent.children[*a..*b]
+            .iter()
+            .map(|c| natural_w(c, avail, measure))
+            .sum(),
+        Item::Grp(i) => {
+            let c = &parent.children[*i];
+            let w = match c.bx.width {
+                Some(Len::Px(p)) => p,
+                _ => cell_max_content(c, avail, measure),
+            };
+            w + resolve_len(c.bx.margin[3], avail) + resolve_len(c.bx.margin[1], avail)
+        }
+    }
+}
+
 /// Value of attribute `name` on the open tag whose text is `tag` (including
 /// the leading `<`), or None.
 fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -4118,18 +4172,20 @@ fn inject_svg_class_paint(markup: &str, sheet: &crate::css::Sheet, dark: bool) -
 }
 
 /// Resolved track widths + gaps: returns total width of all tracks+gaps.
-/// shortcut: `Content` tracks measure 0 here (this path sizes a grid that is
-/// itself being shrink-to-fit, where per-column item widths aren't known);
-/// the `fr` tracks absorb the slack. Layout's `grid()` sizes real content.
+/// shortcut: intrinsic tracks (`auto`/`min-content`/`max-content`) measure 0
+/// here — this path sizes a grid that is itself shrink-to-fit, where
+/// per-column item widths aren't known; the `fr` tracks absorb the slack and
+/// layout's `grid()` sizes real content.
 fn tracks_w(cols: &[Track], avail: f32, gap: f32) -> f32 {
     let mut fixed = 0.0;
     let mut fr = 0.0;
     for t in cols {
-        match t {
-            Track::Px(p) => fixed += p,
-            Track::Pct(p) => fixed += p / 100.0 * avail,
-            Track::Fr(f) => fr += f,
-            Track::Content => {}
+        let s = track_size(t, avail, 0.0, 0.0);
+        if s.flex > 0.0 {
+            fixed += s.min;
+            fr += s.flex;
+        } else {
+            fixed += s.max.max(s.min);
         }
     }
     let gaps = gap * (cols.len() as f32 - 1.0).max(0.0);
@@ -4137,39 +4193,232 @@ fn tracks_w(cols: &[Track], avail: f32, gap: f32) -> f32 {
     fixed + if fr > 0.0 { free } else { 0.0 } + gaps
 }
 
-/// Resolve each track to a pixel width. `content[c]` is column `c`'s measured
-/// max-content width, used only by `Track::Content` tracks (empty slice = all
-/// fixed/fr, the pre-content behavior). `fr` tracks split whatever width the
-/// fixed + content tracks leave over.
-fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, content: &[f32]) -> Vec<f32> {
-    let cw = |i: usize| content.get(i).copied().unwrap_or(0.0);
-    let mut fixed = 0.0;
-    let mut fr = 0.0;
-    for (i, t) in cols.iter().enumerate() {
-        match t {
-            Track::Px(p) => fixed += p,
-            Track::Pct(p) => fixed += p / 100.0 * avail,
-            Track::Fr(f) => fr += f,
-            Track::Content => fixed += cw(i),
-        }
+/// One track's sizing inputs: a hard minimum, a preferred maximum, and a
+/// flex factor (0 = not flexible; `f32::INFINITY` max = grow without limit).
+#[derive(Clone, Copy)]
+struct TrackSize {
+    min: f32,
+    max: f32,
+    flex: f32,
+}
+
+/// `minmax()` minimum side. `Fr` is invalid as a minimum and resolves to 0.
+fn breadth_min(b: TrackBreadth, avail: f32, cmin: f32, cmax: f32) -> f32 {
+    match b {
+        TrackBreadth::Px(p) => p,
+        TrackBreadth::Pct(p) => p / 100.0 * avail,
+        TrackBreadth::Fr(_) => 0.0,
+        TrackBreadth::Auto => cmin,
+        TrackBreadth::MinContent => cmin,
+        TrackBreadth::MaxContent => cmax,
     }
-    let gaps = gap * (cols.len() as f32 - 1.0).max(0.0);
-    let free = (avail - fixed - gaps).max(0.0);
-    cols.iter()
-        .enumerate()
-        .map(|(i, t)| match t {
-            Track::Px(p) => *p,
-            Track::Pct(p) => p / 100.0 * avail,
-            Track::Fr(f) => {
-                if fr > 0.0 {
-                    free * f / fr
-                } else {
-                    0.0
+}
+
+/// `minmax()` maximum side. `Fr` returns infinity (handled by `track_size`).
+fn breadth_max(b: TrackBreadth, avail: f32, cmin: f32, cmax: f32) -> f32 {
+    match b {
+        TrackBreadth::Px(p) => p,
+        TrackBreadth::Pct(p) => p / 100.0 * avail,
+        TrackBreadth::Fr(_) => f32::INFINITY,
+        TrackBreadth::Auto => cmax,
+        TrackBreadth::MinContent => cmin,
+        TrackBreadth::MaxContent => cmax,
+    }
+}
+
+/// Turn a declaration into min/max/flex inputs. `cmin`/`cmax` are the
+/// measured min-content (widest word) and max-content (one line) widths of
+/// the widest item placed in this column, including padding/border/margins.
+fn track_size(t: &Track, avail: f32, cmin: f32, cmax: f32) -> TrackSize {
+    match *t {
+        Track::Fr(f) => TrackSize {
+            min: 0.0,
+            max: if f > 0.0 { f32::INFINITY } else { 0.0 },
+            flex: f,
+        },
+        Track::Px(p) => TrackSize {
+            min: p,
+            max: p,
+            flex: 0.0,
+        },
+        Track::Pct(p) => {
+            let w = p / 100.0 * avail;
+            TrackSize {
+                min: w,
+                max: w,
+                flex: 0.0,
+            }
+        }
+        // auto = max-content, but never below the min-content floor
+        Track::Auto => TrackSize {
+            min: cmin,
+            max: cmax.max(cmin),
+            flex: 0.0,
+        },
+        Track::MinContent => TrackSize {
+            min: cmin,
+            max: cmin,
+            flex: 0.0,
+        },
+        Track::MaxContent => TrackSize {
+            min: cmax,
+            max: cmax,
+            flex: 0.0,
+        },
+        Track::MinMax(a, b) => {
+            let min = breadth_min(a, avail, cmin, cmax).max(0.0);
+            match b {
+                TrackBreadth::Fr(f) => TrackSize {
+                    min,
+                    max: if f > 0.0 { f32::INFINITY } else { min },
+                    flex: f,
+                },
+                // a definite max below the min is floored by the min (CSS: the
+                // min sizing function wins when it exceeds the max)
+                _ => {
+                    let max = breadth_max(b, avail, cmin, cmax).max(min);
+                    TrackSize { min, max, flex: 0.0 }
                 }
             }
-            Track::Content => cw(i),
+        }
+    }
+}
+
+/// Does this track need measured item widths to size?
+fn track_intrinsic(t: &Track) -> bool {
+    let intrinsic = |b: TrackBreadth| {
+        matches!(
+            b,
+            TrackBreadth::Auto | TrackBreadth::MinContent | TrackBreadth::MaxContent
+        )
+    };
+    match *t {
+        Track::Auto | Track::MinContent | Track::MaxContent => true,
+        Track::MinMax(a, b) => intrinsic(a) || intrinsic(b),
+        _ => false,
+    }
+}
+
+/// Minimum height of a `grid-template-rows` track. A definite length (or the
+/// definite side of `minmax`) is a floor; intrinsic tracks let the tallest
+/// cell decide.
+/// shortcut: `fr` rows are content-sized (a block grid's height is content-
+/// derived, so there is no definite height to fill); percent rows resolve
+/// only against a declared px height, else they are auto.
+fn row_track_floor(t: &Track, avail_h: f32) -> f32 {
+    let px = |b: TrackBreadth| match b {
+        TrackBreadth::Px(p) => p,
+        TrackBreadth::Pct(p) => p / 100.0 * avail_h,
+        TrackBreadth::Fr(_) => 0.0,
+        TrackBreadth::Auto | TrackBreadth::MinContent | TrackBreadth::MaxContent => 0.0,
+    };
+    match *t {
+        Track::Px(p) => p,
+        Track::Pct(p) => p / 100.0 * avail_h,
+        Track::MinMax(a, b) => px(a).max(px(b)),
+        _ => 0.0,
+    }
+}
+
+/// Resolve grid columns with two explicit phases.
+///
+/// 1. **Base pass**: every track starts at its minimum (fixed/percent length,
+///    `auto`/`min-content` → measured min-content, `fr`/`minmax(…, fr)` →
+///    the `minmax` floor, a bare `fr` → 0). Free space then grows non-flex
+///    tracks toward their preferred maximum: `auto`/`max-content` → measured
+///    max-content, a definite `minmax` max → that length. A grid whose
+///    minimums already exceed the container keeps those minimums and overflows
+///    (it never collapses a track below min-content).
+/// 2. **Flex pass**: the remaining space is shared among `fr` tracks by
+///    weight, water-filled so a `minmax(min, fr)` track is pinned at its
+///    floor when its proportional share is smaller. Any residual overflow
+///    (a definite `minmax(0, N)` that cannot fit) shrinks non-flex tracks
+///    back toward their minimums, right to left.
+///
+/// shortcut: leftover space after all tracks reach their maximum is not
+/// distributed back to non-flex tracks (no `justify-content` stretch); when
+/// several non-flex tracks compete for too little space their growth is
+/// granted left-to-right rather than in equal shares; and spanning items
+/// contribute their full width to every covered column.
+fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f32]) -> Vec<f32> {
+    let n = cols.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let sizes: Vec<TrackSize> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            track_size(
+                t,
+                avail,
+                cmin.get(i).copied().unwrap_or(0.0),
+                cmax.get(i).copied().unwrap_or(0.0),
+            )
         })
-        .collect()
+        .collect();
+    let gaps = gap * (n as f32 - 1.0).max(0.0);
+    let mut w: Vec<f32> = sizes.iter().map(|s| s.min).collect();
+    let mut free = (avail - w.iter().sum::<f32>() - gaps).max(0.0);
+    for i in 0..n {
+        if sizes[i].flex <= 0.0 && w[i] < sizes[i].max && free > 0.0 {
+            let grow = (sizes[i].max - w[i]).min(free);
+            w[i] += grow;
+            free -= grow;
+        }
+    }
+    let flex_sum: f32 = sizes.iter().map(|s| s.flex).sum();
+    if flex_sum > 0.0 {
+        let nonflex: f32 = (0..n)
+            .filter(|&i| sizes[i].flex <= 0.0)
+            .map(|i| w[i])
+            .sum();
+        let mut pool = (avail - gaps - nonflex).max(0.0);
+        let mut active: Vec<usize> = (0..n).filter(|&i| sizes[i].flex > 0.0).collect();
+        while !active.is_empty() {
+            let wsum: f32 = active.iter().map(|&i| sizes[i].flex).sum();
+            if wsum <= 0.0 {
+                break;
+            }
+            let mut pinned = false;
+            let mut next = Vec::new();
+            for &i in &active {
+                let share = pool * sizes[i].flex / wsum;
+                if share < sizes[i].min {
+                    w[i] = sizes[i].min;
+                    pool -= sizes[i].min;
+                    pinned = true;
+                } else {
+                    next.push(i);
+                }
+            }
+            if pinned {
+                active = next;
+                pool = pool.max(0.0);
+            } else {
+                for &i in &active {
+                    w[i] = pool * sizes[i].flex / wsum;
+                }
+                break;
+            }
+        }
+    }
+    let total: f32 = w.iter().sum::<f32>() + gaps;
+    if total > avail {
+        let mut excess = total - avail;
+        for i in (0..n).rev() {
+            if sizes[i].flex > 0.0 {
+                continue;
+            }
+            let cut = (w[i] - sizes[i].min).min(excess);
+            w[i] -= cut;
+            excess -= cut;
+            if excess <= 0.0 {
+                break;
+            }
+        }
+    }
+    w
 }
 
 /// One placed float's margin box in DOC coordinates + its side.
@@ -4915,27 +5164,30 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             }
         });
     }
-    // per-column max-content width for `min-content`/`max-content`/`auto`
-    // tracks: the widest item placed in the column. shortcut: a multi-column
-    // span contributes its full width to each column it covers (over-allocates
-    // a spanning content track; rare in practice).
-    let content: Vec<f32> = if n.bx.cols.iter().any(|t| *t == Track::Content) {
-        let mut c = vec![0.0f32; nc];
+    // Per-column measured widths for `auto`/`min-content`/`max-content`/
+    // `minmax(…)`: min-content = widest unbreakable word, max-content = the
+    // item on one line, both outer (padding/border/margins). shortcut: a
+    // multi-column span contributes its full width to every covered column.
+    let (col_min, col_max): (Vec<f32>, Vec<f32>) = if n.bx.cols.iter().any(track_intrinsic) {
+        let mut lo = vec![0.0f32; nc];
+        let mut hi = vec![0.0f32; nc];
         for (i, it) in items.iter().enumerate() {
             let (_, c0, c1) = spots[i];
-            let w = item_natural(n, it, n.w, measure);
+            let wmin = item_min_content(n, it, n.w, measure);
+            let wmax = item_max_content(n, it, n.w, measure);
             for col in c0..c1.min(nc) {
-                c[col] = c[col].max(w);
+                lo[col] = lo[col].max(wmin);
+                hi[col] = hi[col].max(wmax);
             }
         }
-        c
+        (lo, hi)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let cols: Vec<f32> = if n.bx.cols.is_empty() {
         vec![n.w]
     } else {
-        resolve_tracks(&n.bx.cols, n.w, n.bx.gap_col, &content)
+        resolve_tracks(&n.bx.cols, n.w, n.bx.gap_col, &col_min, &col_max)
     };
     // x offset + width of columns [c0, c1)
     let span_xw = |c0: usize, c1: usize| {
@@ -4944,6 +5196,11 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         (x, w)
     };
     let nrows = spots.iter().map(|s| s.0).max().unwrap_or(0) + 1;
+    // percent row tracks need a definite grid height; otherwise they are auto
+    let row_avail_h = match n.bx.height {
+        Some(Len::Px(h)) => h,
+        _ => 0.0,
+    };
     let mut y = n.y;
     let mut last_open = false;
     for r in 0..nrows {
@@ -4977,6 +5234,10 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             marks.push((rs, us, ih));
             cell_ios.push(io);
             row_h = row_h.max(ih);
+        }
+        // a declared row track is a height floor (the tallest cell still wins)
+        if let Some(t) = n.bx.rows.get(r) {
+            row_h = row_h.max(row_track_floor(t, row_avail_h));
         }
         // cross-axis align within the row (ranges are safe: the next row
         // hasn't been laid yet)
@@ -5955,7 +6216,7 @@ mod tests {
             Style::new(),
             BoxStyle {
                 display: Display::Grid,
-                cols: vec![Track::Content, Track::Fr(1.0), Track::Content, Track::Content],
+                cols: vec![Track::Auto, Track::Fr(1.0), Track::Auto, Track::Auto],
                 ..BoxStyle::default()
             },
         );
@@ -5976,6 +6237,266 @@ mod tests {
         assert!((x("B") - 16.0).abs() < 0.01, "col1 (1fr) x={}", x("B"));
         assert!((x("CCCCCC") - 68.0).abs() < 0.01, "col2 x={}", x("CCCCCC"));
         assert!((x("DD") - 92.0).abs() < 0.01, "col3 x={}", x("DD"));
+    }
+
+    /// A grid of one block item per text, laid out at `width`.
+    fn grid_case(
+        cols: Vec<Track>,
+        texts: &[&str],
+        width: f32,
+        gap: f32,
+    ) -> (BoxNode, Layout) {
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols,
+                gap_col: gap,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = texts.iter().map(|t| boxed(t)).collect();
+        let l = layout_tree(&mut n, width, &m4);
+        (n, l)
+    }
+
+    #[test]
+    fn grid_fixed_and_fr_columns_split_free_space() {
+        let (n, _) = grid_case(
+            vec![Track::Px(100.0), Track::Fr(1.0)],
+            &["a", "b"],
+            400.0,
+            0.0,
+        );
+        assert_eq!(n.children[0].w, 100.0);
+        assert_eq!(n.children[1].w, 300.0);
+    }
+
+    #[test]
+    fn grid_fr_columns_share_by_weight() {
+        let (equal, _) = grid_case(vec![Track::Fr(1.0), Track::Fr(1.0)], &["a", "b"], 400.0, 0.0);
+        assert_eq!(equal.children[0].w, 200.0);
+        assert_eq!(equal.children[1].w, 200.0);
+        let (weighted, _) =
+            grid_case(vec![Track::Fr(1.0), Track::Fr(2.0)], &["a", "b"], 400.0, 0.0);
+        assert!((weighted.children[0].w - 133.333).abs() < 0.01);
+        assert!((weighted.children[1].w - 266.667).abs() < 0.01);
+    }
+
+    #[test]
+    fn grid_minmax_zero_fr_is_not_content_sized() {
+        // The MDN bug class: `minmax(0, 1fr)` must take the free-space share,
+        // never grow to the item's long word. The TEXT overflows the cell.
+        let word = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+        let (n, l) = grid_case(
+            vec![
+                Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::Fr(1.0)),
+                Track::Px(200.0),
+            ],
+            &[word, "b"],
+            400.0,
+            0.0,
+        );
+        assert_eq!(n.children[0].w, 200.0, "track is the free-space share");
+        let run = l.runs.iter().find(|r| r.text == word).expect("long word");
+        assert!(
+            run.width > 200.0,
+            "text ({}px) overflows the {}px track",
+            run.width,
+            n.children[0].w
+        );
+    }
+
+    #[test]
+    fn grid_auto_tracks_size_to_content() {
+        let (n, _) = grid_case(
+            vec![Track::Auto, Track::Auto],
+            &["aa", "bbbb"],
+            400.0,
+            0.0,
+        );
+        assert_eq!(n.children[0].w, 8.0, "short content");
+        assert_eq!(n.children[1].w, 16.0, "long content");
+        assert_eq!(n.children[1].x, 8.0, "columns sit edge to edge");
+    }
+
+    #[test]
+    fn grid_minmax_uses_its_minimum_floor() {
+        let (n, _) = grid_case(
+            vec![Track::MinMax(TrackBreadth::Px(200.0), TrackBreadth::Auto)],
+            &["hi"],
+            400.0,
+            0.0,
+        );
+        assert_eq!(n.children[0].w, 200.0, "narrow content keeps 200px min");
+
+        // a definite max caps the content contribution, never below the min;
+        // a breakable phrase has a small min-content floor, so the cap wins
+        let (capped, _) = grid_case(
+            vec![Track::MinMax(
+                TrackBreadth::Auto,
+                TrackBreadth::Px(100.0),
+            )],
+            &["aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa"],
+            400.0,
+            0.0,
+        );
+        assert_eq!(capped.children[0].w, 100.0);
+    }
+
+    #[test]
+    fn grid_auto_measurements_include_padding_border_and_margins() {
+        let mut padded = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                pad: [Len::Px(10.0); 4],
+                border: [Len::Px(1.0); 4],
+                margin: [Len::Px(5.0); 4],
+                ..BoxStyle::default()
+            },
+        );
+        padded.children = vec![leaf("aa")];
+        let mut plain = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        plain.children = vec![leaf("b")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Auto, Track::Auto],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![padded, plain];
+        layout_tree(&mut n, 300.0, &m4);
+        // "aa" 8 + padding 20 + border 2 + margins 10 = 40
+        assert_eq!(n.children[1].x, 40.0, "auto track is the margin box");
+        assert_eq!(n.children[0].w, 30.0, "border box inside its 5px margins");
+        assert_eq!(n.children[0].x, 5.0, "left margin offsets the item");
+    }
+
+    #[test]
+    fn grid_min_content_and_max_content_tracks_measure_differently() {
+        let (n, _) = grid_case(
+            vec![Track::MinContent, Track::MaxContent],
+            &["aa bbbb", "cc"],
+            400.0,
+            0.0,
+        );
+        assert_eq!(n.children[0].w, 16.0, "widest word = bbbb");
+        assert_eq!(n.children[1].w, 8.0, "one line = cc");
+    }
+
+    #[test]
+    fn grid_column_gap_comes_out_of_the_free_space() {
+        let (n, _) = grid_case(vec![Track::Fr(1.0), Track::Fr(1.0)], &["a", "b"], 400.0, 20.0);
+        assert_eq!(n.children[0].w, 190.0);
+        assert_eq!(n.children[1].x, 210.0);
+        assert_eq!(n.children[1].w, 190.0);
+    }
+
+    #[test]
+    fn grid_percent_track_resolves_against_the_container() {
+        let (n, _) = grid_case(vec![Track::Pct(50.0)], &["a"], 400.0, 0.0);
+        assert_eq!(n.children[0].w, 200.0);
+    }
+
+    #[test]
+    fn grid_minmax_sidebar_keeps_its_floor_instead_of_collapsing() {
+        // MDN's layout-1-sidebar-left shape (resolved vars):
+        // minmax(15rem,1fr) 2rem minmax(0,48rem) minmax(0,1fr)
+        // at 1000px: the content track shrinks to 728 and the sidebar keeps
+        // 240px — the pre-fix parser took only the max side, turning the
+        // sidebar into a bare 1fr and giving it ~1/10 of the width.
+        let (n, _) = grid_case(
+            vec![
+                Track::MinMax(TrackBreadth::Px(240.0), TrackBreadth::Fr(1.0)),
+                Track::Px(32.0),
+                Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::Px(768.0)),
+                Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::Fr(1.0)),
+            ],
+            &["sidebar", "gap", "article"],
+            1000.0,
+            0.0,
+        );
+        assert_eq!(n.children[0].w, 240.0, "sidebar floor");
+        assert_eq!(n.children[1].w, 32.0);
+        assert_eq!(n.children[2].w, 728.0, "content fills the rest");
+    }
+
+    #[test]
+    fn grid_row_tracks_floor_the_row_height() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Fr(1.0)],
+                rows: vec![Track::Px(100.0), Track::Px(50.0)],
+                ..BoxStyle::default()
+            },
+        );
+        for t in ["a", "b"] {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            n.children.push(g);
+        }
+        layout_tree(&mut n, 300.0, &m4);
+        assert_eq!(n.children[0].y, 0.0);
+        assert_eq!(n.children[1].y, 100.0, "second row starts after 100px");
+    }
+
+    #[test]
+    fn pages_without_grids_keep_their_paint_snapshot() {
+        // regression guard: the grid branches activate only for
+        // `display: grid` boxes, so a page with none paints exactly as before
+        let mut root = boxes_of(
+            r#"<div class=a>alpha</div><p class=b>beta <b>bold</b></p>"#,
+            ".a{width:120px;background:#112233}.b{width:90px;background:#445566}",
+        );
+        let l = layout_tree(&mut root, 400.0, &m4);
+        assert_eq!(
+            l.rects,
+            vec![
+                (0.0, 0.0, 120.0, 20.25, 0x11_22_33, 0.0, false),
+                (0.0, 29.25, 90.0, 20.25, 0x44_55_66, 0.0, false),
+            ]
+        );
+        let runs: Vec<(String, f32, f32, f32)> = l
+            .runs
+            .iter()
+            .map(|r| (r.text.clone(), r.x, r.y, r.width))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                ("alpha".to_string(), 0.0, 0.0, 20.0),
+                ("beta".to_string(), 0.0, 29.25, 16.0),
+                ("bold".to_string(), 20.0, 29.25, 16.0),
+            ]
+        );
     }
 
     #[test]

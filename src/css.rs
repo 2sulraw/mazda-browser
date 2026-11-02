@@ -37,15 +37,33 @@ pub enum Len {
     Pct(f32),
 }
 
-/// One `grid-template-columns` track.
+/// One side of a `minmax()` track range. `Fr` only appears as a maximum in
+/// valid CSS; an `Fr` minimum resolves to 0 at layout.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TrackBreadth {
+    Px(f32),
+    Pct(f32),
+    Fr(f32),
+    Auto,
+    MinContent,
+    MaxContent,
+}
+
+/// One `grid-template-columns` / `grid-template-rows` track.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Track {
+    /// a bare `<flex>` track: minimum 0, maximum fr
     Fr(f32),
     Px(f32),
     Pct(f32),
-    /// `min-content` / `max-content` / `auto` — sized to the widest item
-    /// placed in the column (resolved at layout, where items are measured)
-    Content,
+    /// `auto`: content-based, clamped between min-content and max-content
+    Auto,
+    /// `min-content`: the widest unbreakable word (intrinsic, at layout)
+    MinContent,
+    /// `max-content`: the item's one-line width (intrinsic, at layout)
+    MaxContent,
+    /// `minmax(min, max)`; the min is a hard floor for `fr` maximums too
+    MinMax(TrackBreadth, TrackBreadth),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -286,6 +304,10 @@ pub struct BoxStyle {
     pub gap_row: f32,
     pub gap_col: f32,
     pub cols: Vec<Track>,
+    /// `grid-template-rows`; a fixed/percent row is a height floor, intrinsic
+    /// and `fr` rows are content-sized (see layout's `grid()`). shortcut:
+    /// `fr` rows don't fill a declared container height.
+    pub rows: Vec<Track>,
     /// `[line-name]` boundaries from `grid-template-columns`
     /// (name → track index it precedes)
     pub col_lines: Vec<(String, usize)>,
@@ -495,6 +517,7 @@ impl Default for BoxStyle {
             gap_row: 0.0,
             gap_col: 0.0,
             cols: Vec::new(),
+            rows: Vec::new(),
             col_lines: Vec::new(),
             grid_col: None,
             width: None,
@@ -987,6 +1010,7 @@ const KNOWN: &[&str] = &[
     "row-gap",
     "column-gap",
     "grid-template-columns",
+    "grid-template-rows",
     "grid-column",
     "width",
     "max-width",
@@ -2038,6 +2062,7 @@ fn apply_decl(
             bx.cols = cols;
             bx.col_lines = lines;
         }
+        "grid-template-rows" => bx.rows = parse_tracks(&d.1, vp).0,
         // item placement into named lines: `grid-column: content` spans the
         // [content-start]…[content-end] pair from the container's template
         "grid-column" => {
@@ -3079,88 +3104,145 @@ fn tracking(v: &str, vp: (f32, f32), size: f32, inherited: f32) -> f32 {
     }
 }
 
-/// `grid-template-columns`: `1fr 1fr 1fr`, `repeat(3, 1fr)`,
-/// `minmax(0, 1fr)`, `200px 50%`. Empty = single implicit column.
-/// Returns the tracks plus line names (`[content-start]` → index of the
-/// track boundary it precedes) so items can place via `grid-column: name`.
-/// shortcut: `repeat(auto-fill, …)` and multi-token line names are dropped.
+/// `grid-template-columns` / `grid-template-rows`: `1fr 1fr`, `repeat(3, 1fr)`,
+/// `minmax(240px, 1fr)`, `200px 50%`, `auto`, `min-content`, `max-content`.
+/// Empty = single implicit column. Returns the tracks plus line names
+/// (`[content-start]` → index of the track boundary it precedes) so items
+/// can place via `grid-column: name`.
+///
+/// `minmax()` keeps BOTH sides: taking only the maximum (the old behavior)
+/// turned `minmax(15rem, 1fr)` into a bare 1fr and dropped the 15rem floor —
+/// the class that collapsed a sidebar to its free-space share.
+///
+/// shortcut: `repeat(auto-fill|auto-fit, …)` needs the container width at
+/// parse time, so it is skipped; `fit-content(x)` is skipped; math groups
+/// (`calc`/`min`/`max`/`clamp`) are skipped whole (no phantom inner tracks).
 fn parse_tracks(v: &str, vp: (f32, f32)) -> (Vec<Track>, Vec<(String, usize)>) {
     let mut out = Vec::new();
     let mut lines: Vec<(String, usize)> = Vec::new();
     let v = v.trim();
-    if v.is_empty() || v == "none" {
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return (out, lines);
     }
-    // expand repeat(n, …) and minmax(a, b) first so tokens are space-free
-    let mut s = String::new();
-    let mut i = 0;
+    parse_track_list(v, vp, &mut out, &mut lines, 0);
+    (out, lines)
+}
+
+/// Recursive track-list scanner (recursion only enters `repeat()`).
+fn parse_track_list(
+    v: &str,
+    vp: (f32, f32),
+    out: &mut Vec<Track>,
+    lines: &mut Vec<(String, usize)>,
+    depth: u8,
+) {
     let b = v.as_bytes();
+    let mut i = 0usize;
     while i < b.len() {
-        if v[i..].starts_with("repeat(") {
-            let open = i + 6;
-            let Some(close) = match_paren(b, open) else { break };
-            let inner = &v[open + 1..close];
-            let Some((n, list)) = inner.split_once(',') else { break };
-            if let Ok(n) = n.trim().parse::<usize>() {
-                for _ in 0..n.min(64) {
-                    s.push_str(list);
-                    s.push(' ');
-                }
-            }
-            i = close + 1;
-        } else if v[i..].starts_with("minmax(") {
-            // minmax(a, b) → take the max side (b); handles inner spaces
-            let open = i + 6; // index of '('
-            let Some(close) = match_paren(b, open) else { break };
-            let inner = &v[open + 1..close];
-            if let Some((_, max)) = inner.rsplit_once(',') {
-                s.push_str(max.trim());
-                s.push(' ');
-            }
-            i = close + 1;
-        } else if v[i..].starts_with("calc(") || v[i..].starts_with("max(") || v[i..].starts_with("min(") {
-            // math groups skip whole — max()/min() have no evaluator, and
-            // cutting inside the parens used to leak inner literals (e.g.
-            // `calc(50vw - 720px)` minted a phantom 720px track that zeroed
-            // the 1fr tracks). shortcut: a bare `calc(…)` track COULD resolve
-            // now that the viewport is available, but one skip path for all
-            // three functions keeps the phantom fix simple.
-            let open = v[i..].find('(').unwrap();
-            let Some(close) = match_paren(b, i + open) else { break };
-            s.push(' '); // keep neighbors separated
-            i = close + 1;
-        } else {
-            s.push(b[i] as char);
+        // track lists are whitespace/comma separated
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
             i += 1;
         }
-    }
-    for tok in s.split_whitespace() {
-        // [line-name] → record the boundary index it precedes
-        if let Some(name) = tok.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-            if !name.contains(' ') {
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b'[' {
+            let end = v[i..].find(']').map(|e| i + e).unwrap_or(b.len());
+            for name in v[i + 1..end].split_whitespace() {
                 lines.push((name.to_string(), out.len()));
             }
+            i = (end + 1).min(b.len());
             continue;
         }
-        let tok = tok.trim_end_matches(',');
-        if let Some(n) = tok.strip_suffix("fr") {
-            if let Ok(f) = n.trim().parse::<f32>() {
-                out.push(Track::Fr(f.max(0.0)));
+        let rest = &v[i..];
+        let func = ["repeat(", "minmax(", "fit-content(", "calc(", "clamp(", "min(", "max("]
+            .iter()
+            .find(|f| rest.len() >= f.len() && rest[..f.len()].eq_ignore_ascii_case(f))
+            .copied();
+        if let Some(f) = func {
+            let open = i + f.len() - 1; // index of '('
+            let Some(close) = match_paren(b, open) else { break };
+            let inner = &v[open + 1..close];
+            match f {
+                "repeat(" if depth < 8 => {
+                    if let Some((n, list)) = split_top_level(inner, ",") {
+                        if let Ok(n) = n.trim().parse::<usize>() {
+                            for _ in 0..n.min(64) {
+                                parse_track_list(list, vp, out, lines, depth + 1);
+                            }
+                        }
+                        // shortcut: `repeat(auto-fill|auto-fit, …)` is skipped
+                        // (its repetition count is only known at layout).
+                    }
+                }
+                "minmax(" => {
+                    if let Some((min, max)) = split_top_level(inner, ",") {
+                        if let (Some(a), Some(b)) =
+                            (parse_breadth(min, vp), parse_breadth(max, vp))
+                        {
+                            out.push(Track::MinMax(a, b));
+                        }
+                    }
+                }
+                // shortcut: fit-content() is not modeled (falls back to auto
+                // only if the author also writes a bare length).
+                "fit-content(" => {}
+                // math groups skip whole — max()/min() have no evaluator, and
+                // cutting inside the parens used to leak inner literals (e.g.
+                // `calc(50vw - 720px)` minted a phantom 720px track that zeroed
+                // the 1fr tracks).
+                _ => {}
             }
-        } else if matches!(tok, "min-content" | "max-content" | "auto") {
-            // content-sized track: width = widest item in the column,
-            // resolved at layout (min-content ≈ max-content here — fine for
-            // the single-line header labels these mostly size)
-            out.push(Track::Content);
-        } else if let Some(l) = parse_len(tok, vp) {
-            out.push(match l {
-                Len::Px(p) => Track::Px(p),
-                Len::Pct(p) => Track::Pct(p),
-            });
+            i = close + 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b',' {
+            i += 1;
+        }
+        let tok = v[start..i].trim_end_matches(',');
+        if let Some(breadth) = parse_breadth(tok, vp) {
+            out.push(breadth_track(breadth));
         }
         // other unknown tokens are skipped
     }
-    (out, lines)
+}
+
+/// One `<track-breadth>` token.
+fn parse_breadth(tok: &str, vp: (f32, f32)) -> Option<TrackBreadth> {
+    let t = tok.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Some(TrackBreadth::Auto);
+    }
+    if t.eq_ignore_ascii_case("min-content") {
+        return Some(TrackBreadth::MinContent);
+    }
+    if t.eq_ignore_ascii_case("max-content") {
+        return Some(TrackBreadth::MaxContent);
+    }
+    if let Some(n) = t
+        .to_ascii_lowercase()
+        .strip_suffix("fr")
+        .and_then(|n| n.trim().parse::<f32>().ok())
+        .filter(|n| n.is_finite())
+    {
+        return Some(TrackBreadth::Fr(n.max(0.0)));
+    }
+    parse_len(t, vp).map(|l| match l {
+        Len::Px(p) => TrackBreadth::Px(p),
+        Len::Pct(p) => TrackBreadth::Pct(p),
+    })
+}
+
+fn breadth_track(b: TrackBreadth) -> Track {
+    match b {
+        TrackBreadth::Px(p) => Track::Px(p),
+        TrackBreadth::Pct(p) => Track::Pct(p),
+        TrackBreadth::Fr(f) => Track::Fr(f),
+        TrackBreadth::Auto => Track::Auto,
+        TrackBreadth::MinContent => Track::MinContent,
+        TrackBreadth::MaxContent => Track::MaxContent,
+    }
 }
 
 /// Index of the `)` matching the `(` at `open`.
@@ -5539,20 +5621,49 @@ mod tests {
             tracks("200px 50% 1fr"),
             vec![Track::Px(200.0), Track::Pct(50.0), Track::Fr(1.0)]
         );
-        // minmax(0, 1fr) → take the max side
-        assert_eq!(tracks("minmax(0, 1fr)"), vec![Track::Fr(1.0)]);
+        // minmax keeps BOTH sides: the min is a real floor for fr maximums
+        assert_eq!(
+            tracks("minmax(0, 1fr)"),
+            vec![Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::Fr(1.0))]
+        );
+        assert_eq!(
+            tracks("minmax(240px, 1fr) minmax(200px, auto) minmax(auto, 300px)"),
+            vec![
+                Track::MinMax(TrackBreadth::Px(240.0), TrackBreadth::Fr(1.0)),
+                Track::MinMax(TrackBreadth::Px(200.0), TrackBreadth::Auto),
+                Track::MinMax(TrackBreadth::Auto, TrackBreadth::Px(300.0)),
+            ]
+        );
+        // repeat() expands a nested minmax() list
+        assert_eq!(
+            tracks("repeat(2, minmax(100px, 1fr))"),
+            vec![
+                Track::MinMax(TrackBreadth::Px(100.0), TrackBreadth::Fr(1.0)),
+                Track::MinMax(TrackBreadth::Px(100.0), TrackBreadth::Fr(1.0)),
+            ]
+        );
         assert!(tracks("none").is_empty());
         // garbage tokens are skipped, valid ones survive
         assert_eq!(tracks("[line1] bogus 2fr"), vec![Track::Fr(2.0)]);
-        // min-content / max-content / auto → content-sized track
+        // intrinsic tracks stay distinct: auto vs min-content vs max-content
         assert_eq!(
             tracks("min-content 1fr auto max-content"),
-            vec![Track::Content, Track::Fr(1.0), Track::Content, Track::Content]
+            vec![
+                Track::MinContent,
+                Track::Fr(1.0),
+                Track::Auto,
+                Track::MaxContent
+            ]
         );
-        // line names are recorded with the boundary index they precede
+        // several line names before one boundary all map to that boundary
         assert_eq!(
-            parse_tracks("[a] 1fr [b-start] 200px [b-end]", VP).1,
-            vec![("a".to_string(), 0), ("b-start".to_string(), 1), ("b-end".to_string(), 2)]
+            parse_tracks("[a b] 1fr [c-start] 200px [c-end]", VP).1,
+            vec![
+                ("a".to_string(), 0),
+                ("b".to_string(), 0),
+                ("c-start".to_string(), 1),
+                ("c-end".to_string(), 2)
+            ]
         );
     }
 
@@ -5583,7 +5694,14 @@ mod tests {
             "[s] max(1rem,calc(50vw - 720px + 1rem)) [c0] 1fr [c1] minmax(0,48rem) [c2] 1fr [e]",
             VP,
         );
-        assert_eq!(cols, vec![Track::Fr(1.0), Track::Px(768.0), Track::Fr(1.0)]);
+        assert_eq!(
+            cols,
+            vec![
+                Track::Fr(1.0),
+                Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::Px(768.0)),
+                Track::Fr(1.0)
+            ]
+        );
     }
 
     #[test]
@@ -5661,7 +5779,7 @@ mod tests {
     fn box_props_cascade_into_boxstyle() {
         let sheet = parse(
             ".row { display: flex; flex-direction: column; gap: 8px 12px; justify-content: center; align-items: end }\
-             .grid { display: grid; grid-template-columns: repeat(2, 1fr); column-gap: 5px }\
+             .grid { display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: 10px 1fr; column-gap: 5px }\
              .box { width: 300px; max-width: 50%; margin: 0 auto }\
              .inl { display: inline }",
         );
@@ -5681,6 +5799,7 @@ mod tests {
         let grid = bx("grid");
         assert_eq!(grid.display, Display::Grid);
         assert_eq!(grid.cols, vec![Track::Fr(1.0), Track::Fr(1.0)]);
+        assert_eq!(grid.rows, vec![Track::Px(10.0), Track::Fr(1.0)]);
         assert_eq!(grid.gap_col, 5.0);
         assert_eq!(grid.gap_row, 0.0);
 
