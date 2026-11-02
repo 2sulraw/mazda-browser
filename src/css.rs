@@ -345,6 +345,26 @@ pub struct BoxStyle {
     /// the title against the language menu. shortcut: no `flex-basis` and
     /// no `flex-shrink` — the base width is always the item's natural size.
     pub grow: f32,
+    /// `flex-shrink` — share of a flex ROW's NEGATIVE free space this item
+    /// absorbs (CSS initial = 1). 0 = never shrinks. Distributed in
+    /// proportion to `shrink x flex base` (see layout's `flex_row`), so a
+    /// narrow item gives up less than a wide one.
+    pub shrink: f32,
+    /// `flex-basis` — the item's base width BEFORE grow/shrink (px/%/0).
+    /// None = `auto`: use `width`, else the content's natural size.
+    /// `flex: 1 1 0` therefore gives every item the same share, which plain
+    /// grow over natural sizes does not.
+    pub basis: Option<Len>,
+    /// `min-width` — floor under the used border-box width. Flex items also
+    /// use it as their shrink floor; without a declaration the floor is the
+    /// automatic minimum size (min-content, unless `overflow` clips).
+    pub min_width: Option<Len>,
+    /// `order` — flex/grid items lay out in ascending `order`, DOM order
+    /// breaking ties (anonymous text runs count as 0).
+    pub order: i32,
+    /// `align-self` — this item's cross-axis alignment, overriding the
+    /// container's `align-items`. None = inherit it.
+    pub align_self: Option<Align>,
     /// per-slot auto margins (`margin-left/right: auto`) — CSS: both auto →
     /// center, left-auto-only → push right, right-auto-only → hug left.
     /// `margin_x_auto` stays the shorthand "both auto" centering flag (the
@@ -555,6 +575,11 @@ impl Default for BoxStyle {
             min_height: None,
             margin_x_auto: false,
             grow: 0.0,
+            shrink: 1.0,
+            basis: None,
+            min_width: None,
+            order: 0,
+            align_self: None,
             margin_l_auto: false,
             margin_r_auto: false,
             pad: [Len::Px(0.0); 4],
@@ -1114,9 +1139,14 @@ const KNOWN: &[&str] = &[
     "opacity",
     "text-align",
     "flex-direction",
+    "flex-flow",
     "justify-content",
     "align-items",
+    "align-self",
     "flex-wrap",
+    "flex-shrink",
+    "flex-basis",
+    "order",
     "gap",
     "row-gap",
     "column-gap",
@@ -1127,6 +1157,7 @@ const KNOWN: &[&str] = &[
     "grid-column",
     "width",
     "max-width",
+    "min-width",
     "box-sizing",
     "height",
     "min-height",
@@ -2258,6 +2289,33 @@ fn apply_decl(
         "flex-direction" => {
             bx.dir = if d.1.contains("column") { Dir::Column } else { Dir::Row }
         }
+        // `flex-flow: <direction> || <wrap>` — both halves optional, any order
+        "flex-flow" => {
+            for t in joined_tokens(&d.1) {
+                match t.as_str() {
+                    "row" => bx.dir = Dir::Row,
+                    "column" => bx.dir = Dir::Column,
+                    // shortcut: row-reverse/column-reverse keep the forward
+                    // axis (the reversed main axis is not modeled)
+                    "row-reverse" => bx.dir = Dir::Row,
+                    "column-reverse" => bx.dir = Dir::Column,
+                    "wrap" | "wrap-reverse" => bx.wrap = true,
+                    "nowrap" => bx.wrap = false,
+                    _ => {}
+                }
+            }
+        }
+        // per-item cross-axis alignment: overrides the container's align-items
+        "align-self" => {
+            bx.align_self = match d.1.trim() {
+                "center" => Some(Align::Center),
+                "flex-end" | "end" | "self-end" | "bottom" => Some(Align::End),
+                "stretch" => Some(Align::Stretch),
+                "flex-start" | "start" | "self-start" | "top" => Some(Align::Start),
+                // `auto` = no override
+                _ => None,
+            }
+        }
         "justify-content" => {
             bx.justify = match d.1.as_str() {
                 "center" => Justify::Center,
@@ -2494,18 +2552,68 @@ fn apply_decl(
         }
         "margin-block-start" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         "margin-block-end" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
-        // flex grow factor. `flex: <grow> [<shrink> <basis>]` takes its grow
-        // from the first token (`none` = 0, `auto` = 1); shrink/basis are
-        // not modeled yet (layout.rs uses the item's natural size as basis).
+        // `flex: <grow> [<shrink> <basis>]` / `none` (0 0 auto) / `auto`
+        // (1 1 auto) / a bare length (1 1 <length>, per spec)
         "flex-grow" => bx.grow = d.1.trim().parse::<f32>().unwrap_or(0.0).max(0.0),
+        "flex-shrink" => bx.shrink = d.1.trim().parse::<f32>().unwrap_or(1.0).max(0.0),
+        "flex-basis" => {
+            bx.basis = match d.1.trim() {
+                // `content` = intrinsic content size = our auto path
+                "auto" | "content" => None,
+                v => parse_len(v, vp),
+            }
+        }
         "flex" => {
             let tok = joined_tokens(&d.1);
-            bx.grow = match tok.first().map(String::as_str) {
-                Some("none") => 0.0,
-                Some("auto") => 1.0,
-                Some(v) => v.parse::<f32>().unwrap_or(0.0).max(0.0),
-                None => 0.0,
-            };
+            match tok.first().map(String::as_str) {
+                Some("none") => {
+                    bx.grow = 0.0;
+                    bx.shrink = 0.0;
+                    bx.basis = None;
+                }
+                Some("auto") => {
+                    bx.grow = 1.0;
+                    bx.shrink = 1.0;
+                    bx.basis = None;
+                }
+                Some(_) => {
+                    // `flex: 10px` / `flex: 0%` = grow 1, shrink 1, that basis
+                    // (a bare number is ALWAYS the grow factor: `flex: 0`
+                    // means grow 0, not basis 0)
+                    if let Ok(g) = tok[0].parse::<f32>() {
+                        bx.grow = g.max(0.0);
+                        bx.shrink = 1.0;
+                        bx.basis = None;
+                        if let Some(s) = tok.get(1).and_then(|s| s.parse::<f32>().ok()) {
+                            bx.shrink = s.max(0.0);
+                            if let Some(b) = tok.get(2) {
+                                bx.basis = match b.as_str() {
+                                    "auto" | "content" => None,
+                                    _ => parse_len(b, vp),
+                                };
+                            }
+                        } else if let Some(b) = tok.get(1) {
+                            // `flex: <grow> <basis>`
+                            bx.basis = match b.as_str() {
+                                "auto" | "content" => None,
+                                _ => parse_len(b, vp),
+                            };
+                        }
+                    } else if let Some(l) = parse_len(tok[0].as_str(), vp) {
+                        bx.grow = 1.0;
+                        bx.shrink = 1.0;
+                        bx.basis = Some(l);
+                    }
+                }
+                None => {}
+            }
+        }
+        "order" => bx.order = d.1.trim().parse::<i32>().unwrap_or(0),
+        "min-width" => {
+            bx.min_width = match d.1.trim() {
+                "auto" => None,
+                v => parse_len(v, vp),
+            }
         }
         // longhand auto: per-side flag; `margin_x_auto` (centering) is
         // recomputed so `margin-left: auto; margin-right: auto` still
@@ -7192,6 +7300,45 @@ mod tests {
         assert_eq!(g("d"), 0.0, "flex: 0 1 auto");
         assert_eq!(g("e"), 2.0, "flex-grow longhand");
         assert_eq!(g("f"), 1.0, "three-value flex shorthand");
+    }
+
+    #[test]
+    fn flex_shrink_basis_order_align_self_and_flow_parse() {
+        let sheet = parse(
+            ".a { flex: 0 1 auto } .b { flex: 1 1 0 } .c { flex: 10px } \
+             .d { flex-shrink: 0 } .e { flex-basis: 30% } .f { flex-basis: auto } \
+             .g { min-width: 120px } .h { order: -2 } .i { align-self: center } \
+             .j { align-self: auto } .k { flex-flow: column wrap } \
+             .l { flex-flow: nowrap row } .m { flex: 2 3 }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>\
+             <div class=e></div><div class=f></div><div class=g></div><div class=h></div>\
+             <div class=i></div><div class=j></div><div class=k></div><div class=l></div>\
+             <div class=m></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!((bx("a").grow, bx("a").shrink), (0.0, 1.0), "flex: 0 1 auto");
+        assert_eq!(bx("b").basis, Some(Len::Px(0.0)), "flex: 1 1 0 basis");
+        assert_eq!(bx("c").grow, 1.0, "a bare length is the basis, grow 1");
+        assert_eq!(bx("c").basis, Some(Len::Px(10.0)), "flex: 10px basis");
+        assert_eq!(bx("d").shrink, 0.0, "flex-shrink longhand");
+        assert_eq!(bx("e").basis, Some(Len::Pct(30.0)), "flex-basis %");
+        assert_eq!(bx("f").basis, None, "flex-basis: auto = natural");
+        assert_eq!(bx("g").min_width, Some(Len::Px(120.0)), "min-width");
+        assert_eq!(bx("h").order, -2, "negative order");
+        assert_eq!(bx("i").align_self, Some(Align::Center), "align-self");
+        assert_eq!(bx("j").align_self, None, "align-self: auto = inherit");
+        assert_eq!((bx("k").dir, bx("k").wrap), (Dir::Column, true), "flex-flow");
+        assert_eq!((bx("l").dir, bx("l").wrap), (Dir::Row, false), "flex-flow row nowrap");
+        assert_eq!((bx("m").grow, bx("m").shrink), (2.0, 3.0), "flex: grow shrink");
+        // a bare `flex: 0` is the GROW factor, not a zero basis
+        let sheet = parse(".z { flex: 0 }");
+        let z = sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None);
+        let _ = z;
+        let sheet0 = parse(".a { flex: 0 }");
+        let z = sheet0.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).bx;
+        assert_eq!((z.grow, z.basis), (0.0, None), "flex: 0 = grow 0, basis auto");
     }
 
     #[test]

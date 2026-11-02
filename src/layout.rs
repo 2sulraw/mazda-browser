@@ -3060,6 +3060,15 @@ fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
             };
         }
     }
+    content_min_w(n, avail, measure)
+}
+
+/// Min-content width measured from `n`'s CONTENT, ignoring a declared width
+/// on `n` itself (nested boxes still honor theirs). [`min_content_w`] treats
+/// a declared width as the box's floor, which is right for grid tracks but
+/// wrong for a flex item's automatic minimum size: there the declared width
+/// is exactly the base being shrunk, so the floor must come from the content.
+fn content_min_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
     let content = if n.is_text {
         if n.hard_break {
             0.0
@@ -3491,6 +3500,10 @@ fn place(
     }
     if let Some(m) = n.bx.max_width {
         w = w.min(resolve_len(m, avail));
+    }
+    // `min-width` floors the used border-box width (author wins over content)
+    if let Some(m) = n.bx.min_width {
+        w = w.max(resolve_len(m, avail));
     }
     // aspect-ratio with one declared axis derives the other. A declared
     // height + ratio sets the width here (an auto block width would
@@ -3936,6 +3949,13 @@ fn items_of(children: &[BoxNode]) -> Vec<Item> {
             i += 1;
         }
     }
+    // `order`: items lay out ascending, DOM order breaking ties (stable
+    // sort). Anonymous text runs carry no style, so they stay at 0 — same as
+    // the spec's "order does not apply to anonymous items".
+    out.sort_by_key(|it| match it {
+        Item::Grp(i) => children[*i].bx.order,
+        Item::Text(..) => 0,
+    });
     out
 }
 
@@ -5020,39 +5040,52 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     let gap = n.bx.gap_col;
     let gaps = gap * (k as f32 - 1.0).max(0.0);
     let mut widths: Vec<f32> = items.iter().map(|it| item_natural(n, it, n.w, measure)).collect();
-    // A % width on a flex item is its flex basis: it resolves against the
-    // row's content width, but the row still owes the other items their
-    // own widths — cap the margin box at the space the siblings leave and
-    // floor it at the item's intrinsic size (real engines' min-width:auto
-    // clamp). Without the cap a `width:100%` list (the wiki article-tools
-    // tabs beside the Tools menu) measured into justify-content's pocket
-    // and slid the sibling onto its end; without the basis side-by-side
-    // `%` column items sized from intrinsic text width instead of the row.
+    // A declared flex BASIS replaces the natural base before grow/shrink.
+    // `flex-basis: auto` (None) already came from `item_natural` (declared
+    // width, else content). A % basis resolves against the row and is capped
+    // at the space the siblings leave; it also keeps the old intrinsic floor
+    // (a `width:100%` item must not pocket its siblings' share). A px basis
+    // is exact: the spec lets the content overflow it.
     for (idx, it) in items.iter().enumerate() {
-        if let Item::Grp(i) = it {
-            if let Some(Len::Pct(p)) = n.children[*i].bx.width {
+        let Item::Grp(i) = it else { continue };
+        let c = &n.children[*i];
+        let mlr = resolve_len(c.bx.margin[3], n.w) + resolve_len(c.bx.margin[1], n.w);
+        match c.bx.basis {
+            Some(Len::Pct(p)) => {
                 let others: f32 = widths
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != idx)
                     .map(|(_, v)| *v)
                     .sum();
-                let mlr = resolve_len(n.children[*i].bx.margin[3], n.w)
-                    + resolve_len(n.children[*i].bx.margin[1], n.w);
                 let basis = (p / 100.0 * n.w + mlr).max(widths[idx]);
                 let cap = (n.w - gaps - others).max(widths[idx]);
                 widths[idx] = basis.min(cap);
+            }
+            Some(l) => widths[idx] = resolve_len(l, n.w) + mlr,
+            None => {
+                // `width: %` doubles as the basis (flex-basis: auto)
+                if let Some(Len::Pct(p)) = c.bx.width {
+                    let others: f32 = widths
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != idx)
+                        .map(|(_, v)| *v)
+                        .sum();
+                    let basis = (p / 100.0 * n.w + mlr).max(widths[idx]);
+                    let cap = (n.w - gaps - others).max(widths[idx]);
+                    widths[idx] = basis.min(cap);
+                }
             }
         }
     }
 
     let natural_sum: f32 = widths.iter().sum();
-    // nowrap shrinks to fit; wrap keeps natural widths and breaks lines
+    // nowrap: negative free space is distributed by `shrink x base`, clamped
+    // at each item's floor (automatic minimum size). The old uniform scale
+    // squeezed text past its longest word and ignored `flex-shrink: 0`.
     if !n.bx.wrap && natural_sum + gaps > n.w && natural_sum > 0.0 {
-        let scale = ((n.w - gaps).max(0.0)) / natural_sum;
-        for w in &mut widths {
-            *w *= scale;
-        }
+        shrink_row(n, &items, &mut widths, natural_sum + gaps - n.w, measure);
     }
     // wrap: greedily split items into lines that fit the content width
     let lines: Vec<std::ops::Range<usize>> = if n.bx.wrap {
@@ -5107,22 +5140,22 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     let mut y = n.y;
     let mut total_h = 0.0f32;
     let mut last_open = false;
-    // convert a % item's width to the slot's exact px: the row reserved
-    // exactly this width (the basis cap above), so placing must not
-    // re-resolve the % against the container and inflate past the slot —
-    // that re-resolution was what slid justified siblings onto the item
+    // Pin every DECLARED width to the slot the flex pass computed: `place()`
+    // re-resolves a declared width against the slot and would otherwise
+    // ignore the basis/shrink/grow result (the box keeps 300px while its
+    // slot is 180px). Text items have no declared width and fill the slot
+    // on their own.
     for (idx, it) in items.iter().enumerate() {
-        if let Item::Grp(i) = it {
-            if let Some(Len::Pct(_)) = n.children[*i].bx.width {
-                let ml = resolve_len(n.children[*i].bx.margin[3], widths[idx]);
-                let mr = resolve_len(n.children[*i].bx.margin[1], widths[idx]);
-                n.children[*i].bx.width = Some(Len::Px(as_content_decl(
-                    (widths[idx] - ml - mr).max(0.0),
-                    &n.children[*i].bx,
-                    widths[idx],
-                )));
-            }
+        let Item::Grp(i) = it else { continue };
+        let c = &mut n.children[*i];
+        if c.bx.width.is_none() {
+            continue;
         }
+        let ml = resolve_len(c.bx.margin[3], widths[idx]);
+        let mr = resolve_len(c.bx.margin[1], widths[idx]);
+        let content = (widths[idx] - ml - mr).max(0.0);
+        let wpx = as_content_decl(content, &c.bx, widths[idx]);
+        c.bx.width = Some(Len::Px(wpx));
     }
     for (li, line) in lines.iter().enumerate() {
         if li > 0 {
@@ -5134,6 +5167,95 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     }
     n.h = total_h;
     n.open = last_open;
+}
+
+/// Distribute `overflow` px of NEGATIVE free space over a nowrap flex line:
+/// each item gives up `flex-shrink x flex base` of the total, never crossing
+/// its floor. Items at their floor drop out and the rest take the remainder;
+/// four passes converge for any real line (and the pass count is capped, so
+/// a degenerate line cannot spin). Whatever still does not fit — every item
+/// already at its floor — overflows the container, as the spec says.
+fn shrink_row(
+    n: &BoxNode,
+    items: &[Item],
+    widths: &mut [f32],
+    mut overflow: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) {
+    let k = items.len();
+    let base: Vec<f32> = widths.to_vec();
+    let factor: Vec<f32> = items
+        .iter()
+        .map(|it| match it {
+            Item::Grp(i) => n.children[*i].bx.shrink.max(0.0),
+            Item::Text(..) => 1.0,
+        })
+        .collect();
+    let floor: Vec<f32> = items
+        .iter()
+        .map(|it| flex_floor(n, it, n.w, measure))
+        .collect();
+    for _ in 0..4 {
+        if overflow <= 0.01 {
+            break;
+        }
+        let total: f32 = (0..k)
+            .filter(|&j| widths[j] > floor[j] + 0.01)
+            .map(|j| factor[j] * base[j])
+            .sum();
+        if total <= 0.0 {
+            break;
+        }
+        let mut moved = 0.0f32;
+        for j in 0..k {
+            let room = widths[j] - floor[j];
+            if room <= 0.01 || factor[j] <= 0.0 {
+                continue;
+            }
+            let take = (overflow * factor[j] * base[j] / total).min(room);
+            widths[j] -= take;
+            moved += take;
+        }
+        if moved <= 0.01 {
+            break;
+        }
+        overflow -= moved;
+    }
+}
+
+/// Automatic minimum size of a flex item (its shrink floor), as a MARGIN
+/// box. `min-width` wins when declared; otherwise the content-based minimum
+/// (min-content) applies, except that a clipping box (`overflow: hidden/
+/// auto/scroll/clip`) may collapse to nothing, and an explicit width still
+/// caps the content-based minimum (CSS "automatic minimum size").
+fn flex_floor(
+    n: &BoxNode,
+    it: &Item,
+    avail: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> f32 {
+    match it {
+        Item::Text(a, b) => n.children[*a..*b]
+            .iter()
+            .map(|c| min_content_w(c, avail, measure))
+            .fold(0.0f32, f32::max),
+        Item::Grp(i) => {
+            let c = &n.children[*i];
+            let mlr = resolve_len(c.bx.margin[3], avail) + resolve_len(c.bx.margin[1], avail);
+            if let Some(m) = c.bx.min_width {
+                return resolve_len(m, avail) + mlr;
+            }
+            if c.bx.clip {
+                return mlr;
+            }
+            let content_min = content_min_w(c, avail, measure);
+            let cap = match c.bx.width {
+                Some(Len::Px(p)) => p.min(content_min),
+                _ => content_min,
+            };
+            cap + mlr
+        }
+    }
 }
 
 /// Place one flex line (justify + cross-axis align); returns the line height.
@@ -5220,7 +5342,11 @@ fn flex_line(
     }
     // cross-axis align: shift each item (runs slice + box coords) into row_h
     for (idx, &(rs, us, h)) in marks.iter().enumerate() {
-        let dy = match n.bx.align {
+        let align = match items[line.start + idx] {
+            Item::Grp(i) => n.children[i].bx.align_self.unwrap_or(n.bx.align),
+            Item::Text(..) => n.bx.align,
+        };
+        let dy = match align {
             Align::Center => (row_h - h) * 0.5,
             Align::End => row_h - h,
             _ => 0.0, // Start / Stretch (stretch: shortcut, no reflow)
@@ -5274,7 +5400,8 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
             }
             Item::Grp(i) => {
                 let adv = place(&mut n.children[*i], n.x, y, n.w, measure, runs, uls, &[]);
-                let dx = match n.bx.align {
+                let align = n.children[*i].bx.align_self.unwrap_or(n.bx.align);
+                let dx = match align {
                     Align::Center => (n.w - n.children[*i].w) * 0.5,
                     Align::End => n.w - n.children[*i].w,
                     _ => 0.0,
@@ -6589,6 +6716,202 @@ mod tests {
         assert_eq!(n.children[0].w, 284.0, "grow item = 300 - 16");
         assert_eq!(n.children[0].x, 0.0, "starts at the row's left edge");
         assert_eq!(n.children[1].x, 284.0, "fixed item after it");
+    }
+
+    #[test]
+    fn flex_shrink_shares_negative_space_by_base_size() {
+        // 300 + 100 in a 100px row: 300px to remove, shared by shrink(1) x
+        // base — the wide item gives up 3/4, the narrow one 1/4. The old
+        // uniform scale also squeezed `flex-shrink: 0` items and words.
+        let item = |px: f32| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(px)),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf("x")];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![item(300.0), item(100.0)];
+        layout_tree(&mut n, 100.0, &m4);
+        assert!((n.children[0].w - 75.0).abs() < 0.01, "wide={}", n.children[0].w);
+        assert!((n.children[1].w - 25.0).abs() < 0.01, "narrow={}", n.children[1].w);
+        assert_eq!(n.children[1].x, 75.0, "narrow item follows the shrunk slot");
+    }
+
+    #[test]
+    fn flex_shrink_zero_gives_up_nothing() {
+        let item = |px: f32, shrink: f32| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(px)),
+                    shrink,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf("x")];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![item(300.0, 0.0), item(100.0, 1.0)];
+        layout_tree(&mut n, 100.0, &m4);
+        assert_eq!(n.children[0].w, 300.0, "shrink:0 keeps its base");
+        // the shrinkable item bottoms out at its automatic minimum size (one
+        // 4px glyph); the line still overflows instead of vanishing
+        assert!((n.children[1].w - 4.0).abs() < 0.01, "narrow={}", n.children[1].w);
+    }
+
+    #[test]
+    fn flex_shrink_stops_at_the_longest_word() {
+        // A single unbreakable word is the automatic minimum size: no amount
+        // of negative free space may squeeze the slot below it (the old
+        // uniform scale did, and the text spilled at the wrong advance).
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("wordword")]; // 32px, no break opportunity
+        let l = layout_tree(&mut n, 20.0, &m4);
+        assert_eq!(l.runs[0].width, 32.0, "slot keeps the word's min-content");
+    }
+
+    #[test]
+    fn flex_basis_zero_makes_grow_shares_equal() {
+        // `flex: 1 1 0` starts every item at zero, so grow hands out equal
+        // shares regardless of content; growing over natural sizes (the old
+        // model) gives the longer text more space.
+        let item = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    grow: 1.0,
+                    basis: Some(Len::Px(0.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![item("a"), item("aaaaaa")];
+        layout_tree(&mut n, 100.0, &m4);
+        assert_eq!(n.children[0].w, 50.0, "equal share");
+        assert_eq!(n.children[1].w, 50.0, "equal share");
+        assert_eq!(n.children[1].x, 50.0);
+    }
+
+    #[test]
+    fn flex_order_reorders_without_touching_the_dom() {
+        let item = |t: &str, order: i32| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    order,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![item("a", 2), item("b", 0), item("c", 1)];
+        let l = layout_tree(&mut n, 300.0, &m4);
+        let x = |t: &str| l.runs.iter().find(|r| r.text == t).unwrap().x;
+        assert!(
+            x("b") < x("c") && x("c") < x("a"),
+            "visual order must be b,c,a (orders 0,1,2): b={} c={} a={}",
+            x("b"),
+            x("c"),
+            x("a")
+        );
+        assert_eq!(x("b"), 0.0, "order-0 item keeps the line start");
+    }
+
+    #[test]
+    fn align_self_overrides_align_items() {
+        // Row height = two lines; align-items: start, the short item asks for
+        // center, so it drops by half a line instead of sitting at the top.
+        let tall = {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![
+                leaf("x"),
+                BoxNode::leaf(Style::new(), String::new(), true, None), // <br>
+                leaf("y"),
+            ];
+            g
+        };
+        let short = {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    align_self: Some(Align::Center),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf("aa")];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                align: Align::Start,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![tall, short];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        let line = 15.0 * 1.35;
+        let s = l.runs.iter().find(|r| r.text == "aa").unwrap();
+        assert!((s.y - line * 0.5).abs() < 0.01, "centered: y={}", s.y);
     }
 
     #[test]

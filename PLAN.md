@@ -1044,6 +1044,43 @@ curve matters more than the baseline (near-flat as tabs grow).
   (`snapshot_round_trip_preserves_the_tree`,
   `snapshot_rejects_corrupt_or_truncated_files`,
   `snapshot_rejects_inconsistent_links`, `hover_relayout_needs_pointer_motion`).
+  **(p) Flex model completion** — the row model only had `flex-grow`, a
+  natural-size base and a uniform squeeze when a line overflowed, so
+  `flex-shrink: 0` items still shrank, long words were squeezed below their
+  min-content, `flex: 1 1 0` gave the longer text more space than the
+  shorter, and `order`/`align-self`/`flex-flow`/`flex-basis`/`min-width` were
+  dropped at parse time. `BoxStyle` gained `shrink` (initial 1), `basis`
+  (px/%/auto), `min_width`, `order` and `align_self`; the `flex` shorthand is
+  now complete (`none`/`auto`/bare length/`grow [shrink [basis]]`, a bare
+  number always the grow factor) and `flex-flow` sets direction + wrap.
+  Layout: `items_of` stable-sorts by `order`; a declared `min-width` floors
+  the used width in `place()`; the row computes each item's basis, then
+  `shrink_row` distributes negative free space by `shrink x base` in up to
+  four passes, clamping every item at its automatic minimum size
+  (`flex_floor`: min-content of the CONTENT — a new `content_min_w` ignores
+  the item's own declared width, which is the base being shrunk — capped by
+  that declared width, and collapsed to the margin box when `overflow`
+  clips); `min-width` overrides the floor. Every declared item width is
+  pinned to the computed slot so `place()` cannot re-resolve it back to its
+  authored size, and `align_self` overrides `align-items` on both the row
+  line and the column cross axis.
+  Live (debug, 6 sites): Wikipedia Rust article 14973 runs / 315 images /
+  107.3 MB, MDN list-style-type 2773 runs / 81.9 MB, rust-lang.org 483 runs /
+  82.3 MB (its GET STARTED label now sits inside the button instead of
+  overflowing it), Hacker News 784 runs / 73.8 MB, nextjs.org 502 runs /
+  99.5 MB, example.com 25 runs / 66.7 MB — no unexpected relayouts.
+  shortcut: `row-reverse`/`column-reverse` keep the forward main axis;
+  `align-self: stretch` does not reflow the item (same as `align-items`);
+  `flex-basis: content` is treated as `auto`; `order` changes paint/layout
+  order only, not tab/focus order.
+  Tests: default **574**, `engine-b + woff2` **578**
+  (`flex_shrink_shares_negative_space_by_base_size`,
+  `flex_shrink_zero_gives_up_nothing`,
+  `flex_shrink_stops_at_the_longest_word`,
+  `flex_basis_zero_makes_grow_shares_equal`,
+  `flex_order_reorders_without_touching_the_dom`,
+  `align_self_overrides_align_items`,
+  `flex_shrink_basis_order_align_self_and_flow_parse`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
@@ -1149,6 +1186,12 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 9 (DOM snapshots + restore) | Wikipedia Rust article (fresh load, snapshot saved 1347 KB) | 109.4 MB (14973 runs, 315 images; worker 11.8 s) |
 | 2026-11-03 | wave 9 (DOM snapshots + restore) | Wikipedia Rust article (restored, no fetch) | 105.4-114.9 MB (19239 nodes, 14973 runs, 315 images; worker 4.1 s) |
 | 2026-11-03 | wave 9 (DOM snapshots + restore) | example.com (restored) | 62.9 MB (25 runs; worker 43 ms vs 684 ms fresh) |
+| 2026-11-03 | wave 10 (flex model completion) | Wikipedia Rust article | 107.3 MB (14973 runs, 315 images; pixel-unchanged) |
+| 2026-11-03 | wave 10 (flex model completion) | MDN `/Web/CSS/list-style-type` | 81.9 MB (2773 runs, 11 images; unchanged) |
+| 2026-11-03 | wave 10 (flex model completion) | rust-lang.org | 82.3 MB (483 runs; GET STARTED label inside its button, nav unchanged) |
+| 2026-11-03 | wave 10 (flex model completion) | Hacker News | 73.8 MB (784 runs) |
+| 2026-11-03 | wave 10 (flex model completion) | nextjs.org | 99.5 MB (502 runs) |
+| 2026-11-03 | wave 10 (flex model completion) | example.com | 66.7 MB (25 runs) |
 
 ### Phase 1c (Track A) findings
 
