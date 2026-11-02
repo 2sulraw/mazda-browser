@@ -135,6 +135,9 @@ struct App {
     /// lands (a relayout doesn't set `pending`, so the 1 Hz tick alone
     /// would delay the hover repaint by up to a second)
     hover_wait: bool,
+    /// scrollbar drag in progress: distance from the pointer to the thumb's
+    /// top edge, in viewport units. None = not dragging.
+    bar_grab: Option<f32>,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -164,6 +167,45 @@ fn page_w(pw: usize) -> f32 {
 /// Viewport height for layout / scroll clamping (matches the old shell).
 fn page_h(ph: usize) -> f32 {
     (ph as f32 - 2.0 * PADDING as f32).max(40.0)
+}
+
+/// Page scrollbar: width of the strip in the right gutter, in pixels.
+const BAR_W: usize = 8;
+/// Shortest thumb the bar will draw, so a barely-overflowing document
+/// still leaves something grabbable.
+const BAR_MIN: f32 = 24.0;
+
+/// Horizontal band of the scrollbar in page-buffer pixels `(x0, x1)`.
+/// One source of truth for both painting and hit-testing.
+fn scrollbar_strip(pw: usize) -> (f32, f32) {
+    let x0 = (pw.saturating_sub(PADDING) + 2) as f32;
+    (x0, (x0 + BAR_W as f32).min(pw as f32 - 2.0))
+}
+
+/// Thumb `(y, h)` in viewport units (0 = top of the page area), or None
+/// when the document fits (no bar). The length is proportional to
+/// viewport/document and floored at [`BAR_MIN`].
+fn scrollbar_thumb(doc_h: f32, page: f32, scroll: f32) -> Option<(f32, f32)> {
+    if !(doc_h > page) || page <= 0.0 {
+        return None;
+    }
+    let max_scroll = doc_h - page;
+    let th = (page * page / doc_h).max(BAR_MIN).min(page);
+    let travel = page - th;
+    let y = (scroll.clamp(0.0, max_scroll) / max_scroll) * travel;
+    Some((y, th))
+}
+
+/// Scroll offset for a thumb top at `y` — the inverse of
+/// [`scrollbar_thumb`], used while dragging.
+fn scroll_from_thumb(doc_h: f32, page: f32, y: f32) -> f32 {
+    let max_scroll = (doc_h - page).max(0.0);
+    if max_scroll == 0.0 || page <= 0.0 {
+        return 0.0;
+    }
+    let th = (page * page / doc_h).max(BAR_MIN).min(page);
+    let travel = (page - th).max(1.0);
+    (y / travel * max_scroll).clamp(0.0, max_scroll)
 }
 
 /// 0x00RRGGBB framebuffer → egui ColorImage (RGBA, opaque).
@@ -262,6 +304,7 @@ impl App {
             settings_open: false,
             hovered: None,
             hover_wait: false,
+        bar_grab: None,
         };
         app.dispatch(&url, pw, ph, 0.0);
         app
@@ -470,6 +513,10 @@ impl App {
 
     /// Re-rasterize the active page into `pixels` (marks the texture dirty).
     fn repaint_page(&mut self, pw: usize, ph: usize) {
+        // the buffer and `last_size` must never disagree: a width change
+        // (window resize) followed by a scroll repaint used to leave the
+        // texture dims stale and trip the color-image length assertion
+        self.last_size = (pw, ph);
         self.pixels = vec![self.page.bg; pw * ph];
         render(
             &mut self.pixels,
@@ -481,7 +528,37 @@ impl App {
             page_h(ph),
             0.0,
         );
+        // viewport chrome painted on top of the content (never scrolls)
+        draw_scrollbar(
+            &mut self.pixels,
+            pw,
+            ph,
+            self.page.laid.height,
+            page_h(ph),
+            self.scroll,
+        );
         self.dirty = true;
+    }
+
+    /// Apply a scroll offset: clamp, repaint, and tell the worker. Scroll
+    /// jobs coalesce worker-side (a drag storm stays cheap) and only
+    /// re-lay-out when a listener actually mutated the DOM.
+    fn set_scroll(&mut self, y: f32, pw: usize, ph: usize) {
+        let max = (self.page.laid.height - page_h(ph)).max(0.0);
+        let y = y.clamp(0.0, max);
+        if y == self.scroll {
+            return;
+        }
+        self.scroll = y;
+        self.tabs[self.active].scroll = y;
+        self.repaint_page(pw, ph);
+        let req = LoadReq::Scroll {
+            url: self.page.url.clone(),
+            y,
+        };
+        if self.jobs.send(req).is_err() {
+            eprintln!("[nav] loader thread unavailable, scroll event dropped");
+        }
     }
 
     /// Load `url` into the active tab: push history, reset scroll.
@@ -737,8 +814,6 @@ impl eframe::App for App {
                     }
                 }
 
-                // scrolling: wheel + Up/Down, clamped, suppressed while typing
-                let max_scroll = (self.page.laid.height - page_h(ph)).max(0.0);
                 // form typing: route keys to the focused field (the address
                 // bar owns the keyboard while it's focused). Enter submits
                 // (shell logs + fires change with the final value), Escape
@@ -846,30 +921,15 @@ impl eframe::App for App {
                     }
                 }
                 if !ui.ctx().egui_wants_keyboard_input() && !self.address_focused {
-                    let before = self.scroll;
                     let wheel = ui.input(|i| i.smooth_scroll_delta());
                     if wheel.y != 0.0 {
-                        self.scroll = (self.scroll - wheel.y).clamp(0.0, max_scroll);
+                        self.set_scroll(self.scroll - wheel.y, pw, ph);
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        self.scroll = (self.scroll + 40.0).min(max_scroll);
+                        self.set_scroll(self.scroll + 40.0, pw, ph);
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        self.scroll = (self.scroll - 40.0).max(0.0);
-                    }
-                    if self.scroll != before {
-                        self.repaint_page(pw, ph);
-                        // scroll listeners: worker-side coalescing keeps
-                        // only the latest scroll per batch (never drops a
-                        // non-scroll event); cheap because a scroll event
-                        // only re-lays out when a listener mutated the DOM
-                        let req = LoadReq::Scroll {
-                            url: self.page.url.clone(),
-                            y: self.scroll,
-                        };
-                        if self.jobs.send(req).is_err() {
-                            eprintln!("[nav] loader thread unavailable, scroll event dropped");
-                        }
+                        self.set_scroll(self.scroll - 40.0, pw, ph);
                     }
                 }
 
@@ -895,10 +955,51 @@ impl eframe::App for App {
                         egui::Image::new(&*tex)
                             .fit_to_exact_size(egui::vec2(iw as f32, ih as f32))
                             .texture_options(egui::TextureOptions::NEAREST)
-                            .sense(egui::Sense::click()),
+                            .sense(egui::Sense::click_and_drag()),
                     );
+                    // scrollbar geometry, image-local (buffer pixels map 1:1)
+                    let (bar_x0, bar_x1) = scrollbar_strip(pw);
+                    let page = page_h(ph);
+                    let doc_h = self.page.laid.height;
+                    let bar_y0 = PADDING as f32;
+                    let bar_y1 = ph as f32 - PADDING as f32;
+                    let in_bar = |p: egui::Pos2| {
+                        let lx = p.x - resp.rect.min.x;
+                        let ly = p.y - resp.rect.min.y;
+                        lx >= bar_x0 && lx <= bar_x1 && ly >= bar_y0 && ly <= bar_y1
+                    };
+                    // scrollbar press: grab the thumb, or jump the track so
+                    // the thumb centres on the pointer (then keep dragging —
+                    // the grab offset is half a thumb)
+                    let press = ui
+                        .input(|i| i.pointer.primary_pressed().then(|| i.pointer.interact_pos()))
+                        .flatten()
+                        .filter(|p| resp.rect.contains(*p) && in_bar(*p));
+                    if let Some(p) = press {
+                        if let Some((ty, th)) = scrollbar_thumb(doc_h, page, self.scroll) {
+                            let ly = p.y - resp.rect.min.y - bar_y0;
+                            if ly >= ty && ly <= ty + th {
+                                self.bar_grab = Some(ly - ty);
+                            } else {
+                                self.bar_grab = Some(th * 0.5);
+                                self.set_scroll(scroll_from_thumb(doc_h, page, ly - th * 0.5), pw, ph);
+                            }
+                        }
+                    }
+                    if let Some(grab) = self.bar_grab {
+                        if resp.dragged() || resp.drag_started() {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let ly = p.y - resp.rect.min.y - bar_y0;
+                                self.set_scroll(scroll_from_thumb(doc_h, page, ly - grab), pw, ph);
+                            }
+                        }
+                        if resp.drag_stopped() || !ui.input(|i| i.pointer.any_down()) {
+                            self.bar_grab = None;
+                        }
+                    }
                     // link hit-test — identical math to the old minifb shell
-                    if resp.clicked() {
+                    // (a press inside the scrollbar strip belongs to the bar)
+                    if resp.clicked() && !resp.interact_pointer_pos().map_or(false, in_bar) {
                         if let Some(p) = resp.interact_pointer_pos() {
                             let rx = p.x - resp.rect.min.x - PADDING as f32;
                             let my_doc = p.y - resp.rect.min.y - PADDING as f32;
@@ -967,12 +1068,21 @@ impl eframe::App for App {
                     // hovered set changed
                     let hover_pos = ui.input(|i| i.pointer.hover_pos());
                     let inside = hover_pos.filter(|p| resp.rect.contains(*p));
-                    let hit = inside.and_then(|p| {
+                    let over_bar = inside.map_or(false, in_bar);
+                    let hit = inside.filter(|_| !over_bar).and_then(|p| {
                         let rx = p.x - resp.rect.min.x - PADDING as f32;
                         let my_doc = p.y - resp.rect.min.y - PADDING as f32;
                         self.page.laid.hit_hover(rx, my_doc, self.scroll)
                     });
-                    if inside.is_some() {
+                    if over_bar {
+                        // the bar is chrome, not page content: no link hover,
+                        // no `cursor: pointer` leaking through it
+                        ui.ctx().set_cursor_icon(if self.bar_grab.is_some() {
+                            egui::CursorIcon::Grabbing
+                        } else {
+                            egui::CursorIcon::Default
+                        });
+                    } else if inside.is_some() {
                         // cursor follows the hit; no hit (page background)
                         // = Default. Only written inside the page image —
                         // over the chrome egui's own per-frame output wins
@@ -982,7 +1092,11 @@ impl eframe::App for App {
                             .unwrap_or(egui::CursorIcon::Default);
                         ui.ctx().set_cursor_icon(icon);
                     }
-                    let new_hovered = hit.map(|(n, _)| n);
+                    let new_hovered = if self.bar_grab.is_some() {
+                        None
+                    } else {
+                        hit.map(|(n, _)| n)
+                    };
                     if new_hovered != self.hovered
                         // skip while another job is in flight and retry next
                         // frame (self-healing); a hover change is a full
@@ -4041,6 +4155,59 @@ fn blend(dst: &mut u32, src: u32, alpha: u8) {
     *dst = (r << 16) | (g << 8) | b;
 }
 
+/// Fill a vertical pill (rounded top and bottom, square sides) into the
+/// page buffer, alpha-blended. Used for the scrollbar track and thumb.
+fn fill_pill(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+    color: u32,
+    alpha: u8,
+) {
+    let r = ((x1 - x0) * 0.5).max(0.5);
+    let y0 = y0.max(0.0);
+    let y1 = y1.min(height as f32);
+    let xa = x0.max(0.0) as usize;
+    let xb = x1.min(width as f32) as usize;
+    let mut py = y0 as usize;
+    while (py as f32) < y1 && py < height {
+        // inset from the pill's rounded end at this row (0 in the middle)
+        let cy = py as f32 + 0.5;
+        let d = (cy - y0).min(y1 - cy).max(0.0);
+        let inset = if d < r {
+            r - (r * r - (r - d) * (r - d)).max(0.0).sqrt()
+        } else {
+            0.0
+        };
+        let lo = (xa as f32 + inset) as usize;
+        let hi = (xb as f32 - inset).max(0.0) as usize;
+        for px in lo..hi {
+            blend(&mut buf[py * width + px], color, alpha);
+        }
+        py += 1;
+    }
+}
+
+/// Page scrollbar drawn after every render in viewport coordinates: a faint
+/// track in the right gutter and a proportional thumb. Shortcut: no
+/// hover highlight, no arrow buttons, no CSS scrollbar styling, and no
+/// scrollbar gutter reservation — the strip paints over the page padding,
+/// which is outside the laid-out content, so nothing is occluded.
+fn draw_scrollbar(buf: &mut [u32], width: usize, height: usize, doc_h: f32, page: f32, scroll: f32) {
+    let Some((ty, th)) = scrollbar_thumb(doc_h, page, scroll) else {
+        return;
+    };
+    let (x0, x1) = scrollbar_strip(width);
+    let top = PADDING as f32;
+    let bottom = (height as f32 - PADDING as f32).max(top);
+    fill_pill(buf, width, height, x0, x1, top, bottom, 0x00_00_00, 18);
+    fill_pill(buf, width, height, x0, x1, top + ty, top + ty + th, 0x00_00_00, 96);
+}
+
 /// Working-set size in MB via GetProcessMemoryInfo.
 #[cfg(windows)]
 fn working_set_mb() -> f64 {
@@ -5304,6 +5471,59 @@ mod tests {
             panic!("img box should carry the source")
         };
         assert_eq!(chosen.as_ref(), "h-900.webp");
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_proportional_and_floored() {
+        // no overflow -> no bar at all
+        assert_eq!(scrollbar_thumb(600.0, 600.0, 0.0), None);
+        assert_eq!(scrollbar_thumb(400.0, 600.0, 0.0), None);
+        // 1200 of 600: half the viewport, travel = 300, ends pinned
+        let (y0, h) = scrollbar_thumb(1200.0, 600.0, 0.0).unwrap();
+        assert_eq!((y0, h), (0.0, 300.0));
+        let (ym, _) = scrollbar_thumb(1200.0, 600.0, 300.0).unwrap();
+        assert_eq!(ym, 150.0);
+        let (ye, _) = scrollbar_thumb(1200.0, 600.0, 600.0).unwrap();
+        assert_eq!(ye, 300.0);
+        // far past the end clamps like a real scroll offset
+        let (ybig, _) = scrollbar_thumb(1200.0, 600.0, 9999.0).unwrap();
+        assert_eq!(ybig, 300.0);
+        // a huge document: thumb floored at BAR_MIN
+        let (_, min_h) = scrollbar_thumb(100_000.0, 600.0, 0.0).unwrap();
+        assert_eq!(min_h, BAR_MIN);
+        // a tiny viewport still yields a sane thumb
+        let (_, tiny) = scrollbar_thumb(1e6, 20.0, 0.0).unwrap();
+        assert!(tiny > 0.0 && tiny <= 20.0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_inverse_round_trips() {
+        let (doc, page) = (2400.0, 600.0);
+        for scroll in [0.0, 37.0, 900.0, 1800.0] {
+            let (y, _) = scrollbar_thumb(doc, page, scroll).unwrap();
+            let back = scroll_from_thumb(doc, page, y);
+            assert!((back - scroll).abs() < 1e-3, "{scroll} -> {y} -> {back}");
+        }
+        // top/bottom of the strip map to the scroll extremes
+        assert_eq!(scroll_from_thumb(doc, 600.0, 0.0), 0.0);
+        assert_eq!(scroll_from_thumb(doc, 600.0, 600.0), 1800.0);
+        // negative travel clamps instead of going negative
+        assert_eq!(scroll_from_thumb(doc, 600.0, -50.0), 0.0);
+        // a page that fits has nothing to scroll
+        assert_eq!(scroll_from_thumb(500.0, 600.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_strip_is_inside_the_right_gutter() {
+        let (x0, x1) = scrollbar_strip(1000);
+        assert!(x1 > x0);
+        // right of the content area, left of the buffer edge
+        assert!(x0 >= (1000 - PADDING) as f32);
+        assert!(x1 <= 998.0);
+        assert_eq!(x1 - x0, BAR_W as f32);
+        // a pathological narrow viewport can't produce an inverted strip
+        let (a, b) = scrollbar_strip(10);
+        assert!(b >= a);
     }
 }
 
