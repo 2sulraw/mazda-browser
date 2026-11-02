@@ -780,14 +780,27 @@ curve matters more than the baseline (near-flat as tabs grow).
   new size while `last_size` still described the old texture, tripping the
   color-image length assertion — `repaint_page` now syncs `last_size`. Runs
   entirely in the shell, so page memory is unchanged.
-  Tests: default **531**, `engine-b + woff2` **535**. Live: wiki Rust article
+  **(d) `display: contents` + named grid areas** (`80cba80`, +5 tests) — a
+  `display: contents` element generates no box: `build_into` hoists its
+  children into the parent's flow, so a grid/flex parent sees them as its own
+  items, and inline contents join the surrounding line with no wrapper.
+  `grid-template-areas` (quoted rows, `.` = empty cell, a name repeated across
+  cells spans them) and `grid-area: <name>` now place an item into its cell
+  rect; a name with no matching cell falls back to auto placement, and a grid
+  with no explicit columns gets one content-sized `auto` track per area
+  column. Row-spanning items paint from their start row but do not stretch the
+  rows they cover (shortcut: no span-aware row distribution — a tall spanning
+  sidebar can overhang its last row); numeric/`span` `grid-area` forms and
+  named *lines* beyond `grid-column: <name>` are still not modeled.
+  Tests: default **536**, `engine-b + woff2` **540**. Live: wiki Rust article
   **105.0 MB** (14973 runs, 315 images); MDN `/Web/CSS/list-style-type`
-  **100.3 MB** (4687 runs) — still visibly wrong: MDN places its columns with
-  `grid-area`/`grid-template-areas` named areas (not implemented yet; items
-  auto-place into the wrong tracks, so the article text lands in a narrow
-  column). The scrollbar draws and follows the document (verification capture
-  only; drag was not synthetically driven). Filed as the wave 9 target
-  together with the Wikipedia h1/languages-box overlap.
+  **88.8 MB** (4687 runs) — the sidebar + article + "In this article" TOC now
+  form a real three-column layout (previously the whole page collapsed into
+  one narrow column because `display: contents` and named areas were missing);
+  remaining visual gap: TOC/sidebar link rows overlap their background bands.
+  The scrollbar draws and follows the document (verification capture only;
+  drag was not synthetically driven). Next: the Wikipedia h1/languages-box
+  overlap and the MDN link-row spacing.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -877,7 +890,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 7 (table layout, object-fit/aspect-ratio, image sources) | Wikipedia Rust article | 112.2 MB (14973 runs; infobox renders as a real two-column table, 315 images, 0 format skips; +9.5 MB vs wave 5 = WOFF2 site fonts) |
 | 2026-11-02 | wave 7 | data: URL page | 68.8 MB (8 runs; PNG + WebP data images decoded inline) |
 | 2026-11-02 | wave 8 (grid tracks, CSS math, scrollbar) | Wikipedia Rust article | 105.0 MB (14973 runs; same layout as wave 7, 315 images, 0 format skips) |
-| 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 100.3 MB (4687 runs; named grid areas still unimplemented — article column collapses, next wave) |
+| 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 88.8 MB (4687 runs; `display:contents` + named grid areas give the real 3-column layout; TOC link rows still overlap their background bands) |
 
 ### Phase 1c (Track A) findings
 
