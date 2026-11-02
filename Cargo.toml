@@ -39,6 +39,11 @@ eframe = { version = "0.37", default-features = false, features = ["glow", "defa
 engine-b = ["dep:boa_engine"]
 woff2 = ["dep:wuff"]
 
+# the page rasterizer is per-pixel CPU work: at opt-level 0 (the dev default)
+# one scroll frame costs ~90 ms, which is what made scrolling feel stuck
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 opt-level = "s"
 lto = true

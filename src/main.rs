@@ -1232,7 +1232,7 @@ impl eframe::App for App {
         // wheel momentum lives in egui's smoothed delta, which only advances
         // when a frame runs: without this, one wheel notch applied a slice of
         // its delta and then sat still until the next input event
-        if ui.input(|i| i.is_scrolling()) {
+        if ui.input(|i| i.smooth_scroll_delta().y != 0.0) {
             ui.ctx().request_repaint();
         }
         // while a load, a link-click decision or a hover relayout is in
@@ -4473,6 +4473,20 @@ mod tests {
         // a different 1/4-px pen fraction is a different raster
         let c = fonts.glyph_mask(&font, id, scale, 12.25, 100.0).unwrap();
         assert!(!Rc::ptr_eq(&a, &c));
+    }
+
+    #[test]
+    fn glyph_cache_blit_matches_cold_render() {
+        let fonts = Fonts::load();
+        let style = Style::new();
+        let (w, h) = (240, 40);
+        let mut warm = vec![0x00ff_ffffu32; w * h];
+        draw_text(&mut warm, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, None);
+        fonts.glyphs.borrow_mut().clear(); // cold
+        let mut cold = vec![0x00ff_ffffu32; w * h];
+        draw_text(&mut cold, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, None);
+        assert_eq!(warm, cold);
+        assert!(warm.iter().any(|&p| p != 0x00ff_ffff), "text drew no ink");
     }
 
     #[test]
