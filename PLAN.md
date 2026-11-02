@@ -573,6 +573,70 @@ curve matters more than the baseline (near-flat as tabs grow).
   transiently crashed rustc (stack-buffer-overrun) under the prior
   disk-pressure episode; after the disk freed up it built clean in 2m45s
   with no code changes (`505a98b` pushed).
+- [x] **Wave 4 + Wave 5 (four parallel worktrees, two waves in flight) — mask-image,
+  `:hover` + `cursor`, `position: sticky`, typography batch** (mask and sticky
+  branched from `62614f3`, hover and typography likewise; all merged into
+  master as `c276ab5` → `cda4355` → `da5a2e5`):
+  **(a) `mask-image`** (`26cd43e`, `18373b6`) — a GENERAL vendor-prefix strip at
+  the declaration gate: a property starting with a single `-` (never `--`)
+  drops through its second `-` and the remainder is looked up in `KNOWN`, so
+  every prefixed spelling of a known property behaves exactly like the bare
+  one (no vendor name is ever written down; `@supports` gates the same way).
+  `mask`/`mask-image`/`mask-size`/`mask-position`/`mask-repeat` reuse the
+  background geometry parsers; a mask URL rides the existing image pipeline as
+  a second placeholder child (`is_mask`) and counts against the same pixel
+  budget; paint suppresses the box's own bg rect + bg image and draws the mask
+  image tinted with the box's bg color (RGB replaced, alpha kept, tinted once
+  and cached) — untinted when no bg-color. Shortcuts: masks the box's own
+  background only (text/children unmasked), one layer, no
+  composite/mode/clip/origin.
+  **(b) `:hover` + `cursor`** (`2cf19a3`, `dbc7313`) — `Pseudo::Hover` parses
+  (other dynamic pseudo-classes still drop); Hover-carrying rules partition
+  into `Sheet::hover` composing with the pseudo bucket (`li:hover::before`);
+  a `Cell<Option<u32>>` on the sheet names the hovered node (`None` = nothing
+  matches), and `Hover` matches the node or an ancestor/descendant of it.
+  Layout stamps each element box's DOM id (`BoxNode.node`) and emits
+  `Layout::hover_targets` (doc rect + node + effective `cursor`), reverse-scanned
+  by `hit_hover` with the same scroll math as link hit-testing; the shell reads
+  the pointer position only, and on a changed hovered set re-cascades + rebuilds
+  from the cached DOM (forms preserved) and repaints. `cursor` parses to a
+  keyword enum, inherited down the box tree, mapped to the OS pointer only
+  inside the page rect. Shortcuts: full rebuild per hover change (no
+  invalidation), hit-testing in tree order (z/transform not reflected),
+  over-matching on ancestor+descendant walks.
+  **(c) `position: sticky`** (`1661fe4`) — `Pos::Sticky` is its own variant and
+  every match treats it as IN FLOW (a declared `top` never offsets layout, the
+  anti-relative guard); `collect_paint` records one `StickyGroup` per sticky box
+  that declares `top`: subtree spans across all paint channels (rects/shadows/
+  images from DFS push windows closed after the children, runs/underlines from
+  `run_range`/`ul_range`, plus the decoded-image span filled by the shell's
+  decode pass) with `doc_y`/`doc_h`, px `top`, the parent's bottom as the
+  container edge; per frame
+  `offset = clamp(scroll + top - doc_y, 0, container_y1 - (doc_y + doc_h))`
+  shifts every entry in the group, z order untouched. Shortcuts: top-only
+  stickiness, nested groups shift independently, container = parent box (not
+  the spec scrollport), hit-test/form rects unshifted, no re-clipping at the
+  container edge.
+  **(d) typography batch** (`0aadf15`, +11 tests) — `text-transform` maps the
+  string once when text boxes are built (ASCII-only case ops, `capitalize`
+  = first ASCII letter per whitespace-separated word); `letter-spacing` /
+  `word-spacing` resolve onto `Style` and are added by ONE shared rule
+  (`spacing_extra`) in the line builder and replayed per glyph in the draw
+  path, so measurement and paint never disagree; `white-space`
+  (normal/nowrap/pre/pre-wrap/pre-line) picks the atom splitter — nowrap never
+  wraps, `pre` keeps whitespace and turns `\n` into hard breaks, `pre-wrap`
+  keeps and wraps, `pre-line` folds but breaks; `text-indent` shifts the first
+  line of its declaring block (negative allowed). Shortcuts: ASCII-only case
+  mapping, no script/CJK spacing rules, per-node white-space, block-level
+  indent only, no `break-word`/`overflow-wrap`, form labels skip
+  text-transform (live user input).
+  Merge: mask + sticky + typography landed with hand-resolved unions
+  (dual-channel `collect_paint` signature, `decode_images` keyword union of
+  `parent_bg`/`parent_masked`/`next`, `Atom` word/`br` helpers threaded with
+  hover `node`/`cursor`, `Layout` field unions). Tests: default **450**,
+  feature **453**. Live: wiki Main_Page **93.6 MB** (1618 runs, DOWN 3.9 MB vs
+  wave 3 with +150 runs of preserved typography), Rust article 102.7 MB /
+  14740 runs; both render clean (`da5a2e5` pushed).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -654,6 +718,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-01 | wave 1 (box-sizing + overflow/clip culling) | Wikipedia Main Page | 96.4 MB (1253 runs), CPU 0.9s; skip-link "Jump to content" no longer renders (closed the documented clip/overflow known-gap) |
 | 2026-11-01 | wave 2 (float/clear/vertical-align + background-size/position/repeat) | Wikipedia Main Page | 105.4 MB (1253 runs), CPU 0.5s; float text-wrap + right-floated sidebar + sized bg headers live (+9 MB vs wave 1 from tiled paint entries) |
 | 2026-11-02 | wave 3 (::before/::after + content, z-index + transform) | Wikipedia Main Page | 97.5 MB (1468 runs, +215 pseudo boxes; RAM down 7.9 MB vs wave 2), CPU 0.8s |
+| 2026-11-02 | waves 4+5 (mask-image; :hover + cursor; position:sticky; typography batch) | Wikipedia Main Page | 93.6 MB (1618 runs; +150 runs of preserved whitespace/typography, RAM down 3.9 MB vs wave 3 — no per-frame hover state at rest) |
+| 2026-11-02 | waves 4+5 | Wikipedia Rust article | 102.7 MB (14740 runs; word-level runs on a long content page, 315 images decoded at display size) |
 
 ### Phase 1c (Track A) findings
 
