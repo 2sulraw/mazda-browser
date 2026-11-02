@@ -14,8 +14,9 @@ mod woff;
 use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont};
 use eframe::egui;
 use layout::{Fam, Layout, Style};
-use runtime::{Conf, EngineChoice, ScriptRuntime};
+use runtime::{Conf, EngineChoice, FontsChoice, ScriptRuntime};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -183,11 +184,12 @@ impl App {
         // chrome; the page rasterizes its own fonts regardless
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let fonts = Fonts::load();
-        // start URL = first arg that is not a `--engine=` testing knob
-        // (the selectable-runtime CLI override may come in any position)
+        // start URL = first arg that is not a `--knob` (the selectable
+        // runtime/fonts CLI overrides may come in any position; every
+        // `--xxx[=value]` knob is excluded, never mistaken for a URL)
         let start = std::env::args()
             .skip(1)
-            .find(|a| !a.starts_with("--engine="))
+            .find(|a| !a.starts_with("--"))
             .unwrap_or_else(|| "https://example.com".to_string());
         // logical viewport = NativeOptions initial size; one texture pixel per
         // logical point (a HiDPI framebuffer upscales the texture — fine at
@@ -274,6 +276,7 @@ impl App {
             max_w: page_w(pw),
             vh: page_h(ph),
             engine: self.conf.engine,
+            fonts: self.conf.fonts,
         };
         // receiver only drops when the worker thread is gone
         if self.jobs.send(req).is_err() {
@@ -1013,6 +1016,7 @@ impl eframe::App for App {
                         ui,
                         self.conf.engine,
                         crate::runtime::EngineChoice::B.available(),
+                        self.conf.fonts,
                     ) {
                         match ev {
                             ui_chrome::SettingsEvent::SetEngine(choice) => {
@@ -1024,6 +1028,20 @@ impl eframe::App for App {
                                 // this reload covers the current one
                                 let target = self.page.url.clone();
                                 self.dispatch(&target, pw, ph, 0.0);
+                            }
+                            ui_chrome::SettingsEvent::SetFonts(choice) => {
+                                self.conf.fonts = choice;
+                                self.conf.save();
+                                eprintln!("[settings] fonts set to {}", choice.as_conf());
+                                // shortcut: applies on the NEXT navigation —
+                                // no reload here (the engine row reloads
+                                // because it swaps the running interpreter;
+                                // fonts only change what the next load
+                                // fetches, so the current page is untouched).
+                                // A form-submit load fired by a worker Event
+                                // also keeps the loaded page's policy; the
+                                // next dispatch() (link / address bar / reload)
+                                // is what adopts the new one.
                             }
                             ui_chrome::SettingsEvent::Close => {
                                 self.settings_open = false;
@@ -1160,6 +1178,10 @@ enum LoadReq {
         /// runtime). A relayout/event never switches engines: the kept
         /// page keeps its runtime; this only matters for loads.
         engine: EngineChoice,
+        /// webfont policy for this load (`A` = site fonts, `B` = system
+        /// fonts only). Like `engine`, a relayout/event never switches it —
+        /// the settings choice applies on the NEXT navigation.
+        fonts: FontsChoice,
     },
     /// re-cascade + re-layout the kept page (resize / DOM change / hover
     /// change), carrying the UI's live form state + hover cell forward
@@ -1215,6 +1237,15 @@ impl LoadReq {
         match self {
             LoadReq::Load { engine, .. } | LoadReq::Relayout { engine, .. } | LoadReq::Event { engine, .. } => *engine,
             LoadReq::Scroll { .. } => EngineChoice::A,
+        }
+    }
+
+    /// The webfont policy a fresh navigation carries; relayout/event/scroll
+    /// keep the current page's policy (settings apply on the next load).
+    fn fonts_choice(&self) -> Option<FontsChoice> {
+        match self {
+            LoadReq::Load { fonts, .. } => Some(*fonts),
+            _ => None,
         }
     }
 }
@@ -1760,6 +1791,11 @@ fn process_job(
     last_geom: &mut (f32, f32),
     last_forms: &mut layout::FormState,
 ) -> (Option<PageWire>, Option<String>, bool, bool, bool) {
+    // a fresh navigation adopts the settings-page webfont policy; layout
+    // runs (relayout/event/scroll) keep the loaded page's policy
+    if let Some(choice) = job.fonts_choice() {
+        fonts.set_choice(choice);
+    }
     match job {
         LoadReq::Load { url, max_w, vh, .. } => {
             *last_geom = (*max_w, *vh);
@@ -3114,6 +3150,34 @@ fn fetch_accept(
     Ok((buf, content_type))
 }
 
+/// Decoded webfont bytes kept in RAM per page (per `Fonts` instance: the
+/// loader thread and the UI painter each own one, so a page is bounded at
+/// 2 × 32 MB across both). Site fonts often ship 3-8 faces at 1-4 MB each;
+/// 32 MB keeps normal pages fully covered while a hostile page (dozens of
+/// huge faces) cannot grow without bound.
+/// Rule: on every successful decode the oldest-USED face is evicted (LRU by
+/// `last_use` stamp) until the new font fits; a single font larger than the
+/// cap is skipped entirely (system fallback) rather than breaking the cap.
+/// shortcut: this is a per-page decoded-font byte budget, NOT the spec's
+/// font-set loading semantics (unicode-range/font-display untouched).
+const WEBFONT_BUDGET: usize = 32 << 20;
+
+/// One stderr note per process when site webfonts are off (option B, or a
+/// build without the decoder). `begin_page` runs on every relayout, so a
+/// plain eprintln would spam the log on hover/typing.
+fn note_webfont_skip(system_only: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        if system_only {
+            eprintln!("[font] webfonts disabled for this page (system fonts only)");
+        } else {
+            eprintln!("[font] webfonts unavailable (built without the woff2 feature)");
+        }
+    }
+}
+
+
 /// Font variants load on first use. ab_glyph parses lazily (~1MB raw bytes per
 /// font, glyph outlines parsed on demand) — the whole set costs less than one
 /// eagerly-parsed fontdue font did.
@@ -3134,16 +3198,60 @@ struct Fonts {
     faces: Vec<PageFace>,
     /// one lazy slot per SYSTEM_FAMILIES entry
     sys: Vec<std::sync::OnceLock<Option<FontVec>>>,
+    /// webfont policy the CURRENT page was loaded with (`A` site fonts,
+    /// `B` system only). Set from the navigation job, never mid-page.
+    webfonts: FontsChoice,
+    /// per-page cap (const in production; tests lower it to exercise LRU)
+    webfont_cap: usize,
+    /// decoded webfont bytes currently retained for this page
+    webfont_bytes: std::cell::Cell<usize>,
+    /// monotonically increasing access stamp (see [`PageFace::last_use`])
+    webfont_clock: std::cell::Cell<u64>,
 }
 
 /// One page's `@font-face` definition with its lazily-fetched font.
+/// `Rc` (not a plain Vec) so the byte-budget LRU can drop a cached face
+/// while a glyph already picked for painting stays alive for that frame.
 struct PageFace {
     family: String, // lowercased, as parsed
     wmin: u16,
     wmax: u16,
     italic: bool,
     srcs: Vec<String>, // absolute URLs in declared order
-    font: std::sync::OnceLock<Option<FontVec>>,
+    font: std::cell::RefCell<Option<Rc<FontVec>>>,
+    /// decoded size this face contributed to the page budget (0 = uncached)
+    bytes: std::cell::Cell<usize>,
+    /// last-picked stamp for LRU eviction (higher = more recent)
+    last_use: std::cell::Cell<u64>,
+    /// negative cache: every `src` failed, or the face exceeds the whole
+    /// budget. Without it a broken/giant face would refetch on EVERY glyph
+    /// (the old `OnceLock` cached failures; the LRU slot must too).
+    failed: std::cell::Cell<bool>,
+}
+
+/// A font chosen for one character: system faces are borrowed from the
+/// picker's long-lived slots, webfonts are shared so eviction cannot free a
+/// font that the current paint pass is still using.
+enum Picked<'a> {
+    Borrowed(&'a FontVec),
+    Shared(Rc<FontVec>),
+}
+
+impl std::ops::Deref for Picked<'_> {
+    type Target = FontVec;
+    fn deref(&self) -> &FontVec {
+        match self {
+            Picked::Borrowed(f) => f,
+            Picked::Shared(f) => f,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Picked<'_> {
+    fn ptr(&self) -> *const FontVec {
+        &**self as *const FontVec
+    }
 }
 
 /// Installed families sites commonly ask for by name → font files. One
@@ -3314,13 +3422,43 @@ impl Fonts {
             sys: (0..SYSTEM_FAMILIES.len())
                 .map(|_| std::sync::OnceLock::new())
                 .collect(),
+            webfonts: FontsChoice::A,
+            webfont_cap: WEBFONT_BUDGET,
+            webfont_bytes: std::cell::Cell::new(0),
+            webfont_clock: std::cell::Cell::new(0),
         }
+    }
+
+    /// Adopt the policy of the page being loaded (set from the navigation
+    /// job, so the settings change applies on NEXT navigation).
+    fn set_choice(&mut self, choice: FontsChoice) {
+        self.webfonts = choice;
     }
 
     /// Page-scoped font state: drop the previous page's webfonts and stack
     /// ids (RAM freed on navigation), register the new page's `@font-face`
     /// defs — each font itself still loads lazily on first use.
     fn begin_page(&mut self, faces: Vec<css::FontFace>) {
+        self.faces.clear();
+        self.webfont_bytes.set(0);
+        self.webfont_clock.set(0);
+        // reset the shared stack table BEFORE any early return: the cascade
+        // (running later in `layout_page`) pushes this page's stacks into it,
+        // so stale names/id slots must never survive a navigation
+        {
+            let mut t = self.stacks.borrow_mut();
+            t.clear();
+            t.push(Vec::new()); // id 0 = "no stack"
+        }
+        if self.webfonts == FontsChoice::B || !cfg!(feature = "woff2") {
+            // system-fonts-only mode (or a dev build with no WOFF2 decoder):
+            // keep NO face definitions, so the lazy loader is never
+            // reachable — no webfont request is made and nothing is
+            // downloaded, decoded or cached (the UI RAM/network claim).
+            // release builds are made WITH the `woff2` feature.
+            note_webfont_skip(self.webfonts == FontsChoice::B);
+            return;
+        }
         self.faces = faces
             .into_iter()
             .map(|f| PageFace {
@@ -3329,12 +3467,12 @@ impl Fonts {
                 wmax: f.wmax,
                 italic: f.italic,
                 srcs: f.srcs,
-                font: std::sync::OnceLock::new(),
+                font: std::cell::RefCell::new(None),
+                bytes: std::cell::Cell::new(0),
+                last_use: std::cell::Cell::new(0),
+                failed: std::cell::Cell::new(false),
             })
             .collect();
-        let mut t = self.stacks.borrow_mut();
-        t.clear();
-        t.push(Vec::new()); // id 0 = "no stack"
         if !self.faces.is_empty() {
             eprintln!("[font] {} @font-face defs for this page", self.faces.len());
         }
@@ -3364,7 +3502,7 @@ impl Fonts {
     /// Range-gated so Thai/Arabic/etc. (no fallback font for them) never pay
     /// the font-load cost just to learn there's no glyph.
     /// shortcut: fallback is always the *regular* weight — no bold/italic CJK.
-    fn pick_font_for(&self, ch: char, style: &Style) -> &FontVec {
+    fn pick_font_for(&self, ch: char, style: &Style) -> Picked<'_> {
         if style.fam_stack != 0 {
             let table = self.stacks.borrow();
             if let Some(names) = table.get(style.fam_stack as usize) {
@@ -3380,52 +3518,110 @@ impl Fonts {
         }
         let primary = self.pick(style);
         if primary.glyph_id(ch).0 != 0 {
-            return primary;
+            return Picked::Borrowed(primary);
         }
         if is_cjk(ch) {
             if let Some(f) = self.cjk.get_or_init(|| try_load_font(CJK_FONTS)) {
                 if f.glyph_id(ch).0 != 0 {
-                    return f;
+                    return Picked::Borrowed(f);
                 }
             }
         }
         if is_hangul(ch) {
             if let Some(f) = self.hangul.get_or_init(|| try_load_font(HANGUL_FONTS)) {
                 if f.glyph_id(ch).0 != 0 {
-                    return f;
+                    return Picked::Borrowed(f);
                 }
             }
         }
-        primary
+        Picked::Borrowed(primary)
     }
 
     /// One family name from a stack: the page's `@font-face` webfont for it
-    /// (fetched+decoded once, disk-cached), else a known installed alias.
-    /// None → the caller continues to the next name in the stack.
-    fn stack_font(&self, name: &str, style: &Style, ch: char) -> Option<&FontVec> {
+    /// (fetched+decoded once, charged against the per-page LRU budget), else
+    /// a known installed alias. None → the caller continues to the stack.
+    fn stack_font(&self, name: &str, style: &Style, ch: char) -> Option<Picked<'_>> {
         // best face for this weight/italic, else the family's regular face
         let want: u16 = if style.bold { 700 } else { 400 };
-        let face = self
+        let idx = self
             .faces
             .iter()
-            .find(|f| {
+            .position(|f| {
                 f.family == name && f.italic == style.italic && f.wmin <= want && want <= f.wmax
             })
-            .or_else(|| self.faces.iter().find(|f| f.family == name && !f.italic));
-        if let Some(def) = face {
-            if let Some(f) = def.font.get_or_init(|| load_webfont(&def.srcs)) {
+            .or_else(|| self.faces.iter().position(|f| f.family == name && !f.italic));
+        if let Some(i) = idx {
+            // `B` never gets here: begin_page leaves `faces` empty, so no
+            // webfont URL is even fetched (the UI's RAM promise)
+            let empty = self.faces[i].font.borrow().is_none() && !self.faces[i].failed.get();
+            if empty {
+                match load_webfont(&self.faces[i].srcs) {
+                    Some(font) => self.cache_webfont(i, font),
+                    // negative cache: a dead src list is not retried per glyph
+                    None => self.faces[i].failed.set(true),
+                }
+            }
+            let cached = self.faces[i].font.borrow().clone();
+            if let Some(f) = cached {
                 if f.glyph_id(ch).0 != 0 {
-                    return Some(f);
+                    self.touch_webfont(i);
+                    return Some(Picked::Shared(f));
                 }
             }
         }
         let idx = SYSTEM_FAMILIES.iter().position(|(n, _)| *n == name)?;
         if let Some(f) = self.sys[idx].get_or_init(|| try_load_font(SYSTEM_FAMILIES[idx].1)) {
             if f.glyph_id(ch).0 != 0 {
-                return Some(f);
+                return Some(Picked::Borrowed(f));
             }
         }
         None
+    }
+
+    /// Cache one decoded webfont against the page budget: LRU-evict the
+    /// least-recently-picked cached faces until it fits (see WEBFONT_BUDGET).
+    /// A font bigger than the whole cap is skipped (system fallback).
+    fn cache_webfont(&self, face: usize, font: FontVec) {
+        let size = font.as_slice().len();
+        if size > self.webfont_cap {
+            eprintln!(
+                "[font] webfont {} KB exceeds the {}-KB page budget — system fallback",
+                size / 1024,
+                self.webfont_cap / 1024
+            );
+            // remember the verdict: re-decoding a too-large face per glyph
+            // would burn CPU forever
+            self.faces[face].failed.set(true);
+            return;
+        }
+        while self.webfont_bytes.get() + size > self.webfont_cap {
+            let victim = self
+                .faces
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.font.borrow().is_some())
+                .min_by_key(|(_, f)| f.last_use.get())
+                .map(|(i, _)| i);
+            let Some(v) = victim else { break };
+            *self.faces[v].font.borrow_mut() = None;
+            let freed = self.faces[v].bytes.replace(0);
+            self.webfont_bytes
+                .set(self.webfont_bytes.get().saturating_sub(freed));
+            eprintln!("[font] page budget: evicted {freed} KB webfont");
+        }
+        let clock = self.webfont_clock.get() + 1;
+        self.webfont_clock.set(clock);
+        *self.faces[face].font.borrow_mut() = Some(Rc::new(font));
+        self.faces[face].bytes.set(size);
+        self.faces[face].last_use.set(clock);
+        self.webfont_bytes.set(self.webfont_bytes.get() + size);
+    }
+
+    /// Mark a cached face as most-recently used (O(1); eviction scans stamps).
+    fn touch_webfont(&self, face: usize) {
+        let clock = self.webfont_clock.get() + 1;
+        self.webfont_clock.set(clock);
+        self.faces[face].last_use.set(clock);
     }
 
     fn measure(&self, text: &str, style: &Style) -> f32 {
@@ -3444,8 +3640,9 @@ fn load_font(candidates: &[&str]) -> FontVec {
 }
 
 /// Fetch + decode one webfont (`@font-face` src list, declared order).
-/// Disk-cached like any resource; containers: raw sfnt + WOFF1 via
-/// `woff::decode_font` (WOFF2 → None → try the next src / fall back).
+/// Disk-cached like any resource; containers: raw sfnt + WOFF1, plus WOFF2
+/// when this build has the `woff2` feature (`woff::decode_font` returns None
+/// otherwise → try the next src / fall back to system fonts).
 fn load_webfont(srcs: &[String]) -> Option<FontVec> {
     for u in srcs {
         let Ok((bytes, _)) = fetch(u) else { continue };
@@ -3910,14 +4107,14 @@ mod tests {
         let primary = fonts.pick(&Style::new());
         for ch in "Hello, world! 123".chars() {
             assert!(
-                std::ptr::eq(fonts.pick_font_for(ch, &Style::new()), primary),
+                std::ptr::eq(fonts.pick_font_for(ch, &Style::new()).ptr(), primary),
                 "char {ch:?} should not trigger fallback"
             );
         }
         // Thai has no fallback font — must not even consult one (costs nothing,
         // stays .notdef as before)
         assert!(
-            std::ptr::eq(fonts.pick_font_for('ก', &Style::new()), primary),
+            std::ptr::eq(fonts.pick_font_for('ก', &Style::new()).ptr(), primary),
             "Thai should stay on primary"
         );
     }
@@ -3932,13 +4129,16 @@ mod tests {
         ]);
         let mut st = Style::new();
         st.fam_stack = 1;
-        assert!(std::ptr::eq(fonts.pick_font_for('R', &st), fonts.pick(&st)));
+        assert!(std::ptr::eq(
+            fonts.pick_font_for('R', &st).ptr(),
+            fonts.pick(&st)
+        ));
         // an installed alias in the stack beats the generic pick (HN: Verdana)
         fonts.stacks.borrow_mut().push(vec!["verdana".to_string()]);
         st.fam_stack = 2;
         let f = fonts.pick_font_for('R', &st);
         assert!(
-            !std::ptr::eq(f, fonts.pick(&st)),
+            !std::ptr::eq(f.ptr(), fonts.pick(&st)),
             "verdana should win over the generic primary"
         );
         assert!(f.glyph_id('R').0 != 0);
@@ -3956,15 +4156,19 @@ mod tests {
             wmax: 400,
             italic: false,
             srcs: vec![],
-            font: std::sync::OnceLock::from(Some(pre)),
+            font: std::cell::RefCell::new(Some(Rc::new(pre))),
+            bytes: std::cell::Cell::new(0),
+            last_use: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(false),
         });
         fonts.stacks.borrow_mut().push(vec!["testface".to_string()]);
         let mut st = Style::new();
         st.fam = Fam::Serif; // generic pick would be Georgia
         st.fam_stack = 1;
         let f = fonts.pick_font_for('R', &st);
+        let cached = fonts.faces[0].font.borrow();
         assert!(
-            std::ptr::eq(f, fonts.faces[0].font.get().unwrap().as_ref().unwrap()),
+            std::ptr::eq(f.ptr(), cached.as_ref().unwrap().as_ref()),
             "the page's webfont wins over the generic"
         );
     }
@@ -3972,18 +4176,150 @@ mod tests {
     #[test]
     fn webfont_fetch_failure_falls_through_stack() {
         let mut fonts = Fonts::load();
+        // no usable src: offline-deterministic stand-in for "every fetch/decode
+        // failed" (the container fallbacks themselves are covered in woff.rs)
         fonts.faces.push(PageFace {
             family: "ghost".to_string(),
             wmin: 400,
             wmax: 400,
             italic: false,
-            srcs: vec!["https://invalid.invalid/f.woff".to_string()],
-            font: std::sync::OnceLock::new(),
+            srcs: vec![],
+            font: std::cell::RefCell::new(None),
+            bytes: std::cell::Cell::new(0),
+            last_use: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(false),
         });
         fonts.stacks.borrow_mut().push(vec!["ghost".to_string()]);
-        let st = Style::new();
-        // unreachable src → old behaviour: the primary generic pick
-        assert!(std::ptr::eq(fonts.pick_font_for('R', &st), fonts.pick(&st)));
+        let mut st = Style::new();
+        st.fam_stack = 1;
+        // nowhere to load from → old behaviour: the primary generic pick
+        assert!(std::ptr::eq(
+            fonts.pick_font_for('R', &st).ptr(),
+            fonts.pick(&st)
+        ));
+        // and the dead face is negative-cached (no per-glyph retry)
+        assert!(fonts.faces[0].failed.get());
+    }
+
+    /// The per-page budget: oldest-picked face is evicted first once a new
+    /// decode would exceed the cap; a face larger than the whole cap is
+    /// skipped and negative-cached (system fallback).
+    #[test]
+    fn webfont_budget_evicts_least_recently_used() {
+        let mut fonts = Fonts::load();
+        let base = try_load_font(FONT_REGULAR).unwrap();
+        let size = base.as_slice().len();
+        assert!(size > 0);
+        // room for exactly two faces (same size, so the arithmetic is tight)
+        fonts.webfont_cap = size * 2 + 1;
+        for family in ["one", "two", "three"] {
+            fonts.faces.push(PageFace {
+                family: family.to_string(),
+                wmin: 400,
+                wmax: 400,
+                italic: false,
+                srcs: vec![],
+                font: std::cell::RefCell::new(None),
+                bytes: std::cell::Cell::new(0),
+                last_use: std::cell::Cell::new(0),
+                failed: std::cell::Cell::new(false),
+            });
+        }
+        let dup = || FontVec::try_from_vec(base.as_slice().to_vec()).unwrap();
+        fonts.cache_webfont(0, dup());
+        fonts.cache_webfont(1, dup());
+        assert_eq!(fonts.webfont_bytes.get(), size * 2);
+        // touch 0 so face 1 becomes the oldest, then a third face must evict it
+        fonts.touch_webfont(0);
+        fonts.cache_webfont(2, dup());
+        assert!(fonts.faces[0].font.borrow().is_some(), "recent face kept");
+        assert!(fonts.faces[1].font.borrow().is_none(), "oldest evicted");
+        assert!(fonts.faces[2].font.borrow().is_some(), "new face cached");
+        assert_eq!(fonts.webfont_bytes.get(), size * 2, "accounting stays exact");
+
+        // a face bigger than the entire cap is skipped (never breaks the cap)
+        let mut small = Fonts::load();
+        small.webfont_cap = size - 1;
+        small.faces.push(PageFace {
+            family: "huge".to_string(),
+            wmin: 400,
+            wmax: 400,
+            italic: false,
+            srcs: vec![],
+            font: std::cell::RefCell::new(None),
+            bytes: std::cell::Cell::new(0),
+            last_use: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(false),
+        });
+        small.cache_webfont(0, dup());
+        assert!(small.faces[0].font.borrow().is_none());
+        assert!(small.faces[0].failed.get(), "oversize verdict is remembered");
+        assert_eq!(small.webfont_bytes.get(), 0);
+    }
+
+    /// B (system fonts only) must register NO face defs, so the lazy loader
+    /// is unreachable: no webfont fetch, decode or cache at all.
+    #[test]
+    fn fonts_b_skips_webfont_loading_entirely() {
+        let mut fonts = Fonts::load();
+        fonts.stacks.borrow_mut().push(vec!["stale-from-previous-page".into()]);
+        fonts.set_choice(FontsChoice::B);
+        fonts.begin_page(vec![css::FontFace {
+            family: "siteface".into(),
+            srcs: vec!["https://invalid.invalid/font.woff2".into()],
+            wmin: 400,
+            wmax: 700,
+            italic: false,
+        }]);
+        assert!(fonts.faces.is_empty(), "B keeps no @font-face defs");
+        // stack table reset before the early return (no stale leak)
+        assert_eq!(fonts.stacks.borrow().len(), 1, "only the id-0 slot");
+        // and the picker falls straight through to system fonts
+        assert!(std::ptr::eq(
+            fonts.pick_font_for('R', &Style::new()).ptr(),
+            fonts.pick(&Style::new())
+        ));
+        // A registers the same def (lazily; no network call until a glyph) —
+        // except in a build compiled without the WOFF2 decoder, where the
+        // whole webfont path is skipped (release builds enable the feature)
+        fonts.set_choice(FontsChoice::A);
+        fonts.begin_page(vec![css::FontFace {
+            family: "siteface".into(),
+            srcs: vec![],
+            wmin: 400,
+            wmax: 700,
+            italic: false,
+        }]);
+        #[cfg(feature = "woff2")]
+        assert_eq!(fonts.faces.len(), 1);
+        #[cfg(not(feature = "woff2"))]
+        assert!(fonts.faces.is_empty(), "feature-off build fetches no webfonts");
+    }
+
+    /// The policy is carried by a fresh navigation only: relayout/event/scroll
+    /// jobs return None, so a settings change never mutates the live page.
+    #[test]
+    fn fonts_policy_applies_on_next_navigation_only() {
+        let load = LoadReq::Load {
+            id: 1,
+            url: "https://x/".into(),
+            max_w: 100.0,
+            vh: 100.0,
+            engine: EngineChoice::A,
+            fonts: FontsChoice::B,
+        };
+        assert_eq!(load.fonts_choice(), Some(FontsChoice::B));
+        let re = LoadReq::Relayout {
+            id: 2,
+            url: "https://x/".into(),
+            max_w: 100.0,
+            vh: 100.0,
+            forms: layout::FormState::default(),
+            hover: None,
+            engine: EngineChoice::A,
+        };
+        assert_eq!(re.fonts_choice(), None);
+        assert_eq!(LoadReq::Scroll { url: "https://x/".into(), y: 0.0 }.fonts_choice(), None);
     }
 
     #[test]
@@ -4526,6 +4862,7 @@ mod tests {
             max_w: 1.0,
             vh: 1.0,
             engine: EngineChoice::A,
+            fonts: FontsChoice::A,
         };
     }
 
@@ -4584,7 +4921,7 @@ mod tests {
     /// never dropped and breaks both collapsing runs.
     #[test]
     fn coalesce_batch_superseded_runs() {
-        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, engine: EngineChoice::A };
+        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, engine: EngineChoice::A, fonts: FontsChoice::A };
         let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default(), hover: None, engine: EngineChoice::A };
         let ev = |id, kind: &str| LoadReq::Event {
             id,

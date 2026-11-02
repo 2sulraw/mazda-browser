@@ -89,6 +89,8 @@ pub enum ToolbarEvent {
 pub enum SettingsEvent {
     /// the user picked an engine (radio row click)
     SetEngine(crate::runtime::EngineChoice),
+    /// the user picked a webfont policy (radio row click)
+    SetFonts(crate::runtime::FontsChoice),
     /// close requested (✕ or click outside)
     Close,
 }
@@ -431,9 +433,58 @@ const SET_TEXT: f32 = TEXT; // 13px
 const SET_FG: Color32 = FG_HOVER; // #e8eaed (same token as the chrome text)
 const SET_DIM: Color32 = DISABLED_FG;
 const SET_W: f32 = 430.0;
-const SET_H: f32 = 128.0;
+/// two labelled radio groups (engine + fonts), 2 rows each
+const SET_H: f32 = 200.0;
 const SET_PAD: f32 = 16.0;
 const SET_ROW_H: f32 = 30.0;
+
+/// One radio row: marker + label, hover highlight, click → selected. Returns
+/// true when this row was clicked (callers ignore clicks on a dimmed row).
+#[allow(clippy::too_many_arguments)]
+fn settings_radio_row(
+    ui: &mut Ui,
+    panel: Rect,
+    row_y: f32,
+    font: &FontId,
+    label: &str,
+    sel: bool,
+    dim: bool,
+    id: &'static str,
+) -> bool {
+    let row_w = SET_W - 2.0 * SET_PAD;
+    let m = if sel { "(•)" } else { "( )" };
+    let rect = Rect::from_min_size(
+        pos2(panel.left() + SET_PAD, row_y),
+        vec2(row_w, SET_ROW_H),
+    );
+    let resp = ui.interact(rect, ui.scope_id().with(id), Sense::click());
+    // an unavailable row dims everything (and stays inert)
+    let (mark_fg, text_fg) = if dim {
+        (SET_DIM, SET_DIM)
+    } else if sel {
+        (SET_FG, SET_FG)
+    } else {
+        (ICON, SET_FG)
+    };
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, BG_HOVER);
+    }
+    ui.painter().text(
+        pos2(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        m,
+        font.clone(),
+        mark_fg,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 34.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font.clone(),
+        text_fg,
+    );
+    resp.clicked()
+}
 
 /// The modal settings dialog: pick the script runtime the next page loads
 /// run through. Painted with the same raw-shapes style as the chrome rows.
@@ -443,17 +494,22 @@ const SET_ROW_H: f32 = 30.0;
 /// JavaScript engine:
 ///   (•) A — Pure Rust built-in (light)
 ///   ( ) B — Full JS engine core (compatibility, +30 MB/page)
+/// Font loading: (•) A — WOFF2 webfonts (site fonts, +~10-15 MB/page)
+///               ( ) B — System fonts only (minimal RAM)
 /// ```
 /// Engine B's row is dimmed and inert when this build was compiled without
 /// the feature (the runtime falls back to A with a `[settings]` stderr
 /// note); both sit behind the same runtime contract, the choice applies
-/// from the NEXT navigation on (no hot-swap of a running page).
+/// from the NEXT navigation on (no hot-swap of a running page). The fonts
+/// choice applies from the next navigation too (it changes what the page
+/// loader fetches, not a live re-layout).
 pub fn settings_overlay(
     ui: &mut Ui,
     chosen: crate::runtime::EngineChoice,
     b_available: bool,
+    chosen_fonts: crate::runtime::FontsChoice,
 ) -> Vec<SettingsEvent> {
-    use crate::runtime::EngineChoice;
+    use crate::runtime::{EngineChoice, FontsChoice};
     let mut events = Vec::new();
     let screen = ui.max_rect();
     let center = screen.center();
@@ -495,9 +551,8 @@ pub fn settings_overlay(
         events.push(SettingsEvent::Close);
     }
 
-    // radio rows: (label, choice) — the "(•)"/"( )" marker tracks the choice
+    // ---- engine group: radio rows, the marker tracks the choice ----
     let mut row_y = panel.top() + SET_PAD + 30.0;
-    let row_w = SET_W - 2.0 * SET_PAD;
     for (label, choice) in [
         ("A — Pure Rust built-in (light)", EngineChoice::A),
         (
@@ -505,47 +560,47 @@ pub fn settings_overlay(
             EngineChoice::B,
         ),
     ] {
-        let sel = chosen == choice;
-        let m = if sel { "(•)" } else { "( )" };
-        let rect = Rect::from_min_size(pos2(panel.left() + SET_PAD, row_y), vec2(row_w, SET_ROW_H));
-        let resp = ui.interact(
-            rect,
-            ui.scope_id().with(("settings_engine", choice.as_conf())),
-            Sense::click(),
-        );
-        // an unavailable B row dims everything (and stays inert)
         let dim = !b_available && choice == EngineChoice::B;
-        let (mark_fg, text_fg) = if dim {
-            (SET_DIM, SET_DIM)
-        } else if sel {
-            (SET_FG, SET_FG)
+        let id = if choice == EngineChoice::A {
+            "settings_engine_a"
         } else {
-            (ICON, SET_FG)
+            "settings_engine_b"
         };
-        if resp.hovered() {
-            ui.painter().rect_filled(rect, 6.0, BG_HOVER);
-        }
-        ui.painter().text(
-            pos2(rect.left() + 4.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            m,
-            font.clone(),
-            mark_fg,
-        );
-        ui.painter().text(
-            pos2(rect.left() + 34.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            font.clone(),
-            text_fg,
-        );
-        if resp.clicked() {
-            if choice.available() {
+        if settings_radio_row(ui, panel, row_y, &font, label, chosen == choice, dim, id) {
+            if dim {
+                eprintln!("[chrome] settings: engine B unavailable in this build");
+            } else {
                 eprintln!("[chrome] settings: engine set to {}", choice.as_conf());
                 events.push(SettingsEvent::SetEngine(choice));
-            } else {
-                eprintln!("[chrome] settings: engine B unavailable in this build");
             }
+        }
+        row_y += SET_ROW_H;
+    }
+
+    // ---- fonts group (frozen copy; both choices always available) ----
+    row_y += 14.0;
+    ui.painter().text(
+        pos2(panel.left() + SET_PAD, row_y - 16.0),
+        Align2::LEFT_CENTER,
+        "Font loading:",
+        font.clone(),
+        SET_FG,
+    );
+    for (label, choice) in [
+        (
+            "A — WOFF2 webfonts (site fonts, +~10-15 MB/page)",
+            FontsChoice::A,
+        ),
+        ("B — System fonts only (minimal RAM)", FontsChoice::B),
+    ] {
+        let id = if choice == FontsChoice::A {
+            "settings_fonts_a"
+        } else {
+            "settings_fonts_b"
+        };
+        if settings_radio_row(ui, panel, row_y, &font, label, chosen_fonts == choice, false, id) {
+            eprintln!("[chrome] settings: fonts set to {}", choice.as_conf());
+            events.push(SettingsEvent::SetFonts(choice));
         }
         row_y += SET_ROW_H;
     }
