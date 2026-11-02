@@ -997,6 +997,137 @@ pub struct PositionedRun {
     pub clip: Option<(f32, f32, f32, f32)>,
 }
 
+/// One `position: sticky` box's paint-time pinning record — see
+/// [`Layout::sticky`]. Layout leaves the box at its static flow position
+/// (the scroll threshold never offsets flow, unlike `position: relative`);
+/// each frame `render()` adds [`sticky_offset`] to every paint entry of the
+/// box's ENTIRE subtree so the whole subtree moves together, keeping the
+/// z order `zsort` already gave it (the shift never re-sorts — sticky vs
+/// `z-index` interactions are approximate: a pinned entry keeps painting at
+/// its sorted level while it moves).
+///
+/// Spans are `(start, end)` ranges into the paint channels: `rects`/
+/// `shadows`/`imgs` from `collect_paint`'s push indices (a subtree's
+/// entries are contiguous in the DFS), `runs`/`uls` from the box's
+/// `run_range`/`ul_range`; `imgs_dec` covers the content images the shell
+/// decodes AFTER layout (`main.rs` `decode_images` appends them past every
+/// z-sorted entry).
+///
+/// shortcut: only the `top` threshold pins — `bottom`/`left`/`right`
+/// never do (top pinning is what real site headers/sidebars declare);
+/// `top` in `%` resolves against the parent box's height; `container_y1`
+/// is the PARENT box's border-box bottom, not the spec's nearest
+/// scrollport containing block; nested/overlapping sticky groups shift
+/// independently (an entry inside two groups' spans gets both offsets —
+/// approximation for a sticky box inside a sticky box, rare); form rects
+/// and hit-testing are NOT shifted (`FormBox`, the link walk) — hover and
+/// click on a stuck navbar land where the box was before pinning, and a
+/// form control inside a sticky subtree paints at its flow position; no
+/// re-clipping at the container edge (the clamp keeps the group inside
+/// its container, so entries can't smear past it, but entries pre-culled
+/// against an ANCESTOR clip keep their flow-position cut — while a sticky
+/// box's own run clip moves with the group, glued like a transform); an
+/// absolute/fixed descendant sits outside `run_range`/`ul_range` and
+/// keeps its own position; inside a `position: fixed` subtree the
+/// coordinates don't scroll, so pinning runs against scroll 0 (`fixed`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct StickyGroup {
+    /// (start, end) into `Layout::shadows`
+    pub shadows: (usize, usize),
+    /// (start, end) into `Layout::rects`
+    pub rects: (usize, usize),
+    /// (start, end) into `Layout::images` from layout paint
+    pub imgs: (usize, usize),
+    /// (start, end) into `Layout::images` from the post-layout decode
+    /// pass (empty until `main.rs` fills it)
+    pub imgs_dec: (usize, usize),
+    /// (start, end) into `Layout::runs`
+    pub runs: (usize, usize),
+    /// (start, end) into `Layout::underline_rects`
+    pub uls: (usize, usize),
+    /// the sticky box's own flow y (border box, doc coords)
+    pub doc_y: f32,
+    /// its flow height
+    pub doc_h: f32,
+    /// resolved `top` threshold in px (`BoxStyle::inset[0]`; only boxes
+    /// that declare `top` get a group — a threshold-less sticky never pins)
+    pub top: f32,
+    /// parent box's border-box bottom — the edge the pin clamps against
+    pub container_y1: f32,
+    /// inside a `position: fixed` subtree: coordinates are viewport-
+    /// relative, so pinning ignores scroll (see struct doc)
+    pub fixed: bool,
+}
+
+/// One frame's pin offset for one sticky group (see [`StickyGroup`]):
+/// `0.0` while the box's flow top still sits below `scroll + top`
+/// (un-stuck — layout is never touched), then it follows `scroll + top`
+/// (the box's document y becomes `scroll + top`, i.e. it pins `top` px
+/// below the viewport top), clamped so the box's bottom never passes
+/// `container_y1`. A container shorter than the box gives a negative
+/// clamp range → `max(0.0)` → never pins. In a `fixed` subtree nothing
+/// scrolls, so the threshold runs against scroll 0; a sticky box inside
+/// a plain `absolute` subtree keeps document coordinates, so the normal
+/// scroll path applies to it unchanged.
+pub fn sticky_offset(g: &StickyGroup, scroll: f32) -> f32 {
+    let scroll = if g.fixed { 0.0 } else { scroll };
+    let room = g.container_y1 - (g.doc_y + g.doc_h);
+    (scroll + g.top - g.doc_y).clamp(0.0, room.max(0.0))
+}
+
+/// Per-frame sticky pin deltas for every paint entry: `entry.y +
+/// off[channel][i]` is the pinned y. All five vectors are empty on pages
+/// without sticky boxes, so every lookup yields `0.0` and paint is
+/// byte-identical to a build without the feature.
+#[derive(Default)]
+pub struct StickyFrame {
+    pub sh: Vec<f32>,
+    pub rect: Vec<f32>,
+    pub img: Vec<f32>,
+    pub run: Vec<f32>,
+    pub ul: Vec<f32>,
+}
+
+/// Build this frame's [`StickyFrame`] from the layout's groups (see
+/// [`sticky_offset`]); entries covered by several groups (nested sticky)
+/// get the sum of their offsets.
+pub fn sticky_frame(laid: &Layout, scroll: f32) -> StickyFrame {
+    if laid.sticky.is_empty() {
+        return StickyFrame::default();
+    }
+    let mut f = StickyFrame {
+        sh: vec![0.0; laid.shadows.len()],
+        rect: vec![0.0; laid.rects.len()],
+        img: vec![0.0; laid.images.len()],
+        run: vec![0.0; laid.runs.len()],
+        ul: vec![0.0; laid.underline_rects.len()],
+    };
+    for g in &laid.sticky {
+        let d = sticky_offset(g, scroll);
+        if d == 0.0 {
+            continue;
+        }
+        add_span(&mut f.sh, g.shadows, d);
+        add_span(&mut f.rect, g.rects, d);
+        add_span(&mut f.img, g.imgs, d);
+        add_span(&mut f.img, g.imgs_dec, d);
+        add_span(&mut f.run, g.runs, d);
+        add_span(&mut f.ul, g.uls, d);
+    }
+    f
+}
+
+/// Add `d` to every entry of one recorded span (out-of-range ends are
+/// clamped — a span past the channel's end would be a bookkeeping bug,
+/// and shifting what exists beats panicking mid-frame).
+fn add_span(v: &mut [f32], (a, b): (usize, usize), d: f32) {
+    let a = a.min(v.len());
+    let b = b.min(v.len()).max(a);
+    for x in &mut v[a..b] {
+        *x += d;
+    }
+}
+
 pub struct Layout {
     pub runs: Vec<PositionedRun>,
     pub height: f32,
@@ -1021,6 +1152,11 @@ pub struct Layout {
     /// one via [`Layout::set_form_value`], else the initial value from
     /// the markup
     pub form_values: HashMap<u32, String>,
+    /// one entry per `position: sticky` box that declares `top` — the
+    /// paint-time pinning records the shell applies per frame (see
+    /// [`StickyGroup`]); empty on pages without one. shortcut: boxes
+    /// without `top` never pin, so they get no group.
+    pub sticky: Vec<StickyGroup>,
 }
 
 /// Default viewport height for [`layout_tree`] — matches the fixed window in
@@ -1186,29 +1322,49 @@ pub fn layout_in_forms(
     let mut images = Vec::new();
     let mut img_z = Vec::new();
     let mut shadows = Vec::new();
+    let mut sticky = Vec::new();
     collect_paint(
         root,
         false,
         Xf::IDENT,
         0,
         None,
+        // the root's "parent" is the viewport: a root-level sticky pins
+        // against the initial containing block (its height)
+        (0.0, viewport_h),
         &mut rects,
         &mut rect_z,
         &mut images,
         &mut img_z,
         &mut shadows,
+        &mut sticky,
     );
     // stacking levels: each channel paints in (z, tree order) — a stable
-    // sort keyed by the stamped levels (identity when no page sets z-index)
-    zsort(&mut rects, &rect_z);
-    zsort(&mut images, &img_z);
+    // sort keyed by the stamped levels (identity when no page sets z-index);
+    // sticky spans were recorded in paint-walk order, so they follow their
+    // entries through a permutation (exact while the subtree kept one level)
+    let rm = zsort(&mut rects, &rect_z);
+    let im = zsort(&mut images, &img_z);
     // text channel: move runs/underlines through their boxes' transforms
     // (layout coords never move — transforms are visual-only), stamp their
     // stacking levels, then stable-sort like the rect/image channels
     let mut run_z = vec![0i32; runs.len()];
     transform_runs(root, Xf::IDENT, 0, &mut runs, &mut uls, &mut run_z);
-    zsort(&mut runs, &run_z);
+    let mm = zsort(&mut runs, &run_z);
+    if !sticky.is_empty() {
+        if let Some(m) = rm {
+            remap_sticky_spans(&mut sticky, |g| &mut g.rects, &m);
+        }
+        if let Some(m) = im {
+            remap_sticky_spans(&mut sticky, |g| &mut g.imgs, &m);
+        }
+        if let Some(m) = mm {
+            remap_sticky_spans(&mut sticky, |g| &mut g.runs, &m);
+        }
+    }
     // form controls: laid rects + focus visuals (caret) + value seeding
+    // (the caret is appended past every group's ul span — forms are never
+    // shifted, see StickyGroup)
     let mut forms = Vec::new();
     let mut form_values = HashMap::new();
     collect_forms(root, false, state, &mut forms, &mut uls, &mut form_values, measure);
@@ -1223,6 +1379,7 @@ pub fn layout_in_forms(
         forms,
         focused: state.focused,
         form_values,
+        sticky,
     }
 }
 
@@ -1504,14 +1661,43 @@ fn collect_paint(
     m: Xf,
     z: i32,
     clip: Option<(f32, f32, f32, f32)>,
+    // parent box's (y0, y1) — the sticky container edge recorded for
+    // groups (shortcut: parent border box, not the spec's scrollport
+    // containing block; the root's parent is the viewport)
+    container: (f32, f32),
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     out_z: &mut Vec<i32>,
     imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
     img_z: &mut Vec<i32>,
     shadows: &mut Vec<ShadowRect>,
+    sticky: &mut Vec<StickyGroup>,
 ) {
     if !n.is_text {
         let fixed = fixed || n.bx.pos == Pos::Fixed;
+        // sticky box declaring `top`: open its group window BEFORE any of
+        // this subtree's pushes (runs/uls come from the box's ranges) —
+        // closed after the children recurse, so the spans cover exactly
+        // this subtree's entries (the DFS pushes them contiguously)
+        let sg = (n.bx.pos == Pos::Sticky && n.bx.inset[0].is_some()).then(|| {
+            let i = sticky.len();
+            sticky.push(StickyGroup {
+                shadows: (shadows.len(), 0),
+                rects: (out.len(), 0),
+                imgs: (imgs.len(), 0),
+                imgs_dec: (0, 0), // filled by main.rs's decode pass
+                runs: (n.run_range.0 as usize, n.run_range.1 as usize),
+                uls: (n.ul_range.0 as usize, n.ul_range.1 as usize),
+                doc_y: n.y,
+                doc_h: n.h,
+                top: match n.bx.inset[0].unwrap() {
+                    Len::Px(v) => v,
+                    Len::Pct(p) => p / 100.0 * (container.1 - container.0),
+                },
+                container_y1: container.1,
+                fixed,
+            });
+            i
+        });
         // this box's transform joins the ancestor chain for its rendering
         // AND its children's; identity keeps every number below unchanged
         let m = match box_xf(n) {
@@ -1714,7 +1900,26 @@ fn collect_paint(
             if masked && ch.is_bg {
                 continue;
             }
-            collect_paint(ch, fixed, m, z, content_clip, out, out_z, imgs, img_z, shadows);
+            collect_paint(
+                ch,
+                fixed,
+                m,
+                z,
+                content_clip,
+                (n.y, n.y + n.h),
+                out,
+                out_z,
+                imgs,
+                img_z,
+                shadows,
+                sticky,
+            );
+        }
+        // close the sticky group's window (own entries + every descendant)
+        if let Some(i) = sg {
+            sticky[i].shadows.1 = shadows.len();
+            sticky[i].rects.1 = out.len();
+            sticky[i].imgs.1 = imgs.len();
         }
     }
 }
@@ -1812,17 +2017,54 @@ fn box_xf(n: &BoxNode) -> Option<Xf> {
 /// the same tree walk). Stability keeps TREE order within a level — the
 /// CSS tie-break — and an all-equal key list (no `z-index` anywhere)
 /// permutes to itself, so pages without the property are untouched.
-fn zsort<T>(v: &mut Vec<T>, keys: &[i32]) {
+///
+/// Returns `Some(map)` with `map[orig] = new index` when it actually
+/// permuted (sticky groups remap their recorded spans through it — see
+/// [`remap_sticky_spans`]), `None` on the identity fast path.
+fn zsort<T>(v: &mut Vec<T>, keys: &[i32]) -> Option<Vec<usize>> {
     debug_assert_eq!(v.len(), keys.len(), "zsort: keys must match entries");
     if keys.windows(2).all(|w| w[0] == w[1]) {
-        return; // one level (incl. the empty/single-entry case) = tree order
+        return None; // one level (incl. the empty/single-entry case) = tree order
     }
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_by_key(|&i| keys[i]); // stable: ties keep tree order
+    let mut map = vec![0usize; idx.len()];
+    for (new, &orig) in idx.iter().enumerate() {
+        map[orig] = new;
+    }
     let orig = std::mem::take(v);
     let mut slots: Vec<Option<T>> = orig.into_iter().map(Some).collect();
     for i in idx {
         v.push(slots[i].take().unwrap());
+    }
+    Some(map)
+}
+
+/// Remap one channel's sticky-group spans through [`zsort`]'s index map
+/// so they still cover the same subtree after the channel was re-sorted.
+/// A subtree that kept ONE stacking level lands in one contiguous run
+/// (stable sort) → exact remap. A nested integer `z-index` inside the
+/// sticky box splits the subtree across levels → the run can't be
+/// represented as a span, so the group is DISABLED: its clamp range is
+/// forced to 0, which pins nothing in ANY channel (safe degradation —
+/// shortcut: sticky under a splitting nested z never pins).
+fn remap_sticky_spans(
+    sticky: &mut [StickyGroup],
+    span: impl Fn(&mut StickyGroup) -> &mut (usize, usize),
+    map: &[usize],
+) {
+    for g in sticky.iter_mut() {
+        let (a, b) = *span(g);
+        let ok = a < b
+            && b <= map.len()
+            && (a..b).all(|i| map[i] == map[a] + (i - a));
+        if !ok {
+            if a < b {
+                g.container_y1 = g.doc_y + g.doc_h; // room 0 → no pin
+            }
+            continue;
+        }
+        *span(g) = (map[a], map[a] + (b - a));
     }
 }
 
@@ -2218,6 +2460,12 @@ fn position_all(
     match pos {
         // in flow already (also the root, laid by layout_in)
         Pos::Static => {}
+        // sticky: in flow EXACTLY like static — its threshold is scroll-
+        // dependent and never offsets layout (a declared `top: 40px`
+        // shifts nothing here, unlike relative; paint pins it later —
+        // see StickyGroup). Out-of-flow matches below never see it, so it
+        // keeps its flow space (that's why it exists).
+        Pos::Sticky => {}
         // stays in flow, just shifts — dx = left (wins) else −right
         Pos::Relative => {
             let dx = match (inset[3], inset[1]) {
@@ -3755,6 +4003,7 @@ fn layout_from(
             forms: Vec::new(),
             focused: None,
             form_values: HashMap::new(),
+            sticky: Vec::new(),
         },
         x,
     )
@@ -5361,6 +5610,139 @@ mod tests {
         // the flow sibling is unaffected
         let vis = l.runs.iter().find(|r| r.text == "visible").expect("flow run");
         assert!(vis.y >= 0.0 && vis.y < 50.0, "in-flow text stays on canvas: y={}", vis.y);
+    }
+
+    // ---- position: sticky (in flow like static, pinned at paint time) ----
+
+    #[test]
+    fn sticky_keeps_static_flow_position_even_with_top() {
+        // same tree three ways: a sticky box declaring top:40px must lay
+        // out EXACTLY like static (the threshold is scroll-dependent and
+        // never offsets flow — the anti-relative guard; relative WOULD
+        // shift), and its following sibling must stack the same way.
+        let build = |pos: Pos| {
+            let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+            let head = pos_box(pos, [Some(Len::Px(40.0)), None, None, None], vec![leaf("head")]);
+            let after = pos_box(Pos::Static, [None; 4], vec![leaf("after")]);
+            root.children = vec![head, after];
+            let l = layout_tree(&mut root, 300.0, &m4);
+            let runs = l
+                .runs
+                .iter()
+                .map(|r| (r.text.clone(), r.x, r.y))
+                .collect::<Vec<_>>();
+            (runs, root.h)
+        };
+        let (static_runs, static_h) = build(Pos::Static);
+        let (sticky_runs, sticky_h) = build(Pos::Sticky);
+        assert_eq!(sticky_runs, static_runs, "flow positions byte-identical to static");
+        assert_eq!(sticky_h, static_h, "container height identical");
+        // the guard has teeth: the same inset DOES move a relative box
+        let (rel_runs, _) = build(Pos::Relative);
+        assert_ne!(sticky_runs, rel_runs, "relative shifts by top:40 — sticky must not");
+    }
+
+    #[test]
+    fn sticky_offset_pin_math() {
+        let g = |doc_y: f32, doc_h: f32, top: f32, container_y1: f32| StickyGroup {
+            shadows: (0, 0),
+            rects: (0, 0),
+            imgs: (0, 0),
+            imgs_dec: (0, 0),
+            runs: (0, 0),
+            uls: (0, 0),
+            doc_y,
+            doc_h,
+            top,
+            container_y1,
+            fixed: false,
+        };
+        // un-stuck: flow top still below the threshold → 0
+        assert_eq!(sticky_offset(&g(100.0, 50.0, 40.0, 2000.0), 0.0), 0.0);
+        assert_eq!(sticky_offset(&g(100.0, 50.0, 40.0, 2000.0), 50.0), 0.0);
+        // scrolled past → pins: doc_y + off == scroll + top (240 = 200 + 40)
+        assert_eq!(sticky_offset(&g(100.0, 50.0, 40.0, 2000.0), 200.0), 140.0);
+        // clamped at the container bottom: box bottom lands on container_y1
+        // (room = 2000 − (100 + 50))
+        assert_eq!(sticky_offset(&g(100.0, 50.0, 40.0, 2000.0), 5000.0), 1850.0);
+        // negative clamp range (box taller than its container) → no pin
+        assert_eq!(sticky_offset(&g(100.0, 50.0, 40.0, 120.0), 5000.0), 0.0);
+        // inside a fixed subtree nothing scrolls → threshold vs scroll 0
+        let mut fg = g(10.0, 50.0, 40.0, 2000.0);
+        fg.fixed = true;
+        assert_eq!(sticky_offset(&fg, 9999.0), 30.0);
+    }
+
+    #[test]
+    fn sticky_group_spans_cover_subtree_paint() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        // sticky parent with a background + a text child: both channels'
+        // subtree entries must fall inside the group's recorded spans
+        let mut head = pos_box(Pos::Sticky, [Some(Len::Px(0.0)), None, None, None], vec![leaf("title")]);
+        head.bx.bg = Some(0x112233);
+        // a threshold-less sticky never pins → it gets no group
+        let bare = pos_box(Pos::Sticky, [None; 4], vec![leaf("bare")]);
+        root.children = vec![head, bare];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        assert_eq!(l.sticky.len(), 1, "only the top:0 box gets a group");
+        let g = l.sticky[0];
+        let ri = l.rects.iter().position(|r| r.4 == 0x112233).expect("bg rect");
+        assert!(g.rects.0 <= ri && ri < g.rects.1, "rect {ri} outside {:?}", g.rects);
+        let ti = l.runs.iter().position(|r| r.text == "title").expect("title run");
+        assert!(g.runs.0 <= ti && ti < g.runs.1, "run {ti} outside {:?}", g.runs);
+        assert_eq!(g.top, 0.0, "top:0 → pins at the viewport top");
+    }
+
+    #[test]
+    fn page_without_sticky_is_untouched_and_paint_matches_static() {
+        let build = |pos: Pos| {
+            let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+            let mut box1 = pos_box(pos, [Some(Len::Px(40.0)), None, None, None], vec![leaf("one")]);
+            box1.bx.bg = Some(0x224466);
+            let box2 = pos_box(Pos::Static, [None; 4], vec![leaf("two")]);
+            root.children = vec![box1, box2];
+            layout_tree(&mut root, 300.0, &m4)
+        };
+        // a page without a sticky declaration records no groups …
+        let plain = build(Pos::Static);
+        assert!(plain.sticky.is_empty());
+        // … and a sticky page's paint lists are byte-identical to the
+        // static style's: layout/paint never offsets (pinning is render-
+        // time only — regression guard for the never-scrolled page)
+        let sticky = build(Pos::Sticky);
+        assert_eq!(sticky.sticky.len(), 1);
+        assert_eq!(sticky.rects, plain.rects, "bg rects identical");
+        assert_eq!(sticky.underline_rects, plain.underline_rects, "underlines identical");
+        assert_eq!(sticky.shadows, plain.shadows, "shadows identical");
+        assert_eq!(sticky.images.len(), plain.images.len(), "images identical");
+        assert_eq!(sticky.height, plain.height, "page height identical");
+        let proj = |l: &Layout| {
+            l.runs
+                .iter()
+                .map(|r| (r.x, r.y, r.width, r.text.clone(), r.fixed))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(proj(&sticky), proj(&plain), "text runs identical");
+    }
+
+    #[test]
+    fn sticky_inside_fixed_subtree_pins_without_scroll() {
+        // a sticky box under position:fixed lives in viewport coordinates:
+        // its group carries `fixed`, so pinning runs against scroll 0
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut bar = pos_box(Pos::Fixed, [Some(Len::Px(0.0)), None, None, None], vec![]);
+        let inner = pos_box(Pos::Sticky, [Some(Len::Px(10.0)), None, None, None], vec![leaf("stuck")]);
+        // filler below gives the sticky box room to pin inside the bar
+        let filler = pos_box(Pos::Static, [None; 4], vec![leaf("filler")]);
+        bar.children = vec![inner, filler];
+        root.children = vec![bar];
+        let l = layout_in(&mut root, 300.0, 100.0, &m4);
+        assert_eq!(l.sticky.len(), 1);
+        let g = &l.sticky[0];
+        assert!(g.fixed, "group inherits the fixed ancestor");
+        assert_eq!(g.doc_y, 0.0, "laid at the viewport top");
+        // scroll never applies inside the fixed subtree (999 ignored)
+        assert_eq!(sticky_offset(g, 999.0), 10.0, "pins at top:10 of the viewport");
     }
 
     // ---- overflow: hidden / clip: rect() paint culling ----

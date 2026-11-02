@@ -203,6 +203,7 @@ impl App {
                 forms: Vec::new(),
                 focused: None,
                 form_values: Default::default(),
+                sticky: Vec::new(),
             },
             bg: BG,
         };
@@ -1219,6 +1220,9 @@ struct PageWire {
     /// x, y, w, h, pixels (owned), fixed
     images: Vec<(f32, f32, f32, f32, image::ImageData, bool)>,
     shadows: Vec<layout::ShadowRect>,
+    /// sticky pinning records — the UI thread applies them per frame in
+    /// `render` (indexes into the channels above, so they ride along)
+    sticky: Vec<layout::StickyGroup>,
     /// the cascade's font-family stack table (ids are baked into run styles)
     stacks: Vec<Vec<String>>,
     /// the page's `@font-face` defs so the renderer resolves webfonts too
@@ -1314,6 +1318,7 @@ fn page_to_wire(
             })
             .collect(),
         shadows: p.laid.shadows,
+        sticky: p.laid.sticky,
         stacks,
         faces,
         forms: p.laid.forms,
@@ -1352,6 +1357,7 @@ fn wire_to_page(w: PageWire) -> Page {
                 .map(|(x, y, w, h, img, fixed)| (x, y, w, h, std::rc::Rc::new(img), fixed))
                 .collect(),
             shadows: w.shadows,
+            sticky: w.sticky,
             open_line: false, // paint-only consumer; flow state not needed
             // forms state rides the wire: rects for hit-testing, focus +
             // values for painting the accent border / caret / typed text
@@ -2505,7 +2511,17 @@ fn layout_page(
     let mut laid = layout::layout_in_forms(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st), state);
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
-    let n_px = decode_images(&mut root_box, url, &mut laid, &mut img_budget, false, None, false);
+    let mut sticky_next = 0usize; // sticky-group index counter, see decode_images
+    let n_px = decode_images(
+        &mut root_box,
+        url,
+        &mut laid,
+        &mut img_budget,
+        false,
+        None,
+        false,
+        &mut sticky_next,
+    );
     if n_px > 0 {
         eprintln!("[img] {n_px} decoded at display size");
     }
@@ -2615,6 +2631,12 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
 /// layout so the tint happens right here), and a live mask placeholder on
 /// that box means `collect_paint` already suppressed its background image —
 /// decoding it would draw what paint deliberately dropped (mask wins).
+///
+/// `next` counts sticky boxes met in tree order: the walk visits the same
+/// boxes with the same predicate as `collect_paint`'s group recording, so
+/// the index lands on this box's [`layout::StickyGroup`]; each group's
+/// `imgs_dec` span then covers the images its subtree appended here (they
+/// sit past every z-sorted entry, outside the layout-time `imgs` span).
 fn decode_images(
     n: &mut layout::BoxNode,
     base: &str,
@@ -2623,8 +2645,19 @@ fn decode_images(
     fixed: bool,
     parent_bg: Option<u32>,
     parent_masked: bool,
+    next: &mut usize,
 ) -> usize {
     let fixed = fixed || n.bx.pos == css::Pos::Fixed;
+    // same predicate as collect_paint's sticky recording (DFS order aligns
+    // the indices); img0 opens this subtree's append window before its
+    // own push
+    let grp = (!n.is_text && n.bx.pos == css::Pos::Sticky && n.bx.inset[0].is_some())
+        .then(|| {
+            let i = *next;
+            *next += 1;
+            i
+        });
+    let img0 = laid.images.len();
     let mut count = 0usize;
     // the box's own background image loses to a live mask on the same box:
     // skip the whole decode (no pixels fetched, no budget charged)
@@ -2676,7 +2709,12 @@ fn decode_images(
     let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
     let bg = n.bx.bg;
     for c in &mut n.children {
-        count += decode_images(c, base, laid, budget, fixed, bg, masked);
+        count += decode_images(c, base, laid, budget, fixed, bg, masked, next);
+    }
+    if let Some(i) = grp {
+        if let Some(g) = laid.sticky.get_mut(i) {
+            g.imgs_dec = (img0, laid.images.len());
+        }
     }
     count
 }
@@ -3350,16 +3388,22 @@ fn render(
     // panels own that space instead)
     top: f32,
 ) {
+    // sticky pinning: this frame's per-entry y offsets (empty on pages
+    // without sticky boxes → every lookup is 0.0, paint unchanged); the
+    // shift never re-sorts — zsort already ran at layout, so a moved
+    // entry keeps its stacking level (sticky-vs-z is approximate)
+    let so = layout::sticky_frame(laid, scroll);
     // two passes: normal content (scrolled) first, then fixed overlays on
     // top in viewport coordinates (no scroll offset)
     for want_fixed in [false, true] {
         // box-shadows under everything else in this pass — blurred rounded
         // rects, per-pixel distance falloff over blur/2
-        for s in &laid.shadows {
+        for (i, s) in laid.shadows.iter().enumerate() {
             if s.fixed != want_fixed {
                 continue;
             }
-            let y0 = if s.fixed { s.y } else { s.y - scroll };
+            let y = s.y + so.sh.get(i).copied().unwrap_or(0.0);
+            let y0 = if s.fixed { y } else { y - scroll };
             // grow the paint area by the blur so the falloff isn't clipped
             let pad = s.blur;
             if y0 + s.h + pad < 0.0 || y0 - pad > page {
@@ -3400,10 +3444,11 @@ fn render(
             }
         }
         // box backgrounds first (parent-before-child), then text on top
-        for &(x, y, w, h, color, rad, fixed) in &laid.rects {
+        for (i, &(x, y, w, h, color, rad, fixed)) in laid.rects.iter().enumerate() {
             if fixed != want_fixed {
                 continue;
             }
+            let y = y + so.rect.get(i).copied().unwrap_or(0.0);
             let y = if fixed { y } else { y - scroll };
             if y + h < 0.0 || y > page {
                 continue;
@@ -3436,11 +3481,12 @@ fn render(
             }
         }
         // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
-        for (x, y, w, h, img, fixed) in &laid.images {
+        for (i, (x, y, w, h, img, fixed)) in laid.images.iter().enumerate() {
             if *fixed != want_fixed {
                 continue;
             }
-            let y0 = if *fixed { *y } else { y - scroll };
+            let y = *y + so.img.get(i).copied().unwrap_or(0.0);
+            let y0 = if *fixed { y } else { y - scroll };
             if y0 + h < 0.0 || y0 > page {
                 continue;
             }
@@ -3468,11 +3514,14 @@ fn render(
                 }
             }
         }
-        for run in &laid.runs {
+        for (i, run) in laid.runs.iter().enumerate() {
             if run.fixed != want_fixed {
                 continue;
             }
-            let y = if run.fixed { run.y } else { run.y - scroll };
+            // sticky pin: the run and its clip window move together
+            // (glued like a transform — see StickyGroup's shortcuts)
+            let dy = so.run.get(i).copied().unwrap_or(0.0);
+            let y = if run.fixed { run.y + dy } else { run.y + dy - scroll };
             if y < -run.style.size * 2.0 || y > page + run.style.size {
                 continue;
             }
@@ -3480,6 +3529,7 @@ fn render(
             // doc coords − scroll). Fully-outside / degenerate window →
             // draw NOTHING (the skip-link case: text outside a 1px box).
             let clip = run.clip.map(|(x0, y0, x1, y1)| {
+                let (y0, y1) = (y0 + dy, y1 + dy);
                 let (y0, y1) = if run.fixed { (y0, y1) } else { (y0 - scroll, y1 - scroll) };
                 (x0, y0, x1, y1)
             });
@@ -3514,10 +3564,11 @@ fn render(
                 }),
             );
         }
-        for &(x, y, w, h, color, fixed) in &laid.underline_rects {
+        for (i, &(x, y, w, h, color, fixed)) in laid.underline_rects.iter().enumerate() {
             if fixed != want_fixed {
                 continue;
             }
+            let y = y + so.ul.get(i).copied().unwrap_or(0.0);
             let y = if fixed { y } else { y - scroll };
             if y < 0.0 || y > page {
                 continue;
@@ -3897,6 +3948,19 @@ mod tests {
             forms: Vec::new(),
             focused: None,
             form_values: Default::default(),
+            sticky: vec![layout::StickyGroup {
+                shadows: (0, 0),
+                rects: (0, 1),
+                imgs: (0, 0),
+                imgs_dec: (0, 0),
+                runs: (0, 1),
+                uls: (0, 1),
+                doc_y: 50.0,
+                doc_h: 20.0,
+                top: 40.0,
+                container_y1: 500.0,
+                fixed: false,
+            }],
         };
         let page = Page {
             url: "https://example.com/".into(),
@@ -3937,6 +4001,10 @@ mod tests {
         assert_eq!(page.laid.shadows[0].blur, 2.0);
         assert_eq!(page.laid.rects.len(), 1);
         assert_eq!(page.laid.underline_rects.len(), 1);
+        // sticky pinning records ride the wire too (render needs them)
+        assert_eq!(page.laid.sticky.len(), 1);
+        assert_eq!(page.laid.sticky[0].top, 40.0);
+        assert_eq!(page.laid.sticky[0].rects, (0, 1));
     }
 
     /// Form interaction state must survive the worker→UI hop: focus, typed
