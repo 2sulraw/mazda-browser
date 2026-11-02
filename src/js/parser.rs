@@ -94,6 +94,24 @@ pub enum ExprKind {
         base: Box<Expr>,
         steps: Vec<ChainStep>,
     },
+    /// `super(...)` / `super.m(...)` — resolved at parse time against the
+    /// class's hidden superclass binding, so eval only needs the current
+    /// `this` from the environment.
+    SuperCall {
+        class: Box<Expr>,
+        /// None = constructor call; Some(key) = superclass method
+        key: Option<Rc<str>>,
+        /// look the method up on the class itself (static) instead of its
+        /// prototype
+        static_: bool,
+        args: Vec<CallArg>,
+    },
+    /// `super.m` without a call (returns the unbound function)
+    SuperMember {
+        class: Box<Expr>,
+        key: Rc<str>,
+        static_: bool,
+    },
     /// elements: Hole = hole, Spread = `...expr`
     Array(Vec<ArrayElem>),
     Object(Vec<ObjElem>),
@@ -429,6 +447,26 @@ pub enum FnBody {
 
 pub type Program = Vec<Stmt>;
 
+/// What a `class` body accumulates. Lowered to statements once the whole
+/// body is parsed, in source order per list (instance members and static
+/// members keep their own relative order).
+#[derive(Clone, Debug)]
+enum ClassItem {
+    Method(Rc<FnDef>),
+    Accessor(Rc<str>, Option<Rc<FnDef>>, Option<Rc<FnDef>>),
+    /// static field: `Class.name = init` at definition time
+    Field(Rc<str>, Option<Expr>),
+}
+
+/// Class context while parsing a method body: where `super` points and
+/// whether the current member is static (look `super.x` up on the class
+/// itself rather than on its prototype).
+#[derive(Clone)]
+struct ClassCtx {
+    super_name: Option<Rc<str>>,
+    is_static: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -447,6 +485,7 @@ pub fn parse(source: &str) -> Result<Program, JsError> {
         toks,
         pos: 0,
         depth: 0,
+        class_stack: Vec::new(),
     };
     p.program()
 }
@@ -473,6 +512,9 @@ struct Parser<'a> {
     /// recursion guard: pathological nesting (`((((...))))`, `[[[[...]]]]`,
     /// `{{{{...}}}}`) must be a SyntaxError, not a native stack overflow
     depth: usize,
+    /// enclosing class contexts (innermost last); `super` resolves against
+    /// the top entry
+    class_stack: Vec<ClassCtx>,
 }
 
 /// nesting cap; deep enough for any real page, shallow enough to stay far
@@ -812,9 +854,6 @@ impl<'a> Parser<'a> {
                     kind: StmtKind::List(list),
                     span: self.span_from(start),
                 });
-            }
-            Tok::Kw(Kw::Super) | Tok::Kw(Kw::Extends) | Tok::Kw(Kw::Static) => {
-                return self.err("class inheritance/static members are not supported (later wave)")
             }
             _ => {
                 let e = self.expr()?;
@@ -1279,21 +1318,247 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     /// plus accessor-definition statements for get/set pairs.
     fn class_rest(&mut self) -> Result<Vec<Stmt>, JsError> {
         let name = self.expect_ident()?;
-        if self.eat_kw(Kw::Extends) || self.eat_kw(Kw::Static) {
-            return self.err("class inheritance/static members are not supported (later wave)");
-        }
+        let superclass = if self.eat_kw(Kw::Extends) {
+            Some(self.lhs_expr()?)
+        } else {
+            None
+        };
         self.expect_punct(Punct::LBrace)?;
+        // Hidden binding for the superclass. It lives in the same scope as
+        // the class declaration, so the constructor and every method (which
+        // are closures created there) can reach it.
+        let super_name: Option<Rc<str>> = superclass
+            .as_ref()
+            .map(|_| Rc::from(format!("__super{}", next_class_id()).as_str()));
+        self.class_stack.push(ClassCtx {
+            super_name: super_name.clone(),
+            is_static: false,
+        });
+        let parsed = self.class_body(&name);
+        self.class_stack.pop();
+        let (ctor, instance, statics, fields) = parsed?;
+
+        let span = Span { start: 0, end: 0 };
+        let ident = |n: &Rc<str>| Expr {
+            kind: ExprKind::Ident(n.clone()),
+            span,
+        };
+        let proto_of = |n: &Rc<str>| Expr {
+            kind: ExprKind::Member {
+                base: Box::new(ident(n)),
+                key: Rc::from("prototype"),
+            },
+            span,
+        };
+        let member = |base: Expr, key: &Rc<str>| Expr {
+            kind: ExprKind::Member {
+                base: Box::new(base),
+                key: key.clone(),
+            },
+            span,
+        };
+        let undefined = || Expr {
+            kind: ExprKind::Void(Box::new(Expr {
+                kind: ExprKind::Num(0.0),
+                span,
+            })),
+            span,
+        };
+        let assign = |target: Expr, value: Expr| Stmt {
+            kind: StmtKind::Expr(Box::new(Expr {
+                kind: ExprKind::Assign {
+                    target: Box::new(target),
+                    op: None,
+                    value: Box::new(value),
+                },
+                span,
+            })),
+            span,
+        };
+
+        // Default constructor. A derived class with no explicit constructor
+        // forwards every argument to the superclass (spec behavior).
+        let mut ctor_def = ctor.unwrap_or_else(|| {
+            let body = match &super_name {
+                Some(sn) => vec![Stmt {
+                    kind: StmtKind::Expr(Box::new(Expr {
+                        kind: ExprKind::SuperCall {
+                            class: Box::new(ident(sn)),
+                            key: None,
+                            static_: false,
+                            args: vec![CallArg::Spread(Expr {
+                                kind: ExprKind::Ident(Rc::from("arguments")),
+                                span,
+                            })],
+                        },
+                        span,
+                    })),
+                    span,
+                }],
+                None => Vec::new(),
+            };
+            Rc::new(FnDef {
+                name: name.clone(),
+                params: Vec::new(),
+                body: FnBody::Block(body),
+                uses_arguments: super_name.is_some(),
+                is_async: false,
+                is_generator: false,
+                has_yield: false,
+            })
+        });
+        // Instance fields initialize inside the constructor. In a derived
+        // class they run right after the first top-level `super(...)` call
+        // (before it when the constructor has no top-level super call -
+        // shortcut: a super call nested in an arrow is not detected).
+        if !fields.is_empty() {
+            let mut body = match &ctor_def.body {
+                FnBody::Block(b) => b.clone(),
+                _ => Vec::new(),
+            };
+            let inits: Vec<Stmt> = fields
+                .iter()
+                .map(|(k, init)| {
+                    assign(
+                        member(
+                            Expr {
+                                kind: ExprKind::This,
+                                span,
+                            },
+                            k,
+                        ),
+                        init.clone().unwrap_or_else(&undefined),
+                    )
+                })
+                .collect();
+            let at = if super_name.is_some() {
+                body.iter()
+                    .position(|s| {
+                        matches!(&s.kind, StmtKind::Expr(e) if matches!(e.kind, ExprKind::SuperCall { .. }))
+                    })
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            body.splice(at..at, inits);
+            ctor_def = Rc::new(FnDef {
+                body: FnBody::Block(body),
+                ..(*ctor_def).clone()
+            });
+        }
+
+        let mut out = Vec::new();
+        if let (Some(sn), Some(sc)) = (&super_name, superclass) {
+            out.push(Stmt {
+                kind: StmtKind::VarDecl(
+                    VarKind::Let,
+                    vec![Declarator {
+                        name: sn.clone(),
+                        pat: None,
+                        init: Some(sc),
+                    }],
+                ),
+                span,
+            });
+        }
+        out.push(Stmt {
+            kind: StmtKind::FuncDecl(ctor_def),
+            span,
+        });
+        if let Some(sn) = &super_name {
+            // Prototype chains: instance methods via `.prototype`, static
+            // members via the class function's own [[Prototype]].
+            let set_proto = |target: Expr, proto: Expr| Stmt {
+                kind: StmtKind::Expr(Box::new(Expr {
+                    kind: ExprKind::Call {
+                        callee: Box::new(Expr {
+                            kind: ExprKind::Member {
+                                base: Box::new(Expr {
+                                    kind: ExprKind::Ident(Rc::from("Object")),
+                                    span,
+                                }),
+                                key: Rc::from("setPrototypeOf"),
+                            },
+                            span,
+                        }),
+                        args: vec![CallArg::Arg(target), CallArg::Arg(proto)],
+                    },
+                    span,
+                })),
+                span,
+            };
+            out.push(set_proto(ident(&name), ident(sn)));
+            out.push(set_proto(proto_of(&name), proto_of(sn)));
+        }
+
+        // Lower members in source order within each list.
+        let lower = |items: Vec<ClassItem>, is_static: bool| -> Vec<Stmt> {
+            items
+                .into_iter()
+                .map(|it| match it {
+                    ClassItem::Method(f) => {
+                        let owner = if is_static { ident(&name) } else { proto_of(&name) };
+                        assign(member(owner, &f.name), Expr {
+                            kind: ExprKind::Func(f),
+                            span,
+                        })
+                    }
+                    ClassItem::Accessor(key, getter, setter) => Stmt {
+                        kind: StmtKind::DefineAcc {
+                            owner: if is_static { ident(&name) } else { proto_of(&name) },
+                            key,
+                            getter,
+                            setter,
+                        },
+                        span,
+                    },
+                    ClassItem::Field(key, init) => {
+                        assign(member(ident(&name), &key), init.unwrap_or_else(&undefined))
+                    }
+                })
+                .collect()
+        };
+        out.extend(lower(instance, false));
+        out.extend(lower(statics, true));
+        Ok(out)
+    }
+
+    /// Parse the inside of a class body. Callers have pushed the class
+    /// context so `super` resolves; this only collects members.
+    #[allow(clippy::type_complexity)]
+    fn class_body(
+        &mut self,
+        name: &Rc<str>,
+    ) -> Result<
+        (
+            Option<Rc<FnDef>>,
+            Vec<ClassItem>,
+            Vec<ClassItem>,
+            Vec<(Rc<str>, Option<Expr>)>,
+        ),
+        JsError,
+    > {
         let mut ctor: Option<Rc<FnDef>> = None;
-        let mut methods: Vec<Rc<FnDef>> = Vec::new();
-        // accumulated accessors, in source order (getter/setter may split)
-        let mut accs: Vec<(Rc<str>, Option<Rc<FnDef>>, Option<Rc<FnDef>>)> = Vec::new();
+        let mut instance: Vec<ClassItem> = Vec::new();
+        let mut statics: Vec<ClassItem> = Vec::new();
+        // instance fields (static fields are ClassItem::Field in `statics`)
+        let mut fields: Vec<(Rc<str>, Option<Expr>)> = Vec::new();
         while !self.eat_punct(Punct::RBrace) {
             if self.eat_punct(Punct::Semi) {
-                continue; // class fields are a later wave; tolerate `;`
+                continue;
             }
-            // accessor detection: `get X(...)`/`set X(...)` where X is a
-            // property name followed by the parameter list (a method actually
-            // NAMED get/set has `(` directly after the name)
+            // `static` modifier: not a method named `static` (`static()`)
+            let is_static = *self.peek() == Tok::Kw(Kw::Static)
+                && *self.peek_at(1) != Tok::Punct(Punct::LParen);
+            if is_static {
+                self.next();
+            }
+            if let Some(c) = self.class_stack.last_mut() {
+                c.is_static = is_static;
+            }
+            // accessor: `get X(...)` / `set X(...)` (a method NAMED get/set
+            // has `(` directly after the name)
             let is_acc = matches!(
                 self.peek(),
                 Tok::Ident(s) if s.as_ref() == "get" || s.as_ref() == "set"
@@ -1317,139 +1582,84 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     is_generator: false,
                     has_yield: false,
                 });
-                let slot = accs.iter_mut().find(|(k, _, _)| *k == key);
-                match slot {
-                    Some((_, g, s)) => {
-                        if getset.as_ref() == "get" {
-                            if g.is_some() {
-                                return self.err("duplicate accessor getter");
+                let list = if is_static { &mut statics } else { &mut instance };
+                let mut found = false;
+                for it in list.iter_mut() {
+                    if let ClassItem::Accessor(k, g, s) = it {
+                        if *k == key {
+                            if getset.as_ref() == "get" {
+                                if g.is_some() {
+                                    return self.err("duplicate accessor getter");
+                                }
+                                *g = Some(f.clone());
+                            } else {
+                                if s.is_some() {
+                                    return self.err("duplicate accessor setter");
+                                }
+                                *s = Some(f.clone());
                             }
-                            *g = Some(f);
-                        } else {
-                            if s.is_some() {
-                                return self.err("duplicate accessor setter");
-                            }
-                            *s = Some(f);
+                            found = true;
+                            break;
                         }
                     }
-                    None => {
-                        let (g, s) = if getset.as_ref() == "get" {
-                            (Some(f), None)
-                        } else {
-                            (None, Some(f))
-                        };
-                        accs.push((key, g, s));
-                    }
+                }
+                if !found {
+                    let (g, s) = if getset.as_ref() == "get" {
+                        (Some(f), None)
+                    } else {
+                        (None, Some(f))
+                    };
+                    list.push(ClassItem::Accessor(key, g, s));
                 }
                 continue;
             }
-            let mname = self.prop_name()?;
-            if mname.as_ref() == "constructor" {
-                if ctor.is_some() {
-                    return self.err("duplicate class constructor");
+            let key = self.prop_name()?;
+            if *self.peek() == Tok::Punct(Punct::LParen) {
+                let params = self.param_list()?;
+                self.expect_punct(Punct::LBrace)?;
+                let body = self.block_body()?;
+                let uses_arguments = scan_uses_arguments_stmts(&body);
+                let is_ctor = !is_static && key.as_ref() == "constructor";
+                let f = Rc::new(FnDef {
+                    name: if is_ctor { name.clone() } else { key.clone() },
+                    params,
+                    body: FnBody::Block(body),
+                    uses_arguments,
+                    is_async: false,
+                    is_generator: false,
+                    has_yield: false,
+                });
+                if is_ctor {
+                    if ctor.is_some() {
+                        return self.err("duplicate class constructor");
+                    }
+                    ctor = Some(f);
+                } else if is_static {
+                    statics.push(ClassItem::Method(f));
+                } else {
+                    instance.push(ClassItem::Method(f));
                 }
-                let params = self.param_list()?;
-                self.expect_punct(Punct::LBrace)?;
-                let body = self.block_body()?;
-                let uses_arguments = scan_uses_arguments_stmts(&body);
-                // the declared function is bound under the CLASS name
-                ctor = Some(Rc::new(FnDef {
-                    name: name.clone(),
-                    params,
-                    body: FnBody::Block(body),
-                    uses_arguments,
-                    is_async: false,
-                    is_generator: false,
-                    has_yield: false,
-                }));
-            } else if mname.as_ref() == "get" || mname.as_ref() == "set" {
-                return self.err("accessor shorthand requires a property name");
             } else {
-                let params = self.param_list()?;
-                self.expect_punct(Punct::LBrace)?;
-                let body = self.block_body()?;
-                let uses_arguments = scan_uses_arguments_stmts(&body);
-                methods.push(Rc::new(FnDef {
-                    name: mname,
-                    params,
-                    body: FnBody::Block(body),
-                    uses_arguments,
-                    is_async: false,
-                    is_generator: false,
-                    has_yield: false,
-                }));
+                // public field: `x = init` / `x`
+                let init = if self.eat_op(Op::Assign) {
+                    Some(self.assign_expr()?)
+                } else {
+                    None
+                };
+                let terminated = self.eat_punct(Punct::Semi)
+                    || *self.peek() == Tok::Punct(Punct::RBrace)
+                    || self.cur().nl;
+                if !terminated {
+                    return self.err("expected `;` after class field");
+                }
+                if is_static {
+                    statics.push(ClassItem::Field(key, init));
+                } else {
+                    fields.push((key, init));
+                }
             }
         }
-        let span = Span { start: 0, end: 0 };
-        let mut out = Vec::new();
-        let ctor_def = ctor.unwrap_or_else(|| {
-            Rc::new(FnDef {
-                name: name.clone(),
-                params: Vec::new(),
-                body: FnBody::Block(Vec::new()),
-                uses_arguments: false,
-                is_async: false,
-                is_generator: false,
-                has_yield: false,
-            })
-        });
-        out.push(Stmt {
-            kind: StmtKind::FuncDecl(ctor_def),
-            span,
-        });
-        for m in methods {
-            let proto_member = Expr {
-                kind: ExprKind::Member {
-                    base: Box::new(Expr {
-                        kind: ExprKind::Member {
-                            base: Box::new(Expr {
-                                kind: ExprKind::Ident(name.clone()),
-                                span,
-                            }),
-                            key: Rc::from("prototype"),
-                        },
-                        span,
-                    }),
-                    key: m.name.clone(),
-                },
-                span,
-            };
-            out.push(Stmt {
-                kind: StmtKind::Expr(Box::new(Expr {
-                    kind: ExprKind::Assign {
-                        target: Box::new(proto_member),
-                        op: None,
-                        value: Box::new(Expr {
-                            kind: ExprKind::Func(m),
-                            span,
-                        }),
-                    },
-                    span,
-                })),
-                span,
-            });
-        }
-        for (key, getter, setter) in accs {
-            out.push(Stmt {
-                kind: StmtKind::DefineAcc {
-                    owner: Expr {
-                        kind: ExprKind::Member {
-                            base: Box::new(Expr {
-                                kind: ExprKind::Ident(name.clone()),
-                                span,
-                            }),
-                            key: Rc::from("prototype"),
-                        },
-                        span,
-                    },
-                    key,
-                    getter,
-                    setter,
-                },
-                span,
-            });
-        }
-        Ok(out)
+        Ok((ctor, instance, statics, fields))
     }
 
     // -- expressions --------------------------------------------------------
@@ -1712,6 +1922,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             toks: inner,
             pos: 0,
             depth: 0,
+            class_stack: Vec::new(),
         };
         let mut idx = 0usize;
         let params = sub.params_after_lparen(&mut idx)?;
@@ -2258,6 +2469,39 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 self.next();
                 ExprKind::This
             }
+            Tok::Kw(Kw::Super) => {
+                self.next();
+                let ctx = match self.class_stack.last() {
+                    Some(c) => c.clone(),
+                    None => return self.err("`super` is only valid inside a class"),
+                };
+                let sn = match ctx.super_name {
+                    Some(sn) => sn,
+                    None => return self.err("`super` requires the class to have `extends`"),
+                };
+                let class = Box::new(Expr {
+                    kind: ExprKind::Ident(sn),
+                    span: self.span_from(start),
+                });
+                if self.eat_punct(Punct::LParen) {
+                    let args = self.call_args()?;
+                    ExprKind::SuperCall {
+                        class,
+                        key: None,
+                        static_: ctx.is_static,
+                        args,
+                    }
+                } else if self.eat_punct(Punct::Dot) {
+                    let key = self.prop_name()?;
+                    ExprKind::SuperMember {
+                        class,
+                        key,
+                        static_: ctx.is_static,
+                    }
+                } else {
+                    return self.err("expected `(` or `.` after `super`");
+                }
+            }
             Tok::Kw(Kw::Function) => {
                 self.next();
                 let is_gen = matches!(self.peek(), Tok::Op(Op::Mul));
@@ -2290,6 +2534,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                                 toks,
                                 pos: 0,
                                 depth: 0,
+                                class_stack: Vec::new(),
                             };
                             let e = sub.expr()?;
                             segs.push(TplSeg::Expr(e));
@@ -2626,6 +2871,12 @@ fn num_key(n: f64) -> Rc<str> {
     }
 }
 
+fn next_class_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 fn tok_str(t: &Tok) -> String {
     match t {
         Tok::Num(n) => format!("{}", n),
@@ -2693,6 +2944,13 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
         }
         Member { base, .. } => expr_uses(base, k),
         Index { base, index } => expr_uses(base, k) || expr_uses(index, k),
+        SuperCall { class, args, .. } => {
+            expr_uses(class, k)
+                || args.iter().any(|a| match a {
+                    CallArg::Arg(x) | CallArg::Spread(x) => expr_uses(x, k),
+                })
+        }
+        SuperMember { class, .. } => expr_uses(class, k),
         OptionalChain { base, steps } => {
             expr_uses(base, k)
                 || steps.iter().any(|s| match s {
@@ -3070,6 +3328,13 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         }
         Member { base, .. } => scan_expr_arguments(base),
         Index { base, index } => scan_expr_arguments(base) || scan_expr_arguments(index),
+        SuperCall { class, args, .. } => {
+            scan_expr_arguments(class)
+                || args.iter().any(|a| match a {
+                    CallArg::Arg(x) | CallArg::Spread(x) => scan_expr_arguments(x),
+                })
+        }
+        SuperMember { class, .. } => scan_expr_arguments(class),
         OptionalChain { base, steps } => {
             scan_expr_arguments(base)
                 || steps.iter().any(|s| match s {

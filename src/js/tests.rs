@@ -466,6 +466,77 @@ fn classes_desugar() {
 }
 
 #[test]
+fn class_extends_and_super() {
+    // derived constructor, inherited method via super, instanceof
+    let src = "class A { constructor() { this.a = 1 } hi() { return 'A' } }
+               class B extends A { constructor() { super(); this.b = 2 } hi() { return 'B' + super.hi() } }
+               const b = new B();
+               b.a + ',' + b.b + ',' + b.hi() + ',' + (b instanceof A)";
+    assert_eq!(string(src), "1,2,BA,true");
+    // inherited method without an override
+    assert_eq!(
+        num("class A { m() { return 5 } } class B extends A {} new B().m()"),
+        5.0
+    );
+    // default derived constructor forwards arguments
+    assert_eq!(
+        num("class A { constructor(x) { this.x = x } } class B extends A {} new B(7).x"),
+        7.0
+    );
+    // super.m() keeps `this` bound to the instance
+    assert_eq!(
+        string(
+            "class A { m() { return this.n } } class B extends A { m() { this.n = 3; return super.m() } } new B().m()"
+        ),
+        "3"
+    );
+}
+
+#[test]
+fn class_static_members() {
+    // static method / field / accessor, and static inheritance
+    assert_eq!(num("class C { static s() { return 7 } } C.s()"), 7.0);
+    assert_eq!(num("class C { static v = 9 } C.v"), 9.0);
+    assert_eq!(
+        num("class C { static v = 9; static get g() { return 4 } } C.v + C.g"),
+        13.0
+    );
+    assert_eq!(
+        num("class A { static s() { return 1 } } class B extends A {} B.s()"),
+        1.0
+    );
+    assert_eq!(
+        num("class A { static s() { return 1 } } class B extends A { static s() { return super.s() + 1 } } B.s()"),
+        2.0
+    );
+    // static setter
+    assert_eq!(
+        num("class T { static _v = 1; static get v() { return T._v } static set v(x) { T._v = x } } T.v = 5; T.v"),
+        5.0
+    );
+}
+
+#[test]
+fn class_fields() {
+    // instance fields initialize before the constructor body runs
+    assert_eq!(
+        string(
+            "class F { x = 1; y; constructor() { this.z = 3 } } const f = new F(); f.x + ',' + f.y + ',' + f.z"
+        ),
+        "1,undefined,3"
+    );
+    // derived class: fields run after super(), so they can use `this`
+    assert_eq!(
+        string(
+            "class A { constructor() { this.a = 1 } }
+             class B extends A { b = this.a + 1; constructor() { super(); this.c = 3 } }
+             const b = new B(); b.a + ',' + b.b + ',' + b.c"
+        ),
+        "1,2,3"
+    );
+}
+
+#[test]
 fn null_undefined_property_access_throws() {
     match err("let o = null; o.a") {
         JsError::Throw(v) => assert!(v.to_string().contains("TypeError")),

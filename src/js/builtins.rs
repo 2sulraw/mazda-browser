@@ -81,6 +81,10 @@ pub(crate) fn install(e: &mut JsEngine) {
     }
     let dp = e.register_native("Object.defineProperty", n_object, O_DEFINE_PROP);
     obj_set_own(own(&object), "defineProperty", Val::Native(dp));
+    let sp = e.register_native("Object.setPrototypeOf", n_object, O_SET_PROTO);
+    obj_set_own(own(&object), "setPrototypeOf", Val::Native(sp));
+    let gp = e.register_native("Object.getPrototypeOf", n_object, O_GET_PROTO);
+    obj_set_own(own(&object), "getPrototypeOf", Val::Native(gp));
     e.set_global("Object", object);
 
     // Object.prototype + Array.prototype chain
@@ -588,6 +592,8 @@ const O_VALUES: u16 = 1;
 const O_ENTRIES: u16 = 2;
 const O_ASSIGN: u16 = 3;
 const O_DEFINE_PROP: u16 = 4;
+const O_SET_PROTO: u16 = 5;
+const O_GET_PROTO: u16 = 6;
 
 fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
@@ -682,6 +688,36 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 }
             }
             Ok(target)
+        }
+        O_SET_PROTO => {
+            // Object.setPrototypeOf(target, proto) - the only way a function
+            // object gets a [[Prototype]] (class `extends` lowering)
+            let target = args.first().cloned().unwrap_or(Val::Undefined);
+            let proto = args.get(1).cloned().unwrap_or(Val::Null);
+            let next = if matches!(proto, Val::Null) {
+                None
+            } else {
+                Some(proto.clone())
+            };
+            match &target {
+                Val::Obj(o) => {
+                    o.borrow_mut().proto = match proto {
+                        Val::Obj(p) => Some(p),
+                        _ => None,
+                    }
+                }
+                Val::Func(f) => *f.proto.borrow_mut() = next,
+                _ => {}
+            }
+            Ok(target)
+        }
+        O_GET_PROTO => {
+            let target = args.first().cloned().unwrap_or(Val::Undefined);
+            Ok(match &target {
+                Val::Obj(o) => o.borrow().proto.clone().map(Val::Obj).unwrap_or(Val::Null),
+                Val::Func(f) => f.proto.borrow().clone().unwrap_or(Val::Null),
+                _ => Val::Null,
+            })
         }
         _ => Ok(Val::Undefined),
     }

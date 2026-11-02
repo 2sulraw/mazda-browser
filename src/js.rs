@@ -251,6 +251,9 @@ pub struct Closure {
     pub this: Val,
     pub is_arrow: bool,
     pub props: RefCell<Vec<(Rc<str>, Val)>>,
+    /// [[Prototype]] of the function object itself (class `extends` sets it
+    /// so static members inherit); objects use `Obj::proto`.
+    pub proto: RefCell<Option<Val>>,
 }
 
 impl std::fmt::Debug for Closure {
@@ -1727,7 +1730,18 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
         }
         Val::Func(c) => {
             if let Some(v) = c.props.borrow().iter().find(|(k, _)| k.as_ref() == key) {
-                return Ok(v.1.clone());
+                return match &v.1 {
+                    // static accessor (`static get x()`) on the class function
+                    Val::Acc(acc) => {
+                        let g = acc.getter.clone().unwrap_or(Val::Undefined);
+                        if is_callable(&g) {
+                            e.call(g, base.clone(), Vec::new())
+                        } else {
+                            Ok(Val::Undefined)
+                        }
+                    }
+                    v => Ok(v.clone()),
+                };
             }
             match key {
                 // lazy prototype: reading `.prototype` materializes it so
@@ -1738,7 +1752,44 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                 "bind" => Ok(Val::Method(Meth::FnBind)),
                 "name" => Ok(Val::Str(c.def.name.clone())),
                 "length" => Ok(Val::Num(c.def.params.len() as f64)),
-                _ => Ok(Val::Undefined),
+                _ => {
+                    // class static members inherited through the function's
+                    // own [[Prototype]] (`class B extends A` links B -> A)
+                    let mut cur = c.proto.borrow().clone();
+                    for _ in 0..100 {
+                        let p = match cur {
+                            None => break,
+                            Some(p) => p,
+                        };
+                        cur = match &p {
+                            Val::Func(f) => {
+                                let found = f
+                                    .props
+                                    .borrow()
+                                    .iter()
+                                    .find(|(k, _)| k.as_ref() == key)
+                                    .map(|(_, v)| v.clone());
+                                if let Some(v) = found {
+                                    return match &v {
+                                        Val::Acc(acc) => {
+                                            let g =
+                                                acc.getter.clone().unwrap_or(Val::Undefined);
+                                            if is_callable(&g) {
+                                                e.call(g, base.clone(), Vec::new())
+                                            } else {
+                                                Ok(Val::Undefined)
+                                            }
+                                        }
+                                        v => Ok(v.clone()),
+                                    };
+                                }
+                                f.proto.borrow().clone()
+                            }
+                            _ => None,
+                        };
+                    }
+                    Ok(Val::Undefined)
+                }
             }
         }
         Val::Native(_) => {
@@ -1940,6 +1991,32 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
         // sloppy-mode silent no-op on primitives (non-strict JS behavior)
         Val::Str(_) | Val::Num(_) | Val::Bool(_) => Ok(()),
         Val::Func(c) => {
+            // static accessors: a setter may live on the function itself or
+            // be inherited through its [[Prototype]] (class `extends`)
+            let mut cur = Some(base.clone());
+            for _ in 0..PROTO_WALK_CAP {
+                let f = match cur {
+                    Some(Val::Func(f)) => f,
+                    _ => break,
+                };
+                let found = f
+                    .props
+                    .borrow()
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .map(|(_, x)| x.clone());
+                cur = f.proto.borrow().clone();
+                if let Some(ex) = found {
+                    if let Val::Acc(acc) = &ex {
+                        let s = acc.setter.clone().unwrap_or(Val::Undefined);
+                        if is_callable(&s) {
+                            e.call(s, base.clone(), vec![v.clone()])?;
+                        }
+                        return Ok(());
+                    }
+                    break;
+                }
+            }
             let mut ps = c.props.borrow_mut();
             match ps.iter_mut().find(|(k, _)| k.as_ref() == key) {
                 Some((_, slot)) => *slot = v,

@@ -1156,6 +1156,36 @@ curve matters more than the baseline (near-flat as tabs grow).
   `/Web/CSS/list-style-type` is unchanged (2773 runs, 81.8 MB: no
   run-count or RAM regression); the Wikipedia `JavaScript` article (new
   URL) parses and lays out at 11404 runs / 100.8 MB.
+  **(s) class completion** — real pages declare `class X extends Y` and
+  the engine rejected the whole script. Classes are now complete enough for
+  ordinary site code:
+  - **`extends`** links both chains: instance methods through
+    `Object.setPrototypeOf(B.prototype, A.prototype)`, statics through a
+    new `Closure.proto` [[Prototype]] on the class function
+    (`Object.setPrototypeOf(B, A)`), so `B.s()` finds `A.s` and
+    `instanceof` keeps working. `Object.getPrototypeOf` added alongside.
+  - **`super()` / `super.m()`** are resolved at PARSE time against a hidden
+    `__superN` binding created next to the class, so a method can sit in a
+    closure created in any scope. `super.m()` evaluates the superclass
+    prototype (or the class itself in a static member) and calls it with the
+    current `this`; a bare `super.m` yields the unbound function.
+  - **static members**: `static m(){}`, `static x = v`, `static get/set`
+    (installed on the class function; `get_member`/`set_member` now
+    intercept `Val::Acc` there and walk the function proto chain).
+  - **public instance fields** `x = v` / `x;` initialize at the top of the
+    constructor — in a derived class right after the first top-level
+    `super(...)` call (a super call nested inside an arrow is not detected:
+    honest shortcut). Static fields run at definition time in source order.
+  - a derived class with no constructor gets the spec default
+    `constructor(...args) { super(...args) }`.
+  Deferred with honest errors: private `#fields`, computed class keys,
+  class expressions, `new.target`, and class redeclaration across separate
+  `<script>` tags (the old binding silently wins).
+  Tests: `class_extends_and_super`, `class_static_members`,
+  `class_fields` (594 default / 598 with `engine-b woff2`). Live: a
+  `data:` page runs 11 class checks — 11/11 `ok`. MDN
+  `/Web/CSS/list-style-type` unchanged (2773 runs, 81.9 MB); the Wikipedia
+  `JavaScript` article unchanged at 11404 runs.
   Tests: default **591**, `engine-b + woff2` **595**
   (`computed_object_keys`, `object_literal_accessors`,
   `optional_chaining`; the `**` assertions moved into
@@ -1279,6 +1309,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 12 (JS syntax batch 1) | `data:` 16-construct probe | 75.3 MB (16/16 `ok`: `?.`, `?.[]`, `?.()`, `[k]: v`, get/set, `**`, `**=`) |
 | 2026-11-03 | wave 12 (JS syntax batch 1) | MDN `/Web/CSS/list-style-type` | 81.8 MB (2773 runs; unchanged — no regression) |
 | 2026-11-03 | wave 12 (JS syntax batch 1) | Wikipedia `/wiki/JavaScript` (new URL) | 100.8 MB (11404 runs) |
+| 2026-11-03 | wave 13 (class completion) | `data:` 11-class probe | 74.9 MB (11/11 `ok`: `extends`, `super()`, `super.m()`, static method/field/accessor/inheritance, instance fields, get/set pair, default ctor) |
+| 2026-11-03 | wave 13 (class completion) | MDN `/Web/CSS/list-style-type` | 81.9 MB (2773 runs; unchanged — no regression) |
+| 2026-11-03 | wave 13 (class completion) | Wikipedia `/wiki/JavaScript` | 11404 runs (identical; status-bar RSS 95.0 MB) |
+| 2026-11-03 | wave 13 (class completion) | svelte.dev | 77.0 MB (577 nodes; client-rendered shell stays blank — its inline scripts fail on `catch {}` optional binding, a later syntax batch) |
 
 ### Phase 1c (Track A) findings
 

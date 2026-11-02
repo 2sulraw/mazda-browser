@@ -1,4 +1,4 @@
-﻿//! Tree-walking evaluator: statements, expressions, operators, calls.
+//! Tree-walking evaluator: statements, expressions, operators, calls.
 //!
 //! Execution flow through statements is a small `Flow` enum (break/continue/
 //! return); script `throw` travels as `Err(JsError::Throw(..))` so `try`
@@ -6,7 +6,7 @@
 //! This wave adds: destructuring binding (`Pat` trees evaluated directly,
 //! no temporary desugar), spread/rest argument expansion, regex literals
 //! (compiled once per (pattern, flags) on the engine), `await` (run-to-
-//! completion microtask pump â€” see `await_value`), and generator bodies
+//! completion microtask pump — see `await_value`), and generator bodies
 //! walking through the resumable VM in `gen.rs`.
 
 use super::gen;
@@ -37,7 +37,7 @@ pub(crate) enum BindKind {
 }
 
 /// Hoist `var` names (as undefined) and function declarations to the top of
-/// a function/program body â€” a naive AST walk (shortcut: no TDZ for `let`,
+/// a function/program body — a naive AST walk (shortcut: no TDZ for `let`,
 /// no Annex-B block-level function semantics). Destructured `var` leaves
 /// participate (hoisted undefined).
 pub(crate) fn hoist(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) {
@@ -150,6 +150,7 @@ fn make_closure(_e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, is_arrow: bool)
         this: Val::Undefined,
         is_arrow,
         props: RefCell::new(Vec::new()),
+        proto: RefCell::new(None),
     }))
 }
 
@@ -440,28 +441,26 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             setter,
         } => {
             let o = eval_expr(e, env, owner)?;
-            let ob = match &o {
-                Val::Obj(ob) => ob.clone(),
-                _ => {
-                    return Err(JsError::throw(
-                        "TypeError: accessors can only be installed on objects",
-                    ))
-                }
-            };
             let getter_v = getter
                 .as_ref()
                 .map(|f| make_val_closure(e, env, f, false));
             let setter_v = setter
                 .as_ref()
                 .map(|f| make_val_closure(e, env, f, false));
-            obj_set_own(
-                &ob,
-                key,
-                Val::Acc(Rc::new(AccEntry {
-                    getter: getter_v,
-                    setter: setter_v,
-                })),
-            );
+            let acc = Val::Acc(Rc::new(AccEntry {
+                getter: getter_v,
+                setter: setter_v,
+            }));
+            match &o {
+                Val::Obj(ob) => obj_set_own(ob, key, acc),
+                // static accessor: installed on the class function object
+                Val::Func(c) => c.props.borrow_mut().push((key.clone(), acc)),
+                _ => {
+                    return Err(JsError::throw(
+                        "TypeError: accessors can only be installed on objects",
+                    ))
+                }
+            }
             Ok(Flow::Normal)
         }
     }
@@ -476,6 +475,7 @@ fn make_val_closure(e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, arrow: bool)
         this: Val::Undefined,
         is_arrow: arrow,
         props: RefCell::new(Vec::new()),
+        proto: RefCell::new(None),
     }))
 }
 
@@ -702,7 +702,7 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
     }
 }
 
-/// shortcut: no iterator protocol â€” arrays and strings only; anything else
+/// shortcut: no iterator protocol — arrays and strings only; anything else
 /// throws a clear TypeError (custom iterables, Maps, Sets are later waves).
 pub(crate) fn for_of_items(v: &Val) -> Result<Vec<Val>, JsError> {
     match v {
@@ -818,6 +818,23 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                     let f = get_member(e, &b, &k)?;
                     e.call(f, b, argvals)
                 }
+                // `super.m(...)`: method found on the superclass, `this`
+                // stays the current instance
+                ExprKind::SuperMember {
+                    class,
+                    key,
+                    static_,
+                } => {
+                    let sup = eval_expr(e, env, class)?;
+                    let holder = if *static_ {
+                        sup
+                    } else {
+                        get_member(e, &sup, "prototype")?
+                    };
+                    let f = get_member(e, &holder, key)?;
+                    let this = e.env_get(env, "this");
+                    e.call(f, this, argvals)
+                }
                 _ => {
                     let f = eval_expr(e, env, callee)?;
                     // sloppy mode: plain calls get the global object as this
@@ -850,12 +867,51 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
             let b = eval_expr(e, env, base)?;
             get_member(e, &b, key)
         }
+        // `super(...)` / `super.m(...)`: the superclass binding is resolved
+        // at parse time; `this` always comes from the current environment.
+        ExprKind::SuperCall {
+            class,
+            key,
+            static_,
+            args,
+        } => {
+            let argvals = eval_args(e, env, args)?;
+            let sup = eval_expr(e, env, class)?;
+            let this = e.env_get(env, "this");
+            match key {
+                // constructor call: run the superclass ctor on the SAME
+                // object `new` already created for us
+                None => e.call(sup, this, argvals),
+                Some(k) => {
+                    let holder = if *static_ {
+                        sup
+                    } else {
+                        get_member(e, &sup, "prototype")?
+                    };
+                    let f = get_member(e, &holder, k)?;
+                    e.call(f, this, argvals)
+                }
+            }
+        }
+        ExprKind::SuperMember {
+            class,
+            key,
+            static_,
+        } => {
+            let sup = eval_expr(e, env, class)?;
+            let holder = if *static_ {
+                sup
+            } else {
+                get_member(e, &sup, "prototype")?
+            };
+            get_member(e, &holder, key)
+        }
         ExprKind::Index { base, index } => {
             let b = eval_expr(e, env, base)?;
             let k = eval_expr(e, env, index)?.to_string();
             get_member(e, &b, &k)
         }
-        // `a?.b.c?.[d]?.()` — a nullish value at an OPTIONAL step ends the
+        // `a?.b.c?.[d]?.()` - a nullish value at an OPTIONAL step ends the
         // whole chain (undefined); at a non-optional step it throws like a
         // plain member read.
         ExprKind::OptionalChain { base, steps } => {
@@ -923,7 +979,7 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                     }
                     // `{...src}` copies own enumerable props (arrays copy
                     // their dense items as index keys; accessors invoke their
-                    // getters â€” matching real spread semantics closely enough
+                    // getters — matching real spread semantics closely enough
                     // for the honest scope of this wave)
                     ObjElem::Spread(sp) => {
                         let src = eval_expr(e, env, sp)?;
@@ -985,6 +1041,7 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                 this: Val::Undefined,
                 is_arrow: false,
                 props: RefCell::new(Vec::new()),
+                proto: RefCell::new(None),
             });
             // a named function expression binds its own name inside its scope
             // (`let f = function fact() { fact() }`); declarations already
@@ -999,6 +1056,7 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                     this: Val::Undefined,
                     is_arrow: false,
                     props: RefCell::new(Vec::new()),
+                    proto: RefCell::new(None),
                 });
                 fenv.declare(f.name.clone(), Val::Func(c.clone()), false);
                 return Ok(Val::Func(c));
@@ -1015,6 +1073,7 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                 this: lexical_this,
                 is_arrow: true,
                 props: RefCell::new(Vec::new()),
+                proto: RefCell::new(None),
             })))
         }
         ExprKind::Seq(list) => {
@@ -1093,7 +1152,7 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
 /// - already-settled engine promise: unwrap (rejection throws into the frame)
 /// - pending engine promise: pump the microtask queue (bounded) until it
 ///   settles; the honest exception is promises that only timers/macrotasks
-///   can settle â€” those error out (see `await_promise`)
+///   can settle — those error out (see `await_promise`)
 /// - non-promise values pass through unchanged
 fn await_value(e: &mut JsEngine, v: Val) -> Result<Val, JsError> {
     let p = match promise_of(&v) {
@@ -1363,8 +1422,8 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
 }
 
 fn relational(op: BinOp, l: &Val, r: &Val) -> bool {
-    // both strings compare lexicographically (UTF-8 byte order â‰ˆ JS's
-    // UTF-16 code-unit order for BMP text; astral pairs differ â€” shortcut)
+    // both strings compare lexicographically (UTF-8 byte order ≈ JS's
+    // UTF-16 code-unit order for BMP text; astral pairs differ — shortcut)
     if let (Val::Str(a), Val::Str(b)) = (l, r) {
         return match op {
             BinOp::Lt => a.as_bytes() < b.as_bytes(),
@@ -1874,6 +1933,7 @@ pub(crate) fn call_method(
                         this: Val::Undefined,
                         is_arrow: false,
                         props: RefCell::new(Vec::new()),
+                        proto: RefCell::new(None),
                     })))
                 }
                 _ => unreachable!(),
@@ -1926,7 +1986,7 @@ fn regex_split(re: &regex::Regex, chars: &[char]) -> Result<Val, JsError> {
     Ok(Val::new_array(parts))
 }
 
-/// `str.replace(re, repl)` â€” string-or-function replacement with $-patterns
+/// `str.replace(re, repl)` — string-or-function replacement with $-patterns
 fn regex_replace(
     e: &mut JsEngine,
     re: &regex::Regex,
@@ -2067,7 +2127,7 @@ fn is_callable(v: &Val) -> bool {
     matches!(v, Val::Func(_) | Val::Native(_) | Val::Method(_))
 }
 
-/// `.finally(cb)` â€” reaction that runs cb then propagates the outcome
+/// `.finally(cb)` — reaction that runs cb then propagates the outcome
 fn finally_then(e: &mut JsEngine, o: &Rc<RefCell<Obj>>, cb: Val) -> Result<Val, JsError> {
     let ret = new_promise_obj();
     let re = Reaction {

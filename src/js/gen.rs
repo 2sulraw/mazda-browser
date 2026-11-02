@@ -668,6 +668,13 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
         }
         Member { base, .. } => expr_has_yield(base),
         Index { base, index } => expr_has_yield(base) || expr_has_yield(index),
+        SuperCall { class, args, .. } => {
+            expr_has_yield(class)
+                || args.iter().any(|a| match a {
+                    parser::CallArg::Arg(x) | parser::CallArg::Spread(x) => expr_has_yield(x),
+                })
+        }
+        SuperMember { class, .. } => expr_has_yield(class),
         OptionalChain { base, steps } => {
             expr_has_yield(base)
                 || steps.iter().any(|s| match s {
