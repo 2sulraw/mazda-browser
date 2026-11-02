@@ -22,6 +22,10 @@ boa_engine = { version = "0.22.0", optional = true }
 # zlib inflate for WOFF1 font containers (pure Rust miniz_oxide backend;
 # already in the tree via png+ureq, so no new crates to build)
 flate2 = "1"
+# WOFF2 webfont decode (pure Rust, MIT): optional, behind the `woff2` feature —
+# OFF for dev builds, ON in release (site typography needs it). Only the
+# brotli decompressor is needed; the crate's WOFF1/flate2 half is not built.
+wuff = { version = "0.2.9", optional = true, default-features = false, features = ["brotli"] }
 # window + chrome shell: eframe with the glow (OpenGL software-ish) backend,
 # NOT wgpu — wgpu would add a large driver/GPU stack to the RAM budget.
 # x11+wayland keep it Linux-capable; window controls/resize come from winit.
@@ -29,6 +33,7 @@ eframe = { version = "0.37", default-features = false, features = ["glow", "defa
 
 [features]
 engine-b = ["dep:boa_engine"]
+woff2 = ["dep:wuff"]
 
 [profile.release]
 opt-level = "s"

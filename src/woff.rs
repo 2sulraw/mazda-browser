@@ -1,6 +1,7 @@
 //! Font container decoding: raw sfnt + WOFF1 (`wOFF`) → raw sfnt for ab_glyph.
-//! shortcut: no WOFF2 (`wOF2`, Brotli) — rejects to None, caller falls back
-//! to the site's stack/generic font (see PLAN.md for why it's blocked).
+//! WOFF2 (`wOF2`, Brotli) decodes too when the optional `woff2` feature is
+//! compiled in; feature OFF keeps the honest reject → caller falls back to
+//! the next `src` URL or the site's stack/generic font.
 
 use std::io::Read;
 
@@ -12,10 +13,9 @@ const MAX_FONT_BYTES: usize = 256 << 20;
 
 /// Decode font bytes in any container we support to a raw sfnt
 /// (`\0\x1\0\0`/OTTO/true) parseable by the font lib.
-/// `wOF2` (WOFF2/Brotli) → None — caller falls back to the next `src` URL
-/// or the site's generic font. shortcut: no WOFF2; see PLAN.md (the one
-/// pure-Rust crate that decodes it does not compile against its own pinned
-/// deps, and the alternative ships a shaping engine we don't need).
+/// `wOF2` (WOFF2/Brotli): decoded when this build has the `woff2` feature,
+/// else None — the caller tries the next `src` URL and finally the site's
+/// generic/system font, so a missing decoder costs typography, never a crash.
 pub fn decode_font(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     // four sfnt version magics: TrueType, CFF, True, type1
     if bytes.starts_with(&[0x00, 0x01, 0x00, 0x00])
@@ -28,7 +28,51 @@ pub fn decode_font(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     if bytes.starts_with(b"wOFF") {
         return woff1_to_sfnt(bytes).map(std::borrow::Cow::Owned);
     }
-    None // wOF2 (WOFF2) and anything else — unsupported container
+    if bytes.starts_with(b"wOF2") {
+        return woff2_to_sfnt(bytes).map(std::borrow::Cow::Owned);
+    }
+    None // anything else — unsupported container
+}
+
+/// WOFF2 → sfnt. `wuff` (pure Rust, MIT) undoes the per-table transforms
+/// (glyf/loca + hmtx) and reassembles a complete sfnt with a directory.
+/// shortcut: the transform/uncompressed-table coverage is exactly what wuff
+/// implements (WOFF2 1.0); any rejected or malformed font returns None, and
+/// the caller falls back to system fonts rather than rendering wrong glyphs.
+/// The header's `totalSfntSize` is checked before allocating/decompressing so
+/// a corrupt (zip-bomb) header cannot balloon memory.
+#[cfg(feature = "woff2")]
+pub fn woff2_to_sfnt(data: &[u8]) -> Option<Vec<u8>> {
+    // 48-byte fixed header; totalSfntSize at offset 16
+    if data.len() < 48 || &data[0..4] != b"wOF2" {
+        return None;
+    }
+    let claimed = u32::from_be_bytes(data[16..20].try_into().ok()?) as usize;
+    if claimed == 0 || claimed > MAX_FONT_BYTES {
+        return None;
+    }
+    let sfnt = wuff::decompress_woff2(data).ok()?;
+    // the reassembled font must be one the font lib can read (and a sane size)
+    if sfnt.len() > MAX_FONT_BYTES
+        || !(sfnt.starts_with(&[0x00, 0x01, 0x00, 0x00])
+            || sfnt.starts_with(b"OTTO")
+            || sfnt.starts_with(b"true")
+            || sfnt.starts_with(b"typ1"))
+    {
+        return None;
+    }
+    // numTables lives at 4..6; zero tables is not a usable font
+    if sfnt.len() < 12 || sfnt[4..6] == [0, 0] {
+        return None;
+    }
+    Some(sfnt)
+}
+
+/// Feature-off stub: keeps `decode_font`'s signature/dispatch unchanged and
+/// makes the fallback explicit (never a silent partial decode).
+#[cfg(not(feature = "woff2"))]
+pub fn woff2_to_sfnt(_data: &[u8]) -> Option<Vec<u8>> {
+    None
 }
 
 /// WOFF1 → sfnt per WOFF 1.0 (w3.org/TR/WOFF/): 44-byte header, 20-byte
@@ -217,9 +261,43 @@ mod tests {
         assert!(woff1_to_sfnt(&woff1_of(&tiny_sfnt(&[0; 4]), true)[..43]).is_none());
     }
 
+    /// Real 1.4 KB WOFF2 (web-platform-tests `valid-002`, CFF flavor).
+    const WOFF2_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/tiny.woff2");
+
+    #[cfg(feature = "woff2")]
     #[test]
-    fn woff2_returns_none_honest_fallback() {
-        // no WOFF2 decoder (see module doc) — reject rather than render wrong
+    fn woff2_fixture_decodes_to_a_complete_sfnt() {
+        let sfnt = decode_font(WOFF2_FIXTURE).expect("woff2 decodes with the feature on");
+        assert!(matches!(sfnt, std::borrow::Cow::Owned(_)));
+        // the sfnt version is carried over from the WOFF2 header (this
+        // fixture is CFF-flavored → OTTO; TrueType → \0\x01\0\0)
+        assert!(sfnt.starts_with(b"OTTO"), "flavor signature preserved");
+        // dispatch produced an sfnt the font parser accepts (not just a magic)
+        let font = ab_glyph::FontVec::try_from_vec(sfnt.into_owned());
+        assert!(font.is_ok(), "decoded WOFF2 must parse as a real font");
+    }
+
+    #[cfg(feature = "woff2")]
+    #[test]
+    fn woff2_garbage_and_truncation_are_none_not_panic() {
+        // truncated at every boundary of the real fixture: never panics
+        let n = WOFF2_FIXTURE.len();
+        for cut in [0, 1, 3, 4, 12, 20, 47, 48, n / 2, n - 1] {
+            assert!(decode_font(&WOFF2_FIXTURE[..cut]).is_none(), "cut {cut}");
+        }
+        // right magic, junk body (and a lying totalSfntSize)
+        let mut lie = b"wOF2\x00\x00\x00\x00".to_vec();
+        lie.extend_from_slice(&[0xff; 60]);
+        lie[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_font(&lie).is_none());
+        assert!(decode_font(b"wOF2").is_none());
+    }
+
+    #[cfg(not(feature = "woff2"))]
+    #[test]
+    fn woff2_feature_off_returns_none_honest_fallback() {
+        // default (dev) build has no decoder — reject rather than render wrong
+        assert!(decode_font(WOFF2_FIXTURE).is_none());
         assert!(decode_font(b"wOF2\x00\x00\x00\x01brotli bytes here").is_none());
         assert!(decode_font(b"wOF2").is_none()); // truncated header
     }
