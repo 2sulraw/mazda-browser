@@ -4001,6 +4001,22 @@ mod tests {
     }
 
     #[test]
+    fn list_marker_glyphs_are_present_and_measure_non_zero() {
+        // the synthesized markers (layout.rs marker_text) draw disc/circle/
+        // square from these code points; a font without one would silently
+        // render .notdef at zero advance, so pin the coverage we rely on
+        let fonts = Fonts::load();
+        for ch in ['\u{2022}', '\u{25e6}', '\u{25aa}'] {
+            let f = fonts.pick_font_for(ch, &Style::new());
+            assert_ne!(f.glyph_id(ch).0, 0, "no glyph for {ch:?}");
+            assert!(
+                fonts.measure(&ch.to_string(), &Style::new()) > 0.0,
+                "{ch:?} measures zero"
+            );
+        }
+    }
+
+    #[test]
     fn nav_gate_only_latest_wins() {
         let mut g = NavGate::new();
         let a = g.begin();

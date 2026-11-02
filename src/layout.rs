@@ -4,8 +4,8 @@
 //! `block()`); upgrade when a real CSS engine lands (Phase 1b+).
 
 use crate::css::{
-    content_text, decl, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor, Dir, Display,
-    Float, Justify, Len, Pos, PseudoEl, Sheet, Track, VAlign,
+    content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor,
+    Dir, Display, Float, Justify, Len, Pos, PseudoEl, Sheet, Track, VAlign,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -61,6 +61,34 @@ impl Ws {
     }
 }
 
+/// `list-style-type` — inherited (the UA sets it on `<ul>`/`<ol>` in
+/// [`style_for`], exactly where the other UA defaults live, and `<li>`
+/// inherits the parent list's value). `None` = no marker box at all.
+/// shortcut: only these ten values — no `disclosure-*`, CJK/`ethiopic-*`
+/// styles, `symbols()` or `@counter-style`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ListStyleType {
+    None,
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    DecimalLeadingZero,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+/// `list-style-position` — inherited like the type; `Outside` (default)
+/// hangs the marker left of the content box, `Inside` puts it in the first
+/// line's flow.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ListPos {
+    Outside,
+    Inside,
+}
+
 /// `text-transform` — inherited, applied ONCE when a text box is built
 /// (see [`transform_text`]): runs, wrapping, measurement and drawing all
 /// see the final string, so nothing downstream needs to know about it.
@@ -97,6 +125,10 @@ pub struct Style {
     /// interned id of the full `font-family` comma stack (0 = none → generic
     /// pick); the names live in the shared table Fonts reads at pick time
     pub fam_stack: u16,
+    /// `list-style-type` — inherited (see [`ListStyleType`])
+    pub list_type: ListStyleType,
+    /// `list-style-position` — inherited (see [`ListPos`])
+    pub list_pos: ListPos,
 }
 
 impl Style {
@@ -115,6 +147,9 @@ impl Style {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             fam_stack: 0,
+            // CSS initial value is `disc`; `<ol>` overrides it in style_for
+            list_type: ListStyleType::Disc,
+            list_pos: ListPos::Outside,
         }
     }
 
@@ -257,6 +292,16 @@ fn style_for(tag: &str, base: Style) -> Style {
         }
         "small" => s.size = base.size - 2.0,
         "del" => s.color = 0x00_cc_77_77,
+        // list UA defaults: the list ELEMENT owns the type and `li` inherits
+        // it, exactly the UA-sheet shape (`ul { list-style-type: disc }`,
+        // `ol { list-style-type: decimal }`). A nested list therefore resets
+        // its own type instead of inheriting the outer one.
+        // This engine has no textual UA sheet — `style_for` + `is_block` ARE
+        // its UA defaults (headings, links, `<pre>` all live here), so the
+        // list defaults land here too. `list-style-position` keeps its
+        // inherited value (initial `outside`).
+        "ul" => s.list_type = ListStyleType::Disc,
+        "ol" => s.list_type = ListStyleType::Decimal,
         _ => {}
     }
     s
@@ -465,6 +510,11 @@ pub struct BoxNode {
     /// the background image, the mask draws tinted with the bg color —
     /// see `BoxStyle::mask_image` for the shortcuts)
     pub is_mask: bool,
+    /// synthesized list-item marker run (`<li>` with `list-style-type` ≠
+    /// none). `out` position markers are painted in the list's left gutter
+    /// by `block()` without advancing the line; `inside` ones are ordinary
+    /// in-flow text leaves (leading the first line)
+    pub is_marker: bool,
     /// tiling region for a REPEATING background placeholder: the parent's
     /// padding box (x0, y0, x1, y1) in document coords, recorded by
     /// `place()`; `collect_paint` emits one entry per tile over it. None =
@@ -514,6 +564,7 @@ impl BoxNode {
             is_text: false,
             is_bg: false,
             is_mask: false,
+            is_marker: false,
             bg_tile_region: None,
             style,
             bx,
@@ -540,6 +591,7 @@ impl BoxNode {
             is_text: true,
             is_bg: false,
             is_mask: false,
+            is_marker: false,
             bg_tile_region: None,
             style,
             bx: BoxStyle::default(),
@@ -668,10 +720,11 @@ fn paints_chrome(bx: &BoxStyle) -> bool {
 /// surrounding text, or an inline box carrying the pseudo's own style when
 /// it paints chrome (background/border/padding) or declares a box-level
 /// `display` — the same box decision an element with that style gets.
-/// shortcut: generated content is plain text — `counter()` renders as
-/// nothing (list-item markers don't appear), and a `::before` on a
-/// replaced element (`<img>`/`<svg>`) or form control generates no box at
-/// all (those branches return before this is consulted).
+/// shortcut: generated content is plain text — non-list counters render as
+/// nothing (list-item markers are a separate synthesized run, see
+/// `list_marker`), and a `::before` on a replaced element (`<img>`/`<svg>`)
+/// or form control generates no box at all (those branches return before
+/// this is consulted).
 fn pseudo_box(
     sheet: &Sheet,
     dom: &Dom,
@@ -689,7 +742,8 @@ fn pseudo_box(
     // (inherited) one; the generated box belongs to the ORIGIN element
     let cur = out.bx.cursor.or(cursor);
     let raw = out.bx.content.as_deref()?; // content undeclared → no box
-    let text = content_text(raw, dom, node)?; // none/normal/malformed → no box
+    // `None` item: ::before/::after have no list-item counter
+    let text = content_text(raw, dom, node, None)?; // none/normal/malformed → no box
     // generated content transforms like any other built text box
     let text = transform_text(&text, out.style.text_transform).into_owned();
     let chrome = paints_chrome(&out.bx);
@@ -721,6 +775,52 @@ fn pseudo_box(
     }
 }
 
+/// Synthesize the marker run for one list item. `ordinal` is the item's
+/// number inside its parent list (build_into counts `<li>` siblings, honoring
+/// `<ol start>`/`<li value>`). Returns None when `list-style-type` is `none`.
+///
+/// The marker is a text leaf carrying the marker text (`•`, `1.`, `iv.`, …)
+/// in the item's own style, so it inherits color/font like real marker boxes.
+/// A `::marker` rule overrides the text (`content`, with
+/// `counter(list-item)` resolving to this item's number) and the color;
+/// shortcut: no other `::marker` properties are applied (font/border/etc.),
+/// and `content: none` keeps the UA marker rather than removing it.
+fn list_marker(
+    sheet: &Sheet,
+    dom: &Dom,
+    node: u32,
+    ordinal: i64,
+    base: Style,
+    link: Option<std::rc::Rc<str>>,
+    cursor: Option<Cursor>,
+) -> Option<BoxNode> {
+    let mut text = marker_text(base.list_type, ordinal)?;
+    let mut style = base;
+    if let Some(m) = sheet.resolve_pseudo(dom, node, base, PseudoEl::Marker) {
+        if let Some(raw) = m.bx.content.as_deref() {
+            if let Some(t) = content_text(raw, dom, node, Some((ordinal, base.list_type))) {
+                if !t.is_empty() {
+                    text = t;
+                }
+            }
+        }
+        // only `color` applies (see shortcut above); other properties stay
+        // the item's inherited ones
+        style.color = m.style.color;
+    }
+    // inside markers are ordinary first-line text: the space separates the
+    // glyph from the content. Outside markers are positioned by `block()`,
+    // which adds the gap itself.
+    if base.list_pos == ListPos::Inside {
+        text.push(' ');
+    }
+    let mut l = BoxNode::leaf(style, text, false, link);
+    l.is_marker = true;
+    l.node = Some(node);
+    l.bx.cursor = cursor;
+    Some(l)
+}
+
 /// `width="85%"` / `width="400"` presentational attribute → [`Len`] — the
 /// same `Len` the CSS `width` property produces, so the attribute behaves
 /// identically at layout.
@@ -750,6 +850,19 @@ fn build_into(
     cursor: Option<Cursor>,
     out: &mut Vec<BoxNode>,
 ) {
+    // Per-list item numbering: `node` is the PARENT whose children are being
+    // built, so each `<ol>`/`<ul>` gets its own counter (nested lists restart
+    // independently). `<ol start=N>` seeds it; `<li value=N>` resets it for
+    // that item and the following ones continue from there. shortcut: the
+    // `reversed` attribute is ignored.
+    let mut list_counter = if dom.tag(node) == "ol" {
+        dom.attr(node, "start")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(1)
+            - 1
+    } else {
+        0
+    };
     for &child in &dom.nodes[node as usize].children {
         match &dom.nodes[child as usize].kind {
             NodeKind::Text(t) => {
@@ -771,6 +884,17 @@ fn build_into(
                 let tag = dom.tag(child);
                 if NON_RENDERED.contains(&tag) {
                     continue;
+                }
+                // list item number (see the counter above). Computed before
+                // the display:none skip so a hidden item still counts, like
+                // real list numbering.
+                let mut ordinal = 0i64;
+                if tag == "li" {
+                    list_counter = dom
+                        .attr(child, "value")
+                        .and_then(|v| v.trim().parse::<i64>().ok())
+                        .unwrap_or(list_counter + 1);
+                    ordinal = list_counter;
                 }
                 if tag == "br" || tag == "hr" {
                     out.push(BoxNode::leaf(style, String::new(), true, None));
@@ -1082,6 +1206,19 @@ fn build_into(
                     if let Some(u) = g.bx.mask_image.clone() {
                         let ph = mask_placeholder(&u, outcome.style, &g.bx);
                         g.children.push(ph);
+                    }
+                    // list-item marker — a synthesized run BEFORE all content
+                    // (marker box first, then ::before, then the item).
+                    // shortcut: markers are generated for `<li>` elements
+                    // only (the UA `display:list-item` equivalent here);
+                    // an author `display:list-item` on another tag gets no
+                    // marker.
+                    if tag == "li" {
+                        if let Some(m) = list_marker(
+                            sheet, dom, child, ordinal, outcome.style, child_link.clone(), cur,
+                        ) {
+                            g.children.push(m);
+                        }
                     }
                     if let Some(b) = before {
                         g.children.push(b);
@@ -3485,7 +3622,32 @@ fn block(
     let mut indent_left = true;
     let mut i = 0;
     while i < n.children.len() {
-        if n.children[i].is_text {
+        if n.children[i].is_marker && n.style.list_pos == ListPos::Outside {
+            // list-style-position: outside — the marker hangs in the list's
+            // left gutter: its RIGHT edge sits `gap` left of the content box
+            // (which already starts after the UA 40px list padding), on the
+            // current line's top. It advances neither y nor the line cursor,
+            // so the following text starts at the content edge and every
+            // continuation line aligns with the FIRST LINE'S TEXT.
+            // shortcut: a declared text-align on the item does not move the
+            // hung marker (the text block shifts, the gutter does not).
+            let m = &n.children[i];
+            let w = measure(&m.text, &m.style);
+            let top = cont.map_or(y, |(t, _, _)| t);
+            runs.push(PositionedRun {
+                x: n.x - n.style.size * 0.5 - w,
+                y: top,
+                text: m.text.clone(),
+                style: m.style,
+                width: w,
+                link: m.link.clone(),
+                fixed: false,
+                clip: None,
+                node: m.node,
+                cursor: m.bx.cursor,
+            });
+            i += 1;
+        } else if n.children[i].is_text {
             let (x0, seg_top) = match cont {
                 Some((top, _, x)) => (x, top),
                 None => (0.0, y),
@@ -3498,7 +3660,10 @@ fn block(
                 }
             }
             let mut atoms = Vec::new();
-            while i < n.children.len() && n.children[i].is_text {
+            while i < n.children.len()
+                && n.children[i].is_text
+                && !(n.children[i].is_marker && n.style.list_pos == ListPos::Outside)
+            {
                 atoms.push(leaf_atom(&n.children[i]));
                 i += 1;
             }
@@ -8184,6 +8349,178 @@ line</textarea></div>"#,
         assert_eq!(
             dump, want,
             "undeclared typography must not move a single pixel"
+        );
+    }
+
+    // ---- list markers (list-style-*, ::marker) ----
+
+    #[test]
+    fn ul_marker_hangs_left_of_its_text() {
+        let mut root = tree_of("<ul><li>alpha</li></ul>");
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let marker = l.runs.iter().find(|r| r.text == "\u{2022}").expect("disc marker run");
+        let text = l.runs.iter().find(|r| r.text == "alpha").expect("item text");
+        assert_eq!(marker.y, text.y, "marker sits on the item's first line");
+        assert!(marker.x < text.x, "marker left of the text: {} vs {}", marker.x, text.x);
+        assert!(
+            marker.x + marker.width <= text.x,
+            "marker clears the text: {} + {} > {}",
+            marker.x,
+            marker.width,
+            text.x
+        );
+        // the UA 40px list padding puts the item text at x=40
+        assert_eq!(text.x, 40.0, "list content starts after the UA gutter");
+    }
+
+    #[test]
+    fn ol_numbers_three_items_and_counts_per_list() {
+        let mut root = tree_of("<ol><li>a</li><li>b</li><li>c</li></ol>");
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let markers: Vec<&str> = l
+            .runs
+            .iter()
+            .filter(|r| r.text.ends_with('.'))
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(markers, vec!["1.", "2.", "3."]);
+        // each marker is on its item's line
+        let a = l.runs.iter().find(|r| r.text == "a").unwrap();
+        let c = l.runs.iter().find(|r| r.text == "c").unwrap();
+        assert!(c.y > a.y, "items stack");
+        assert_eq!(
+            l.runs.iter().filter(|r| r.text.ends_with('.')).count(),
+            3,
+            "exactly one marker per item"
+        );
+    }
+
+    #[test]
+    fn ol_start_and_li_value_seed_the_counter() {
+        let mut root =
+            tree_of(r#"<ol start="5"><li>a</li><li value="9">b</li><li>c</li></ol>"#);
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let markers: Vec<&str> = l
+            .runs
+            .iter()
+            .filter(|r| r.text.ends_with('.'))
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(markers, vec!["5.", "9.", "10."], "start= and value= both honored");
+    }
+
+    #[test]
+    fn nested_list_restarts_its_own_counter() {
+        let mut root = tree_of("<ol><li>a<ol><li>b</li></ol></li></ol>");
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let ones: Vec<&PositionedRun> =
+            l.runs.iter().filter(|r| r.text == "1.").collect();
+        assert_eq!(ones.len(), 2, "outer and inner lists each count from 1");
+        assert!(
+            ones[1].x > ones[0].x,
+            "nested marker indented by the nested list: {} vs {}",
+            ones[1].x,
+            ones[0].x
+        );
+    }
+
+    #[test]
+    fn list_style_type_none_suppresses_the_marker() {
+        for css in ["li { list-style-type: none }", "li { list-style: none }"] {
+            let mut root = boxes_of("<ul><li>a</li><li>b</li></ul>", css);
+            let l = layout_tree(&mut root, 400.0, &m4);
+            assert_eq!(
+                l.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                vec!["a", "b"],
+                "no marker runs with {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_marker_strings_alpha_and_roman() {
+        let mut alpha = boxes_of(
+            "<ol><li>a</li><li>b</li><li>c</li></ol>",
+            "ol { list-style-type: upper-alpha }",
+        );
+        let la = layout_tree(&mut alpha, 400.0, &m4);
+        let am: Vec<&str> = la.runs.iter().filter(|r| r.text.ends_with('.')).map(|r| r.text.as_str()).collect();
+        assert_eq!(am, vec!["A.", "B.", "C."]);
+
+        let mut roman = boxes_of(
+            "<ol><li>a</li><li>b</li><li>c</li><li>d</li></ol>",
+            "ol { list-style-type: lower-roman }",
+        );
+        let lr = layout_tree(&mut roman, 400.0, &m4);
+        let rm: Vec<&str> = lr.runs.iter().filter(|r| r.text.ends_with('.')).map(|r| r.text.as_str()).collect();
+        assert_eq!(rm, vec!["i.", "ii.", "iii.", "iv."]);
+    }
+
+    #[test]
+    fn circle_and_square_glyphs_replace_the_disc() {
+        let mut circle = boxes_of("<ul><li>a</li></ul>", "ul { list-style-type: circle }");
+        let lc = layout_tree(&mut circle, 400.0, &m4);
+        assert!(lc.runs.iter().any(|r| r.text == "\u{25e6}"), "circle glyph");
+        let mut square = boxes_of("<ul><li>a</li></ul>", "ul { list-style-type: square }");
+        let ls = layout_tree(&mut square, 400.0, &m4);
+        assert!(ls.runs.iter().any(|r| r.text == "\u{25aa}"), "square glyph");
+    }
+
+    #[test]
+    fn inside_marker_leads_the_first_line_in_flow() {
+        let mut root = boxes_of(
+            "<ul><li>alpha</li></ul>",
+            "ul { list-style-position: inside }",
+        );
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let marker = l.runs.iter().find(|r| r.text == "\u{2022}").expect("marker run");
+        let text = l.runs.iter().find(|r| r.text == "alpha").expect("text run");
+        assert_eq!(marker.x, 40.0, "marker starts at the item's text start");
+        assert_eq!(marker.y, text.y, "text follows on the same line");
+        assert!(text.x > marker.x, "text after the in-flow marker");
+        assert!(
+            text.x <= marker.x + marker.width + 10.0,
+            "no gutter gap for inside markers"
+        );
+    }
+
+    #[test]
+    fn marker_pseudo_content_and_color_override_the_default() {
+        let mut root = boxes_of(
+            "<ul><li>a</li></ul>",
+            "li::marker { content: \"X\"; color: #ff0000 }",
+        );
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let m = l
+            .runs
+            .iter()
+            .find(|r| r.text == "X")
+            .expect("::marker content replaces the bullet");
+        assert_eq!(m.style.color, 0x00_ff_00_00, "::marker color applies");
+        assert!(!l.runs.iter().any(|r| r.text == "\u{2022}"), "bullet gone");
+        // counter(list-item) in ::marker resolves to the item's number
+        let mut root2 = boxes_of(
+            "<ol><li>a</li><li>b</li></ol>",
+            "li::marker { content: counter(list-item) }",
+        );
+        let l2 = layout_tree(&mut root2, 400.0, &m4);
+        let nums: Vec<&str> = l2.runs.iter().filter(|r| r.text.ends_with('.')).map(|r| r.text.as_str()).collect();
+        assert_eq!(nums, vec!["1.", "2."]);
+    }
+
+    #[test]
+    fn plain_paragraph_layout_is_untouched_by_list_support() {
+        let mut root = boxes_of("<p>plain text</p>", "");
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let dump: Vec<(String, f32, f32)> = l
+            .runs
+            .iter()
+            .map(|r| (r.text.clone(), r.x, r.y))
+            .collect();
+        assert_eq!(
+            dump,
+            vec![("plain".into(), 0.0, 0.0), ("text".into(), 24.0, 0.0)],
+            "a plain <p> keeps its flush-left geometry"
         );
     }
 }
