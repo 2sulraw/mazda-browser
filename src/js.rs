@@ -1616,7 +1616,19 @@ pub fn obj_set_own(o: &Rc<RefCell<Obj>>, key: &str, v: Val) {
         }
     }
     match b.props.iter_mut().find(|(k, _)| k.as_ref() == key) {
-        Some((_, slot)) => *slot = v,
+        Some((_, slot)) => {
+            // `{ get x(){}, set x(v){} }` (and a class's get/set pair) must
+            // become ONE accessor property, not the last half replacing the
+            // first: merge the two halves instead of overwriting.
+            if let (Val::Acc(old), Val::Acc(new)) = (&*slot, &v) {
+                *slot = Val::Acc(Rc::new(AccEntry {
+                    getter: new.getter.clone().or_else(|| old.getter.clone()),
+                    setter: new.setter.clone().or_else(|| old.setter.clone()),
+                }));
+            } else {
+                *slot = v;
+            }
+        }
         None => b.props.push((Rc::from(key), v)),
     }
 }

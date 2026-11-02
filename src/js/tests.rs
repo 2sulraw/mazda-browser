@@ -110,8 +110,12 @@ fn arithmetic_and_precedence() {
     assert_eq!(num("(1 + 2) * 3"), 9.0);
     assert_eq!(num("10 % 3"), 1.0);
     assert_eq!(num("7 / 2"), 3.5);
-    // `**` is an explicit unsupported error, not a misparse
-    assert!(matches!(err("2 ** 3"), JsError::Syntax { .. }));
+    // `**` is right-associative and binds tighter than `*`
+    assert_eq!(num("2 ** 3"), 8.0);
+    assert_eq!(num("2 ** 3 ** 2"), 512.0);
+    assert_eq!(num("2 * 3 ** 2"), 18.0);
+    assert_eq!(num("2 ** -1"), 0.5);
+    assert_eq!(num("var a = 3; a **= 2; a"), 9.0);
     assert_eq!(num("var a = 5; a += 3; a"), 8.0);
     assert_eq!(num("var a = 5; a -= 3; a"), 2.0);
     assert_eq!(num("var a = 5; a *= 3; a"), 15.0);
@@ -404,6 +408,29 @@ fn object_literals_and_members() {
 }
 
 #[test]
+fn computed_object_keys() {
+    assert_eq!(num("let k = 'a'; let o = {[k]: 1}; o.a"), 1.0);
+    assert_eq!(num("let i = 2; let o = {['x' + i]: 5}; o.x2"), 5.0);
+    // computed method shorthand
+    assert_eq!(num("let k = 'm'; let o = {[k]() { return 7 }}; o.m()"), 7.0);
+    // the key expression is evaluated at object-creation time, in order
+    assert_eq!(string("let log = ''; let o = {[log += 'a']: 1, [log += 'b']: 2}; log"), "ab");
+}
+
+#[test]
+fn object_literal_accessors() {
+    assert_eq!(num("let o = { get x() { return 42 } }; o.x"), 42.0);
+    assert_eq!(num("let o = { get x() { return this._v }, set x(v) { this._v = v * 2 } }; o.x = 3; o.x"), 6.0);
+    // a getter is not a data property: reading twice calls it twice
+    assert_eq!(num("let n = 0; let o = { get x() { n++; return n } }; o.x + o.x"), 3.0);
+    // setters run for member assignment, and `in` still sees the key
+    assert!(boolean("let o = { set x(v) {} }; o.x = 1; 'x' in o"));
+    // ordinary properties named get/set still work
+    assert_eq!(num("let o = {get: 1, set: 2}; o.get + o.set"), 3.0);
+    assert_eq!(num("let o = { get() { return 3 } }; o.get()"), 3.0);
+}
+
+#[test]
 fn this_binding() {
     // method call: this = receiver
     assert_eq!(num("let o = {v: 3, m: function() { return this.v }}; o.m()"), 3.0);
@@ -448,6 +475,28 @@ fn null_undefined_property_access_throws() {
         JsError::Throw(v) => assert!(v.to_string().contains("TypeError")),
         other => panic!("expected Throw, got {:?}", other),
     }
+}
+
+#[test]
+fn optional_chaining() {
+    // short-circuits a nullish base to undefined, no throw
+    assert!(boolean("let o = null; o?.a === undefined"));
+    assert!(boolean("let o = undefined; o?.a.b.c === undefined"));
+    // a present base behaves like plain member access
+    assert_eq!(num("let o = {a: {b: 2}}; o?.a.b"), 2.0);
+    // `?.[i]` and `?.()`
+    assert_eq!(num("let a = [9]; a?.[0]"), 9.0);
+    assert_eq!(num("let o = {v: 4, m() { return this.v }}; o.m?.()"), 4.0);
+    assert!(boolean("let f = null; f?.() === undefined"));
+    // a non-optional step after a present optional one still throws
+    match err("let o = {a: null}; o?.a.b") {
+        JsError::Throw(v) => assert!(v.to_string().contains("TypeError")),
+        other => panic!("expected Throw, got {:?}", other),
+    }
+    // the base is evaluated exactly once even when it short-circuits
+    assert_eq!(num("let n = 0; function f() { n++; return null } f()?.x; n"), 1.0);
+    // chain after a call keeps `this` on the receiver
+    assert_eq!(num("let o = {v: 5, get() { return this }}; o.get()?.v"), 5.0);
 }
 
 // ---------------------------------------------------------------------------

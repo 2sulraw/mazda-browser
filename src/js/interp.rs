@@ -855,6 +855,49 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
             let k = eval_expr(e, env, index)?.to_string();
             get_member(e, &b, &k)
         }
+        // `a?.b.c?.[d]?.()` — a nullish value at an OPTIONAL step ends the
+        // whole chain (undefined); at a non-optional step it throws like a
+        // plain member read.
+        ExprKind::OptionalChain { base, steps } => {
+            use super::parser::ChainStep;
+            let mut cur = eval_expr(e, env, base)?;
+            // `this` for a call is the object of the preceding member/index
+            // step; a direct call uses the global object (sloppy mode).
+            let mut this = Val::Obj(e.global_obj.clone());
+            let mut after_prop = false;
+            for step in steps {
+                if step.optional() && matches!(cur, Val::Undefined | Val::Null) {
+                    return Ok(Val::Undefined);
+                }
+                match step {
+                    ChainStep::Member { key, .. } => {
+                        let obj = cur;
+                        cur = get_member(e, &obj, key)?;
+                        this = obj;
+                        after_prop = true;
+                    }
+                    ChainStep::Index { index, .. } => {
+                        let obj = cur;
+                        let k = eval_expr(e, env, index)?.to_string();
+                        cur = get_member(e, &obj, &k)?;
+                        this = obj;
+                        after_prop = true;
+                    }
+                    ChainStep::Call { args, .. } => {
+                        let argvals = eval_args(e, env, args)?;
+                        let f = cur;
+                        let recv = if after_prop {
+                            this.clone()
+                        } else {
+                            Val::Obj(e.global_obj.clone())
+                        };
+                        cur = e.call(f, recv, argvals)?;
+                        after_prop = false;
+                    }
+                }
+            }
+            Ok(cur)
+        }
         ExprKind::Array(items) => {
             let mut vals = Vec::with_capacity(items.len());
             for i in items {
@@ -905,6 +948,31 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                                 obj_set_own(&orc, &k, v);
                             }
                         }
+                    }
+                    ObjElem::Computed { key, value } => {
+                        let k = eval_expr(e, env, key)?.to_string();
+                        let val = eval_expr(e, env, value)?;
+                        obj_set_own(&orc, &k, val);
+                    }
+                    ObjElem::Accessor {
+                        key,
+                        getter,
+                        setter,
+                    } => {
+                        let getter_v = getter
+                            .as_ref()
+                            .map(|f| make_val_closure(e, env, f, false));
+                        let setter_v = setter
+                            .as_ref()
+                            .map(|f| make_val_closure(e, env, f, false));
+                        obj_set_own(
+                            &orc,
+                            key,
+                            Val::Acc(Rc::new(AccEntry {
+                                getter: getter_v,
+                                setter: setter_v,
+                            })),
+                        );
                     }
                 }
             }
@@ -1144,6 +1212,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
         Mul => Val::Num(l.to_number() * r.to_number()),
         Div => Val::Num(l.to_number() / r.to_number()),
         Mod => Val::Num(l.to_number() % r.to_number()),
+        Pow => Val::Num(l.to_number().powf(r.to_number())),
         Eq => Val::Bool(loose_eq(l, r)),
         Ne => Val::Bool(!loose_eq(l, r)),
         StrictEq => Val::Bool(strict_eq(l, r)),

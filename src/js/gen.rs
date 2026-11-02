@@ -668,6 +668,16 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
         }
         Member { base, .. } => expr_has_yield(base),
         Index { base, index } => expr_has_yield(base) || expr_has_yield(index),
+        OptionalChain { base, steps } => {
+            expr_has_yield(base)
+                || steps.iter().any(|s| match s {
+                    parser::ChainStep::Member { .. } => false,
+                    parser::ChainStep::Index { index, .. } => expr_has_yield(index),
+                    parser::ChainStep::Call { args, .. } => args.iter().any(|a| match a {
+                        parser::CallArg::Arg(x) | parser::CallArg::Spread(x) => expr_has_yield(x),
+                    }),
+                })
+        }
         Array(items) => items
             .iter()
             .any(|i| match i {
@@ -679,6 +689,11 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
             .any(|p| match p {
                 parser::ObjElem::Prop(_, v) => expr_has_yield(v),
                 parser::ObjElem::Spread(v) => expr_has_yield(v),
+                parser::ObjElem::Computed { key, value } => {
+                    expr_has_yield(key) || expr_has_yield(value)
+                }
+                // accessor bodies are nested functions: their own trees
+                parser::ObjElem::Accessor { .. } => false,
             }),
         PatAssign { pat: _, value } => expr_has_yield(value),
         Func(_) | Arrow(_) => false,

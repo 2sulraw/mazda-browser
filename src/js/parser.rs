@@ -11,9 +11,10 @@
 //! lookahead rules; good enough for real code.
 //!
 //! deferred to later waves (all produce a clear SyntaxError, never a panic):
-//! destructuring, spread/rest, generators, async/await, modules, `extends`,
-//! static class members, getters/setters, computed keys `[k]: v`, labeled
-//! statements, exponent `**`, BigInt, regex literals.
+//! destructuring in weird positions, generators, modules, `extends`, static
+//! class members, BigInt, labeled statements, computed class keys.
+//! Supported: optional chaining `?.`, computed object keys, object-literal
+//! getters/setters, `**`/`**=`, spread, destructuring, async/await, regex.
 
 use super::lexer::{tokenize, Kw, Op, Punct, Span, Tok, TplPart, Token};
 use super::JsError;
@@ -85,6 +86,14 @@ pub enum ExprKind {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    /// `a?.b.c?.[d]?.()` — one node for the WHOLE chain so a nullish
+    /// short-circuit skips every remaining step (a per-step `Member` node
+    /// would have to throw on what follows). The first step that carries
+    /// `optional` is the one written with `?.`.
+    OptionalChain {
+        base: Box<Expr>,
+        steps: Vec<ChainStep>,
+    },
     /// elements: Hole = hole, Spread = `...expr`
     Array(Vec<ArrayElem>),
     Object(Vec<ObjElem>),
@@ -129,6 +138,27 @@ pub enum ArrayElem {
     Spread(Expr),
 }
 
+/// one postfix step of an optional chain (`?.` may appear on any of them)
+#[derive(Clone, Debug)]
+pub enum ChainStep {
+    Member { key: Rc<str>, optional: bool },
+    Index { index: Expr, optional: bool },
+    Call {
+        args: Vec<CallArg>,
+        optional: bool,
+    },
+}
+
+impl ChainStep {
+    pub fn optional(&self) -> bool {
+        match self {
+            ChainStep::Member { optional, .. }
+            | ChainStep::Index { optional, .. }
+            | ChainStep::Call { optional, .. } => *optional,
+        }
+    }
+}
+
 /// one argument, plain or `...spread`
 #[derive(Clone, Debug)]
 pub enum CallArg {
@@ -142,6 +172,15 @@ pub enum ObjElem {
     /// key -> value (shorthand `{a}` desugars to Prop("a", Ident("a")))
     Prop(Rc<str>, Expr),
     Spread(Expr),
+    /// `[expr]: v` — key evaluated at object-creation time
+    Computed { key: Expr, value: Expr },
+    /// `get x(){}` / `set x(v){}` (both sides optional when a later literal
+    /// defines the other half of the pair)
+    Accessor {
+        key: Rc<str>,
+        getter: Option<Rc<FnDef>>,
+        setter: Option<Rc<FnDef>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +248,7 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Pow,
     Eq,
     Ne,
     StrictEq,
@@ -1549,6 +1589,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             | Op::MulAssign
             | Op::DivAssign
             | Op::ModAssign
+            | Op::PowAssign
             | Op::AndAssign
             | Op::OrAssign
             | Op::XorAssign
@@ -1591,6 +1632,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 Op::MulAssign => Some(BinOp::Mul),
                 Op::DivAssign => Some(BinOp::Div),
                 Op::ModAssign => Some(BinOp::Mod),
+                Op::PowAssign => Some(BinOp::Pow),
                 Op::AndAssign => Some(BinOp::BitAnd),
                 Op::OrAssign => Some(BinOp::BitOr),
                 Op::XorAssign => Some(BinOp::BitXor),
@@ -1903,7 +1945,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
 
     fn mul_expr(&mut self) -> Result<Expr, JsError> {
         let start = self.pos;
-        let mut l = self.unary_expr()?;
+        let mut l = self.pow_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Op(Op::Mul) => BinOp::Mul,
@@ -1912,7 +1954,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 _ => break,
             };
             self.next();
-            let r = self.unary_expr()?;
+            let r = self.pow_expr()?;
             l = Expr {
                 kind: ExprKind::Binary {
                     op,
@@ -1922,31 +1964,25 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 span: self.span_from(start),
             };
         }
-        // postfix ++/-- binds tighter than binary operators
-        match self.peek() {
-            Tok::Op(Op::Inc) => {
-                self.next();
-                check_assign_target(&l)?;
-                l = Expr {
-                    kind: ExprKind::Postfix {
-                        target: Box::new(l),
-                        inc: true,
-                    },
-                    span: self.span_from(start),
-                };
-            }
-            Tok::Op(Op::Dec) => {
-                self.next();
-                check_assign_target(&l)?;
-                l = Expr {
-                    kind: ExprKind::Postfix {
-                        target: Box::new(l),
-                        inc: false,
-                    },
-                    span: self.span_from(start),
-                };
-            }
-            _ => {}
+        Ok(l)
+    }
+
+    /// `**` binds tighter than `*`/`/` and is right-associative
+    /// (`2 ** 3 ** 2` == `2 ** (3 ** 2)`). shortcut: `-2 ** 2` yields
+    /// `(-2) ** 2` (the spec rejects it) because parentheses are not tracked.
+    fn pow_expr(&mut self) -> Result<Expr, JsError> {
+        let start = self.pos;
+        let l = self.unary_expr()?;
+        if self.eat_op(Op::Pow) {
+            let r = self.pow_expr()?;
+            return Ok(Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Pow,
+                    l: Box::new(l),
+                    r: Box::new(r),
+                },
+                span: self.span_from(start),
+            });
         }
         Ok(l)
     }
@@ -2041,44 +2077,140 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         } else {
             self.primary()?
         };
+        // Postfix terms of the whole chain, in source order. They are folded
+        // back into nested `Member`/`Index`/`Call` nodes unless a `?.`
+        // appeared, in which case one `OptionalChain` node keeps the
+        // short-circuit from node in one place.
+        let mut steps: Vec<ChainStep> = Vec::new();
+        let mut has_optional = false;
         loop {
             match self.peek() {
                 Tok::Punct(Punct::Dot) => {
                     self.next();
                     let key = self.prop_name()?;
-                    e = Expr {
+                    steps.push(ChainStep::Member {
+                        key,
+                        optional: false,
+                    });
+                }
+                // `?.` is lexed as `Question` then `Dot`; `a?.5:b` (a
+                // conditional) has a number after `?`, so it stays a
+                // conditional. `a?.[i]` / `a?.(x)` are also `?` `.`.
+                Tok::Punct(Punct::Question)
+                    if *self.peek_at(1) == Tok::Punct(Punct::Dot) =>
+                {
+                    self.next();
+                    self.next();
+                    has_optional = true;
+                    match self.peek() {
+                        Tok::Punct(Punct::LBrack) => {
+                            self.next();
+                            let index = self.expr()?;
+                            self.expect_punct(Punct::RBrack)?;
+                            steps.push(ChainStep::Index {
+                                index,
+                                optional: true,
+                            });
+                        }
+                        Tok::Punct(Punct::LParen) => {
+                            self.next();
+                            let args = self.call_args()?;
+                            steps.push(ChainStep::Call {
+                                args,
+                                optional: true,
+                            });
+                        }
+                        _ => {
+                            // `a?.b`: a property name follows the dot
+                            let key = self.prop_name()?;
+                            steps.push(ChainStep::Member {
+                                key,
+                                optional: true,
+                            });
+                        }
+                    }
+                }
+                Tok::Punct(Punct::LBrack) => {
+                    self.next();
+                    let index = self.expr()?;
+                    self.expect_punct(Punct::RBrack)?;
+                    steps.push(ChainStep::Index {
+                        index,
+                        optional: false,
+                    });
+                }
+                Tok::Punct(Punct::LParen) => {
+                    self.next();
+                    let args = self.call_args()?;
+                    steps.push(ChainStep::Call {
+                        args,
+                        optional: false,
+                    });
+                }
+                _ => break,
+            }
+        }
+        let mut e = if has_optional {
+            Expr {
+                kind: ExprKind::OptionalChain {
+                    base: Box::new(e),
+                    steps,
+                },
+                span: self.span_from(start),
+            }
+        } else {
+            for st in steps {
+                e = match st {
+                    ChainStep::Member { key, .. } => Expr {
                         kind: ExprKind::Member {
                             base: Box::new(e),
                             key,
                         },
                         span: self.span_from(start),
-                    };
-                }
-                Tok::Punct(Punct::LBrack) => {
-                    self.next();
-                    let idx = self.expr()?;
-                    self.expect_punct(Punct::RBrack)?;
-                    e = Expr {
+                    },
+                    ChainStep::Index { index, .. } => Expr {
                         kind: ExprKind::Index {
                             base: Box::new(e),
-                            index: Box::new(idx),
+                            index: Box::new(index),
                         },
                         span: self.span_from(start),
-                    };
-                }
-                Tok::Punct(Punct::LParen) => {
-                    self.next();
-                    let args = self.call_args()?;
-                    e = Expr {
+                    },
+                    ChainStep::Call { args, .. } => Expr {
                         kind: ExprKind::Call {
                             callee: Box::new(e),
                             args,
                         },
                         span: self.span_from(start),
-                    };
-                }
-                _ => break,
+                    },
+                };
             }
+            e
+        };
+        // postfix ++/-- binds tighter than any binary operator
+        match self.peek() {
+            Tok::Op(Op::Inc) => {
+                self.next();
+                check_assign_target(&e)?;
+                e = Expr {
+                    kind: ExprKind::Postfix {
+                        target: Box::new(e),
+                        inc: true,
+                    },
+                    span: self.span_from(start),
+                };
+            }
+            Tok::Op(Op::Dec) => {
+                self.next();
+                check_assign_target(&e)?;
+                e = Expr {
+                    kind: ExprKind::Postfix {
+                        target: Box::new(e),
+                        inc: false,
+                    },
+                    span: self.span_from(start),
+                };
+            }
+            _ => {}
         }
         Ok(e)
     }
@@ -2254,6 +2386,73 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         props.push(ObjElem::Spread(self.assign_expr()?));
                         continue;
                     }
+                    // computed key: `[expr]: v` / `[expr](){}`
+                    if *self.peek() == Tok::Punct(Punct::LBrack) {
+                        self.next();
+                        let key_e = self.assign_expr()?;
+                        self.expect_punct(Punct::RBrack)?;
+                        let value = if *self.peek() == Tok::Punct(Punct::LParen) {
+                            // computed method shorthand
+                            let params = self.param_list()?;
+                            self.expect_punct(Punct::LBrace)?;
+                            let body = self.block_body()?;
+                            let uses_arguments = scan_uses_arguments_stmts(&body);
+                            Expr {
+                                kind: ExprKind::Func(Rc::new(FnDef {
+                                    name: Rc::from(""),
+                                    params,
+                                    body: FnBody::Block(body),
+                                    uses_arguments,
+                                    is_async: false,
+                                    is_generator: false,
+                                    has_yield: false,
+                                })),
+                                span: self.span_from(start),
+                            }
+                        } else {
+                            self.expect_punct(Punct::Colon)?;
+                            self.assign_expr()?
+                        };
+                        props.push(ObjElem::Computed {
+                            key: key_e,
+                            value,
+                        });
+                        continue;
+                    }
+                    // accessor: `get x(){}` / `set x(v){}` — only when a
+                    // property name follows, so `{get: 1}` and `{get(){}}`
+                    // stay ordinary properties/methods.
+                    let accessor = match self.peek() {
+                        Tok::Ident(s) if &**s == "get" || &**s == "set" => matches!(
+                            self.peek_at(1),
+                            Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::Kw(_)
+                        ),
+                        _ => false,
+                    };
+                    if accessor {
+                        let is_setter = matches!(self.peek(), Tok::Ident(s) if &**s == "set");
+                        self.next(); // `get` / `set`
+                        let key = self.prop_name()?;
+                        let params = self.param_list()?;
+                        self.expect_punct(Punct::LBrace)?;
+                        let body = self.block_body()?;
+                        let uses_arguments = scan_uses_arguments_stmts(&body);
+                        let f = Rc::new(FnDef {
+                            name: key.clone(),
+                            params,
+                            body: FnBody::Block(body),
+                            uses_arguments,
+                            is_async: false,
+                            is_generator: false,
+                            has_yield: false,
+                        });
+                        props.push(ObjElem::Accessor {
+                            key,
+                            getter: if is_setter { None } else { Some(f.clone()) },
+                            setter: if is_setter { Some(f) } else { None },
+                        });
+                        continue;
+                    }
                     // method shorthand: `m(){}` / `"m"(){}`
                     let save = self.pos;
                     let key = self.prop_name()?;
@@ -2394,6 +2593,12 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                         };
                         parts.push(ObjPatPart::Prop { key: key.clone(), part });
                     }
+                    ObjElem::Computed { .. } | ObjElem::Accessor { .. } => {
+                        return Err(
+                            "computed/accessor keys are not supported in a destructuring pattern"
+                                .into(),
+                        )
+                    }
                 }
             }
             Ok(Pat::Obj(parts))
@@ -2488,6 +2693,16 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
         }
         Member { base, .. } => expr_uses(base, k),
         Index { base, index } => expr_uses(base, k) || expr_uses(index, k),
+        OptionalChain { base, steps } => {
+            expr_uses(base, k)
+                || steps.iter().any(|s| match s {
+                    ChainStep::Member { .. } => false,
+                    ChainStep::Index { index, .. } => expr_uses(index, k),
+                    ChainStep::Call { args, .. } => args.iter().any(|a| match a {
+                        CallArg::Arg(x) | CallArg::Spread(x) => expr_uses(x, k),
+                    }),
+                })
+        }
         Array(items) => items.iter().any(|i| match i {
             ArrayElem::Item(x) | ArrayElem::Spread(x) => expr_uses(x, k),
             ArrayElem::Hole => false,
@@ -2495,6 +2710,9 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => expr_uses(v, k),
             ObjElem::Spread(v) => expr_uses(v, k),
+            ObjElem::Computed { key, value } => expr_uses(key, k) || expr_uses(value, k),
+            // accessor bodies are nested functions: their own trees
+            ObjElem::Accessor { .. } => false,
         }),
         PatAssign { pat, value } => pat_uses(pat, k) || expr_uses(value, k),
         Seq(list) => list.iter().any(|x| expr_uses(x, k)),
@@ -2852,6 +3070,16 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         }
         Member { base, .. } => scan_expr_arguments(base),
         Index { base, index } => scan_expr_arguments(base) || scan_expr_arguments(index),
+        OptionalChain { base, steps } => {
+            scan_expr_arguments(base)
+                || steps.iter().any(|s| match s {
+                    ChainStep::Member { .. } => false,
+                    ChainStep::Index { index, .. } => scan_expr_arguments(index),
+                    ChainStep::Call { args, .. } => args.iter().any(|a| match a {
+                        CallArg::Arg(x) | CallArg::Spread(x) => scan_expr_arguments(x),
+                    }),
+                })
+        }
         Array(items) => items.iter().any(|i| match i {
             ArrayElem::Item(x) | ArrayElem::Spread(x) => scan_expr_arguments(x),
             ArrayElem::Hole => false,
@@ -2859,6 +3087,11 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => scan_expr_arguments(v),
             ObjElem::Spread(v) => scan_expr_arguments(v),
+            ObjElem::Computed { key, value } => {
+                scan_expr_arguments(key) || scan_expr_arguments(value)
+            }
+            // accessor bodies are nested functions: their own trees
+            ObjElem::Accessor { .. } => false,
         }),
         Yield(Some(v)) => scan_expr_arguments(v),
         Yield(None) => false,

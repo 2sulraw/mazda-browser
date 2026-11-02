@@ -16,8 +16,10 @@
 //! - keywords are strict (no contextual keywords): `let`/`of`/`in` etc. can
 //!   never be used as identifiers.
 //! - BigInt literals (`123n`) are a syntax error, not silently misparsed.
-//! - `**` (exponent) is an explicit "not supported" error rather than being
-//!   parsed as `* *`.
+//! - `**` is exponentiation (right-associative, `**=` too). `-2 ** 2`
+//!   parses as `(-2) ** 2` where the spec makes it a SyntaxError: the
+//!   parser does not track parenthesis level, so it cannot tell the two
+//!   apart — real code writes `-(2 ** 2)` or `0 - 2 ** 2` instead.
 
 use std::rc::Rc;
 
@@ -111,6 +113,7 @@ pub enum Op {
     MulAssign,
     DivAssign,
     ModAssign,
+    PowAssign,
     AndAssign,
     OrAssign,
     XorAssign,
@@ -130,6 +133,7 @@ pub enum Op {
     Mul,
     Div,
     Mod,
+    Pow,
     And,
     Or,
     Xor,
@@ -780,7 +784,12 @@ impl<'a> Lexer<'a> {
             }
             b'*' => {
                 if self.peek2() == Some(b'*') {
-                    return self.err("`**` exponent operator is not supported (later wave)", start);
+                    // `**` / `**=` (right-associative exponentiation)
+                    if self.src.as_bytes().get(self.pos + 2) == Some(&b'=') {
+                        self.pos += 3;
+                        return Ok(Tok::Op(Op::PowAssign));
+                    }
+                    op2!(Op::Pow)
                 }
                 if self.peek2() == Some(b'=') {
                     op2!(Op::MulAssign)

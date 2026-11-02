@@ -1125,6 +1125,41 @@ curve matters more than the baseline (near-flat as tabs grow).
   `oversized_cookies_are_rejected`,
   `malformed_set_cookie_lines_are_ignored`,
   `url_parts_handle_ports_userinfo_and_ipv6`).
+  **(r) JS syntax batch 1** — real pages kept failing at PARSE time on
+  syntax the engine reported as unsupported. Five constructs now parse and
+  run:
+  - **optional chaining** `?.` on a member, index (`a?.[i]`) or call
+    (`f?.()`). The parser folds a postfix chain into one
+    `ExprKind::OptionalChain { base, steps }`, so a nullish value at an
+    OPTIONAL step ends the WHOLE chain as `undefined` (`a?.b.c.d` never
+    throws when `a` is null), while a nullish value at a later
+    non-optional step still throws. The base is evaluated exactly once and
+    a call step keeps the preceding object as `this`
+    (`o.get()?.v`, `o.m?.()`).
+  - **computed object keys** `{[expr]: v}` and computed methods
+    `{[expr](){}}` (`ObjElem::Computed`), key evaluated once at creation.
+  - **object-literal accessors** `get x(){}` / `set x(v){}`
+    (`ObjElem::Accessor`). `{get: 1}` and `{get(){}}` stay ordinary
+    properties. A get/set pair in one literal (and in a class body) now
+    merges into ONE accessor instead of the second half overwriting the
+    first (`obj_set_own` merges two `Val::Acc` entries).
+  - **exponentiation** `**` and `**=`, right-associative and tighter than
+    `*` (`2 ** 3 ** 2` = 512).
+  - postfix `++`/`--` moved from the `*` level into the postfix chain, so
+    `x * y++` parses as `x * (y++)` (it previously errored on the
+    product). `-2 ** 2` yields `(-2) ** 2` where the spec rejects it —
+    the parser does not track parentheses (honest shortcut).
+  Deferred with honest SyntaxErrors: `class extends`, `static` class
+  members, BigInt literals, labeled statements/`break label`.
+  Live: a `data:` page runs 16 hand-written checks covering every new
+  construct — 16/16 print `ok` in the capture. MDN
+  `/Web/CSS/list-style-type` is unchanged (2773 runs, 81.8 MB: no
+  run-count or RAM regression); the Wikipedia `JavaScript` article (new
+  URL) parses and lays out at 11404 runs / 100.8 MB.
+  Tests: default **591**, `engine-b + woff2` **595**
+  (`computed_object_keys`, `object_literal_accessors`,
+  `optional_chaining`; the `**` assertions moved into
+  `arithmetic_and_precedence`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
@@ -1241,6 +1276,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 11 (cookie jar) | Wikipedia `/wiki/Web_cookie` (fresh) | 97.6 MB (12860 runs; 6 cookies stored, sent on every subresource) |
 | 2026-11-03 | wave 11 (cookie jar) | Wikipedia `/wiki/HTTP_cookie` (new process) | 93.9 MB (12855 runs; the 6 cookies came from the persisted jar) |
 | 2026-11-03 | wave 11 (cookie jar) | MDN `/Web/CSS/list-style-type` (restored) | 81.6 MB (2773 runs; unchanged) |
+| 2026-11-03 | wave 12 (JS syntax batch 1) | `data:` 16-construct probe | 75.3 MB (16/16 `ok`: `?.`, `?.[]`, `?.()`, `[k]: v`, get/set, `**`, `**=`) |
+| 2026-11-03 | wave 12 (JS syntax batch 1) | MDN `/Web/CSS/list-style-type` | 81.8 MB (2773 runs; unchanged — no regression) |
+| 2026-11-03 | wave 12 (JS syntax batch 1) | Wikipedia `/wiki/JavaScript` (new URL) | 100.8 MB (11404 runs) |
 
 ### Phase 1c (Track A) findings
 
