@@ -3714,7 +3714,14 @@ fn draw_text(
     // baseline sits at y0 + ascent (~0.8em for these fonts)
     let baseline = y0 + style.size * 0.8;
     let mut x = x0;
+    // letter/word spacing per glyph — COUPLING: this must stay the exact
+    // arithmetic layout adds to every measured width (layout.rs
+    // `spacing_extra`: ls after EVERY glyph = count × spacing, ws on every
+    // whitespace char), or painted ink drifts off the run width (wrap
+    // decisions, clip windows, text-align, underlines)
     for ch in s.chars() {
+        let gap = if ch.is_whitespace() { style.word_spacing } else { 0.0 }
+            + style.letter_spacing;
         // same font choice as measure() so widths match what's drawn
         let font = fonts.pick_font_for(ch, style);
         let scaled = font.as_scaled(scale);
@@ -3733,7 +3740,7 @@ fn draw_text(
                     || bounds.max.y <= cy0
                     || bounds.min.y >= cy1
                 {
-                    x += advance;
+                    x += advance + gap;
                     continue; // glyph entirely outside the clip window
                 }
             }
@@ -3752,7 +3759,7 @@ fn draw_text(
                 }
             });
         }
-        x += advance;
+        x += advance + gap;
     }
 }
 
