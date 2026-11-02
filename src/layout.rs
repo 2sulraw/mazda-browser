@@ -275,6 +275,11 @@ fn style_for(tag: &str, base: Style) -> Style {
             s.bold = true;
             s.text_align = 1;
         }
+        // UA `button { text-align: center }` — the button's own inline
+        // content centers in its box. It sits on the BOX (not a synthesized
+        // label leaf) so children inherit it and an author `text-align`
+        // still wins.
+        "button" => s.text_align = 1,
         "i" | "em" | "cite" | "var" => s.italic = true,
         "u" | "ins" => s.underline = true,
         "code" | "kbd" | "samp" | "tt" => {
@@ -1003,6 +1008,38 @@ fn build_into(
                 // own declaration over the inherited one (cursor inherits,
                 // see BoxStyle::cursor)
                 let cur = outcome.bx.cursor.or(cursor);
+                // <a href> opens a link scope; nested <a> is invalid HTML so inherit-or-replace is enough
+                let child_link = if tag == "a" {
+                    dom.attr(child, "href")
+                        .map(|h| std::rc::Rc::from(h))
+                        .or_else(|| link.clone())
+                } else {
+                    link.clone()
+                };
+                // ::before/::after generated content — cascaded once here
+                // against this element's computed style (attr() needs the
+                // DOM), inserted as its first/last child in the flow
+                // branches below. Replaced elements (<img>/<svg>) and the
+                // leaf controls (<input>/<select>/<textarea>) ignore these
+                // (see pseudo_box); <button> is a container and keeps them.
+                let before = pseudo_box(
+                    sheet,
+                    dom,
+                    child,
+                    outcome.style,
+                    child_link.clone(),
+                    cur,
+                    PseudoEl::Before,
+                );
+                let after = pseudo_box(
+                    sheet,
+                    dom,
+                    child,
+                    outcome.style,
+                    child_link.clone(),
+                    cur,
+                    PseudoEl::After,
+                );
                 if tag == "img" {
                     // replaced element: box now, pixels when main fetches the src.
                     // width/height attributes are presentational hints (CSS wins:
@@ -1074,23 +1111,43 @@ fn build_into(
                     out.push(g);
                     continue;
                 }
-                // <a href> opens a link scope; nested <a> is invalid HTML so inherit-or-replace is enough
-                let child_link = if tag == "a" {
-                    dom.attr(child, "href")
-                        .map(|h| std::rc::Rc::from(h))
-                        .or_else(|| link.clone())
-                } else {
-                    link.clone()
-                };
+                // <button> is a real CONTAINER, not a leaf control: its
+                // children (an icon <svg>, styled <span>s, an <img>) lay out
+                // inside it like any other element. Flattening them into one
+                // text leaf used to drop every icon a site puts in a button
+                // (search magnifiers, hamburger menus, theme toggles). The
+                // FormCtl stays on the box so a click still activates it and
+                // form submission still reads its label text.
+                if tag == "button" {
+                    let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    control_chrome(&mut g.bx, 20.0, None);
+                    g.node = Some(child);
+                    g.bx.cursor = cur;
+                    // UA default is inline-block (joins the surrounding text
+                    // line); an author display opts out and stacks
+                    g.inline = matches!(g.bx.display, Display::Auto | Display::InlineBlock);
+                    g.form = Some(FormCtl {
+                        node: child,
+                        kind: FormKind::Submit,
+                        value: contained_text(dom, child),
+                    });
+                    if let Some(b) = before {
+                        g.children.push(b);
+                    }
+                    build_into(dom, child, outcome.style, sheet, child_link.clone(), cur, outcome.vars.as_ref(), &mut g.children);
+                    if let Some(a) = after {
+                        g.children.push(a);
+                    }
+                    out.push(g);
+                    continue;
+                }
                 // form controls: one inline box with UA chrome, content
                 // collapsed to a single text run (the selected/first
-                // <option> label, the input value, the textarea default,
-                // the <button> label). Options are never recursed into
-                // here — a closed <select> shows ONE line, never stacked
-                // labels. Every box carries its FormCtl so layout can
-                // collect FormBoxes for hit-testing/focus.
-                if tag == "select" || tag == "input" || tag == "textarea" || tag == "button"
-                {
+                // <option> label, the input value, the textarea default).
+                // Options are never recursed into here — a closed <select>
+                // shows ONE line, never stacked labels. Every box carries its
+                // FormCtl so layout can collect FormBoxes for hit-testing/focus.
+                if tag == "select" || tag == "input" || tag == "textarea" {
                     // shortcut: multiple/size>1 selects and textarea
                     // rows/cols render like the closed single-line control —
                     // there is no popup/listbox/scrolling widget yet
@@ -1129,15 +1186,6 @@ fn build_into(
                             let t = contained_text(dom, child);
                             raw = t.clone();
                             (if t.is_empty() { None } else { Some(t) }, 20.0, Some(170.0), false)
-                        }
-                        "button" => {
-                            // <button>: label = its text content; default
-                            // type is submit (activate on click). The label
-                            // is centered in the box like real UA buttons.
-                            kind = FormKind::Submit;
-                            let t = contained_text(dom, child);
-                            raw = t.clone();
-                            (if t.is_empty() { None } else { Some(t) }, 20.0, None, true)
                         }
                         _ => {
                             // input (VOID: value comes from the attribute)
@@ -1237,30 +1285,6 @@ fn build_into(
                     build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), out);
                     continue;
                 }
-                // ::before/::after generated content — cascaded once here
-                // against this element's computed style (attr() needs the
-                // DOM), inserted as its first/last child in the flow
-                // branches below. The <img>/<svg>/form-control branches
-                // above return before this point: replaced elements and
-                // controls generate no pseudo content (see pseudo_box).
-                let before = pseudo_box(
-                    sheet,
-                    dom,
-                    child,
-                    outcome.style,
-                    child_link.clone(),
-                    cur,
-                    PseudoEl::Before,
-                );
-                let after = pseudo_box(
-                    sheet,
-                    dom,
-                    child,
-                    outcome.style,
-                    child_link.clone(),
-                    cur,
-                    PseudoEl::After,
-                );
                 // which elements get a box: flex/grid/block/inline-block
                 // always; inline tags only when CSS says so; Auto follows
                 // the tag. Absolutely/fixed positioned elements ALWAYS get
@@ -9143,6 +9167,77 @@ line</textarea></div>"#,
             run.x,
             x + 4.0 + slack
         );
+    }
+
+    #[test]
+    fn button_lays_out_its_children() {
+        // An icon <svg> and styled markup inside a <button> must become real
+        // boxes. The old leaf-control path flattened the button to one text
+        // run, so every icon a site puts in a button vanished (MDN's search
+        // button rendered as an empty pill).
+        let mut root = tree_of(
+            r#"<div><button><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M0 0h24v24H0z"/></svg><span>Go</span></button></div>"#,
+        );
+        let btn = controls(&root)
+            .into_iter()
+            .find(|c| c.form.is_some())
+            .expect("button control box");
+        assert!(
+            btn.children.iter().any(|c| c.img.is_some()),
+            "the inline <svg> became an image box inside the button"
+        );
+        assert_eq!(
+            btn.form.as_ref().unwrap().value,
+            "Go",
+            "the form label still skips the icon's markup"
+        );
+        // the children lay out INSIDE the button, not beside it
+        let l = layout_in(&mut root, 500.0, 400.0, &m4);
+        let (bx, _, bw, _) = l.forms[0].rect;
+        let run = l.runs.iter().find(|r| r.text == "Go").expect("label run");
+        assert!(
+            run.x >= bx && run.x < bx + bw,
+            "label run {} inside the button {bx}..{}",
+            run.x,
+            bx + bw
+        );
+    }
+
+    #[test]
+    fn button_keeps_generated_content() {
+        // `button::before` is a common icon technique (hamburgers, chevrons)
+        let root = boxes_of(
+            r#"<div><button>x</button></div>"#,
+            r#"button::before { content: ">" }"#,
+        );
+        let btn = controls(&root)
+            .into_iter()
+            .find(|c| c.form.is_some())
+            .expect("button control box");
+        assert!(
+            btn.children.iter().any(|c| c.is_text && c.text == ">"),
+            "::before content is generated inside the button"
+        );
+    }
+
+    #[test]
+    fn author_text_align_overrides_the_button_default() {
+        // the UA `button { text-align: center }` default must stay beatable
+        let root = boxes_of(
+            r#"<div><button>x</button></div>"#,
+            r#"button { text-align: left }"#,
+        );
+        let btn = controls(&root)
+            .into_iter()
+            .find(|c| c.form.is_some())
+            .expect("button control box");
+        assert_eq!(btn.style.text_align, 0, "author text-align wins");
+        let root = boxes_of(r#"<div><button>x</button></div>"#, "");
+        let btn = controls(&root)
+            .into_iter()
+            .find(|c| c.form.is_some())
+            .expect("button control box");
+        assert_eq!(btn.style.text_align, 1, "UA default centers");
     }
 
     #[test]

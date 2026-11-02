@@ -950,6 +950,27 @@ curve matters more than the baseline (near-flat as tabs grow).
   Tests: default **554**, `engine-b + woff2` **558**
   (`has_pseudo_matches_descendant_child_and_siblings`, `attr_selectors`,
   `word_filling_the_line_exactly_does_not_wrap`).
+  **(l) `<button>` is a container** — the form-control branch flattened
+  every `<button>` into one synthetic text leaf, so any markup inside it
+  vanished: MDN's declarative-shadow search button (an inline `<svg>`
+  magnifier) rendered as an empty 80x30 pill, and `button::before` icon
+  techniques (hamburgers, chevrons) generated nothing. A button now builds
+  a real group box, recurses into its children (icons, styled spans,
+  `::before`/`::after`), and keeps the `FormCtl { Submit }` on the box so
+  clicks still activate and submission still reads the label text. UA
+  `text-align: center` moved onto the box in `style_for`, so children
+  inherit the centering and an author `text-align` still wins.
+  Live: MDN's header now paints the magnifier (3 -> 11 images drawn, 664
+  rules, 2773 runs, 91.0 MB debug); Wikipedia Rust article unchanged (1646
+  rules, 14973 runs, 315 images, 106.7 MB); rust-lang.org unchanged
+  (1753 rules, 483 runs, 88.7 MB); a data:-URL probe with an inline
+  stroke-only magnifier inside a flex button went from "no child box" to
+  "svg box at the button's left inset".
+  shortcut: `<input type=submit|button|reset>` stays a leaf (its label is
+  the `value` attribute by definition); button `type` is always Submit.
+  Tests: default **557**, `engine-b + woff2` **561**
+  (`button_lays_out_its_children`, `button_keeps_generated_content`,
+  `author_text_align_overrides_the_button_default`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -1042,7 +1063,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 88.7 MB (4687 runs; `display:contents` + named grid areas give the real 3-column layout; outer box-shadow hole culls the gray band under sidebar/TOC; remaining: column widths, search widget stacking) |
 | 2026-11-02 | wave 8f (media math, full `:is()`, logical box props, of-type, min-content) | MDN `/Web/CSS/list-style-type` | 83.2 MB (2943 runs; the `<1072px` media gate finally applies, so the wide sidebar is hidden — 1744 fewer runs; 704px baseline card, clean TOC/breadcrumb links, side padding, title chip, search button in its track; remaining: variant custom-property colors, search-pill wrap) |
 | 2026-11-02 | wave 8g (flex-grow, nth-of-type family) | Wikipedia Rust article | 103.9 MB (14973 runs, 315 images; `flex-grow:1` puts the page heading at the title bar's left edge on one line) |
-| 2026-11-02 | wave 8h (relayout image memo) | Wikipedia Rust article | 98.7 MB first layout (14973 runs); relayouts after it report `315 drawn (0 decoded, 315 from the memo)` — the 104 → 118 MB climb was that decode churn |
+| 2026-11-02 | wave 8h (relayout image memo) | Wikipedia Rust article | 98.7 MB first layout (14973 runs); relayouts after it report `315 drawn (0 decoded, 315 from the memo)` - the 104 → 118 MB climb was that decode churn |
+| 2026-11-03 | wave 8l (`<button>` container) | MDN `/Web/CSS/list-style-type` | 91.0 MB (2773 runs, 11 images - the search button's inline `<svg>` magnifier now lays out and paints) |
+| 2026-11-03 | wave 8l (`<button>` container) | Wikipedia Rust article | 106.7 MB (14973 runs, 315 images; pixel-unchanged) |
 
 ### Phase 1c (Track A) findings
 
