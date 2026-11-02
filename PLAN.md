@@ -739,6 +739,55 @@ curve matters more than the baseline (near-flat as tabs grow).
   earlier. Note: a `data:` page re-laid out ~10× in 18 s (no pointer input) —
   not seen on http pages (2-3×), filed as a shell wake-up quirk to watch
   (`0794a6b` pushed).
+- [x] **Wave 8 — real grid track sizing, CSS math, page scrollbar** (grid
+  `715625e`, math `8b6b96f`, shell `9f4ba99`, merge `7b66e0c`):
+  **(a) grid tracks** (`715625e`, +12 tests) — `TrackBreadth`
+  (`Px/Pct/Fr/Auto/MinContent/MaxContent`) and
+  `Track::{...,MinMax(a,b)}`; `minmax()` was previously parsed as only its
+  maximum side (a `minmax(15rem,1fr)` lost its 240 px floor — the MDN
+  sidebar-collapse class). Two-phase sizing: base pass resolves fixed and
+  content floors from the item's **margin-box** min-content (widest
+  unbreakable word, intrinsic replaced width) and max-content (one line),
+  `minmax` floors apply before free-space split; fr tracks then share the
+  remaining space weighted and clamp to their maxima; a grid whose min-content
+  exceeds the container overflows instead of collapsing tracks. `gap` /
+  `row-gap` / `column-gap`, percent tracks, `min-content`/`max-content`, and
+  `grid-template-rows` floors are honored. Shortcuts: `grid-column: span N`
+  not implemented, `repeat()` counts capped at 64, `auto-fill`/`auto-fit`
+  skipped, no baseline alignment/subgrid/masonry, `fit-content()` skipped.
+  **(b) CSS math** (`8b6b96f`, +5 tests) — one recursive evaluator for
+  `calc()`/`min()`/`max()`/`clamp()` (additive < multiplicative < unary,
+  nesting depth 32): px/%/number linear form, `%` carried symbolically in the
+  new `Len::Calc { px, pct }` and resolved by `layout::resolve_len` against the
+  containing block (so `calc(100% - clamp(…))` works); division by zero,
+  non-finite results and unknown functions drop the declaration (initial
+  value), `clamp` with `min > max` yields the min; every `parse_len` caller
+  picks it up (width/height/margins/padding/borders/inset/font-size/
+  letter- and word-spacing/text-indent/background geometry). Math groups in
+  grid tracks resolve to a single px/% track; a px+% mix is skipped (no mixed
+  track form). Shortcuts: mixing px with % ACROSS `min/max/clamp` arguments
+  drops, no `round/mod/abs/sign/trig`, no `ch/ex/lh/cq*`, math inside
+  `repeat()`/`minmax()` args not expanded, box-shadow/bg-position use the px
+  part of a mixed result.
+  **(c) page scrollbar** (`9f4ba99`) — the new shell paints a faint track and a
+  proportional thumb in the right gutter after the page raster
+  (`scrollbar_thumb`/`scroll_from_thumb`/`scrollbar_strip`, thumb floored at
+  24 px), with thumb drag (grab offset kept), track click (thumb centres under
+  the pointer), wheel and arrow keys all routed through one `set_scroll`
+  helper; a press inside the bar strip no longer falls through to link
+  hit-testing and the page `cursor` does not leak across it. Also fixed a
+  latent crash this exposed: a resize repaint could reallocate `pixels` at the
+  new size while `last_size` still described the old texture, tripping the
+  color-image length assertion — `repaint_page` now syncs `last_size`. Runs
+  entirely in the shell, so page memory is unchanged.
+  Tests: default **531**, `engine-b + woff2` **535**. Live: wiki Rust article
+  **105.0 MB** (14973 runs, 315 images); MDN `/Web/CSS/list-style-type`
+  **100.3 MB** (4687 runs) — still visibly wrong: MDN places its columns with
+  `grid-area`/`grid-template-areas` named areas (not implemented yet; items
+  auto-place into the wrong tracks, so the article text lands in a narrow
+  column). The scrollbar draws and follows the document (verification capture
+  only; drag was not synthetically driven). Filed as the wave 9 target
+  together with the Wikipedia h1/languages-box overlap.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -827,6 +876,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 6 | local HTTP WebP page | 72.8 MB (12 runs; VP8X+ALPH decoded at 320x240, alpha visible) |
 | 2026-11-02 | wave 7 (table layout, object-fit/aspect-ratio, image sources) | Wikipedia Rust article | 112.2 MB (14973 runs; infobox renders as a real two-column table, 315 images, 0 format skips; +9.5 MB vs wave 5 = WOFF2 site fonts) |
 | 2026-11-02 | wave 7 | data: URL page | 68.8 MB (8 runs; PNG + WebP data images decoded inline) |
+| 2026-11-02 | wave 8 (grid tracks, CSS math, scrollbar) | Wikipedia Rust article | 105.0 MB (14973 runs; same layout as wave 7, 315 images, 0 format skips) |
+| 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 100.3 MB (4687 runs; named grid areas still unimplemented — article column collapses, next wave) |
 
 ### Phase 1c (Track A) findings
 
