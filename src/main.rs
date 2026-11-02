@@ -7,6 +7,7 @@ mod js;
 mod layout;
 mod runtime;
 mod script;
+mod srcset;
 mod svg;
 mod ui_chrome;
 mod woff;
@@ -2730,7 +2731,7 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
                 }
                 None => skipped += 1,
             }
-        } else if let Some(abs) = resolve(base, &src) {
+        } else if let Some(abs) = resolve_img(base, &src) {
             match fetch_image(&abs) {
                 Ok((bytes, _)) => match image::probe(&bytes).or_else(|| svg::probe(&bytes)) {
                     Some((w, h)) => {
@@ -2742,13 +2743,13 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
                         });
                     }
                     None => {
-                        eprintln!("[img] no size from {abs} ({} bytes, starts {:?})",
-                            bytes.len(), &bytes[..bytes.len().min(12)]);
+                        eprintln!("[img] no size from {} ({} bytes, starts {:?})",
+                            log_url(&abs), bytes.len(), &bytes[..bytes.len().min(12)]);
                         skipped += 1; // AVIF/corrupt
                     }
                 },
                 Err(e) => {
-                    eprintln!("[img] fetch failed {abs}: {e}");
+                    eprintln!("[img] fetch failed {}: {e}", log_url(&abs));
                     skipped += 1;
                 }
             }
@@ -2823,7 +2824,7 @@ fn decode_images(
             let bytes = if inline {
                 Some(src.clone().into_bytes())
             } else {
-                resolve(base, &src)
+                resolve_img(base, &src)
                     .and_then(|abs| fetch_image(&abs).ok().map(|(b, _)| b))
             };
             if let Some(bytes) = bytes {
@@ -2928,6 +2929,27 @@ fn collect_sheets(dom: &html::Dom, node: u32, out: &mut Vec<SheetSrc>) {
     }
     for &c in &dom.nodes[node as usize].children {
         collect_sheets(dom, c, out);
+    }
+}
+
+/// Resolve an IMAGE url against `base`. `data:` URLs pass through untouched:
+/// the fetch layer already turns them into bytes (`fetch_accept` ->
+/// `data_url_body`), and a normal document-relative resolution would reject
+/// the non-http scheme. Everything else resolves like any other URL.
+fn resolve_img(base: &str, src: &str) -> Option<String> {
+    let s = src.trim();
+    if s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
+        return Some(s.to_string());
+    }
+    resolve(base, s)
+}
+
+/// URL for a log line -- a `data:` payload would otherwise dump kilobytes.
+fn log_url(u: &str) -> String {
+    if u.len() > 80 {
+        format!("{}...", u.chars().take(72).collect::<String>())
+    } else {
+        u.to_string()
     }
 }
 
@@ -3125,11 +3147,18 @@ fn fetch(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
     fetch_accept(url, None)
 }
 
+/// Image `Accept` header: formats `image::decode`/`svg::render` handle. WebP
+/// leads (servers that honour `Accept` then skip the JPEG/PNG round trip);
+/// AVIF is deliberately absent -- advertising a format with no decoder would
+/// only buy unrenderable bytes.
+const IMAGE_ACCEPT: &str = "image/webp, image/png, image/jpeg;q=0.9";
+
 /// Fetch an image: content-negotiate for the formats we can decode.
-/// Image proxies (next/image et al.) serve WebP/AVIF when the client
-/// advertises support — omitting them gets the original PNG/JPEG back.
+/// Image proxies (next/image et al.) serve WebP when the client advertises
+/// support -- omitting it gets the original PNG/JPEG back. WebP goes first
+/// and AVIF stays out: we decode one and not the other.
 fn fetch_image(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
-    fetch_accept(url, Some("image/png, image/jpeg;q=0.9"))
+    fetch_accept(url, Some(IMAGE_ACCEPT))
 }
 
 /// Network timeouts: ureq's defaults leave reads unbounded ("requests may
@@ -5080,6 +5109,201 @@ mod tests {
         (1..dom.nodes.len() as u32)
             .find(|&i| dom.tag(i) == "a" && dom.attr(i, "href") == Some(href))
             .unwrap()
+    }
+
+    // ---------- image sources: data: URLs, srcset / <picture> ----------
+
+    /// Fixture PNG (2x3 RGBA) through the same encoder image.rs tests use.
+    fn fixture_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, 2, 3);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            let data: Vec<u8> = (0..6)
+                .flat_map(|i| [((i + 1) * 40) as u8, 0x20, 0x10, 0xff])
+                .collect();
+            w.write_image_data(&data).unwrap();
+        }
+        bytes
+    }
+
+    /// Fixture WebP: 3x2 lossless RGBA (same bytes as image.rs's fixture).
+    const FIXTURE_WEBP: &[u8] = &[
+        0x52, 0x49, 0x46, 0x46, 0x3c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c,
+        0x2f, 0x00, 0x00, 0x00, 0x2f, 0x02, 0x40, 0x00, 0x10, 0x2f, 0x20, 0x10, 0x48, 0xda, 0x1f, 0x7a,
+        0x0d, 0x01, 0x41, 0x91, 0xff, 0xa3, 0x09, 0x08, 0x8a, 0xfc, 0x1f, 0x8d, 0x20, 0xdb, 0xa6, 0x68,
+        0xbb, 0x3f, 0xd4, 0x03, 0xe6, 0x86, 0x95, 0xb9, 0x40, 0x20, 0x40, 0x99, 0x2a, 0x5c, 0x10, 0xd1,
+        0xff, 0xf8, 0x52, 0x00,
+    ];
+
+    /// RFC 4648 base64 (test-only encoder for the `data:` fixtures).
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (c[0] as u32) << 16
+                | (c.get(1).copied().unwrap_or(0) as u32) << 8
+                | c.get(2).copied().unwrap_or(0) as u32;
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    fn find_img(n: &layout::BoxNode) -> Option<&layout::ImgSlot> {
+        if n.img.is_some() {
+            return n.img.as_ref();
+        }
+        n.children.iter().find_map(find_img)
+    }
+
+    /// `<img>` pipeline end to end: box build -> probe -> layout -> decode.
+    /// Returns (probed, skipped, probed dims, drawn (w, h, pixels)).
+    #[allow(clippy::type_complexity)]
+    fn img_pipeline(
+        markup: &str,
+        base: &str,
+        vw: f32,
+    ) -> (
+        usize,
+        usize,
+        Option<(u32, u32)>,
+        Option<(u32, u32, Vec<u32>)>,
+    ) {
+        let dom = html::parse(markup);
+        let mut root = layout::build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            css::BoxStyle::default(),
+            &css::parse_for("", vw),
+        );
+        let (probed, skipped) = probe_images(&mut root, base);
+        let dims = match find_img(&root) {
+            Some(layout::ImgSlot::Probed { w, h, .. }) => Some((*w, *h)),
+            _ => None,
+        };
+        let mut laid =
+            layout::layout_tree(&mut root, vw, &|s: &str, _: &Style| s.chars().count() as f32 * 8.0);
+        let mut budget = IMG_PIXEL_BUDGET;
+        let mut next = 0usize;
+        decode_images(&mut root, base, &mut laid, &mut budget, false, None, false, &mut next);
+        let drawn = laid
+            .images
+            .first()
+            .map(|(_, _, _, _, img, _)| (img.w, img.h, img.px.clone()));
+        (probed, skipped, dims, drawn)
+    }
+
+    #[test]
+    fn data_url_images_probe_and_decode_in_every_supported_format() {
+        let png = format!("data:image/png;base64,{}", b64(&fixture_png()));
+        let webp = format!("data:image/webp;base64,{}", b64(FIXTURE_WEBP));
+        // percent-encoded SVG payload (the `#`-free, quote-light form sites use)
+        let svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' \
+                   width='10' height='20'%3E%3Crect width='10' height='20' fill='red'/%3E%3C/svg%3E"
+            .to_string();
+        for (url, want) in [(&png, (2u32, 3u32)), (&webp, (3, 2)), (&svg, (10, 20))] {
+            let markup = format!(r#"<body><img src="{url}"></body>"#);
+            let (probed, skipped, dims, drawn) = img_pipeline(&markup, "https://example.com/x", 800.0);
+            assert_eq!((probed, skipped), (1, 0), "probed one, skipped none: {url}");
+            assert_eq!(dims, Some(want), "intrinsic size from {url}");
+            let (w, h, px) = drawn.expect("pixels decoded");
+            assert_eq!((w, h), want, "decoded size from {url}");
+            assert!(px.iter().any(|p| p & 0x00ff_ffff != 0), "opaque pixels: {url}");
+        }
+    }
+
+    #[test]
+    fn data_url_reaches_the_box_untouched_and_round_trips_through_resolve() {
+        let url = format!("data:image/png;base64,{}", b64(&fixture_png()));
+        // resolve_img passes `data:` through verbatim (any case)
+        assert_eq!(resolve_img("https://example.com/p", &url).as_deref(), Some(url.as_str()));
+        let upper = url.replacen("data:", "DATA:", 1);
+        assert_eq!(resolve_img("https://example.com/p", &upper).as_deref(), Some(upper.as_str()));
+        // ordinary image URLs still resolve against the page
+        assert_eq!(
+            resolve_img("https://example.com/a/b", "img/x.png").as_deref(),
+            Some("https://example.com/a/img/x.png")
+        );
+        // the box carries the exact attribute string
+        let dom = html::parse(&format!(r#"<body><img src="{url}"></body>"#));
+        let root = layout::build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            css::BoxStyle::default(),
+            &css::parse(""),
+        );
+        let Some(layout::ImgSlot::Pending(src)) = find_img(&root) else {
+            panic!("img box should carry the source")
+        };
+        assert_eq!(src.as_ref(), url.as_str());
+    }
+
+    #[test]
+    fn data_url_background_image_decodes_too() {
+        let url = format!("data:image/png;base64,{}", b64(&fixture_png()));
+        let markup = format!(
+            r#"<body><div style="background-image: url({url})">x</div></body>"#
+        );
+        let (probed, skipped, dims, drawn) = img_pipeline(&markup, "https://example.com/", 800.0);
+        assert_eq!((probed, skipped), (1, 0), "bg data: URL probed");
+        assert_eq!(dims, Some((2, 3)));
+        assert!(drawn.is_some(), "bg data: URL decoded");
+    }
+
+    #[test]
+    fn image_accept_advertises_webp_only_among_modern_formats() {
+        assert!(IMAGE_ACCEPT.contains("image/webp"), "{IMAGE_ACCEPT}");
+        assert!(!IMAGE_ACCEPT.contains("avif"), "no decoder, no advert");
+        // formats we can decode stay advertised
+        assert!(IMAGE_ACCEPT.contains("image/png"));
+        assert!(IMAGE_ACCEPT.contains("image/jpeg"));
+    }
+
+    #[test]
+    fn plain_img_src_is_the_same_url_as_before() {
+        // byte-identical paint guard: no responsive markup -> the box holds
+        // the raw `src` attribute exactly as it always did
+        let src = "img/hero.png?w=1&h=2#frag";
+        let dom = html::parse(&format!(r#"<body><img src="{src}" width="20"></body>"#));
+        let root = layout::build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            css::BoxStyle::default(),
+            &css::parse(""),
+        );
+        let Some(layout::ImgSlot::Pending(chosen)) = find_img(&root) else {
+            panic!("img box should carry the source")
+        };
+        assert_eq!(chosen.as_ref(), src);
+    }
+
+    #[test]
+    fn srcset_and_picture_reach_the_box_as_the_chosen_url() {
+        // the URL that layout carries is the one probe/decode will fetch
+        let markup = r#"<body><picture>
+            <source type="image/webp" srcset="h-400.webp 400w, h-900.webp 900w">
+            <img src="h.jpg" srcset="h-400.jpg 400w, h-900.jpg 900w">
+        </picture></body>"#;
+        let dom = html::parse(markup);
+        let root = layout::build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            css::BoxStyle::default(),
+            &css::parse_for("", 800.0),
+        );
+        let Some(layout::ImgSlot::Pending(chosen)) = find_img(&root) else {
+            panic!("img box should carry the source")
+        };
+        assert_eq!(chosen.as_ref(), "h-900.webp");
     }
 }
 

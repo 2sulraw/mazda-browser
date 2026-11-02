@@ -684,7 +684,7 @@ impl BoxNode {
 /// Elements whose content is never rendered (also covers `<style>`/`<script>`
 /// that appear inside body — head is already excluded by `body_root`).
 const NON_RENDERED: &[&str] = &[
-    "script", "style", "noscript", "template", "head", "title", "meta", "link",
+    "script", "style", "noscript", "template", "head", "title", "meta", "link", "source", "track",
 ];
 
 /// Build the box tree for `node`'s subtree. `style`/`bx` are the cascade
@@ -983,6 +983,10 @@ fn build_into(
                     // replaced element: box now, pixels when main fetches the src.
                     // width/height attributes are presentational hints (CSS wins:
                     // outcome.bx already holds declared width/height).
+                    // `srcset`/`<picture>` selection happens HERE, so the URL
+                    // the box carries is the chosen candidate for this viewport
+                    // (see crate::srcset) and probe/decode/cache never re-parse
+                    // the markup.
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
                     g.node = Some(child);
                     g.bx.cursor = cur;
@@ -992,8 +996,8 @@ fn build_into(
                     if g.bx.height.is_none() {
                         g.bx.height = dom.attr(child, "height").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
                     }
-                    if let Some(src) = dom.attr(child, "src").filter(|s| !s.is_empty()) {
-                        g.img = Some(ImgSlot::Pending(std::rc::Rc::from(src)));
+                    if let Some(src) = crate::srcset::pick_img_source(dom, child, sheet.viewport_w()) {
+                        g.img = Some(ImgSlot::Pending(std::rc::Rc::from(src.as_str())));
                     }
                     // author `inline-block` on a replaced box sits on the
                     // text line like any other inline-block

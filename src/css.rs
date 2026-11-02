@@ -850,6 +850,12 @@ impl Sheet {
         self.vp = (w, h);
     }
 
+    /// Viewport width in CSS px -- what viewport units and the `<img srcset>`
+    /// picker compare against.
+    pub fn viewport_w(&self) -> f32 {
+        self.vp.0
+    }
+
     /// Id of this font-family value's comma stack in the shared table
     /// (0 = "no stack" → generic pick). Repeated values share one id.
     fn intern_stack(&self, v: &str) -> u16 {
@@ -1720,10 +1726,31 @@ fn unprefix(p: &str) -> &str {
     }
 }
 
+/// Split a declaration block on `;`, ignoring separators inside `(...)` --
+/// `background-image: url(data:...;base64,...)` keeps its payload intact.
+fn split_decls(block: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0u32;
+    let mut start = 0usize;
+    for (i, c) in block.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => {
+                out.push(&block[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&block[start..]);
+    out
+}
+
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
 pub fn parse_decls(block: &str) -> Vec<Decl> {
     let mut out = Vec::new();
-    for part in block.split(';') {
+    for part in split_decls(block) {
         let Some((p, v)) = part.split_once(':') else {
             continue;
         };
@@ -6437,6 +6464,24 @@ mod tests {
         let q = bx("a");
         assert_eq!(q.obj_pos, [BgPos::Pct(50.0), BgPos::Pct(50.0)]);
         assert_eq!(q.aspect_ratio, None);
+    }
+
+    #[test]
+    fn data_url_background_survives_the_declaration_split() {
+        // the `;base64` inside url(...) must not end the declaration
+        let sheet = parse(
+            ".a { background-image: url(data:image/png;base64,AAAA); color: #010203 }",
+        );
+        let dom = dom_of("<div class=a></div>");
+        let a = sheet.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None);
+        assert_eq!(a.bx.bg_image.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!(a.style.color, 0x010203, "declaration after it still parses");
+        // quoted form too
+        let q = parse_decls(r#"background: url("data:image/svg+xml,%3Csvg/%3E")"#);
+        assert_eq!(
+            q.iter().find(|(p, _)| p == "background").map(|(_, v)| v.as_str()),
+            Some(r#"url("data:image/svg+xml,%3Csvg/%3E")"#)
+        );
     }
 
     // ---- mask / mask-image / mask geometry ----
