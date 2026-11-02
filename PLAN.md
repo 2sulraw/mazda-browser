@@ -813,6 +813,49 @@ curve matters more than the baseline (near-flat as tabs grow).
   `/Web/CSS/list-style-type` **88.7 MB** (4687 runs) — the gray overlap band
   under the sidebar/TOC is gone; remaining gaps are column widths and the
   search/filter widget stacking.
+  **(f) media math, real `:is()` arguments, UA block tags, logical box
+  shorthands** (`73722e6`, +7 tests) — five independent fixes that all showed
+  up on the same MDN page:
+  - `@media` lengths go through the CSS math evaluator and viewport units
+    (`calc()`, `min()/max()/clamp()`, `vw/vh/vmin/vmax`), so MDN's
+    `(width < calc(1rem*2 + 15rem + 2rem + 31rem))` gate (800px) and its
+    1072px three-column gate now evaluate instead of failing the parse and
+    dropping the whole block. `vh` resolves against a fixed 700px (the same
+    single-window assumption the width already makes; no re-evaluation on
+    resize).
+  - `:is()` / `:where()` accept FULL selector chains per argument
+    (`:is(.toc a):not(:hover)`, `:is(.card summary) .pill`,
+    `:is(:is(...) a)`), not just compound selectors. Sites write the
+    `text-decoration:none` rule for all sidebar/TOC/breadcrumb links this way;
+    dropping it underlined every navigation link on the page. Specificity is
+    the best argument's whole-chain specificity.
+  - unlisted HTML block tags (`details`, `summary`, `dialog`, `menu`,
+    `legend`, `optgroup`, `option`, `search`, `hgroup`, `colgroup`, …) are
+    block-level in the UA sheet. An unstyled `<details>` used to take the
+    inline path and shrink-wrap to max-content: the MDN baseline card
+    measured 766px inside a 704px column. Now 704.
+  - logical box shorthands (`padding-inline`, `padding-block`,
+    `margin-inline`, `margin-block`, and their `-start/-end` longhands) map to
+    physical sides for horizontal-tb, including the `margin-inline: auto`
+    centering pair. MDN's page grid gets its side padding from
+    `padding-inline`; without it content sat flush against the window edge.
+  - `:first-of-type`, `:last-of-type`, `:only-child` (needed by
+    `h1 code:first-of-type` for the title chip and by menu rules), and
+    intrinsic sizing that honors a declared px `width` and sums the items of a
+    non-wrapping flex ROW: the 80px search button had measured at its label's
+    min-content (18px), so its `min-content` grid track collapsed and the
+    button overflowed the header.
+  Development aid: `MAZDA_DUMP_BOXES=2` walks the laid-out box tree
+  (tag.class, rect, display, position, tracks, declared width), and
+  `MAZDA_DUMP_RUNS` also prints run widths/underline flags and the underline
+  channel.
+  Tests: default **543**, `engine-b + woff2` **546**.
+  Known shortcut this exposed: custom properties still come from ONE global
+  last-declaration-wins map, not a per-element/inherited cascade, so a sheet
+  that defines the same variable for several variant classes (MDN's
+  `.baseline-indicator.high` green vs `.removing` red) paints every variant
+  with whichever block appears last — the "Widely available" pill is red.
+  Per-element custom-property cascade is the next CSS wave.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study

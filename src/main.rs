@@ -3935,6 +3935,7 @@ impl Fonts {
             self.faces[face].failed.set(true);
             return;
         }
+        let mut evicted = false;
         while self.webfont_bytes.get() + size > self.webfont_cap {
             let victim = self
                 .faces
@@ -3949,6 +3950,12 @@ impl Fonts {
             self.webfont_bytes
                 .set(self.webfont_bytes.get().saturating_sub(freed));
             eprintln!("[font] page budget: evicted {freed} KB webfont");
+            evicted = true;
+        }
+        if evicted {
+            // glyph masks key on the font's address, which the freed Rc just
+            // made reusable — drop them before a new face can land there
+            self.glyphs.borrow_mut().clear();
         }
         let clock = self.webfont_clock.get() + 1;
         self.webfont_clock.set(clock);
@@ -4448,6 +4455,33 @@ fn working_set_mb() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glyph_masks_cache_by_subpixel_pen() {
+        let fonts = Fonts::load();
+        let style = Style::new();
+        let scale = PxScale::from(style.size);
+        let font = fonts.pick_font_for('A', &style);
+        let id = font.glyph_id('A');
+        let a = fonts.glyph_mask(&font, id, scale, 12.0, 100.0).unwrap();
+        // same subpixel position, different whole-pixel offset → same raster
+        let b = fonts
+            .glyph_mask(&font, id, scale, 15.0, 107.0)
+            .unwrap();
+        assert!(Rc::ptr_eq(&a, &b));
+        assert!(a.w > 0 && a.h > 0 && a.cov.iter().any(|&c| c > 0));
+        // a different 1/4-px pen fraction is a different raster
+        let c = fonts.glyph_mask(&font, id, scale, 12.25, 100.0).unwrap();
+        assert!(!Rc::ptr_eq(&a, &c));
+    }
+
+    #[test]
+    fn pixels_to_image_keeps_rgb() {
+        let img = pixels_to_image(&[0x0012_3456, 0x00ff_ffff], 2, 1);
+        assert_eq!(img.size, [2, 1]);
+        assert_eq!(img.pixels[0], egui::Color32::from_rgb(0x12, 0x34, 0x56));
+        assert_eq!(img.pixels[1], egui::Color32::WHITE);
+    }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("mazda-test-{name}"));

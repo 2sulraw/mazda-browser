@@ -4968,6 +4968,32 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         }
     }
     let natural_sum: f32 = widths.iter().sum();
+    // flex-grow: hand the row's free space to growable items (weighted by
+    // their factor) BEFORE justify-content runs, so the line is full and
+    // justify finds nothing left to distribute. Wrapped rows grow per line
+    // in a real engine; not modeled (each line keeps natural widths).
+    if !n.bx.wrap {
+        let free = (n.w - natural_sum - gaps).max(0.0);
+        if free > 0.0 {
+            let total: f32 = items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Grp(i) => Some(n.children[*i].bx.grow.max(0.0)),
+                    Item::Text(..) => None,
+                })
+                .sum();
+            if total > 0.0 {
+                for (idx, it) in items.iter().enumerate() {
+                    if let Item::Grp(i) = it {
+                        let g = n.children[*i].bx.grow.max(0.0);
+                        if g > 0.0 {
+                            widths[idx] += free * g / total;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // nowrap shrinks to fit; wrap keeps natural widths and breaks lines
     if !n.bx.wrap && natural_sum + gaps > n.w && natural_sum > 0.0 {
         let scale = ((n.w - gaps).max(0.0)) / natural_sum;
@@ -6339,6 +6365,44 @@ mod tests {
         assert!((x("B") - 16.0).abs() < 0.01, "col1 (1fr) x={}", x("B"));
         assert!((x("CCCCCC") - 68.0).abs() < 0.01, "col2 x={}", x("CCCCCC"));
         assert!((x("DD") - 92.0).abs() < 0.01, "col3 x={}", x("DD"));
+    }
+
+    #[test]
+    fn flex_grow_fills_free_space() {
+        // The growable item absorbs everything the fixed one leaves, so a
+        // `justify-content: flex-end` row no longer pushes it into a corner
+        // (the Wikipedia title bar case).
+        let mut grow = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grow: 1.0,
+                ..BoxStyle::default()
+            },
+        );
+        grow.children = vec![leaf("aa")];
+        let mut fixed = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        fixed.children = vec![leaf("bbbb")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                justify: Justify::End,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![grow, fixed];
+        layout_tree(&mut n, 300.0, &m4);
+        assert_eq!(n.children[0].w, 284.0, "grow item = 300 - 16");
+        assert_eq!(n.children[0].x, 0.0, "starts at the row's left edge");
+        assert_eq!(n.children[1].x, 284.0, "fixed item after it");
     }
 
     #[test]

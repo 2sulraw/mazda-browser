@@ -339,6 +339,12 @@ pub struct BoxStyle {
     /// `min-h-[560px]` + `justify-end` to push content to the bottom)
     pub min_height: Option<Len>,
     pub margin_x_auto: bool,
+    /// `flex-grow` — share of a flex ROW's free space this item absorbs
+    /// (0 = fixed). Wikipedia's page title bar relies on `flex-grow: 1` on
+    /// the heading; without it `justify-content: flex-end` right-aligned
+    /// the title against the language menu. shortcut: no `flex-basis` and
+    /// no `flex-shrink` — the base width is always the item's natural size.
+    pub grow: f32,
     /// per-slot auto margins (`margin-left/right: auto`) — CSS: both auto →
     /// center, left-auto-only → push right, right-auto-only → hug left.
     /// `margin_x_auto` stays the shorthand "both auto" centering flag (the
@@ -540,6 +546,7 @@ impl Default for BoxStyle {
             height: None,
             min_height: None,
             margin_x_auto: false,
+            grow: 0.0,
             margin_l_auto: false,
             margin_r_auto: false,
             pad: [Len::Px(0.0); 4],
@@ -1056,6 +1063,8 @@ const KNOWN: &[&str] = &[
     "margin-inline",
     "margin-inline-start",
     "margin-inline-end",
+    "flex",
+    "flex-grow",
     "margin-block",
     "margin-block-start",
     "margin-block-end",
@@ -2285,6 +2294,19 @@ fn apply_decl(
         }
         "margin-block-start" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         "margin-block-end" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
+        // flex grow factor. `flex: <grow> [<shrink> <basis>]` takes its grow
+        // from the first token (`none` = 0, `auto` = 1); shrink/basis are
+        // not modeled yet (layout.rs uses the item's natural size as basis).
+        "flex-grow" => bx.grow = d.1.trim().parse::<f32>().unwrap_or(0.0).max(0.0),
+        "flex" => {
+            let tok = joined_tokens(&d.1);
+            bx.grow = match tok.first().map(String::as_str) {
+                Some("none") => 0.0,
+                Some("auto") => 1.0,
+                Some(v) => v.parse::<f32>().unwrap_or(0.0).max(0.0),
+                None => 0.0,
+            };
+        }
         // longhand auto: per-side flag; `margin_x_auto` (centering) is
         // recomputed so `margin-left: auto; margin-right: auto` still
         // centers regardless of declaration order
@@ -6496,6 +6518,25 @@ mod tests {
         assert!(!bx("c").content_box, "unknown value keeps false");
         assert!(!bx("d").content_box, "undeclared keeps the default false");
         assert!(!BoxStyle::default().content_box, "default = border-box");
+    }
+
+    #[test]
+    fn flex_grow_and_shorthand_parse() {
+        let sheet = parse(
+            ".a { flex: 1 } .b { flex: none } .c { flex: auto } \
+             .d { flex: 0 1 auto } .e { flex-grow: 2 } .f { flex: 1 1 0 }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let g = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx.grow;
+        assert_eq!(g("a"), 1.0, "flex: 1 → grow 1");
+        assert_eq!(g("b"), 0.0, "flex: none");
+        assert_eq!(g("c"), 1.0, "flex: auto");
+        assert_eq!(g("d"), 0.0, "flex: 0 1 auto");
+        assert_eq!(g("e"), 2.0, "flex-grow longhand");
+        assert_eq!(g("f"), 1.0, "three-value flex shorthand");
     }
 
     #[test]
