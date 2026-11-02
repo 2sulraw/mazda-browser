@@ -801,6 +801,18 @@ curve matters more than the baseline (near-flat as tabs grow).
   The scrollbar draws and follows the document (verification capture only;
   drag was not synthetically driven). Next: the Wikipedia h1/languages-box
   overlap and the MDN link-row spacing.
+  **(e) outer box-shadow hole** (`dab4cbf`) — a blurred shadow rect was painted
+  over the element's whole outer footprint, including the area *behind* the
+  box, so any box whose own background was transparent or semi-transparent
+  (cards, sticky sidebars, popovers) showed a gray band through itself. The
+  layout now records the element's border box in `ShadowRect.hole` (mapped
+  through the transform), and the paint pass culls shadow pixels inside that
+  rounded box before falling off — `box-shadow` stays strictly outside, as
+  CSS specifies. One extra `ShadowRect` field, no extra passes.
+  Tests: default **536**, `engine-b + woff2` **540**. Live: MDN
+  `/Web/CSS/list-style-type` **88.7 MB** (4687 runs) — the gray overlap band
+  under the sidebar/TOC is gone; remaining gaps are column widths and the
+  search/filter widget stacking.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -890,7 +902,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 7 (table layout, object-fit/aspect-ratio, image sources) | Wikipedia Rust article | 112.2 MB (14973 runs; infobox renders as a real two-column table, 315 images, 0 format skips; +9.5 MB vs wave 5 = WOFF2 site fonts) |
 | 2026-11-02 | wave 7 | data: URL page | 68.8 MB (8 runs; PNG + WebP data images decoded inline) |
 | 2026-11-02 | wave 8 (grid tracks, CSS math, scrollbar) | Wikipedia Rust article | 105.0 MB (14973 runs; same layout as wave 7, 315 images, 0 format skips) |
-| 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 88.8 MB (4687 runs; `display:contents` + named grid areas give the real 3-column layout; TOC link rows still overlap their background bands) |
+| 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 88.7 MB (4687 runs; `display:contents` + named grid areas give the real 3-column layout; outer box-shadow hole culls the gray band under sidebar/TOC; remaining: column widths, search widget stacking) |
 
 ### Phase 1c (Track A) findings
 
