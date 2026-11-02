@@ -1186,6 +1186,41 @@ curve matters more than the baseline (near-flat as tabs grow).
   `data:` page runs 11 class checks — 11/11 `ok`. MDN
   `/Web/CSS/list-style-type` unchanged (2773 runs, 81.9 MB); the Wikipedia
   `JavaScript` article unchanged at 11404 runs.
+  **(t) JS syntax batch 2** — the next set of constructs real bundles hit at
+  parse time:
+  - **optional catch binding** `catch { ... }` (ES2019). The block gets a
+    non-lexable `#catch` binding so the statement shape stays uniform.
+  - **logical assignment** `??=`, `||=`, `&&=` (`Op::CoalesceAssign` /
+    `LogicalAndAssign` / `LogicalOrAssign`, `ExprKind::LogicalAssign`). The
+    right-hand side is evaluated ONLY when the operator writes
+    (`a ||= f()` never calls `f` when `a` is truthy) — a plain compound
+    assign would have evaluated it eagerly.
+  - **labeled statements** `label: stmt` plus `break label` /
+    `continue label` (`Flow::Break(Option<Rc<str>>)`). A labeled loop takes
+    its label on entry (`JsEngine::pending_label`) so `continue outer`
+    restarts THAT loop; a labeled plain block only observes
+    `break label`. `switch` now propagates a labeled break instead of
+    swallowing it.
+  - **class expressions** `const C = class ...` / `class extends A {}`
+    (`ExprKind::ClassExpr`): the same lowering as a declaration runs in a
+    private child scope, so a named class expression's binding does not
+    leak out.
+  - crash fix found on a live site: `Object.assign(fn, {...})` hit
+    `unreachable!("builtin installed on non-object")` and killed the page
+    load with a worker panic. Assign now writes through `set_member`, so a
+    function/class target (or a primitive) is handled instead of panicking.
+  Still deferred with honest errors: private `#fields`, BigInt literals,
+  modules (`export`/`import`), `for await`, `new.target`.
+  Tests: `optional_catch_binding`, `logical_assignment`,
+  `labeled_statements`, `class_expressions`,
+  `object_assign_accepts_function_target` (599 default / 603 with
+  `engine-b woff2`). Live: a `data:` page runs 13 checks — the 8 newly
+  supported print `ok`, the 5 deferred ones keep their honest errors.
+  **svelte.dev now renders**: it was blank before because its inline
+  scripts died on `catch {}`; the client-rendered hero lays out at 291 runs
+  (115-126 MB with its large hero images). MDN
+  `/Web/CSS/list-style-type` unchanged (2773 runs, 82.0 MB); Wikipedia
+  `JavaScript` unchanged at 11404 runs / 100.1 MB.
   Tests: default **591**, `engine-b + woff2` **595**
   (`computed_object_keys`, `object_literal_accessors`,
   `optional_chaining`; the `**` assertions moved into
@@ -1313,6 +1348,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 13 (class completion) | MDN `/Web/CSS/list-style-type` | 81.9 MB (2773 runs; unchanged — no regression) |
 | 2026-11-03 | wave 13 (class completion) | Wikipedia `/wiki/JavaScript` | 11404 runs (identical; status-bar RSS 95.0 MB) |
 | 2026-11-03 | wave 13 (class completion) | svelte.dev | 77.0 MB (577 nodes; client-rendered shell stays blank — its inline scripts fail on `catch {}` optional binding, a later syntax batch) |
+| 2026-11-03 | wave 14 (JS syntax batch 2) | `data:` 13-construct probe | 75.6 MB (8/8 newly supported print `ok`: `catch {}`, `??=`, `||=`, `&&=`, labels, `break`/`continue label`, class expression, class expression + extends) |
+| 2026-11-03 | wave 14 (JS syntax batch 2) | svelte.dev | 115.9–126.6 MB (291 runs; client-rendered hero now paints — `catch {}` was the blocker, plus an `Object.assign(fn, …)` worker panic fixed) |
+| 2026-11-03 | wave 14 (JS syntax batch 2) | MDN `/Web/CSS/list-style-type` | 82.0 MB (2773 runs; unchanged — no regression) |
+| 2026-11-03 | wave 14 (JS syntax batch 2) | Wikipedia `/wiki/JavaScript` | 100.1 MB (11404 runs; identical) |
 
 ### Phase 1c (Track A) findings
 

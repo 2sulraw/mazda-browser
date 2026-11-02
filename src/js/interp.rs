@@ -21,9 +21,30 @@ use std::cell::RefCell;
 #[derive(Debug, Clone)]
 pub(crate) enum Flow {
     Normal,
-    Break,
-    Continue,
+    /// `break` / `break label` (None = unlabeled)
+    Break(Option<Rc<str>>),
+    /// `continue` / `continue label`
+    Continue(Option<Rc<str>>),
     Return(Val),
+}
+
+/// How a loop reacts to a flow value, given the label the loop was given
+/// (`outer: for (...) { ... }`).
+enum LoopFlow {
+    Next,
+    Stop,
+    Out(Flow),
+}
+
+fn loop_flow(f: Flow, label: &Option<Rc<str>>) -> LoopFlow {
+    match f {
+        Flow::Normal => LoopFlow::Next,
+        Flow::Break(None) => LoopFlow::Stop,
+        Flow::Break(Some(l)) if label.as_deref() == Some(l.as_ref()) => LoopFlow::Stop,
+        Flow::Continue(None) => LoopFlow::Next,
+        Flow::Continue(Some(l)) if label.as_deref() == Some(l.as_ref()) => LoopFlow::Next,
+        other => LoopFlow::Out(other),
+    }
 }
 
 /// How a `Pat` tree binds: a fresh declaration (`let`/`const`/`var`/call
@@ -280,23 +301,23 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             }
         }
         StmtKind::While { test, body } => {
+            let label = e.pending_label.take();
             while eval_expr(e, env, test)?.to_bool() {
-                match eval_stmt(e, env, body)? {
-                    Flow::Normal => {}
-                    Flow::Break => break,
-                    Flow::Continue => {}
-                    r @ Flow::Return(_) => return Ok(r),
+                match loop_flow(eval_stmt(e, env, body)?, &label) {
+                    LoopFlow::Next => {}
+                    LoopFlow::Stop => break,
+                    LoopFlow::Out(f) => return Ok(f),
                 }
             }
             Ok(Flow::Normal)
         }
         StmtKind::DoWhile { body, test } => {
+            let label = e.pending_label.take();
             loop {
-                match eval_stmt(e, env, body)? {
-                    Flow::Normal => {}
-                    Flow::Break => break,
-                    Flow::Continue => {}
-                    r @ Flow::Return(_) => return Ok(r),
+                match loop_flow(eval_stmt(e, env, body)?, &label) {
+                    LoopFlow::Next => {}
+                    LoopFlow::Stop => break,
+                    LoopFlow::Out(f) => return Ok(f),
                 }
                 if !eval_expr(e, env, test)?.to_bool() {
                     break;
@@ -305,6 +326,7 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             Ok(Flow::Normal)
         }
         StmtKind::For { init, cond, upd, body } => {
+            let label = e.pending_label.take();
             let lenv = Env::child(env);
             if let Some(i) = init {
                 eval_stmt(e, &lenv, i)?;
@@ -315,11 +337,10 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
                         break;
                     }
                 }
-                match eval_stmt(e, &lenv, body)? {
-                    Flow::Normal => {}
-                    Flow::Break => break,
-                    Flow::Continue => {}
-                    r @ Flow::Return(_) => return Ok(r),
+                match loop_flow(eval_stmt(e, &lenv, body)?, &label) {
+                    LoopFlow::Next => {}
+                    LoopFlow::Stop => break,
+                    LoopFlow::Out(f) => return Ok(f),
                 }
                 if let Some(u) = upd {
                     eval_expr(e, &lenv, u)?;
@@ -328,27 +349,27 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             Ok(Flow::Normal)
         }
         StmtKind::ForIn { kind, target, obj, body } => {
+            let label = e.pending_label.take();
             let o = eval_expr(e, env, obj)?;
             for k in for_in_keys(&o) {
                 let benv = bind_for_iter(e, env, kind.unwrap_or(VarKind::Var), target, Val::Str(k))?;
-                match eval_stmt(e, &benv, body)? {
-                    Flow::Normal => {}
-                    Flow::Break => break,
-                    Flow::Continue => continue,
-                    r @ Flow::Return(_) => return Ok(r),
+                match loop_flow(eval_stmt(e, &benv, body)?, &label) {
+                    LoopFlow::Next => {}
+                    LoopFlow::Stop => break,
+                    LoopFlow::Out(f) => return Ok(f),
                 }
             }
             Ok(Flow::Normal)
         }
         StmtKind::ForOf { kind, target, iter, body } => {
+            let label = e.pending_label.take();
             let it = eval_expr(e, env, iter)?;
             for v in for_of_items(&it)? {
                 let benv = bind_for_iter(e, env, kind.unwrap_or(VarKind::Var), target, v)?;
-                match eval_stmt(e, &benv, body)? {
-                    Flow::Normal => {}
-                    Flow::Break => break,
-                    Flow::Continue => continue,
-                    r @ Flow::Return(_) => return Ok(r),
+                match loop_flow(eval_stmt(e, &benv, body)?, &label) {
+                    LoopFlow::Next => {}
+                    LoopFlow::Stop => break,
+                    LoopFlow::Out(f) => return Ok(f),
                 }
             }
             Ok(Flow::Normal)
@@ -378,7 +399,8 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
                 for st in &c.body {
                     match eval_stmt(e, &senv, st)? {
                         Flow::Normal => {}
-                        Flow::Break => return Ok(Flow::Normal),
+                        Flow::Break(None) => return Ok(Flow::Normal),
+                        r @ Flow::Break(Some(_)) => return Ok(r), // `break label`
                         r => return Ok(r), // return/continue propagate
                     }
                 }
@@ -419,8 +441,32 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             };
             Ok(Flow::Return(v))
         }
-        StmtKind::Break => Ok(Flow::Break),
-        StmtKind::Continue => Ok(Flow::Continue),
+        StmtKind::Break(label) => Ok(Flow::Break(label.clone())),
+        StmtKind::Continue(label) => Ok(Flow::Continue(label.clone())),
+        // `label: stmt`: a labeled loop takes the label for `continue label`;
+        // any other statement only observes `break label`
+        StmtKind::Label { name, body } => {
+            let is_loop = matches!(
+                body.kind,
+                StmtKind::While { .. }
+                    | StmtKind::DoWhile { .. }
+                    | StmtKind::For { .. }
+                    | StmtKind::ForIn { .. }
+                    | StmtKind::ForOf { .. }
+            );
+            let r = if is_loop {
+                let prev = e.pending_label.replace(name.clone());
+                let r = eval_stmt(e, env, body);
+                e.pending_label = prev;
+                r?
+            } else {
+                eval_stmt(e, env, body)?
+            };
+            match r {
+                Flow::Break(Some(l)) if l.as_ref() == name.as_ref() => Ok(Flow::Normal),
+                other => Ok(other),
+            }
+        }
         StmtKind::FuncDecl(f) => {
             let c = make_closure(e, env, f, false);
             env.declare_if_absent(f.name.clone(), c, false);
@@ -796,6 +842,31 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
             }
             assign_target(e, env, target, v.clone())?;
             Ok(v)
+        }
+        // `a ??= b`, `a ||= b`, `a &&= b`: read, decide, and only then
+        // evaluate (and write) the right-hand side
+        ExprKind::LogicalAssign { target, op, value } => {
+            let cur = eval_target_value(e, env, target)?;
+            let write = match op {
+                LogOp::And => cur.to_bool(),
+                LogOp::Or => !cur.to_bool(),
+                LogOp::Coalesce => matches!(cur, Val::Undefined | Val::Null),
+            };
+            if !write {
+                return Ok(cur);
+            }
+            let v = eval_expr(e, env, value)?;
+            assign_target(e, env, target, v.clone())?;
+            Ok(v)
+        }
+        // class expression: lower in a private scope so a named class
+        // expression's binding never leaks to the enclosing scope
+        ExprKind::ClassExpr { name, stmts } => {
+            let cenv = Env::child(env);
+            for s in stmts {
+                eval_stmt(e, &cenv, s)?;
+            }
+            Ok(e.env_get(&cenv, name))
         }
         ExprKind::Cond { test, then, other } => {
             if eval_expr(e, env, test)?.to_bool() {

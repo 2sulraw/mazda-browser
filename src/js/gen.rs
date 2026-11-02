@@ -335,8 +335,8 @@ fn step_frame(e: &mut JsEngine, vm: &mut GenVm, frame: GFrame) -> Result<StepR, 
                 match step_stmt(e, vm, &st, &env)? {
                     SStep::Done | SStep::Pushed => {}
                     SStep::Flow(Flow::Return(v)) => return Ok(StepR::Retr(v)),
-                    SStep::Flow(Flow::Break) => return Ok(StepR::BreakFlow),
-                    SStep::Flow(Flow::Continue) => return Ok(StepR::ContinueFlow),
+                    SStep::Flow(Flow::Break(_)) => return Ok(StepR::BreakFlow),
+                    SStep::Flow(Flow::Continue(_)) => return Ok(StepR::ContinueFlow),
                     SStep::Flow(Flow::Normal) => {}
                     SStep::Yield(v) => {
                         // push the remnant so resumption lands after `i`
@@ -632,9 +632,9 @@ fn stmt_has_yield(s: &parser::Stmt) -> bool {
             parser::StmtKind::Throw(x) => expr_has_yield(x),
             parser::StmtKind::Return(o) => o.as_ref().map_or(false, expr_has_yield),
             // nested function bodies own their yields
-            parser::StmtKind::FuncDecl(_) | parser::StmtKind::Break | parser::StmtKind::Continue => {
-                false
-            }
+            parser::StmtKind::FuncDecl(_) | parser::StmtKind::Break(_)
+            | parser::StmtKind::Continue(_) => false,
+            parser::StmtKind::Label { body, .. } => w(body),
             // per spec these cannot contain a legal yield; consistent
             parser::StmtKind::PatAssign { .. } | parser::StmtKind::DefineAcc { .. } => false,
         }
@@ -703,6 +703,9 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
                 parser::ObjElem::Accessor { .. } => false,
             }),
         PatAssign { pat: _, value } => expr_has_yield(value),
+        LogicalAssign { target, value, .. } => expr_has_yield(target) || expr_has_yield(value),
+        // class bodies (methods, field initializers) are their own scopes
+        ClassExpr { .. } => false,
         Func(_) | Arrow(_) => false,
         Seq(list) => list.iter().any(expr_has_yield),
         Template(segs) => segs.iter().any(|s| match s {

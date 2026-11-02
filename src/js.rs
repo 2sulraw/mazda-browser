@@ -795,6 +795,9 @@ pub struct JsEngine {
     /// error reports line/col through this (enriched in `exec`, which has
     /// the source; dispatch turns only carry the offset)
     pub(crate) cur_span: usize,
+    /// label of the loop currently being entered (`outer: for (...)`); the
+    /// loop arm takes it so `continue outer` knows its own label
+    pub(crate) pending_label: Option<Rc<str>>,
 }
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
@@ -835,6 +838,7 @@ impl JsEngine {
             steps: 0,
             step_budget: DEFAULT_STEP_BUDGET,
             cur_span: 0,
+            pending_label: None,
             rng_state: 0x9e37_79b9_7f4a_7c15 ^ std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)

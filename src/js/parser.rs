@@ -1,4 +1,4 @@
-﻿//! AST + recursive-descent parser for the JS subset.
+//! AST + recursive-descent parser for the JS subset.
 //!
 //! AST shape: Box-based tree; every node carries a byte `Span` for future
 //! error reporting / tooling. shortcut: spans exist but v1 only uses them to
@@ -86,7 +86,7 @@ pub enum ExprKind {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    /// `a?.b.c?.[d]?.()` — one node for the WHOLE chain so a nullish
+    /// `a?.b.c?.[d]?.()` � one node for the WHOLE chain so a nullish
     /// short-circuit skips every remaining step (a per-step `Member` node
     /// would have to throw on what follows). The first step that carries
     /// `optional` is the one written with `?.`.
@@ -94,7 +94,20 @@ pub enum ExprKind {
         base: Box<Expr>,
         steps: Vec<ChainStep>,
     },
-    /// `super(...)` / `super.m(...)` — resolved at parse time against the
+    /// `a ??= b` / `a ||= b` / `a &&= b` � the value expression is evaluated
+    /// ONLY when the operator decides to write (short-circuit assignment)
+    LogicalAssign {
+        target: Box<Expr>,
+        op: LogOp,
+        value: Box<Expr>,
+    },
+    /// `class ... { }` in expression position: runs the same lowering as a
+    /// class declaration in a private scope and yields the constructor
+    ClassExpr {
+        name: Rc<str>,
+        stmts: Vec<Stmt>,
+    },
+    /// `super(...)` / `super.m(...)` � resolved at parse time against the
     /// class's hidden superclass binding, so eval only needs the current
     /// `this` from the environment.
     SuperCall {
@@ -116,15 +129,15 @@ pub enum ExprKind {
     Array(Vec<ArrayElem>),
     Object(Vec<ObjElem>),
     /// regex literal `/pat/flags`, compiled once per (pattern, flags) and
-    /// cached on the engine â€” not per evaluation
+    /// cached on the engine — not per evaluation
     Regex {
         pattern: Rc<str>,
         flags: Rc<str>,
     },
-    /// `yield` â€” legal only where the generator walker supports it (plain
+    /// `yield` — legal only where the generator walker supports it (plain
     /// expression statement or a declarator initializer)
     Yield(Option<Box<Expr>>),
-    /// `await expr` â€” only inside async functions
+    /// `await expr` — only inside async functions
     Await(Box<Expr>),
     Func(Rc<FnDef>),
     Arrow(Rc<FnDef>),
@@ -134,7 +147,7 @@ pub enum ExprKind {
     Typeof(Box<Expr>),
     Void(Box<Expr>),
     Delete(Box<Expr>),
-    /// destructuring assignment `([a, b] = pair)` â€” an expression-level
+    /// destructuring assignment `([a, b] = pair)` — an expression-level
     /// marker so `assign_expr` can return it in expression position
     PatAssign {
         pat: Pat,
@@ -190,7 +203,7 @@ pub enum ObjElem {
     /// key -> value (shorthand `{a}` desugars to Prop("a", Ident("a")))
     Prop(Rc<str>, Expr),
     Spread(Expr),
-    /// `[expr]: v` — key evaluated at object-creation time
+    /// `[expr]: v` � key evaluated at object-creation time
     Computed { key: Expr, value: Expr },
     /// `get x(){}` / `set x(v){}` (both sides optional when a later literal
     /// defines the other half of the pair)
@@ -202,7 +215,7 @@ pub enum ObjElem {
 }
 
 // ---------------------------------------------------------------------------
-// Destructuring patterns â€” desugared at eval time into binds, not into temps
+// Destructuring patterns — desugared at eval time into binds, not into temps
 // ---------------------------------------------------------------------------
 
 /// Where a pattern leaf binds a value: a fresh name (declaration forms) or an
@@ -210,7 +223,7 @@ pub enum ObjElem {
 #[derive(Clone, Debug)]
 pub enum BindTgt {
     Name(Rc<str>),
-    /// a.b â€” base/key evaluate in the scope where the bind happens
+    /// a.b — base/key evaluate in the scope where the bind happens
     Member {
         base: Box<Expr>,
         key: Rc<str>,
@@ -232,10 +245,10 @@ pub enum Pat {
 
 #[derive(Clone, Debug)]
 pub enum PatPart {
-    /// `[ ,, b]` â€” skip an element
+    /// `[ ,, b]` — skip an element
     Hole,
     Bind(Box<Pat>, Option<Expr>),
-    /// `...rest` â€” must bind a Name/Member/Index leaf (honest restriction)
+    /// `...rest` — must bind a Name/Member/Index leaf (honest restriction)
     Rest(Box<Pat>),
 }
 
@@ -245,7 +258,7 @@ pub enum ObjPatPart {
         key: Rc<str>,
         part: PatPart,
     },
-    /// `{...rest}` â€” remaining own properties
+    /// `{...rest}` — remaining own properties
     Rest(Pat),
 }
 
@@ -347,17 +360,24 @@ pub enum StmtKind {
     },
     Throw(Expr),
     Return(Option<Expr>),
-    Break,
-    Continue,
+    /// `break;` / `break label;` (and continue likewise); the label is
+    /// resolved by the enclosing `Label` statement or labeled loop
+    Break(Option<Rc<str>>),
+    Continue(Option<Rc<str>>),
+    /// `label: stmt` � only observable through `break label` / `continue label`
+    Label {
+        name: Rc<str>,
+        body: Box<Stmt>,
+    },
     FuncDecl(Rc<FnDef>),
-    /// destructuring assignment `([a, b] = pair)` â€” produced when an
+    /// destructuring assignment `([a, b] = pair)` — produced when an
     /// array/object literal turns out to be an assignment target
     PatAssign {
         pat: Pat,
         value: Box<Expr>,
     },
     /// class accessor desugar: install a getter/setter pair on an object
-    /// (`Object`-style, no full property-descriptor model â€” shortcut)
+    /// (`Object`-style, no full property-descriptor model — shortcut)
     DefineAcc {
         owner: Expr,
         key: Rc<str>,
@@ -412,9 +432,9 @@ pub struct FnDef {
     /// nested functions)? If so the interpreter materializes an arguments
     /// object per call; otherwise we skip that per-call allocation (RAM).
     pub uses_arguments: bool,
-    /// `async function` â€” calls return a promise; `await` legal in body
+    /// `async function` — calls return a promise; `await` legal in body
     pub is_async: bool,
-    /// `function*` â€” body executes on a resumable walker (see gen.rs)
+    /// `function*` — body executes on a resumable walker (see gen.rs)
     pub is_generator: bool,
     /// parse-time rollup: does the body contain a `yield` in an evaluable
     /// position? Gates the cheap walk when no generator machinery is needed.
@@ -437,7 +457,7 @@ pub struct Param {
 pub enum FnBody {
     Block(Vec<Stmt>),
     Expr(Expr),
-    /// runtime-only, produced by `Function.prototype.bind` â€” never parsed
+    /// runtime-only, produced by `Function.prototype.bind` — never parsed
     Bound {
         target: super::Val,
         this: super::Val,
@@ -647,6 +667,21 @@ impl<'a> Parser<'a> {
         self.err(format!("expected `;` before `{:?}`", t.tok))
     }
 
+    /// optional label after `break`/`continue` (must be on the same line)
+    fn stmt_label(&mut self) -> Result<Option<Rc<str>>, JsError> {
+        if self.cur().nl {
+            return Ok(None);
+        }
+        match self.peek() {
+            Tok::Ident(name) => {
+                let name = name.clone();
+                self.next();
+                Ok(Some(name))
+            }
+            _ => Ok(None),
+        }
+    }
+
     // -- statements ---------------------------------------------------------
 
     fn statement(&mut self) -> Result<Stmt, JsError> {
@@ -794,9 +829,15 @@ impl<'a> Parser<'a> {
                 let mut catch = None;
                 let mut finally = None;
                 if self.eat_kw(Kw::Catch) {
-                    self.expect_punct(Punct::LParen)?;
-                    let name = self.expect_ident()?;
-                    self.expect_punct(Punct::RParen)?;
+                    // `catch { }` (no binding) is legal since ES2019; the
+                    // hidden non-lexable name keeps the block shape uniform
+                    let name = if self.eat_punct(Punct::LParen) {
+                        let n = self.expect_ident()?;
+                        self.expect_punct(Punct::RParen)?;
+                        n
+                    } else {
+                        Rc::from("#catch")
+                    };
                     self.expect_punct(Punct::LBrace)?;
                     let cbody = self.block_body()?;
                     catch = Some(CatchClause { name, block: cbody });
@@ -839,13 +880,15 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Break) => {
                 self.next();
+                let label = self.stmt_label()?;
                 self.finish_stmt()?;
-                StmtKind::Break
+                StmtKind::Break(label)
             }
             Tok::Kw(Kw::Continue) => {
                 self.next();
+                let label = self.stmt_label()?;
                 self.finish_stmt()?;
-                StmtKind::Continue
+                StmtKind::Continue(label)
             }
             Tok::Kw(Kw::Class) => {
                 self.next();
@@ -854,6 +897,17 @@ impl<'a> Parser<'a> {
                     kind: StmtKind::List(list),
                     span: self.span_from(start),
                 });
+            }
+            // `label: stmt` (only a bare identifier can start a label)
+            Tok::Ident(name) if *self.peek_at(1) == Tok::Punct(Punct::Colon) => {
+                let name = name.clone();
+                self.next(); // the label
+                self.next(); // `:`
+                let body = self.statement()?;
+                StmtKind::Label {
+                    name,
+                    body: Box::new(body),
+                }
             }
             _ => {
                 let e = self.expr()?;
@@ -1124,7 +1178,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let iter = self.assign_expr()?; // no comma in for-of head
                 return Ok(ForHead::Of { kind, target, iter });
             }
-            // `for (let i; ...)` â€” declaration without initializer
+            // `for (let i; ...)` — declaration without initializer
             let init = Some(Box::new(Stmt {
                 kind: StmtKind::VarDecl(
                     kind.unwrap_or(VarKind::Var),
@@ -1146,7 +1200,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         }
         // expression forms
         if *self.peek() == Tok::Punct(Punct::Semi) {
-            // empty init: `for (; cond; upd)` / `for (;;)` â€” for_classic_tail
+            // empty init: `for (; cond; upd)` / `for (;;)` — for_classic_tail
             // consumes the init-terminating `;` itself
             return self.for_classic_tail(None);
         }
@@ -1189,7 +1243,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
 
     fn for_classic_tail(&mut self, init: Option<Box<Stmt>>) -> Result<ForHead, JsError> {
         self.expect_punct(Punct::Semi)?;
-        // empty condition: `for (;; ...)` â€” `;` or `)` means omitted
+        // empty condition: `for (;; ...)` — `;` or `)` means omitted
         let cond = if matches!(
             self.peek(),
             Tok::Punct(Punct::Semi) | Tok::Punct(Punct::RParen)
@@ -1250,7 +1304,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     /// Position check for `yield` inside a generator body: only allowed as a
     /// whole expression statement (`yield x;`) or directly as a declarator
     /// initializer (`let x = yield v`). Anywhere else (conditions, calls,
-    /// operators, return-expr, try blocks) is an honest SyntaxError â€” the
+    /// operators, return-expr, try blocks) is an honest SyntaxError — the
     /// resumable walker suspends exactly at those two positions.
     fn validate_yields(&mut self, stmts: &[Stmt], is_async: bool) -> Result<(), JsError> {
         if is_async {
@@ -1318,6 +1372,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     /// plus accessor-definition statements for get/set pairs.
     fn class_rest(&mut self) -> Result<Vec<Stmt>, JsError> {
         let name = self.expect_ident()?;
+        self.class_rest_named(name)
+    }
+
+    /// Lower a class body whose binding name is already known (declaration
+    /// and expression forms share everything below this point).
+    fn class_rest_named(&mut self, name: Rc<str>) -> Result<Vec<Stmt>, JsError> {
         let superclass = if self.eat_kw(Kw::Extends) {
             Some(self.lhs_expr()?)
         } else {
@@ -1805,7 +1865,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             | Op::XorAssign
             | Op::ShlAssign
             | Op::ShrAssign
-            | Op::UShrAssign)) => Some(*o),
+            | Op::UShrAssign
+            | Op::LogicalAndAssign
+            | Op::LogicalOrAssign
+            | Op::CoalesceAssign)) => Some(*o),
             _ => None,
         };
         if let Some(op) = op {
@@ -1833,6 +1896,25 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     });
                 }
                 _ => return self.err("invalid assignment target"),
+            }
+            // `&&=`/`||=`/`??=` short-circuit: the RHS is only evaluated
+            // when the current value says so, so it gets its own node
+            let logical = match op {
+                Op::LogicalAndAssign => Some(LogOp::And),
+                Op::LogicalOrAssign => Some(LogOp::Or),
+                Op::CoalesceAssign => Some(LogOp::Coalesce),
+                _ => None,
+            };
+            if let Some(lop) = logical {
+                let value = self.assign_expr()?;
+                return Ok(Expr {
+                    kind: ExprKind::LogicalAssign {
+                        target: Box::new(l),
+                        op: lop,
+                        value: Box::new(value),
+                    },
+                    span: self.span_from(start),
+                });
             }
             let value = self.assign_expr()?;
             let binop = match op {
@@ -2250,7 +2332,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     fn lhs_expr(&mut self) -> Result<Expr, JsError> {
         let start = self.pos;
         let mut e = if self.eat_kw(Kw::New) {
-            // new callee(args) â€” callee is a member chain WITHOUT a call
+            // new callee(args) — callee is a member chain WITHOUT a call
             let mut c = self.primary()?;
             while self.eat_punct(Punct::Dot) {
                 let key = self.prop_name()?;
@@ -2588,7 +2670,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
             }
             Tok::Kw(Kw::Class) => {
-                return self.err("class expressions are not supported yet (use a statement)")
+                // class expression: `const C = class extends B { ... }`
+                self.next();
+                let name = match self.peek() {
+                    Tok::Ident(n) => {
+                        let n = n.clone();
+                        self.next();
+                        n
+                    }
+                    _ => Rc::from(format!("__class{}", next_class_id()).as_str()),
+                };
+                let stmts = self.class_rest_named(name.clone())?;
+                ExprKind::ClassExpr { name, stmts }
             }
             Tok::Punct(Punct::LParen) => {
                 self.next();
@@ -2664,7 +2757,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         });
                         continue;
                     }
-                    // accessor: `get x(){}` / `set x(v){}` — only when a
+                    // accessor: `get x(){}` / `set x(v){}` � only when a
                     // property name follows, so `{get: 1}` and `{get(){}}`
                     // stay ordinary properties/methods.
                     let accessor = match self.peek() {
@@ -2973,6 +3066,9 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
             ObjElem::Accessor { .. } => false,
         }),
         PatAssign { pat, value } => pat_uses(pat, k) || expr_uses(value, k),
+        LogicalAssign { target, value, .. } => expr_uses(target, k) || expr_uses(value, k),
+        // class bodies are their own scopes for yield/await purposes
+        ClassExpr { .. } => false,
         Seq(list) => list.iter().any(|x| expr_uses(x, k)),
         Template(segs) => segs.iter().any(|s| match s {
             TplSeg::Lit(_) => false,
@@ -2985,7 +3081,7 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
 }
 
 /// does this stmt tree contain a yield/await anywhere (excluding nested
-/// function bodies, which carry their own) â€” used for honest SyntaxErrors
+/// function bodies, which carry their own) — used for honest SyntaxErrors
 fn stmts_use(stmts: &[Stmt], k: SusKind) -> bool {
     stmts.iter().any(|s| stmt_uses(s, k))
 }
@@ -3032,7 +3128,8 @@ fn stmt_uses(s: &Stmt, k: SusKind) -> bool {
         }
         Throw(e) => expr_uses(e, k),
         Return(o) => o.as_ref().map_or(false, |e| expr_uses(e, k)),
-        Break | Continue => false,
+        Break(_) | Continue(_) => false,
+        Label { body, .. } => stmt_uses(body, k),
         FuncDecl(_) => false, // nested function bodies own their yield/await
         PatAssign { pat, value } => pat_uses(pat, k) || expr_uses(value, k),
         DefineAcc { owner, getter, setter, .. } => {
@@ -3189,7 +3286,8 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
             }
             Ok(())
         }
-        Break | Continue | FuncDecl(_) | DefineAcc { .. } => Ok(()),
+        Break(_) | Continue(_) | FuncDecl(_) | DefineAcc { .. } => Ok(()),
+        Label { body, .. } => check_y_clean(body),
         PatAssign { pat, value } => {
             if pat_uses(pat, SusKind::Yield) || expr_uses(value, SusKind::Yield) {
                 return Err("yield cannot appear in destructuring assignment".into());
@@ -3253,7 +3351,8 @@ fn scan_stmt_arguments(s: &Stmt) -> bool {
         }
         Throw(e) => scan_expr_arguments(e),
         Return(o) => o.as_ref().map_or(false, scan_expr_arguments),
-        Break | Continue => false,
+        Break(_) | Continue(_) => false,
+        Label { body, .. } => scan_stmt_arguments(body),
         // nested function bodies have their own `arguments`; don't descend
         FuncDecl(_) => false,
         PatAssign { pat, value } => {
@@ -3361,6 +3460,10 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         Yield(Some(v)) => scan_expr_arguments(v),
         Yield(None) => false,
         PatAssign { pat, value } => pat_scan_args(pat) || scan_expr_arguments(value),
+        LogicalAssign { target, value, .. } => {
+            scan_expr_arguments(target) || scan_expr_arguments(value)
+        }
+        ClassExpr { stmts, .. } => scan_uses_arguments_stmts(stmts),
         Func(_) | Arrow(_) => false,
         Seq(list) => list.iter().any(scan_expr_arguments),
         Template(segs) => segs.iter().any(|s| match s {

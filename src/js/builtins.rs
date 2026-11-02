@@ -631,8 +631,10 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                         let b = s.borrow();
                         b.props.clone()
                     };
+                    // set_member, not own(): the target may be a class
+                    // function (`Object.assign(Cls, {...})`) or a primitive
                     for (k, v) in pairs {
-                        obj_set_own(own(&target), &k, v);
+                        set_member(e, &target, &k, v)?;
                     }
                 }
             }

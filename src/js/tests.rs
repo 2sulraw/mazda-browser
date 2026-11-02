@@ -517,6 +517,74 @@ fn class_static_members() {
 }
 
 #[test]
+fn object_assign_accepts_function_target() {
+    // a class/function target is a legitimate assignee (`Object.assign(C, ...)`);
+    // it must not hit the "builtin installed on non-object" path
+    assert_eq!(num("function F() {} Object.assign(F, { a: 4 }); F.a"), 4.0);
+    assert_eq!(
+        num("class C {} Object.assign(C, { x: 1 }); Object.assign(C.prototype, { y: 2 }); C.x + new C().y"),
+        3.0
+    );
+}
+
+#[test]
+fn optional_catch_binding() {
+    assert_eq!(num("let n = 0; try { throw 1 } catch { n = 5 } n"), 5.0);
+}
+
+#[test]
+fn logical_assignment() {
+    assert_eq!(num("let a = null; a ??= 5; a"), 5.0);
+    assert_eq!(num("let a = 1; a ??= 5; a"), 1.0);
+    assert_eq!(num("let o = {}; o.x ||= 2; o.x"), 2.0);
+    assert_eq!(num("let o = { x: 3 }; o.x ||= 2; o.x"), 3.0);
+    assert_eq!(num("let o = { x: 0 }; o.x &&= 4; o.x"), 0.0);
+    assert_eq!(num("let o = { x: 1 }; o.x &&= 4; o.x"), 4.0);
+    // the right-hand side is NOT evaluated when the write is skipped
+    assert_eq!(num("let a = 1; let n = 0; a ||= (n = 1); n"), 0.0);
+    assert_eq!(num("let a = null; let n = 0; a ??= (n = 1); n"), 1.0);
+    // member target
+    assert_eq!(num("let o = { n: null }; o.n ??= 7; o.n"), 7.0);
+}
+
+#[test]
+fn labeled_statements() {
+    // `continue label` restarts the labeled (outer) loop
+    assert_eq!(
+        num(
+            "let c = 0; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j === 1) continue outer; c++ } } c"
+        ),
+        3.0
+    );
+    // `break label` leaves both loops
+    assert_eq!(
+        num(
+            "let c = 0; outer: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) { if (i === 2) break outer; c++ } } c"
+        ),
+        10.0
+    );
+    // a label on a plain block only observes `break label`
+    assert_eq!(num("let c = 0; block: { c = 1; break block; c = 2 } c"), 1.0);
+    // unlabeled break still exits the innermost loop
+    assert_eq!(
+        num("let c = 0; for (let i = 0; i < 3; i++) { if (i === 1) break; c++ } c"),
+        1.0
+    );
+}
+
+#[test]
+fn class_expressions() {
+    assert_eq!(num("const C = class { m() { return 3 } }; new C().m()"), 3.0);
+    assert_eq!(num("const C = class D { m() { return 4 } }; new C().m()"), 4.0);
+    assert_eq!(
+        num("class A { m() { return 5 } } const B = class extends A {}; new B().m()"),
+        5.0
+    );
+    // a named class expression's binding does not leak out
+    assert_eq!(string("const C = class D {}; typeof D"), "undefined");
+}
+
+#[test]
 fn class_fields() {
     // instance fields initialize before the constructor body runs
     assert_eq!(

@@ -145,6 +145,11 @@ pub enum Op {
     AndAnd,
     OrOr,
     Coalesce,
+    /// `&&=`, `||=`, `??=` (short-circuit assignment; the value is only
+    /// evaluated when the operator actually writes)
+    LogicalAndAssign,
+    LogicalOrAssign,
+    CoalesceAssign,
     Inc,
     Dec,
     Arrow,
@@ -699,6 +704,10 @@ impl<'a> Lexer<'a> {
             b':' => one!(Punct::Colon),
             b'?' => {
                 if self.peek2() == Some(b'?') {
+                    if self.src.as_bytes().get(self.pos + 2) == Some(&b'=') {
+                        self.pos += 3;
+                        return Ok(Tok::Op(Op::CoalesceAssign));
+                    }
                     op2!(Op::Coalesce)
                 }
                 one!(Punct::Question)
@@ -810,6 +819,10 @@ impl<'a> Lexer<'a> {
             }
             b'&' => {
                 if self.peek2() == Some(b'&') {
+                    if self.src.as_bytes().get(self.pos + 2) == Some(&b'=') {
+                        self.pos += 3;
+                        return Ok(Tok::Op(Op::LogicalAndAssign));
+                    }
                     op2!(Op::AndAnd)
                 }
                 if self.peek2() == Some(b'=') {
@@ -819,6 +832,10 @@ impl<'a> Lexer<'a> {
             }
             b'|' => {
                 if self.peek2() == Some(b'|') {
+                    if self.src.as_bytes().get(self.pos + 2) == Some(&b'=') {
+                        self.pos += 3;
+                        return Ok(Tok::Op(Op::LogicalOrAssign));
+                    }
                     op2!(Op::OrOr)
                 }
                 if self.peek2() == Some(b'=') {
