@@ -637,6 +637,57 @@ curve matters more than the baseline (near-flat as tabs grow).
   feature **453**. Live: wiki Main_Page **93.6 MB** (1618 runs, DOWN 3.9 MB vs
   wave 3 with +150 runs of preserved typography), Rust article 102.7 MB /
   14740 runs; both render clean (`da5a2e5` pushed).
+- [x] **Wave 6 (three parallel worktrees) — CSS list markers, WebP decoding, WOFF2
+  webfonts** (all branched from `b204bf0`; merged `262fc44` → `22517ad` →
+  `41c4018`, then WOFF2 `d9aba58` → `36d4b35`):
+  **(a) list markers** (`262fc44`, +16 tests) — `list-style-type` /
+  `list-style-position` land on the inherited `Style` (so `ul`/`ol` UA defaults
+  flow into `li` like a real UA sheet) with the UA defaults and the 40 px list
+  gutter supplied by a new tag-driven `ua_box(tag)` (author `padding*` still
+  wins); the `list-style` shorthand takes type/position/`url()` in any order
+  (`url()` ignored, shortcut). Marker text is synthesized as the `<li>` box's
+  first child (`•`, `◦`, `▪`, `1.`, `01.`, `a.`, `A.`, `i.`, `I.`), numbered
+  from a per-list counter seeded by `<ol start>` and reset by `<li value>`,
+  nested lists restart independently; `outside` hangs the marker left of the
+  content box without advancing the line (wrapped lines align with the first
+  line's TEXT), `inside` puts it in the first line's flow; `::marker` parses
+  with its own pseudo bucket and honors only `content`/`color`;
+  `content: counter(list-item)` resolves inside the shared content resolver.
+  Shortcuts: the ten common types only, no `list-style-image`, no
+  `@counter-style`/CJK/disclosure markers, no `reversed`, markers only for
+  `<li>` tags, hidden items still consume a number.
+  **(b) WebP** (`22517ad`, +6 tests) — adopt the pure-Rust `image-webp` codec
+  (general-purpose utility crate, per the crate policy) and detect
+  `RIFF....WEBP` exactly; header-only dimension probe for VP8/VP8L/VP8X,
+  decode of static lossy, lossless and extended (alpha plane preserved) through
+  the SAME display-size resample + per-image budget path as PNG/JPEG, into the
+  engine's `0xAARRGGBB` buffer; animated files decode frame 0 only; malformed
+  input is a counted skip, never a panic.
+  **(c) WOFF2** (`38e54e9`, `d9aba58`, +4 tests) — adopt the pure-Rust `wuff`
+  decoder behind the optional `woff2` cargo feature; `src/woff.rs` remains the
+  single container dispatch point (`wOFF` → existing sfnt rebuild, `wOF2` →
+  sfnt when the feature is on, None otherwise), with a decompression size
+  guard. The frozen font setting ships verbatim: `Font loading:` `A — WOFF2
+  webfonts (site fonts, +~10-15 MB/page)` / `B — System fonts only (minimal
+  RAM)`, default A, precedence `--fonts=` > `MAZDA_FONTS` > conf `fonts=` >
+  A, persisted on change and applied on the next navigation; a 32 MB
+  decoded-font LRU evicts oldest-first and rejects single faces over the cap,
+  and B (or a build without the feature) skips the webfont fetch/decode
+  entirely, failed faces are negatively cached. Shortcuts: budget is
+  per-instance (2× worst case), decoder-coverage gaps fall back to system
+  fonts, no unicode-range subsetting/font-display semantics.
+  Tests: default **476**, `woff2` **477**, `engine-b + woff2` **480**.
+  Live: wiki Main_Page **106.9 MB** (1646 runs; +13.3 MB vs wave 5 — exactly
+  the WOFF2 webfonts the UI copy advertises — with site serif typography now
+  active in headings and body, images decoding, zero format skips); wiki list
+  bullets `•`/`▪`, `<ol start=3>` → `3.` `4.` and `<li value=7>` → `7.` all
+  verified on screen; WebP verified live through a local HTTP page (VP8X +
+  ALPH fixture decoded at display size, alpha region visible, 0 format skips).
+  MDN `/Web/CSS/list-style-type`: markers render but its grid still collapses
+  its sidebar to a narrow column (pre-existing grid-track gap, not marker
+  related). Note: `data:` image URLs are skipped as an unknown format for
+  EVERY format (PNG included) — a pre-existing image-source gap, unrelated to
+  WebP (`36d4b35` pushed).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -720,6 +771,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 3 (::before/::after + content, z-index + transform) | Wikipedia Main Page | 97.5 MB (1468 runs, +215 pseudo boxes; RAM down 7.9 MB vs wave 2), CPU 0.8s |
 | 2026-11-02 | waves 4+5 (mask-image; :hover + cursor; position:sticky; typography batch) | Wikipedia Main Page | 93.6 MB (1618 runs; +150 runs of preserved whitespace/typography, RAM down 3.9 MB vs wave 3 — no per-frame hover state at rest) |
 | 2026-11-02 | waves 4+5 | Wikipedia Rust article | 102.7 MB (14740 runs; word-level runs on a long content page, 315 images decoded at display size) |
+| 2026-11-02 | wave 6 (list markers, WebP, WOFF2) | Wikipedia Main Page | 106.9 MB (1646 runs; +13.3 MB = the WOFF2 webfonts the UI copy advertises; site serif active, 25 images decoded, 0 format skips) |
+| 2026-11-02 | wave 6 | MDN `/Web/CSS/list-style-type` | 101.5 MB (4687 runs; 177 images, 0 format skips, markers render) |
+| 2026-11-02 | wave 6 | local HTTP WebP page | 72.8 MB (12 runs; VP8X+ALPH decoded at 320x240, alpha visible) |
 
 ### Phase 1c (Track A) findings
 
