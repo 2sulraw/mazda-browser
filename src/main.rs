@@ -1,5 +1,6 @@
 //! Mazda — Phase 1: fetch → tokenize → arena DOM → word-wrap layout → render.
 //! Phase 2: link hit-testing, click navigation, back history.
+mod cookie;
 mod css;
 mod html;
 mod image;
@@ -820,6 +821,9 @@ fn hover_should_relayout(
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // deferred cookie-jar write (worker mutations inside the same second
+        // as the last write wait here; see cookie::flush)
+        cookie::flush();
         // apply any finished page load (stale generations are dropped inside)
         {
             let (pw, ph) = self.vp_size;
@@ -2769,13 +2773,22 @@ pub(crate) fn build_submission(
 /// is a form POST allowed for a `data:` target? no — fetch_post cannot read
 /// a response from an inline document; the caller turns it into the error
 /// page (honest, same wording as a failed fetch).
+/// Every `Set-Cookie` value of a response. `header()` returns only the
+/// first one, and a login response often sets several at once.
+fn set_cookie_values(resp: &ureq::Response) -> Vec<String> {
+    resp.all("set-cookie").iter().map(|s| s.to_string()).collect()
+}
+
 pub(crate) fn fetch_post(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>), String> {
-    let resp = http_agent()
+    let mut req = http_agent()
         .post(url)
         .set("Content-Type", "application/x-www-form-urlencoded")
-        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)")
-        .send(body.as_bytes())
-        .map_err(|e| e.to_string())?;
+        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)");
+    if let Some(c) = cookie::request_header(url) {
+        req = req.set("Cookie", &c);
+    }
+    let resp = req.send(body.as_bytes()).map_err(|e| e.to_string())?;
+    cookie::store_response(url, &set_cookie_values(&resp));
     let content_type = resp.header("content-type").map(|s| s.to_string());
     // same 20MB cap as every GET fetch (no disk cache: a POST response is
     // per-submission state, caching it would be dishonest)
@@ -3468,7 +3481,7 @@ const CACHE_TTL_SECS: u64 = 300;
 const CACHE_MAX_FILES: usize = 300;
 const CACHE_MAX_BODY: usize = 5 * 1024 * 1024;
 
-fn cache_dir() -> std::path::PathBuf {
+pub(crate) fn cache_dir() -> std::path::PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
@@ -3658,7 +3671,11 @@ fn fetch_accept(
     if let Some(a) = accept {
         req = req.set("Accept", a);
     }
+    if let Some(c) = cookie::request_header(url) {
+        req = req.set("Cookie", &c);
+    }
     let resp = req.call().map_err(|e| e.to_string())?;
+    cookie::store_response(url, &set_cookie_values(&resp));
     let content_type = resp.header("content-type").map(|s| s.to_string());
     // into_reader transparently gunzips (ureq gzip feature); cap at 20MB like a browser
     const CAP: usize = 20 * 1024 * 1024;

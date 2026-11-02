@@ -1081,11 +1081,54 @@ curve matters more than the baseline (near-flat as tabs grow).
   `flex_order_reorders_without_touching_the_dom`,
   `align_self_overrides_align_items`,
   `flex_shrink_basis_order_align_self_and_flow_parse`).
+  **(q) Cookie jar** — every request was anonymous: `Set-Cookie` was thrown
+  away and `document.cookie` did not exist, so a login POST never came back
+  logged in. New `src/cookie.rs` implements an RFC 6265 subset (name/value,
+  `Domain` host-only vs suffix match, `Path`, `Max-Age`/`Expires` with an
+  RFC 1123 date parser, `Secure`, `HttpOnly`), sends the matching `Cookie`
+  header on every GET/POST (page, stylesheet, script, image, font), captures
+  every `Set-Cookie` value through `resp.all` (a login sets several at once)
+  and persists to `%LOCALAPPDATA%\mazda-cache\cookies`. The jar is capped at
+  3000 cookies (expired evicted first, then oldest-created), the file is
+  written at most once per second, and a change made inside that second is
+  **deferred** (dirty flag flushed from the frame loop) rather than dropped —
+  dropping it lost a script's `document.setCookie` on every page that also
+  received a `Set-Cookie`. Script sees `document.getCookie()` /
+  `document.setCookie(str)` because the interpreter has no property
+  accessors; HttpOnly cookies stay hidden and a script write cannot create
+  one.
+  Live: a local two-load probe — load 1 stored `srv=1` from the response and
+  `js=2` from script; load 2 (a new process) sent `Cookie: srv=1; js=2` and
+  the page printed `REQ: srv=1; js=2` / `JS: srv=1; js=2`. Wikipedia
+  `/wiki/Web_cookie` (fresh) stored 6 cookies and sent them on every
+  subresource (12860 runs, 97.6 MB); `/wiki/HTTP_cookie` in a new process
+  sent those 6 from the persisted jar (12855 runs, 93.9 MB); MDN restored
+  unchanged (2773 runs, 81.6 MB).
+  shortcut: `SameSite` is parsed away (all requests are same-site here),
+  `Expires` accepts RFC 1123 only (anything else stays a session cookie), no
+  public-suffix list (a `Domain` must still be a suffix of the request host),
+  cookies set on a redirect hop are lost (the client follows redirects
+  internally), and the jar is one profile-wide store with no per-site
+  partition.
+  Tests: default **587**, `engine-b + woff2` **591**
+  (`set_and_send_respects_path`,
+  `domain_attr_covers_subdomains_but_not_siblings`,
+  `secure_cookies_only_go_over_https`, `http_only_is_hidden_from_script`,
+  `max_age_zero_and_past_expiry_delete`,
+  `expiry_in_the_future_keeps_the_cookie`,
+  `longer_paths_come_first_then_creation_order`,
+  `cap_evicts_oldest_and_expired_first`,
+  `text_round_trip_preserves_cookies`,
+  `corrupt_persisted_lines_are_skipped`,
+  `js_set_uses_the_document_directory_and_js_get_hides_http_only`,
+  `malformed_set_cookie_lines_are_ignored`,
+  `url_parts_handle_ports_userinfo_and_ipv6`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
-  skips fetch+parse; layout is still recomputed per viewport (it must be), and
-  cookies / hibernation-on-pressure / a real tab store are open.
+  skips fetch+parse; cookies done in wave 11 (q): a persisted jar sends on every
+  request and `document.getCookie`/`setCookie` expose the script subset; forms /
+  hibernation-on-pressure / a real tab store are open.
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
 
 ## Recommendations logged (from "translate HTML/CSS to Rust" discussion)
@@ -1192,6 +1235,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 10 (flex model completion) | Hacker News | 73.8 MB (784 runs) |
 | 2026-11-03 | wave 10 (flex model completion) | nextjs.org | 99.5 MB (502 runs) |
 | 2026-11-03 | wave 10 (flex model completion) | example.com | 66.7 MB (25 runs) |
+| 2026-11-03 | wave 11 (cookie jar) | local two-load probe | 63.4 → 63.9 MB (load 2 sent `Cookie: srv=1; js=2`; page printed both from the request and from `document.getCookie()`) |
+| 2026-11-03 | wave 11 (cookie jar) | Wikipedia `/wiki/Web_cookie` (fresh) | 97.6 MB (12860 runs; 6 cookies stored, sent on every subresource) |
+| 2026-11-03 | wave 11 (cookie jar) | Wikipedia `/wiki/HTTP_cookie` (new process) | 93.9 MB (12855 runs; the 6 cookies came from the persisted jar) |
+| 2026-11-03 | wave 11 (cookie jar) | MDN `/Web/CSS/list-style-type` (restored) | 81.6 MB (2773 runs; unchanged) |
 
 ### Phase 1c (Track A) findings
 

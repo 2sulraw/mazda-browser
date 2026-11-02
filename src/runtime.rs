@@ -793,6 +793,19 @@ impl DomHost {
 
     // ---- page services (one implementation, both engines) ----
 
+    /// `document.getCookie()` - the script-visible cookie subset (HttpOnly
+    /// cookies are excluded). The real API is a `document.cookie` accessor;
+    /// the interpreter has no accessor hooks (module docs), so it is a
+    /// method pair.
+    pub fn cookie_get(&self) -> String {
+        crate::cookie::document_get(&self.base)
+    }
+
+    /// `document.setCookie(str)` - same parser as a `Set-Cookie` value.
+    pub fn cookie_set(&mut self, line: &str) {
+        crate::cookie::document_set(&self.base, line);
+    }
+
     /// Resolve `href` against the page base.
     pub fn resolve_url(&self, href: &str) -> Option<String> {
         crate::resolve(&self.base, href)

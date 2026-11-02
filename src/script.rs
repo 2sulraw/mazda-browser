@@ -33,6 +33,11 @@
 //!   object, not a Promise — the interpreter has no async/await.
 //! - `createElement` clones the TagId of a tag already in the parsed
 //!   fragment table (see `element_tid`); unknown tags log and return null.
+//! - `document.cookie` is an accessor in the real API, and property
+//!   accessors cannot be intercepted — so the page-facing surface is
+//!   `document.getCookie()` / `document.setCookie(str)`. The cookies
+//!   themselves are real: `src/cookie.rs` persists a jar, HttpOnly values
+//!   stay hidden from script, and every network request sends them.
 //! - `localStorage` == `sessionStorage` (merged) and lives in worker RAM
 //!   for the current page only: it is dropped on navigation, never written
 //!   to disk. A real disk-backed store is a later wave. `length` is a
@@ -231,6 +236,8 @@ struct Nids {
     doc_query: usize,
     doc_query_all: usize,
     doc_create: usize,
+    doc_cookie_get: usize,
+    doc_cookie_set: usize,
     el_get_element: usize,
     el_query: usize,
     el_query_all: usize,
@@ -336,6 +343,8 @@ const D_GET_ELEMENT_BY_ID: u16 = 0;
 const D_QUERY: u16 = 1;
 const D_QUERY_ALL: u16 = 2;
 const D_CREATE_ELEMENT: u16 = 3;
+const D_COOKIE_GET: u16 = 4;
+const D_COOKIE_SET: u16 = 5;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -415,6 +424,16 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
         D_CREATE_ELEMENT => {
             let Some(tag) = sel else { return Ok(Val::Null) };
             create_element(&tag)
+        }
+        // `document.cookie` is an accessor in the real API; the interpreter
+        // has no accessor hooks, so the page-facing pair is get/setCookie
+        // (documented in the module header).
+        D_COOKIE_GET => Ok(runtime::host(|h| str_val(&h.cookie_get()))),
+        D_COOKIE_SET => {
+            if let Some(s) = args.first().map(|v| v.to_string()) {
+                runtime::host_mut(|h| h.cookie_set(&s));
+            }
+            Ok(Val::Undefined)
         }
         _ => Err(JsError::throw("TypeError: bad document native")),
     }
@@ -791,6 +810,8 @@ impl PageScripts {
             doc_query: engine.register_native("document.querySelector", doc_native, D_QUERY),
             doc_query_all: engine.register_native("document.querySelectorAll", doc_native, D_QUERY_ALL),
             doc_create: engine.register_native("document.createElement", doc_native, D_CREATE_ELEMENT),
+            doc_cookie_get: engine.register_native("document.getCookie", doc_native, D_COOKIE_GET),
+            doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
             el_get_element: engine.register_native("Element.getElementById", el_native, E_GET_ELEMENT_BY_ID),
             el_query: engine.register_native("Element.querySelector", el_native, E_QUERY),
             el_query_all: engine.register_native("Element.querySelectorAll", el_native, E_QUERY_ALL),
@@ -825,6 +846,8 @@ impl PageScripts {
         doc.set("querySelector", Val::Native(ids.doc_query));
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
         doc.set("createElement", Val::Native(ids.doc_create));
+        doc.set("getCookie", Val::Native(ids.doc_cookie_get));
+        doc.set("setCookie", Val::Native(ids.doc_cookie_set));
         // no incremental loader: by the time scripts run, parsing is finished
         doc.set("readyState", str_val("complete"));
 
