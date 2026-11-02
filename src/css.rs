@@ -242,6 +242,26 @@ pub struct BoxStyle {
     /// `background-repeat` — None = undeclared (single draw, see
     /// [`BgRepeat`]); Some(...) tiles on the named axis/axes at paint
     pub bg_repeat: Option<BgRepeat>,
+    /// `mask-image: url(…)` — the raw target, fetched/decoded as this box's
+    /// `is_mask` placeholder child (same pipeline as [`bg_image`]). A LIVE
+    /// mask placeholder REPLACES the box's own background at paint: the
+    /// bg-color rect and the background image are suppressed and the mask
+    /// draws in their place, tinted with this box's bg color (RGB replaced,
+    /// alpha kept; untinted when there is no bg color).
+    /// shortcut: the mask affects only the element's OWN background — text
+    /// and children are never masked; `mask-composite`/`mask-mode`/
+    /// `mask-clip`/`mask-origin` are dropped (the mask substitutes the
+    /// background outright); a multi-layer `mask:` list takes the FIRST
+    /// url, like `background-image`.
+    pub mask_image: Option<std::rc::Rc<str>>,
+    /// `mask-size` — same symbolic storage/resolution as [`bg_size`]
+    /// (against the padding box, in `place()`)
+    pub mask_size: BgSize,
+    /// `mask-position` [x, y] — same two forms as [`bg_pos`]
+    pub mask_pos: [BgPos; 2],
+    /// `mask-repeat` — same model as [`bg_repeat`]: None = undeclared
+    /// (single draw), Some(...) tiles at paint
+    pub mask_repeat: Option<BgRepeat>,
     /// border-radius (all corners; % resolves against box width at layout)
     pub radius: Len,
     /// border widths, top/right/bottom/left (% resolves against box width)
@@ -355,6 +375,10 @@ impl Default for BoxStyle {
             bg_size: BgSize::Auto,
             bg_pos: [BgPos::Pct(0.0); 2], // top-left
             bg_repeat: None,
+            mask_image: None,
+            mask_size: BgSize::Auto,
+            mask_pos: [BgPos::Pct(0.0); 2], // top-left
+            mask_repeat: None,
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
@@ -718,6 +742,11 @@ const KNOWN: &[&str] = &[
     "background-size",
     "background-position",
     "background-repeat",
+    "mask",
+    "mask-image",
+    "mask-size",
+    "mask-position",
+    "mask-repeat",
     "font-size",
     "font-weight",
     "font-style",
@@ -1386,6 +1415,23 @@ fn used_scheme(declared: Option<&str>, root_polarity: Option<bool>, pref_dark: b
     }
 }
 
+/// Canonical spelling for the [`KNOWN`] gate: a property written with a
+/// single leading `-` (but never the `--` of a custom property) carries a
+/// vendor prefix — strip through the NEXT `-` and match the remainder, so
+/// every prefixed spelling of a property we implement resolves to the
+/// same declaration. The prefix text itself is never matched or named:
+/// any prefix behaves alike, and a name with no second `-` (or nothing
+/// known after it) stays unmatched and drops at the gate below.
+fn unprefix(p: &str) -> &str {
+    if !p.starts_with('-') || p.starts_with("--") {
+        return p;
+    }
+    match p[1..].find('-') {
+        Some(i) => &p[2 + i..],
+        None => p,
+    }
+}
+
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
 pub fn parse_decls(block: &str) -> Vec<Decl> {
     let mut out = Vec::new();
@@ -1394,6 +1440,9 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
             continue;
         };
         let p = p.trim().to_ascii_lowercase();
+        // a prefixed spelling strips to its bare property before the gate
+        // (`--custom` properties pass through `unprefix` untouched)
+        let p = unprefix(&p).to_string();
         // custom properties (--x) always survive: var() resolution needs them
         if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
             continue;
@@ -1479,6 +1528,31 @@ fn apply_decl(
         "background-size" => bx.bg_size = parse_bg_size(&d.1, vp),
         "background-position" => bx.bg_pos = parse_bg_pos(&d.1, vp),
         "background-repeat" => bx.bg_repeat = parse_bg_repeat(&d.1),
+        // mask: the image that shapes this box's OWN background — stored
+        // exactly like the background longhands and fetched as the box's
+        // `is_mask` placeholder child (see `BoxStyle::mask_image` for the
+        // shortcuts: text/children are never masked, mask-composite/mode/
+        // clip/origin are dropped, one layer only)
+        "mask-image" => {
+            if d.1.trim() == "none" {
+                bx.mask_image = None;
+            } else if let Some(u) = parse_bg_url(&d.1) {
+                bx.mask_image = Some(u);
+            }
+        }
+        "mask-size" => bx.mask_size = parse_bg_size(&d.1, vp),
+        "mask-position" => bx.mask_pos = parse_bg_pos(&d.1, vp),
+        "mask-repeat" => bx.mask_repeat = parse_bg_repeat(&d.1),
+        "mask" => {
+            // shorthand: first url plus the geometry tokens around it, via
+            // the same split as `background` (a shorthand resets its
+            // longhands, then parses the repeat/position/size it carries)
+            bx.mask_image = parse_bg_url(&d.1);
+            let (rep, pos, size) = bg_shorthand_geom(&d.1, vp);
+            bx.mask_repeat = rep;
+            bx.mask_pos = pos;
+            bx.mask_size = size;
+        }
         // consumed before the cascade in `resolve_with_parent` (the used
         // value decides `light-dark()`) — nothing to do per declaration here
         "color-scheme" => {}
@@ -3527,7 +3601,9 @@ fn supports_condition(q: &str) -> bool {
 /// Do we support this `property: value` pair? Answered from `KNOWN` — the set
 /// of properties the cascade actually implements — which makes
 /// `(color: light-dark(…))` true (color values incl. light-dark parse) and
-/// unknown-feature tests false.
+/// unknown-feature tests false. A prefixed spelling gates on its bare
+/// property (same [`unprefix`] strip `parse_decls` applies), so a feature
+/// test matches what a declaration would actually do.
 /// shortcut: property-level known-ness only; a value we can't parse
 /// (`color: oklch(…)`) is still claimed supported. The failure mode is
 /// entering a branch whose decls then no-op — safer than skipping a branch
@@ -3536,7 +3612,7 @@ fn supports_feature(test: &str) -> bool {
     let Some((prop, _value)) = test.split_once(':') else {
         return false; // bare `(color)` form — needs a value to test
     };
-    KNOWN.contains(&prop.trim())
+    KNOWN.contains(&unprefix(prop.trim()))
 }
 
 /// Split `s` on the FIRST top-level occurrence of `sep`, returning both halves
@@ -5548,6 +5624,92 @@ mod tests {
         assert_eq!(d.bg_repeat, None);
         assert_eq!(d.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
         assert_eq!(d.bg_size, BgSize::Auto);
+    }
+
+    // ---- mask / mask-image / mask geometry ----
+
+    #[test]
+    fn mask_longhands_and_shorthand_parse() {
+        let sheet = parse(
+            ".a { mask-image: url(m.png) } \
+             .b { mask-size: 50% 60%; mask-position: center; mask-repeat: no-repeat } \
+             .c { mask: url(s.png) 10px 20px/cover repeat-x } \
+             .d { mask-image: none }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        let a = bx("a");
+        assert_eq!(a.mask_image.as_deref(), Some("m.png"));
+        // undeclared mask geometry keeps the initial values (same as bg)
+        assert_eq!(a.mask_size, BgSize::Auto);
+        assert_eq!(a.mask_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
+        assert_eq!(a.mask_repeat, None);
+        let b = bx("b");
+        assert_eq!(b.mask_image, None, "geometry longhands carry no url");
+        assert_eq!(
+            b.mask_size,
+            BgSize::Wh(Some(Len::Pct(50.0)), Some(Len::Pct(60.0)))
+        );
+        assert_eq!(b.mask_pos, [BgPos::Pct(50.0), BgPos::Pct(50.0)]);
+        assert_eq!(b.mask_repeat, Some(BgRepeat::NoRepeat));
+        let c = bx("c");
+        assert_eq!(c.mask_image.as_deref(), Some("s.png"), "shorthand url");
+        assert_eq!(c.mask_pos, [BgPos::Px(10.0), BgPos::Px(20.0)]);
+        assert_eq!(c.mask_size, BgSize::Cover, "shorthand /size tokens");
+        assert_eq!(c.mask_repeat, Some(BgRepeat::RepeatX), "shorthand keyword");
+        assert_eq!(bx("d").mask_image, None, "mask-image: none clears");
+    }
+
+    #[test]
+    fn prefixed_spellings_strip_to_the_bare_property() {
+        // a single leading dash (never `--`) strips through the next dash
+        // before the KNOWN lookup — the invented prefix below is not any
+        // real one: EVERY prefixed spelling of a known property behaves
+        // exactly like the bare declaration
+        let sheet = parse(
+            ".a { -x-mask-image: url(p.png) } \
+             .b { -x-z-index: 7 } \
+             .c { -x-mask-image: url(q.png); mask-image: none }",
+        );
+        let dom = dom_of("<div class=a></div><div class=b></div><div class=c></div>");
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(
+            bx("a").mask_image.as_deref(),
+            Some("p.png"),
+            "prefixed mask-image resolves to the same field"
+        );
+        assert_eq!(
+            bx("b").z,
+            Some(7),
+            "prefixed alias of a DIFFERENT known longhand resolves too"
+        );
+        assert_eq!(
+            bx("c").mask_image,
+            None,
+            "cascade order holds across spellings (the later bare `none` wins)"
+        );
+        // @supports gates on the same strip
+        assert!(
+            supports_feature("-x-mask-image: url(x)"),
+            "feature test strips a prefixed property too"
+        );
+        assert!(
+            !supports_feature("-x-nope-image: url(x)"),
+            "nothing known after the strip stays unknown"
+        );
+    }
+
+    #[test]
+    fn custom_properties_are_never_stripped() {
+        // `--…` names pass through the gate untouched (var() resolution
+        // needs them): the prefix strip must not eat their leading dashes
+        let d = parse_decls("--x-mask-image: 1px; --weird: red; color: #123456");
+        assert_eq!(d.len(), 3, "all three declarations survive");
+        assert_eq!((d[0].0.as_str(), d[0].1.as_str()), ("--x-mask-image", "1px"));
+        assert_eq!((d[1].0.as_str(), d[1].1.as_str()), ("--weird", "red"));
+        assert_eq!((d[2].0.as_str(), d[2].1.as_str()), ("color", "#123456"));
     }
 }
 
