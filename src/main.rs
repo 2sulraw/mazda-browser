@@ -2708,7 +2708,7 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
                     None => {
                         eprintln!("[img] no size from {abs} ({} bytes, starts {:?})",
                             bytes.len(), &bytes[..bytes.len().min(12)]);
-                        skipped += 1; // WebP/AVIF/corrupt
+                        skipped += 1; // AVIF/corrupt
                     }
                 },
                 Err(e) => {
