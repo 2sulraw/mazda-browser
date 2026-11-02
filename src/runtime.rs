@@ -181,59 +181,110 @@ impl EngineChoice {
     }
 }
 
+/// Which fonts a page may use. `A` = site `@font-face` webfonts (WOFF2/WOFF1/
+/// sfnt; the default), `B` = system fonts only (no webfont fetch/decode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FontsChoice {
+    A,
+    B,
+}
+
+impl FontsChoice {
+    /// Config-file spelling (lowercase single letter).
+    pub fn as_conf(self) -> &'static str {
+        match self {
+            FontsChoice::A => "a",
+            FontsChoice::B => "b",
+        }
+    }
+}
+
 /// Persistent app settings (`mazda.conf`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Conf {
     pub engine: EngineChoice,
+    pub fonts: FontsChoice,
 }
 
 impl Default for Conf {
     fn default() -> Self {
-        Conf { engine: EngineChoice::A }
+        Conf {
+            engine: EngineChoice::A,
+            fonts: FontsChoice::A,
+        }
     }
 }
 
 /// Parse the conf file body: `key=value` lines, whitespace tolerated,
-/// unknown keys ignored (forward-compat), a malformed engine value leaves
-/// the DEFAULT (A). A line without `=` corrupts the file sense and resets
+/// unknown keys ignored (forward-compat), a malformed value leaves the
+/// DEFAULT (A). A line without `=` corrupts the file sense and resets
 /// everything. Never panics — corruption may cost settings, never crash.
 pub fn parse_conf(text: &str) -> Conf {
+    let mut out = Conf::default();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         match line.split_once('=') {
-            Some((k, v)) if k.trim() == "engine" => {
-                let conf = match v.trim() {
-                    "a" => Conf { engine: EngineChoice::A },
-                    "b" => Conf { engine: EngineChoice::B },
+            Some((k, v)) => match k.trim() {
+                "engine" => match v.trim() {
+                    "a" => out.engine = EngineChoice::A,
+                    "b" => out.engine = EngineChoice::B,
                     _ => return Conf::default(),
-                };
-                return conf;
-            }
-            Some(_) => {} // unknown key: ignore
+                },
+                "fonts" => match v.trim() {
+                    "a" => out.fonts = FontsChoice::A,
+                    "b" => out.fonts = FontsChoice::B,
+                    _ => return Conf::default(),
+                },
+                _ => {} // unknown key: ignore
+            },
             None => return Conf::default(), // corrupt line → default
         }
     }
-    Conf::default()
+    out
 }
 
 /// Serialize one setting per line.
 pub fn serialize_conf(conf: &Conf) -> String {
-    format!("engine={}\n", conf.engine.as_conf())
+    format!(
+        "engine={}\nfonts={}\n",
+        conf.engine.as_conf(),
+        conf.fonts.as_conf()
+    )
 }
 
 impl Conf {
-    /// Startup resolution: `--engine=a|b` flag > `MAZDA_ENGINE` env var >
+    /// Startup resolution, per setting independently:
+    /// `--engine/--fonts=a|b` flag > `MAZDA_ENGINE/MAZDA_FONTS` env var >
     /// `mazda.conf` on disk > built-in default A. The CLI/env knob is
     /// legitimate testing plumbing for the selectable-runtime wave — the
     /// same choice the settings page turns, reachable without UI input
     /// (which this shell may never synthesize).
     pub fn init(args: &[String]) -> Conf {
-        let flag = cli_engine_flag(args);
-        let env = std::env::var("MAZDA_ENGINE").ok();
-        resolve_engine(flag, env.as_deref(), load_conf())
+        let disk = load_conf();
+        let engine = resolve_engine(
+            cli_engine_flag(args),
+            std::env::var("MAZDA_ENGINE").ok().as_deref(),
+            disk,
+        );
+        // one stderr note per process when a fonts override is spelled
+        // wrong — it is ignored (the next precedence level decides) rather
+        // than silently reinterpreted as A or B
+        let flag = cli_fonts_flag(args);
+        let env = std::env::var("MAZDA_FONTS").ok();
+        if flag.is_none() && args.iter().any(|a| a.starts_with("--fonts=")) {
+            warn_invalid_fonts_once("--fonts");
+        }
+        if env.as_deref().is_some_and(|v| env_fonts(v).is_none()) {
+            warn_invalid_fonts_once("MAZDA_FONTS");
+        }
+        let fonts = resolve_fonts(flag, env.as_deref(), disk);
+        Conf {
+            engine: engine.engine,
+            fonts: fonts.fonts,
+        }
     }
 
     /// Write-through-on-change: the settings UI calls this whenever the
@@ -241,17 +292,19 @@ impl Conf {
     /// shell already manages (`%LOCALAPPDATA%\mazda-cache`, conf one level
     /// up — same resolution pattern as main.rs `cache_dir`).
     pub fn save(&self) {
-        if !self.engine.available() && self.engine == EngineChoice::B {
+        let mut out = *self;
+        if out.engine == EngineChoice::B && !out.engine.available() {
             // trying to persist a choice this build cannot run: keep A on
-            // disk so a plain default build can't come up in B.
+            // disk so a plain default build can't come up in B. The fonts
+            // choice still persists (it is independent).
             eprintln!("[settings] not persisting engine B (built without feature)");
-            return;
+            out.engine = EngineChoice::A;
         }
         let path = conf_path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(&path, serialize_conf(self)) {
+        if let Err(e) = std::fs::write(&path, serialize_conf(&out)) {
             eprintln!("[settings] conf write failed {}: {e}", path.display());
         }
     }
@@ -287,11 +340,60 @@ fn env_engine(v: &str) -> Option<EngineChoice> {
 /// rather than being remembered.
 pub fn resolve_engine(flag: Option<EngineChoice>, env: Option<&str>, conf: Conf) -> Conf {
     let honor = |c: Option<EngineChoice>| -> Option<Conf> {
-        c.filter(|e| e.available()).map(|e| Conf { engine: e })
+        c.filter(|e| e.available()).map(|e| Conf { engine: e, ..conf })
     };
     honor(flag)
         .or_else(|| honor(env.and_then(env_engine)))
         .unwrap_or(conf)
+}
+
+/// Run of the argv fonts key: parses `--fonts=a` / `--fonts=B`
+/// (trim + case-insensitive). None when unrelated flags are passed.
+pub fn cli_fonts_flag(args: &[String]) -> Option<FontsChoice> {
+    let mut out: Option<FontsChoice> = None;
+    for a in args {
+        if let Some(v) = a.strip_prefix("--fonts=") {
+            out = match v.trim().to_ascii_lowercase().as_str() {
+                "a" => Some(FontsChoice::A),
+                "b" => Some(FontsChoice::B),
+                _ => out,
+            };
+        }
+    }
+    out
+}
+
+/// `MAZDA_FONTS=a|B` env spelling (trim + lowercase; garbage = unset).
+pub fn env_fonts(v: &str) -> Option<FontsChoice> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "a" => Some(FontsChoice::A),
+        "b" => Some(FontsChoice::B),
+        _ => None,
+    }
+}
+
+/// Precedence chain (pure, tested), independent of the engine chain:
+/// flag > env > conf > default A. Both choices are always selectable (no
+/// build feature gates them); a build compiled without the `woff2` feature
+/// simply makes no webfont request at all, so A behaves like B there.
+pub fn resolve_fonts(flag: Option<FontsChoice>, env: Option<&str>, conf: Conf) -> Conf {
+    Conf {
+        fonts: flag
+            .or_else(|| env.and_then(env_fonts))
+            .unwrap_or(conf.fonts),
+        ..conf
+    }
+}
+
+/// One-time stderr note for an invalid `--fonts=`/`MAZDA_FONTS` spelling.
+fn warn_invalid_fonts_once(where_: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[settings] invalid {where_} value (expected a|b) — ignored; default A applies if nothing else sets it"
+        );
+    }
 }
 
 /// `%LOCALAPPDATA%\mazda.conf` — next to the mazda-cache root the shell
@@ -1861,33 +1963,47 @@ mod engine_b_tests {
 mod conf_tests {
     use super::*;
 
-    /// Round trip: serialize → parse → same engine (the whole conf format).
+    /// Round trip: serialize → parse → same choices (the whole conf format).
     #[test]
     fn conf_round_trip() {
-        for choice in [EngineChoice::A, EngineChoice::B] {
-            let c = Conf { engine: choice };
-            let text = serialize_conf(&c);
-            assert_eq!(text, format!("engine={}\n", choice.as_conf()));
-            let back = parse_conf(&text);
-            assert_eq!(back, c, "round trip for engine={}", choice.as_conf());
+        for engine in [EngineChoice::A, EngineChoice::B] {
+            for fonts in [FontsChoice::A, FontsChoice::B] {
+                let c = Conf { engine, fonts };
+                let text = serialize_conf(&c);
+                assert_eq!(
+                    text,
+                    format!("engine={}\nfonts={}\n", engine.as_conf(), fonts.as_conf())
+                );
+                assert_eq!(parse_conf(&text), c, "round trip for {text:?}");
+            }
         }
     }
 
-    /// A corrupt file (garbage line) resets to the built-in default A —
+    /// A corrupt file (garbage line) resets to the built-in defaults A —
     /// settings may be lost, never a panic.
     #[test]
     fn corrupt_conf_falls_back_to_default_a() {
         assert_eq!(parse_conf("garbage line"), Conf::default());
         assert_eq!(parse_conf("engine=q"), Conf::default());
         assert_eq!(parse_conf("engine="), Conf::default());
+        assert_eq!(parse_conf("fonts=x"), Conf::default());
+        assert_eq!(parse_conf("engine=a\nfonts=c"), Conf::default());
         assert_eq!(parse_conf("engine=a\nbroken-no-equals"), Conf::default());
     }
 
     /// Forward-compat: unknown keys are ignored, trailing whitespace and
-    /// comments tolerated, empty file → default A.
+    /// comments tolerated, empty file → default A. Both settings parse
+    /// independently of line order.
     #[test]
     fn conf_tolerates_noise_and_defaults_clean() {
-        assert_eq!(parse_conf("# comment\n\n  engine = b  \nx_next=1"), Conf { engine: EngineChoice::B });
+        assert_eq!(
+            parse_conf("# comment\n\n  engine = b  \nx_next=1\nfonts = b "),
+            Conf { engine: EngineChoice::B, fonts: FontsChoice::B }
+        );
+        assert_eq!(
+            parse_conf("fonts=b\nengine=a"),
+            Conf { engine: EngineChoice::A, fonts: FontsChoice::B }
+        );
         // default A when a known-but-A value or nothing is present
         assert_eq!(parse_conf("other=yes"), Conf::default());
         assert_eq!(parse_conf(""), Conf::default());
@@ -1896,7 +2012,7 @@ mod conf_tests {
     /// PRECEDENCE: `--engine` flag > MAZDA_ENGINE env > conf file value.
     #[test]
     fn engine_precedence_flag_env_conf() {
-        let conf_on_disk = Conf { engine: EngineChoice::B };
+        let conf_on_disk = Conf { engine: EngineChoice::B, fonts: FontsChoice::A };
         // flag wins over env and disk
         assert_eq!(
             resolve_engine(Some(EngineChoice::A), Some("b"), conf_on_disk).engine,
@@ -1912,9 +2028,46 @@ mod conf_tests {
             resolve_engine(None, None, conf_on_disk).engine,
             EngineChoice::B
         );
-        // honest subset: an errant env value falls back to the disk value
-        // (env parsing accepts only a/b; anything else is treated as unset
-        // by Conf::init's ok/check), disk still decides
+    }
+
+    /// PRECEDENCE (fonts), the same chain shape: flag > env > conf > default
+    /// A. Invalid spellings are treated as unset at their level, so the next
+    /// level still decides — and the two settings resolve independently.
+    #[test]
+    fn fonts_precedence_flag_env_conf() {
+        let conf_on_disk = Conf { engine: EngineChoice::A, fonts: FontsChoice::B };
+        assert_eq!(
+            resolve_fonts(Some(FontsChoice::A), Some("b"), conf_on_disk).fonts,
+            FontsChoice::A
+        );
+        assert_eq!(
+            resolve_fonts(None, Some("b"), conf_on_disk).fonts,
+            FontsChoice::B
+        );
+        assert_eq!(
+            resolve_fonts(None, Some("A"), conf_on_disk).fonts,
+            FontsChoice::A
+        );
+        assert_eq!(resolve_fonts(None, None, conf_on_disk).fonts, FontsChoice::B);
+        // no override anywhere → default A
+        assert_eq!(
+            resolve_fonts(None, None, Conf::default()).fonts,
+            FontsChoice::A
+        );
+        // garbage env is unset → disk value decides (not an implicit A)
+        assert_eq!(
+            resolve_fonts(None, Some("woff3"), conf_on_disk).fonts,
+            FontsChoice::B
+        );
+        // fonts resolution never touches the engine setting (and vice versa)
+        assert_eq!(
+            resolve_fonts(Some(FontsChoice::B), None, conf_on_disk).engine,
+            EngineChoice::A
+        );
+        assert_eq!(env_fonts("b"), Some(FontsChoice::B));
+        assert_eq!(env_fonts("  A "), Some(FontsChoice::A));
+        assert_eq!(env_fonts(""), None);
+        assert_eq!(env_fonts("system"), None);
     }
 
     /// The CLI knob's accepted spellings (and rejections).
@@ -1926,5 +2079,11 @@ mod conf_tests {
         assert_eq!(cli_engine_flag(&args("--engine=x")), None);
         assert_eq!(cli_engine_flag(&args("https://x.com")), None);
         assert_eq!(cli_engine_flag(&args("--engine")), None);
+        // fonts knob (exact same shape)
+        assert_eq!(cli_fonts_flag(&args("--fonts=a")), Some(FontsChoice::A));
+        assert_eq!(cli_fonts_flag(&args("--fonts=B")), Some(FontsChoice::B));
+        assert_eq!(cli_fonts_flag(&args("--fonts=x")), None);
+        assert_eq!(cli_fonts_flag(&args("https://x.com")), None);
+        assert_eq!(cli_fonts_flag(&args("--fonts")), None);
     }
 }
