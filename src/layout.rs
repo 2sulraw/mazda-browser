@@ -6,7 +6,7 @@
 use crate::css::{
     content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor,
     Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track,
-    TrackBreadth, VAlign,
+    TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -698,6 +698,19 @@ const NON_RENDERED: &[&str] = &[
 /// Build the box tree for `node`'s subtree. `style`/`bx` are the cascade
 /// result for `node` itself (main resolves body before calling).
 pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) -> BoxNode {
+    build_scoped(dom, node, style, bx, sheet, None)
+}
+
+/// `build` with the root element's custom-property chain (main resolves the
+/// `<body>` itself, so its own `--*` declarations must reach its children).
+pub fn build_scoped(
+    dom: &Dom,
+    node: u32,
+    style: Style,
+    bx: BoxStyle,
+    sheet: &Sheet,
+    vars: Option<&std::rc::Rc<VarScope>>,
+) -> BoxNode {
     // BoxStyle moves into the root below; the cursor seed threads down first
     let seed = bx.cursor;
     let mut root = BoxNode::group(style, bx);
@@ -723,7 +736,7 @@ pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) ->
     if let Some(b) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::Before) {
         root.children.push(b);
     }
-    build_into(dom, node, style, sheet, None, seed, &mut root.children);
+    build_into(dom, node, style, sheet, None, seed, vars, &mut root.children);
     if let Some(a) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::After) {
         root.children.push(a);
     }
@@ -923,6 +936,9 @@ fn build_into(
     sheet: &Sheet,
     link: Option<std::rc::Rc<str>>,
     cursor: Option<Cursor>,
+    // custom properties in effect for this subtree (the parent's chain) —
+    // `var()` in child declarations resolves through it
+    vars: Option<&std::rc::Rc<VarScope>>,
     out: &mut Vec<BoxNode>,
 ) {
     // Per-list item numbering: `node` is the PARENT whose children are being
@@ -979,7 +995,7 @@ fn build_into(
                 // author CSS (rules + inline style) cascades over UA defaults;
                 // relative font-sizes compute against the TRUE parent (style),
                 // not the UA-bumped child_style (headings would compound 2x)
-                let outcome = sheet.resolve_with_parent(dom, child, child_style, dom.attr(child, "style"), style.size);
+                let outcome = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, vars);
                 if outcome.display_none {
                     continue;
                 }
@@ -1218,7 +1234,7 @@ fn build_into(
                 // boxes generate none) and margins/padding/borders are
                 // ignored. shortcut: on the root/body it still makes a box.
                 if outcome.bx.display == Display::Contents {
-                    build_into(dom, child, outcome.style, sheet, child_link, cur, out);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), out);
                     continue;
                 }
                 // ::before/::after generated content — cascaded once here
@@ -1349,7 +1365,7 @@ fn build_into(
                     // but placed ON the surrounding text line by block()'s
                     // inline branch instead of stacking
                     g.inline = g.bx.display == Display::InlineBlock;
-                    build_into(dom, child, outcome.style, sheet, child_link, cur, &mut g.children);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
                     if let Some(a) = after {
                         g.children.push(a);
                     }
@@ -1379,7 +1395,7 @@ fn build_into(
                         if let Some(b) = before {
                             g.children.push(b);
                         }
-                        build_into(dom, child, outcome.style, sheet, child_link, cur, &mut g.children);
+                        build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
                         if let Some(a) = after {
                             g.children.push(a);
                         }
@@ -1406,7 +1422,7 @@ fn build_into(
                             if let Some(b) = before {
                                 g.children.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, cur, &mut g.children);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
                             if let Some(a) = after {
                                 g.children.push(a);
                             }
@@ -1415,7 +1431,7 @@ fn build_into(
                             if let Some(b) = before {
                                 out.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, cur, out);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), out);
                             if let Some(a) = after {
                                 out.push(a);
                             }

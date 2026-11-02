@@ -892,6 +892,27 @@ curve matters more than the baseline (near-flat as tabs grow).
   Tests: default **549**, `engine-b + woff2` **553**. Live (release): Wikipedia
   article **98.7 MB** first layout (14973 runs; the earlier 104 → 118 MB climb
   was this decode churn, so it no longer reproduces without pointer input).
+  **(i) per-element custom-property cascade** — `--*` declarations used to land
+  in ONE page-wide last-wins map, so a sheet that defines the same variable
+  per variant class painted every variant with whichever block came last:
+  MDN's `.baseline-indicator.high` green pill rendered in `.removing`'s red.
+  Each rule now carries its own `--*` declarations (var-only rules keep an
+  empty `decls` and live in a separate cascade-sorted `var_rules` list), and
+  `resolve_scoped` builds the element's `VarScope` chain: its own matching
+  rules (cascade order, last wins) → parent chain → the page-wide palette as
+  the floor. An element that declares nothing reuses the parent's `Rc`, so the
+  common element costs no allocation; layout threads the chain down
+  `build_into` and `build_scoped` hands the `<body>`'s own chain in.
+  Inline `--*` on the `style` attribute joins the chain too.
+  Live: MDN's "Widely available" pill is green (it was red); page otherwise
+  unchanged (656 rules, 2943 runs, 85.5 MB debug); Wikipedia article
+  unchanged (14973 runs, 106.8 MB debug).
+  shortcut: a pseudo-element's `var()` still resolves from the page-wide
+  palette, not its origin element's chain; the flat map remains what the
+  `:root`-theme polarity filter (`scope_vars`) rewrites, so theme scoping is
+  unchanged.
+  Tests: default **550**, `engine-b + woff2` **554**
+  (`custom_properties_cascade_per_element_and_inherit`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study

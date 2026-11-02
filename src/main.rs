@@ -2859,7 +2859,7 @@ fn layout_page(
             .cursor;
     }
 
-    let mut root_box = layout::build(dom, root, body.style, body.bx, &sheet);
+    let mut root_box = layout::build_scoped(dom, root, body.style, body.bx, &sheet, body.vars.as_ref());
     eprintln!(
         "[mem] after box tree: {:.1} MB ({} boxes)",
         working_set_mb(),

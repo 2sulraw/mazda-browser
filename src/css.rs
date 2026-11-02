@@ -733,14 +733,45 @@ struct Seg {
 struct Rule {
     segs: Vec<Seg>,
     decls: Vec<Decl>,
+    /// custom-property declarations this rule sets (`--name: value`), kept
+    /// apart from `decls`: they don't cascade as properties, they build the
+    /// element's [`VarScope`] chain
+    vars: Vec<(String, String)>,
     /// (ids, classes+attrs, tags) — cascade order key
     spec: (u16, u16, u16),
     order: u32,
 }
 
+/// The custom properties in effect for one element — the inheritance chain
+/// CSS defines for `--*` (they inherit, but a declaration on an element wins
+/// over every ancestor's for that subtree).
+/// Built once per element during the box-tree walk; an element that declares
+/// no custom properties simply shares its parent's `Rc` (no allocation), and
+/// the page-wide `Sheet::vars` palette (the `:root` theme, see `scope_vars`)
+/// is the chain's floor.
+pub struct VarScope {
+    parent: Option<std::rc::Rc<VarScope>>,
+    /// declarations from every matching rule, in cascade order — the last
+    /// one for a name wins, so lookups scan backwards
+    own: Vec<(String, String)>,
+}
+
+impl VarScope {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.own
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 pub struct Sheet {
     /// sorted by (spec, order) at parse time; cascade = apply matches in order
     rules: Vec<Rule>,
+    /// custom-property-only rules, cascade-sorted (see `var_rules` at parse) —
+    /// `scope_of` walks this short list to build an element's `VarScope`
+    var_rules: Vec<Rule>,
     /// pseudo-element rules, bucketed by kind ([0] `::before`, [1] `::after`,
     /// [2] `::marker`), cascade-sorted like `rules`. Kept OUT of `rules` so
     /// the origin element's cascade, `class_paint` and the `color-scheme`
@@ -1006,6 +1037,9 @@ pub struct StyleOutcome {
     pub display_none: bool,
     /// non-inherited box layout properties (flex/grid/width/gap/…)
     pub bx: BoxStyle,
+    /// custom properties in effect for this element — pass down to its
+    /// children's `resolve_scoped` so `var()` inherits the way CSS says
+    pub vars: Option<std::rc::Rc<VarScope>>,
 }
 
 /// Properties we actually use; everything else (margin, padding, …) is dropped
@@ -1151,6 +1185,11 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     let s = strip_comments(text);
     let b = s.as_bytes();
     let mut rules: Vec<Rule> = Vec::new();
+    // rules that only declare custom properties, cascade-sorted — the
+    // per-element scope walk reads this short list, so pages that define
+    // variables (nearly all) don't pay a second full-rule pass per element
+    let mut var_rules: Vec<Rule> = Vec::new();
+    let mut var_order = 0u32;
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut var_defs: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
@@ -1202,6 +1241,31 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                     }
                 })
                 .collect();
+            // the SAME declarations also ride along on their own rule list, so
+            // the element the rule matches gets them in its own inheritance
+            // chain (the page-wide map above is only the root floor — without
+            // this, a variable defined by several variant classes painted
+            // every variant with whichever block came last in the sheet)
+            let own_vars: Vec<(String, String)> = decls
+                .iter()
+                .filter(|d| d.0.starts_with("--"))
+                .map(|d| (d.0.clone(), d.1.clone()))
+                .collect();
+            if !own_vars.is_empty() {
+                for sel in split_selectors(sel_text) {
+                    if let Some(segs) = parse_selector(sel) {
+                        let spec = spec_of(&segs);
+                        var_rules.push(Rule {
+                            segs,
+                            decls: Vec::new(),
+                            vars: own_vars.clone(),
+                            spec,
+                            order: var_order,
+                        });
+                        var_order += 1;
+                    }
+                }
+            }
             if real.is_empty() {
                 i = cb + 1;
                 continue;
@@ -1212,6 +1276,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                     rules.push(Rule {
                         segs,
                         decls: real.clone(),
+                        vars: Vec::new(),
                         spec,
                         order,
                     });
@@ -1227,6 +1292,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     }
 
     rules.sort_by_key(|r| (r.spec, r.order));
+    var_rules.sort_by_key(|r| (r.spec, r.order));
     // pseudo-element rules cascade SEPARATELY (resolve_pseudo): partition
     // them out so the origin element's cascade, class_paint and the
     // color-scheme slice below never see a `p::before` rule. Each bucket
@@ -1269,6 +1335,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         .collect();
     Sheet {
         rules,
+        var_rules,
         schemes,
         pseudo,
         hover,
@@ -1445,6 +1512,22 @@ impl Sheet {
         inline: Option<&str>,
         parent_size: f32,
     ) -> StyleOutcome {
+        self.resolve_scoped(dom, node, base, inline, parent_size, None)
+    }
+
+    /// `resolve_with_parent` with the parent element's custom-property chain:
+    /// `var()` in this element's declarations sees its own `--*` rules first,
+    /// then `parent_vars` (the ancestor chain), then the sheet-wide palette.
+    pub fn resolve_scoped(
+        &self,
+        dom: &Dom,
+        node: u32,
+        base: Style,
+        inline: Option<&str>,
+        parent_size: f32,
+        parent_vars: Option<&std::rc::Rc<VarScope>>,
+    ) -> StyleOutcome {
+        let vars = self.scope_of(dom, node, inline, parent_vars.cloned());
         let mut style = base;
         let mut bg = None;
         let mut display_none = false;
@@ -1463,7 +1546,7 @@ impl Sheet {
             }
             for d in &rule.decls {
                 color_declared |= d.0 == "color";
-                let sd = self.subst(d);
+                let sd = self.subst_scoped(d, vars.as_deref());
                 let fs = self.fam_stack_of(&sd);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
@@ -1474,7 +1557,7 @@ impl Sheet {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
                 color_declared |= d.0 == "color";
-                let sd = self.subst(d);
+                let sd = self.subst_scoped(d, vars.as_deref());
                 let fs = self.fam_stack_of(&sd);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
@@ -1499,6 +1582,7 @@ impl Sheet {
             bg,
             display_none,
             bx,
+            vars,
         }
     }
 
@@ -1558,16 +1642,73 @@ impl Sheet {
             bg,
             display_none,
             bx,
+            // shortcut: a pseudo-element resolves `var()` from the page-wide
+            // root palette, not the origin element's chain — pseudo rules
+            // that read an element-scoped variable are rare
+            vars: None,
         })
     }
 
     /// Substitute `var(--name[, fallback])` references in a decl value.
     /// No-op (no allocation path beyond the check) when there's no `var(`.
     fn subst(&self, d: &Decl) -> Decl {
+        self.subst_scoped(d, None)
+    }
+
+    /// `subst`, but `var()` resolves through the element's own
+    /// [`VarScope`] chain (its declarations, then its ancestors', then the
+    /// page-wide root palette) instead of the root palette alone.
+    fn subst_scoped(&self, d: &Decl, scope: Option<&VarScope>) -> Decl {
         if !d.1.contains("var(") {
             return d.clone();
         }
-        (d.0.clone(), subst_vars(&d.1, &self.vars, 0))
+        (d.0.clone(), subst_vars(&d.1, &|name| self.var_lookup(scope, name), 0))
+    }
+
+    /// Value of `--name` in effect for an element: nearest declaring ancestor
+    /// (or the element itself) wins, else the sheet-wide root palette.
+    fn var_lookup(&self, scope: Option<&VarScope>, name: &str) -> Option<String> {
+        let mut s = scope;
+        while let Some(sc) = s {
+            if let Some(v) = sc.get(name) {
+                return Some(v.to_string());
+            }
+            s = sc.parent.as_deref();
+        }
+        self.vars.get(name).cloned()
+    }
+
+    /// The custom properties in effect for `node`: its parent's chain plus
+    /// whatever its own matching rules (in cascade order) and inline `style`
+    /// declare. Returns the parent chain unchanged when the element declares
+    /// none, so the common element costs no allocation.
+    fn scope_of(
+        &self,
+        dom: &Dom,
+        node: u32,
+        inline: Option<&str>,
+        parent: Option<std::rc::Rc<VarScope>>,
+    ) -> Option<std::rc::Rc<VarScope>> {
+        if self.var_rules.is_empty() {
+            return parent;
+        }
+        let mut own: Vec<(String, String)> = Vec::new();
+        for rule in &self.var_rules {
+            if matches(dom, node, &rule.segs, self.hovered.get()) {
+                own.extend(rule.vars.iter().cloned());
+            }
+        }
+        if let Some(inline) = inline {
+            for d in &parse_decls(inline) {
+                if d.0.starts_with("--") {
+                    own.push((d.0.clone(), d.1.clone()));
+                }
+            }
+        }
+        if own.is_empty() {
+            return parent;
+        }
+        Some(std::rc::Rc::new(VarScope { parent, own }))
     }
 
     /// The cascaded `color-scheme` value for `node`: matched rules in cascade
@@ -1578,7 +1719,7 @@ impl Sheet {
             if matches(dom, node, segs, self.hovered.get()) {
                 // same var() substitution resolve applies to every declaration
                 val = Some(if v.contains("var(") {
-                    subst_vars(v, &self.vars, 0)
+                    subst_vars(v, &|name| self.vars.get(name).cloned(), 0)
                 } else {
                     v.clone()
                 });
@@ -1675,10 +1816,10 @@ impl Sheet {
     }
 }
 
-/// Replace every `var(--name[, fallback])` in `v` from the custom-property
-/// map; unknown names fall back, unresolvable → empty string. Depth-capped
-/// recursion handles nested vars (`--a: var(--b)`).
-fn subst_vars(v: &str, vars: &std::collections::HashMap<String, String>, depth: u8) -> String {
+/// Replace every `var(--name[, fallback])` in `v`, asking `get` for each
+/// name's value; unknown names fall back, unresolvable → empty string.
+/// Depth-capped recursion handles nested vars (`--a: var(--b)`).
+fn subst_vars(v: &str, get: &dyn Fn(&str) -> Option<String>, depth: u8) -> String {
     if depth > 5 {
         return String::new(); // cycle guard
     }
@@ -1709,9 +1850,9 @@ fn subst_vars(v: &str, vars: &std::collections::HashMap<String, String>, depth: 
             Some(c) => (body[..c].trim(), body[c + 1..].trim()),
             None => (body.trim(), ""),
         };
-        let val = match vars.get(name) {
-            Some(v) => subst_vars(v, vars, depth + 1),
-            None => subst_vars(fallback, vars, depth + 1),
+        let val = match get(name) {
+            Some(v) => subst_vars(&v, get, depth + 1),
+            None => subst_vars(fallback, get, depth + 1),
         };
         out.push_str(&val);
         rest = &rest[j..];
@@ -5565,23 +5706,64 @@ mod tests {
     }
 
     #[test]
+    fn custom_properties_cascade_per_element_and_inherit() {
+        // MDN's baseline card: the same variable is defined once per variant
+        // class (`.high` green, `.removing` red) and read by a CHILD (`.pill`).
+        // With one flat last-wins map every variant painted red; the chain
+        // gives each subtree the value its own nearest ancestor declared.
+        let sheet = parse(
+            ".high { --pill-bg: #0f7a34 } .removing { --pill-bg: #b3261e } \
+             .pill { background-color: var(--pill-bg, #999999) }",
+        );
+        let dom = dom_of(
+            "<div class=high><span class=pill>a</span></div>\
+             <div class=removing><span class=pill>b</span></div>\
+             <div><span class=pill>c</span></div>",
+        );
+        let bg_of = |parent: &str| {
+            let scope = sheet.resolve(
+                &dom,
+                by_attr(&dom, "class", parent),
+                Style::new(),
+                None,
+            );
+            sheet
+                .resolve_scoped(
+                    &dom,
+                    by_attr(&dom, "class", "pill"),
+                    Style::new(),
+                    None,
+                    16.0,
+                    scope.vars.as_ref(),
+                )
+                .bg
+        };
+        assert_eq!(bg_of("high"), Some(0x0f7a34), "the green variant stays green");
+        assert_eq!(bg_of("removing"), Some(0xb3261e), "the red variant stays red");
+    }
+
+    #[test]
     fn vars_collected_from_any_selector() {
-        // Documented shortcut: the flat page-wide var map takes definitions
-        // from EVERY selector. It resolves nextjs (.dark block) and Wikipedia
-        // (:root light) alike — theme scoping is not modeled. See css.rs
-        // collect comment for the trade-off.
+        // The page-wide map is still the FLOOR for elements whose ancestors
+        // declare nothing (the theme-scoping shortcut), but a nearer
+        // declaration on an ancestor now wins over it — the chain `resolve`
+        // builds is what layout threads down the box tree.
         let sheet = parse(
             ":root { --bg: #f8f9fa } \
              html.skin-theme-clientpref-night { --bg: #202122 } \
              body { background-color: var(--bg, #ffffff) }",
         );
-        let dom = dom_of("<body class=skin-vector><p>x</p></body>");
+        let dom = dom_of("<html><body><p>x</p></body></html>");
+        let html = by_tag(&dom, "html");
+        let root = sheet.resolve(&dom, html, Style::new(), None);
+        assert!(root.vars.is_some(), ":root declares a custom property");
         let body = by_tag(&dom, "body");
-        // later rule wins in the flat map (source order)
         assert_eq!(
-            sheet.resolve(&dom, body, Style::new(), None).bg,
-            Some(0x202122),
-            "flat var map: last definition wins regardless of selector"
+            sheet
+                .resolve_scoped(&dom, body, Style::new(), None, 16.0, root.vars.as_ref())
+                .bg,
+            Some(0xf8f9fa),
+            "the root's own :root value beats the flat last-wins map"
         );
     }
 
