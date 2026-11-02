@@ -80,12 +80,15 @@ pub enum Align {
     Stretch,
 }
 
-/// CSS `position`. `sticky` maps to `Relative` (shortcut: no scroll
-/// threshold — it just offsets in flow).
+/// CSS `position`. `sticky` is its own value: it lays out exactly like
+/// `Static` in flow (its `top` threshold is scroll-dependent and never
+/// offsets the box — unlike `Relative`, a declared `top: 40px` moves
+/// nothing until paint pins it; see `layout::StickyGroup`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Pos {
     Static,
     Relative,
+    Sticky,
     Absolute,
     Fixed,
 }
@@ -1826,7 +1829,11 @@ fn apply_decl(
         }
         "position" => {
             bx.pos = match d.1.trim() {
-                "relative" | "sticky" => Pos::Relative, // sticky: shortcut = relative
+                "relative" => Pos::Relative,
+                // its own variant: in flow like static, pinned at paint
+                // time by scroll (layout::StickyGroup) — never relative/
+                // absolute behavior
+                "sticky" => Pos::Sticky,
                 "absolute" => Pos::Absolute,
                 "fixed" => Pos::Fixed,
                 _ => Pos::Static, // static / bogus
@@ -5018,13 +5025,35 @@ mod tests {
         let f = get("f");
         assert_eq!(f.bx.pos, Pos::Fixed);
         assert_eq!(f.bx.inset[1], Some(Len::Px(16.0)), "right 1em");
-        // sticky → relative (shortcut: no scroll threshold)
-        assert_eq!(get("s").bx.pos, Pos::Relative);
+        // sticky → its own variant (NOT relative/absolute)
+        assert_eq!(get("s").bx.pos, Pos::Sticky);
+        assert_eq!(get("s").bx.inset[0], Some(Len::Px(0.0)), "top kept");
         assert_eq!(get("d").bx.pos, Pos::Static);
         // unknown keyword and unparseable `auto` → static/None
         let u = get("u");
         assert_eq!(u.bx.pos, Pos::Static, "bogus keyword ignored");
         assert_eq!(u.bx.inset[0], None, "auto → None");
+    }
+
+    #[test]
+    fn position_sticky_parses_as_its_own_variant() {
+        let sheet = parse(".h { position: sticky; top: 40px }");
+        let dom = dom_of(r#"<div class=h></div>"#);
+        let h = sheet.resolve(&dom, by_attr(&dom, "class", "h"), Style::new(), None);
+        assert_eq!(h.bx.pos, Pos::Sticky);
+        assert_eq!(h.bx.inset[0], Some(Len::Px(40.0)), "threshold kept");
+        // every other keyword still maps where it always did
+        for (kw, want) in [
+            ("static", Pos::Static),
+            ("relative", Pos::Relative),
+            ("absolute", Pos::Absolute),
+            ("fixed", Pos::Fixed),
+        ] {
+            let sheet = parse(&format!(".x {{ position: {kw} }}"));
+            let dom = dom_of(r#"<div class=x></div>"#);
+            let x = sheet.resolve(&dom, by_attr(&dom, "class", "x"), Style::new(), None);
+            assert_eq!(x.bx.pos, want, "{kw}");
+        }
     }
 
     #[test]
