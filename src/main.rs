@@ -30,6 +30,85 @@ const BG: u32 = 0x00_ff_ff_ff; // UA default canvas = white (matches every brows
 /// shortcut: first-come document-order cap, not LRU — pages rarely exceed it.
 const IMG_PIXEL_BUDGET: usize = 8_000_000;
 
+/// Decoded-pixel memo for RELAYOUTS. Every relayout (a timer mutating the
+/// DOM, a hover, an event) rebuilds the page from scratch, so without a memo
+/// the same 300-odd `<img>`s are fetched, decoded, downscaled and cropped
+/// again — that was both the runaway relayout time and the 104 → 118 MB
+/// working-set climb on a single Wikipedia article. Keyed by the exact decode
+/// inputs, so a changed size or crop misses and decodes normally.
+/// Lives inside `KeptPage`, so a navigation drops the whole memo.
+/// Cap stays under `IMG_PIXEL_BUDGET`: the memo can hold one page's images,
+/// no more. Cycles (not recency) eviction would need a real LRU; the oldest
+/// insert is dropped instead and re-decoded if it is needed again.
+#[derive(Default)]
+struct ImgCache {
+    map: std::collections::HashMap<ImgKey, (Cached, u64)>,
+    /// cached display pixels (4 B each) — the memo's own RAM accounting
+    px: usize,
+    tick: u64,
+    /// images actually decoded (a cache miss) — the relayout log reports it
+    decodes: usize,
+}
+const IMG_CACHE_PIXELS: usize = 6_000_000;
+
+/// Everything a decoded slot depends on. `src` is a hash: a `data:` URL can be
+/// megabytes and the real key would be copied per lookup.
+/// shortcut: a 64-bit FNV hash of the source; two DIFFERENT sources colliding
+/// would paint the wrong picture, which needs ~1e-19 odds between two images
+/// on one page — the same bet the HTTP disk cache already makes.
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ImgKey {
+    src: u64,
+    dw: u32,
+    dh: u32,
+    /// mask tint: the enclosing box's background color, None = untinted
+    tint: Option<u32>,
+    /// object-fit content rect, as raw f32 bits (exact compare, no rounding)
+    fit: [u32; 4],
+    /// object-fit visible window, if the image overflows its box
+    clip: Option<[u32; 4]>,
+}
+
+/// A cached slot: the pixels to draw (None = wholly clipped away) and where.
+type Cached = Option<(Rc<image::ImageData>, (f32, f32, f32, f32))>;
+
+fn px_of(c: &Cached) -> usize {
+    c.as_ref().map_or(0, |(img, _)| img.px.len())
+}
+
+impl ImgCache {
+    fn get(&mut self, k: &ImgKey) -> Option<Cached> {
+        self.tick += 1;
+        let tick = self.tick;
+        let e = self.map.get_mut(k)?;
+        e.1 = tick; // recency, so a hot slot survives eviction
+        Some(e.0.clone())
+    }
+
+    fn put(&mut self, k: ImgKey, v: Cached) {
+        self.tick += 1;
+        self.decodes += 1;
+        if let Some((old, _)) = self.map.insert(k, (v.clone(), self.tick)) {
+            self.px -= px_of(&old);
+        }
+        self.px += px_of(&v);
+        // evict oldest inserts until the memo fits its cap
+        while self.px > IMG_CACHE_PIXELS {
+            let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            else {
+                return;
+            };
+            if let Some((old, _)) = self.map.remove(&oldest) {
+                self.px -= px_of(&old);
+            }
+        }
+    }
+}
+
 /// A rendered page: enough to draw it and hit-test its links.
 struct Page {
     url: String,
@@ -1640,8 +1719,10 @@ struct KeptPage {
     /// last hover cell a Relayout job set (None on a fresh page): events,
     /// scrolls and timer re-layouts re-cascade with it. Shortcut: a
     /// mismatched full load resets this to None while the shell may still
-    /// hold a node — the next pointer move re-syncs (self-heals).
+    /// hold a node - the next pointer move re-syncs (self-heals).
     hover: Option<u32>,
+    /// decoded-image memo shared by this page's relayouts (see `ImgCache`)
+    imgs: ImgCache,
 }
 
 /// The single long-lived loader thread. Owns its own `Fonts` (font types
@@ -1823,7 +1904,7 @@ fn fire_due(
     // engine of the kept page (form-submission loads fired from timer/rAF
     // turns re-run the full pipeline and must use the same runtime choice)
     let engine = kept.as_ref().map(|k| k.engine).unwrap_or(EngineChoice::A);
-    let KeptPage { dom, scripts, css_text, faces, url, hover, .. } = kept.as_mut().unwrap();
+    let KeptPage { dom, scripts, css_text, faces, url, hover, imgs, .. } = kept.as_mut().unwrap();
     let (mw, vh) = *last_geom;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scripts
@@ -1894,7 +1975,7 @@ fn fire_due(
     }
     if dirty {
         let (page, form_names) = layout_page(
-            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover,
+            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover, imgs,
         );
         let stacks = fonts.stacks.borrow().clone();
         let out_faces = collect_out_faces(fonts);
@@ -1945,6 +2026,7 @@ fn process_job(
             kp.hover = *hover;
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, *hover,
+                &mut kp.imgs,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -2107,6 +2189,7 @@ fn process_job(
             // always re-layout: the event likely changed the DOM
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, kp.hover,
+                &mut kp.imgs,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -2160,7 +2243,7 @@ fn process_job(
                     }
                 let (page, fnames) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
-                    kp.hover,
+                    kp.hover, &mut kp.imgs,
                 );
                 (page, fnames)
             };
@@ -2362,7 +2445,16 @@ fn settle_load(
     css_text: String,
     faces: Vec<css::FontFace>,
 ) -> (Option<PageWire>, Option<String>, Option<runtime::FormNav>) {
-    let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None, engine, hover: None };
+    let mut kp = KeptPage {
+        url: url.to_string(),
+        dom,
+        css_text,
+        faces,
+        scripts: None,
+        engine,
+        hover: None,
+        imgs: ImgCache::default(),
+    };
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = scripts.run_scripts(&mut kp.dom);
@@ -2377,6 +2469,7 @@ fn settle_load(
         &layout::FormState::default(),
         // fresh page: the shell clears its hover cell on navigation too
         None,
+        &mut kp.imgs,
     );
     let stacks = fonts.stacks.borrow().clone();
     let out_faces = collect_out_faces(fonts);
@@ -2712,6 +2805,7 @@ fn layout_page(
     vh: f32,
     state: &layout::FormState,
     hover: Option<u32>,
+    imgs: &mut ImgCache,
 ) -> (Page, HashMap<u32, String>) {
     let root = dom.body_root();
     // media queries evaluate against the window's CSS pixel width
@@ -2786,6 +2880,7 @@ fn layout_page(
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
     let mut sticky_next = 0usize; // sticky-group index counter, see decode_images
+    let decodes_before = imgs.decodes;
     let n_px = decode_images(
         &mut root_box,
         url,
@@ -2795,9 +2890,14 @@ fn layout_page(
         None,
         false,
         &mut sticky_next,
+        imgs,
     );
     if n_px > 0 {
-        eprintln!("[img] {n_px} decoded at display size");
+        eprintln!(
+            "[img] {n_px} drawn ({} decoded, {} from the relayout memo)",
+            imgs.decodes - decodes_before,
+            n_px.saturating_sub(imgs.decodes - decodes_before)
+        );
     }
     eprintln!(
         "[mem] after layout: {:.1} MB ({} runs)",
@@ -2983,6 +3083,67 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
 /// the index lands on this box's [`layout::StickyGroup`]; each group's
 /// `imgs_dec` span then covers the images its subtree appended here (they
 /// sit past every z-sorted entry, outside the layout-time `imgs` span).
+fn decode_slot(
+    src: &str,
+    abs: Option<&str>,
+    dw: u32,
+    dh: u32,
+    tint: Option<u32>,
+    clip: Option<(f32, f32, f32, f32)>,
+    fit: (f32, f32, f32, f32),
+) -> Option<Cached> {
+    let (fx, fy, fw, fh) = fit;
+    // inline <svg> markup arrives as its own bytes; everything else is fetched
+    // (disk-cached) by absolute URL
+    let bytes = if src.starts_with('<') {
+        Some(src.as_bytes().to_vec())
+    } else {
+        abs.and_then(|a| fetch_image(a).ok().map(|(b, _)| b))
+    }?;
+    // raster: decode then resample; svg: rasterize straight at display size
+    // (vector, no full-size buffer ever exists)
+    let img = image::decode(&bytes)
+        .map(|full| {
+            if full.w > dw || full.h > dh {
+                image::downscale(&full, dw, dh)
+            } else {
+                full
+            }
+        })
+        .or_else(|| svg::render(&bytes, dw, dh))?;
+    // a mask draws tinted with its box's background color (RGB replaced,
+    // alpha kept) — no bg color, no tint
+    let img = match tint {
+        Some(c) => layout::tint_image(&img, c),
+        None => img,
+    };
+    // cover/none: keep only the part inside the element's box; the draw rect
+    // shrinks to that window (nearest sampling maps the crop across it exactly)
+    let (img, draw) = match clip {
+        Some((cx0, cy0, cx1, cy1)) if cx1 > cx0 && cy1 > cy0 => {
+            // content-space coordinate → crop pixel index
+            let map = |p: f32, origin: f32, span: f32, n: u32, up: bool| {
+                let f = (p - origin) / span.max(1.0) * n as f32;
+                let f = if up { f.ceil() } else { f.floor() };
+                f.clamp(0.0, n as f32) as u32
+            };
+            (
+                image::crop(
+                    &img,
+                    map(cx0, fx, fw, img.w, false),
+                    map(cy0, fy, fh, img.h, false),
+                    map(cx1, fx, fw, img.w, true),
+                    map(cy1, fy, fh, img.h, true),
+                ),
+                Some((cx0, cy0, cx1 - cx0, cy1 - cy0)),
+            )
+        }
+        Some(_) => (img, None), // wholly outside the box
+        None => (img, Some((fx, fy, fw, fh))),
+    };
+    Some(draw.map(|d| (Rc::new(img), d)))
+}
+
 fn decode_images(
     n: &mut layout::BoxNode,
     base: &str,
@@ -2992,6 +3153,7 @@ fn decode_images(
     parent_bg: Option<u32>,
     parent_masked: bool,
     next: &mut usize,
+    cache: &mut ImgCache,
 ) -> usize {
     let fixed = fixed || n.bx.pos == css::Pos::Fixed;
     // same predicate as collect_paint's sticky recording (DFS order aligns
@@ -3020,70 +3182,34 @@ fn decode_images(
         let dw = fw.round().max(1.0) as u32;
         let dh = fh.round().max(1.0) as u32;
         let px = (dw as usize) * (dh as usize);
+        let abs = if inline { None } else { resolve_img(base, &src) };
+        let tint = match (n.is_mask, parent_bg) {
+            (true, Some(c)) => Some(c),
+            _ => None,
+        };
+        let clip = n.img_clip;
+        // exact decode inputs — see ImgKey; a relayout of an unchanged slot
+        // hits and reuses the same pixels (shared Rc), a resized one misses
+        let key = ImgKey {
+            src: hash_str(abs.as_deref().unwrap_or(&src)),
+            dw,
+            dh,
+            tint,
+            fit: [fx.to_bits(), fy.to_bits(), fw.to_bits(), fh.to_bits()],
+            clip: clip.map(|(a, b, c, d)| [a.to_bits(), b.to_bits(), c.to_bits(), d.to_bits()]),
+        };
         if px <= *budget {
-            let bytes = if inline {
-                Some(src.clone().into_bytes())
-            } else {
-                resolve_img(base, &src)
-                    .and_then(|abs| fetch_image(&abs).ok().map(|(b, _)| b))
-            };
-            if let Some(bytes) = bytes {
+            let slot = cache.get(&key).or_else(|| {
+                let v = decode_slot(&src, abs.as_deref(), dw, dh, tint, clip, (fx, fy, fw, fh))?;
+                cache.put(key.clone(), v.clone());
+                Some(v)
+            });
+            // Some(None) = decoded but wholly clipped away: nothing to draw
+            // and nothing retained, so no budget is charged
+            if let Some(Some((img, draw))) = slot {
                 *budget -= px;
-                // raster: decode then resample; svg: rasterize straight at
-                // display size (vector, no full-size buffer ever exists)
-                let img = image::decode(&bytes)
-                    .map(|full| {
-                        if full.w > dw || full.h > dh {
-                            image::downscale(&full, dw, dh)
-                        } else {
-                            full
-                        }
-                    })
-                    .or_else(|| svg::render(&bytes, dw, dh));
-                if let Some(img) = img {
-                    // a mask draws tinted with its box's background color
-                    // (RGB replaced, alpha kept) — no bg color, no tint
-                    let img = match (n.is_mask, parent_bg) {
-                        (true, Some(c)) => layout::tint_image(&img, c),
-                        _ => img,
-                    };
-                    // cover/none: keep only the part inside the element's
-                    // box; the draw rect shrinks to that window (nearest
-                    // sampling maps the crop across it exactly)
-                    let (img, draw) = match n.img_clip {
-                        Some((cx0, cy0, cx1, cy1)) if cx1 > cx0 && cy1 > cy0 => {
-                            // content-space coordinate → crop pixel index
-                            let map = |p: f32, origin: f32, span: f32, n: u32, up: bool| {
-                                let f = (p - origin) / span.max(1.0) * n as f32;
-                                let f = if up { f.ceil() } else { f.floor() };
-                                f.clamp(0.0, n as f32) as u32
-                            };
-                            (
-                                image::crop(
-                                    &img,
-                                    map(cx0, fx, fw, img.w, false),
-                                    map(cy0, fy, fh, img.h, false),
-                                    map(cx1, fx, fw, img.w, true),
-                                    map(cy1, fy, fh, img.h, true),
-                                ),
-                                Some((cx0, cy0, cx1 - cx0, cy1 - cy0)),
-                            )
-                        }
-                        Some(_) => (img, None), // wholly outside the box
-                        None => (img, Some((fx, fy, fw, fh))),
-                    };
-                    if let Some(draw) = draw {
-                        laid.images.push((
-                            draw.0,
-                            draw.1,
-                            draw.2,
-                            draw.3,
-                            std::rc::Rc::new(img),
-                            fixed,
-                        ));
-                        count += 1;
-                    }
-                }
+                laid.images.push((draw.0, draw.1, draw.2, draw.3, img, fixed));
+                count += 1;
             }
         }
     }
@@ -3093,7 +3219,7 @@ fn decode_images(
     let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
     let bg = n.bx.bg;
     for c in &mut n.children {
-        count += decode_images(c, base, laid, budget, fixed, bg, masked, next);
+        count += decode_images(c, base, laid, budget, fixed, bg, masked, next, cache);
     }
     if let Some(i) = grp {
         if let Some(g) = laid.sticky.get_mut(i) {
@@ -3281,13 +3407,17 @@ fn cache_dir() -> std::path::PathBuf {
 }
 
 /// FNV-1a 64 — collision chance at 300 files is ~1e-13; not worth a hash dep.
-fn cache_key(url: &str) -> String {
+fn hash_str(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in url.as_bytes() {
+    for &b in s.as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    format!("{h:016x}")
+    h
+}
+
+fn cache_key(url: &str) -> String {
+    format!("{:016x}", hash_str(url))
 }
 
 fn now_secs() -> u64 {
@@ -5235,6 +5365,7 @@ mod tests {
             scripts: Some(scripts),
             engine: EngineChoice::A,
             hover: None,
+            imgs: ImgCache::default(),
         });
         let mut fonts = Fonts::load();
         let mut last_geom = (0.0_f32, 0.0_f32);
@@ -5284,6 +5415,7 @@ mod tests {
                 scripts: Some(scripts),
                 engine: EngineChoice::A,
                 hover: None,
+                imgs: ImgCache::default(),
             })
         };
         let mut fonts2 = Fonts::load();
@@ -5587,6 +5719,24 @@ mod tests {
         Option<(u32, u32)>,
         Option<(u32, u32, Vec<u32>)>,
     ) {
+        let (a, b, c, d, _) = img_pipeline_cached(markup, base, vw, &mut ImgCache::default());
+        (a, b, c, d)
+    }
+
+    /// `img_pipeline` with a caller-supplied memo, so a test can run two
+    /// layouts back to back and check the second reused the pixels.
+    fn img_pipeline_cached(
+        markup: &str,
+        base: &str,
+        vw: f32,
+        cache: &mut ImgCache,
+    ) -> (
+        usize,
+        usize,
+        Option<(u32, u32)>,
+        Option<(u32, u32, Vec<u32>)>,
+        Vec<Rc<image::ImageData>>,
+    ) {
         let dom = html::parse(markup);
         let mut root = layout::build(
             &dom,
@@ -5604,12 +5754,35 @@ mod tests {
             layout::layout_tree(&mut root, vw, &|s: &str, _: &Style| s.chars().count() as f32 * 8.0);
         let mut budget = IMG_PIXEL_BUDGET;
         let mut next = 0usize;
-        decode_images(&mut root, base, &mut laid, &mut budget, false, None, false, &mut next);
+        decode_images(&mut root, base, &mut laid, &mut budget, false, None, false, &mut next, cache);
         let drawn = laid
             .images
             .first()
             .map(|(_, _, _, _, img, _)| (img.w, img.h, img.px.clone()));
-        (probed, skipped, dims, drawn)
+        let rcs = laid.images.iter().map(|(.., img, _)| img.clone()).collect();
+        (probed, skipped, dims, drawn, rcs)
+    }
+
+    #[test]
+    fn relayout_reuses_decoded_pixels_from_the_cache() {
+        // A relayout (timer mutation, hover, event) rebuilds the page; the
+        // memo must hand back the SAME buffer instead of decoding again —
+        // that reuse is what keeps a relayout from re-paying the page's
+        // whole image budget and what flattened the RAM climb.
+        let url = format!("data:image/png;base64,{}", b64(&fixture_png()));
+        let markup = format!(r#"<body><img src="{url}"></body>"#);
+        let mut cache = ImgCache::default();
+        let (_, _, _, first, rc1) = img_pipeline_cached(&markup, "https://example.com/x", 800.0, &mut cache);
+        assert_eq!(rc1.len(), 1);
+        let (_, _, _, second, rc2) = img_pipeline_cached(&markup, "https://example.com/x", 800.0, &mut cache);
+        assert_eq!(second, first, "same picture on the relayout");
+        assert!(Rc::ptr_eq(&rc1[0], &rc2[0]), "the pixel buffer is shared, not re-decoded");
+        assert_eq!(cache.map.len(), 1, "the second layout added no slot");
+        // a different display size is a different slot: fresh decode
+        let scaled = format!(r#"<body><img src="{url}" width="1" height="1"></body>"#);
+        let (_, _, _, _, rc3) = img_pipeline_cached(&scaled, "https://example.com/x", 800.0, &mut cache);
+        assert_eq!(cache.map.len(), 2, "a resized image is its own slot");
+        assert!(!Rc::ptr_eq(&rc1[0], &rc3[0]), "and decodes again");
     }
 
     #[test]

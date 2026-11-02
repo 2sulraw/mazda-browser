@@ -875,6 +875,23 @@ curve matters more than the baseline (near-flat as tabs grow).
   title chip present, search button inside its min-content track); plain
   Wikipedia Rust article **103.9 MB** (14973 runs, 315 images; page heading
   now starts at the title bar's left edge on one line).
+  **(h) relayout image memo** — a relayout (JS mutation, event, hover) rebuilds
+  the page from scratch, and every one of them re-fetched, re-decoded,
+  re-downscaled and re-cropped the page's images: 315 decodes × every hover
+  step on the Wikipedia article. `KeptPage` now owns an `ImgCache` keyed by the
+  exact decode inputs (source hash, display size, mask tint, `object-fit`
+  content rect, visible window); a hit reuses the same `Rc<ImageData>`, so the
+  old and new page share one buffer and the decode (the expensive part) never
+  repeats. Verified live in a debug run with 27 relayouts: the first layout
+  decoded 315, every later one reported `315 drawn (0 decoded, 315 from the
+  relayout memo)`. Bounded at 6 M display px (under the 8 M page budget) with
+  oldest-insert eviction; it dies with the page, so a navigation frees it.
+  Shortcut: the memo trusts the bytes it decoded — an image that changes
+  server-side under the same URL keeps the old pixels for that page's lifetime
+  (a reload refetches).
+  Tests: default **549**, `engine-b + woff2` **553**. Live (release): Wikipedia
+  article **98.7 MB** first layout (14973 runs; the earlier 104 → 118 MB climb
+  was this decode churn, so it no longer reproduces without pointer input).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -967,6 +984,7 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 88.7 MB (4687 runs; `display:contents` + named grid areas give the real 3-column layout; outer box-shadow hole culls the gray band under sidebar/TOC; remaining: column widths, search widget stacking) |
 | 2026-11-02 | wave 8f (media math, full `:is()`, logical box props, of-type, min-content) | MDN `/Web/CSS/list-style-type` | 83.2 MB (2943 runs; the `<1072px` media gate finally applies, so the wide sidebar is hidden — 1744 fewer runs; 704px baseline card, clean TOC/breadcrumb links, side padding, title chip, search button in its track; remaining: variant custom-property colors, search-pill wrap) |
 | 2026-11-02 | wave 8g (flex-grow, nth-of-type family) | Wikipedia Rust article | 103.9 MB (14973 runs, 315 images; `flex-grow:1` puts the page heading at the title bar's left edge on one line) |
+| 2026-11-02 | wave 8h (relayout image memo) | Wikipedia Rust article | 98.7 MB first layout (14973 runs); relayouts after it report `315 drawn (0 decoded, 315 from the memo)` — the 104 → 118 MB climb was that decode churn |
 
 ### Phase 1c (Track A) findings
 
