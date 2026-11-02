@@ -4,8 +4,8 @@
 //! `block()`); upgrade when a real CSS engine lands (Phase 1b+).
 
 use crate::css::{
-    content_text, decl, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Dir, Display, Float,
-    Justify, Len, Pos, PseudoEl, Sheet, Track, VAlign,
+    content_text, decl, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor, Dir, Display,
+    Float, Justify, Len, Pos, PseudoEl, Sheet, Track, VAlign,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -79,6 +79,12 @@ pub struct Atom {
     pub hard_break: bool,
     /// raw href of the enclosing <a>, resolved against base URL only on click
     pub link: Option<std::rc::Rc<str>>,
+    /// DOM element the text belongs to (hover hit-testing target); None for
+    /// synthetic text (form-state value leaves, test atoms)
+    pub node: Option<u32>,
+    /// the text's effective `cursor` (inherited down the box tree at build
+    /// time, see `build_into`); None = no declaration anywhere above
+    pub cursor: Option<Cursor>,
 }
 
 /// Apply presentational defaults for an element tag.
@@ -334,6 +340,11 @@ pub struct BoxNode {
     pub hard_break: bool,
     /// raw href of the enclosing <a>, resolved against base URL only on click
     pub link: Option<std::rc::Rc<str>>,
+    /// DOM element node that produced this box — hover hit-testing target
+    /// (`None` for synthetic boxes: background placeholders, form chrome
+    /// leaves, test-built trees). Text leaves carry their CONTAINING
+    /// element (text-node ids never become the hover cell).
+    pub node: Option<u32>,
     /// `<img>` replacement data (None for every other box)
     pub img: Option<ImgSlot>,
     /// form-control identity (input/textarea/button/select): None for
@@ -372,6 +383,7 @@ impl BoxNode {
             text: String::new(),
             hard_break: false,
             link: None,
+            node: None,
             img: None,
             form: None,
             inline: false,
@@ -397,6 +409,7 @@ impl BoxNode {
             text,
             hard_break,
             link,
+            node: None,
             img: None,
             form: None,
             inline: false,
@@ -421,7 +434,12 @@ const NON_RENDERED: &[&str] = &[
 /// Build the box tree for `node`'s subtree. `style`/`bx` are the cascade
 /// result for `node` itself (main resolves body before calling).
 pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) -> BoxNode {
+    // BoxStyle moves into the root below; the cursor seed threads down first
+    let seed = bx.cursor;
     let mut root = BoxNode::group(style, bx);
+    // identity for hover hit-testing — the root box is filtered out at
+    // `collect_hover` (see its doc), this is only uniformity
+    root.node = Some(node);
     // body's own background-image (root = body's box) — pushed before
     // build_into appends, so it stays the first child (paints under)
     if let Some(u) = root.bx.bg_image.clone() {
@@ -436,12 +454,13 @@ pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) ->
     }
     // the body's own ::before/::after (the root IS the body's box):
     // ::before paints over the background placeholder (pushed after it)
-    // and under the content; ::after closes the box
-    if let Some(b) = pseudo_box(sheet, dom, node, style, None, PseudoEl::Before) {
+    // and under the content; ::after closes the box. `bx.cursor` is the
+    // body's effective cursor — build threads it down from here.
+    if let Some(b) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::Before) {
         root.children.push(b);
     }
-    build_into(dom, node, style, sheet, None, &mut root.children);
-    if let Some(a) = pseudo_box(sheet, dom, node, style, None, PseudoEl::After) {
+    build_into(dom, node, style, sheet, None, seed, &mut root.children);
+    if let Some(a) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::After) {
         root.children.push(a);
     }
     root
@@ -522,12 +541,16 @@ fn pseudo_box(
     node: u32,
     base: Style,
     link: Option<std::rc::Rc<str>>,
+    cursor: Option<Cursor>,
     kind: PseudoEl,
 ) -> Option<BoxNode> {
     let out = sheet.resolve_pseudo(dom, node, base, kind)?;
     if out.display_none {
         return None;
     }
+    // effective cursor = the pseudo's own declaration over the origin's
+    // (inherited) one; the generated box belongs to the ORIGIN element
+    let cur = out.bx.cursor.or(cursor);
     let raw = out.bx.content.as_deref()?; // content undeclared → no box
     let text = content_text(raw, dom, node)?; // none/normal/malformed → no box
     let chrome = paints_chrome(&out.bx);
@@ -543,11 +566,19 @@ fn pseudo_box(
     }
     if boxed {
         let mut g = BoxNode::group(out.style, out.bx);
+        g.node = Some(node);
+        g.bx.cursor = cur;
         g.inline = !stacked;
-        g.children.push(BoxNode::leaf(out.style, text, false, link));
+        let mut l = BoxNode::leaf(out.style, text, false, link);
+        l.node = Some(node);
+        l.bx.cursor = cur;
+        g.children.push(l);
         Some(g)
     } else {
-        Some(BoxNode::leaf(out.style, text, false, link))
+        let mut l = BoxNode::leaf(out.style, text, false, link);
+        l.node = Some(node);
+        l.bx.cursor = cur;
+        Some(l)
     }
 }
 
@@ -577,6 +608,7 @@ fn build_into(
     style: Style,
     sheet: &Sheet,
     link: Option<std::rc::Rc<str>>,
+    cursor: Option<Cursor>,
     out: &mut Vec<BoxNode>,
 ) {
     for &child in &dom.nodes[node as usize].children {
@@ -584,7 +616,12 @@ fn build_into(
             NodeKind::Text(t) => {
                 let t = t.trim_matches('\u{a0}');
                 if !t.is_empty() {
-                    out.push(BoxNode::leaf(style, t.to_string(), false, link.clone()));
+                    // the containing element (not the text node) is the
+                    // hover target; `cursor` is already its effective value
+                    let mut l = BoxNode::leaf(style, t.to_string(), false, link.clone());
+                    l.node = Some(node);
+                    l.bx.cursor = cursor;
+                    out.push(l);
                 }
             }
             NodeKind::Element(..) => {
@@ -604,11 +641,17 @@ fn build_into(
                 if outcome.display_none {
                     continue;
                 }
+                // effective cursor for this element's box + subtree: its
+                // own declaration over the inherited one (cursor inherits,
+                // see BoxStyle::cursor)
+                let cur = outcome.bx.cursor.or(cursor);
                 if tag == "img" {
                     // replaced element: box now, pixels when main fetches the src.
                     // width/height attributes are presentational hints (CSS wins:
                     // outcome.bx already holds declared width/height).
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    g.node = Some(child);
+                    g.bx.cursor = cur;
                     if g.bx.width.is_none() {
                         g.bx.width = dom.attr(child, "width").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
                     }
@@ -656,6 +699,8 @@ fn build_into(
                         .replace("currentColor", &hex)
                         .replace("currentcolor", &hex);
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    g.node = Some(child);
+                    g.bx.cursor = cur;
                     if g.bx.width.is_none() {
                         g.bx.width = dom.attr(child, "width").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
                     }
@@ -794,6 +839,8 @@ fn build_into(
                     };
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
                     control_chrome(&mut g.bx, min_h, def_w);
+                    g.node = Some(child);
+                    g.bx.cursor = cur;
                     // UA default (no author `display` declared) = the control
                     // joins the surrounding text line; an author
                     // `display:inline-block` keeps that placement (inline-level
@@ -807,7 +854,10 @@ fn build_into(
                         if centered {
                             st.text_align = 1;
                         }
-                        g.children.push(BoxNode::leaf(st, t, false, child_link.clone()));
+                        let mut l = BoxNode::leaf(st, t, false, child_link.clone());
+                        l.node = Some(child);
+                        l.bx.cursor = cur;
+                        g.children.push(l);
                     }
                     out.push(g);
                     continue;
@@ -824,6 +874,7 @@ fn build_into(
                     child,
                     outcome.style,
                     child_link.clone(),
+                    cur,
                     PseudoEl::Before,
                 );
                 let after = pseudo_box(
@@ -832,6 +883,7 @@ fn build_into(
                     child,
                     outcome.style,
                     child_link.clone(),
+                    cur,
                     PseudoEl::After,
                 );
                 // which elements get a box: flex/grid/block/inline-block
@@ -856,6 +908,8 @@ fn build_into(
                 };
                 if boxed {
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    g.node = Some(child);
+                    g.bx.cursor = cur;
                     // table presentational hints (lower precedence than
                     // author CSS): width="85%"/"400" behaves exactly like
                     // the CSS property; align="center" centers the band
@@ -890,7 +944,7 @@ fn build_into(
                     // but placed ON the surrounding text line by block()'s
                     // inline branch instead of stacking
                     g.inline = g.bx.display == Display::InlineBlock;
-                    build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, &mut g.children);
                     if let Some(a) = after {
                         g.children.push(a);
                     }
@@ -904,6 +958,8 @@ fn build_into(
                     // button). Same placement path as author inline-block.
                     if paints_chrome(&outcome.bx) {
                         let mut g = BoxNode::group(outcome.style, outcome.bx);
+                        g.node = Some(child);
+                        g.bx.cursor = cur;
                         g.inline = true;
                         // background-image placeholder (see above)
                         if let Some(u) = g.bx.bg_image.clone() {
@@ -918,7 +974,7 @@ fn build_into(
                         if let Some(b) = before {
                             g.children.push(b);
                         }
-                        build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                        build_into(dom, child, outcome.style, sheet, child_link, cur, &mut g.children);
                         if let Some(a) = after {
                             g.children.push(a);
                         }
@@ -939,11 +995,13 @@ fn build_into(
                         let has_margin = |l: Len| !matches!(l, Len::Px(v) if v == 0.0);
                         if has_margin(outcome.bx.margin[3]) || has_margin(outcome.bx.margin[1]) {
                             let mut g = BoxNode::group(outcome.style, outcome.bx);
+                            g.node = Some(child);
+                            g.bx.cursor = cur;
                             g.inline = true;
                             if let Some(b) = before {
                                 g.children.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, &mut g.children);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, &mut g.children);
                             if let Some(a) = after {
                                 g.children.push(a);
                             }
@@ -952,7 +1010,7 @@ fn build_into(
                             if let Some(b) = before {
                                 out.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, out);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, out);
                             if let Some(a) = after {
                                 out.push(a);
                             }
@@ -995,6 +1053,24 @@ pub struct PositionedRun {
     /// [`apply_run_clips`] after layout; nested clips compose by
     /// intersection. An empty window (x0 ≥ x1) means main draws nothing.
     pub clip: Option<(f32, f32, f32, f32)>,
+    /// DOM element this run's text belongs to + its effective `cursor` —
+    /// hover hit-testing only (worker-internal: the wire conversion drops
+    /// them, [`Layout::hover_targets`] carries the results upstream)
+    pub node: Option<u32>,
+    pub cursor: Option<Cursor>,
+}
+
+/// One hover hit-test rectangle: document-coord rect + the DOM element it
+/// belongs to + the effective `cursor` + the `position: fixed` flag.
+/// Built by `collect_hover` in tree order; reverse-scanned by
+/// [`Layout::hit_hover`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct HoverTarget {
+    /// (x, y, w, h) in document coordinates
+    pub rect: (f32, f32, f32, f32),
+    pub node: u32,
+    pub cursor: Option<Cursor>,
+    pub fixed: bool,
 }
 
 /// One `position: sticky` box's paint-time pinning record — see
@@ -1157,6 +1233,9 @@ pub struct Layout {
     /// [`StickyGroup`]); empty on pages without one. shortcut: boxes
     /// without `top` never pin, so they get no group.
     pub sticky: Vec<StickyGroup>,
+    /// hover hit-test targets in tree order (element boxes + their own
+    /// text runs) — reverse-scanned by [`Layout::hit_hover`]
+    pub hover_targets: Vec<HoverTarget>,
 }
 
 /// Default viewport height for [`layout_tree`] — matches the fixed window in
@@ -1317,6 +1396,16 @@ pub fn layout_in_forms(
     // clip runs/underline rects to ancestor overflow + clip:rect windows
     // (after position_all so shifts are final; ranges are complete)
     apply_run_clips(root, None, &mut runs, &mut uls);
+    // hover targets: box rects + each box's own runs. Before zsort — the
+    // stable sort would invalidate the run_range indices this walks.
+    let mut hover_targets = Vec::new();
+    collect_hover(
+        root,
+        &runs,
+        false,
+        root.node.unwrap_or(0),
+        &mut hover_targets,
+    );
     let mut rects = Vec::new();
     let mut rect_z = Vec::new();
     let mut images = Vec::new();
@@ -1380,6 +1469,7 @@ pub fn layout_in_forms(
         focused: state.focused,
         form_values,
         sticky,
+        hover_targets,
     }
 }
 
@@ -1513,6 +1603,84 @@ fn collect_forms(
     }
 }
 
+/// Collect every hover hit-test rectangle in tree order: each element box
+/// plus each text run the box owns directly (its `run_range` minus the
+/// children's subranges — the same bookkeeping as `transform_runs`). The
+/// reverse scan in [`Layout::hit_hover`] then finds the deepest/latest
+/// target first. `fixed` = inside a `position: fixed` subtree.
+///
+/// The root (body) box never becomes a target: `body` is an ancestor of
+/// every element, so a cell of body would light every `:hover` rule on the
+/// page — hovering the page background (or body's own text) matches
+/// nothing (shortcut).
+///
+/// shortcut: tree order stands in for paint order (z-index/transforms are
+/// not reflected), as in form hit-testing.
+fn collect_hover(
+    n: &BoxNode,
+    runs: &[PositionedRun],
+    fixed: bool,
+    root_node: u32,
+    out: &mut Vec<HoverTarget>,
+) {
+    if n.is_text {
+        return; // a text leaf's runs are owned by its containing box
+    }
+    let fixed = fixed || n.bx.pos == Pos::Fixed;
+    if let Some(node) = n.node {
+        if node != root_node {
+            out.push(HoverTarget {
+                rect: (n.x, n.y, n.w, n.h),
+                node,
+                cursor: n.bx.cursor,
+                fixed,
+            });
+        }
+    }
+    // this box's own run span = [run_range) minus in-flow children's
+    // subranges (ranges are nested/disjoint, ascending in tree order)
+    let (a, b) = (n.run_range.0 as usize, n.run_range.1 as usize);
+    let mut cur = a;
+    for ch in &n.children {
+        let (ca, cb) = (ch.run_range.0 as usize, ch.run_range.1 as usize);
+        if ca >= a && cb <= b && ca >= cur {
+            push_run_targets(runs, cur, ca, n.bx.cursor, root_node, out);
+            cur = cb;
+        }
+    }
+    push_run_targets(runs, cur, b, n.bx.cursor, root_node, out);
+    for ch in &n.children {
+        collect_hover(ch, runs, fixed, root_node, out);
+    }
+}
+
+/// Hover targets for `runs[lo..hi]` — one per run that carries a DOM node
+/// (node-None runs are synthetic form-state leaves; their control box's
+/// target already covers them). The run's own effective cursor wins, the
+/// box's is the fallback for those unstamped leaves.
+fn push_run_targets(
+    runs: &[PositionedRun],
+    lo: usize,
+    hi: usize,
+    box_cursor: Option<Cursor>,
+    root_node: u32,
+    out: &mut Vec<HoverTarget>,
+) {
+    for r in &runs[lo..hi] {
+        if let Some(node) = r.node {
+            if node == root_node {
+                continue; // body's own text — same rule as the root box
+            }
+            out.push(HoverTarget {
+                rect: (r.x, r.y, r.width, r.style.line_height()),
+                node,
+                cursor: r.cursor.or(box_cursor),
+                fixed: r.fixed,
+            });
+        }
+    }
+}
+
 impl Layout {
     /// Index of the topmost form control under viewport point (x, y),
     /// given the document is scrolled by `scroll` (fixed-position
@@ -1525,6 +1693,23 @@ impl Layout {
             let (fx, fyy, fw, fh) = f.rect;
             if x >= fx && x < fx + fw && fy >= fyy && fy < fyy + fh {
                 return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Topmost hover target under viewport point (x, y), given the document
+    /// is scrolled by `scroll` — same math as [`Self::hit_test_form`].
+    /// Returns the hovered DOM element + its effective `cursor`.
+    /// shortcut: targets are in tree order, not paint order (z-index and
+    /// transforms aren't reflected), and clipped-away text stays hoverable
+    /// — the same approximation as form hit-testing.
+    pub fn hit_hover(&self, x: f32, y: f32, scroll: f32) -> Option<(u32, Option<Cursor>)> {
+        for t in self.hover_targets.iter().rev() {
+            let ty = if t.fixed { y } else { y + scroll };
+            let (rx, ry, rw, rh) = t.rect;
+            if x >= rx && x < rx + rw && ty >= ry && ty < ry + rh {
+                return Some((t.node, t.cursor));
             }
         }
         None
@@ -2212,6 +2397,8 @@ fn leaf_atom(n: &BoxNode) -> Atom {
         style: n.style,
         hard_break: n.hard_break,
         link: n.link.clone(),
+        node: n.node,
+        cursor: n.bx.cursor,
     }
 }
 
@@ -3835,6 +4022,8 @@ fn layout_from(
                 style: a.style,
                 hard_break: true,
                 link: None,
+                node: a.node,
+                cursor: a.cursor,
             });
             continue;
         }
@@ -3855,6 +4044,8 @@ fn layout_from(
                     style: a.style,
                     hard_break: false,
                     link: a.link.clone(),
+                    node: a.node,
+                    cursor: a.cursor,
                 });
             }
             first = false;
@@ -3864,6 +4055,8 @@ fn layout_from(
                 style: a.style,
                 hard_break: false,
                 link: a.link.clone(),
+                node: a.node,
+                cursor: a.cursor,
             });
         }
         // atom ends with whitespace → separator before the next atom's text
@@ -3875,6 +4068,8 @@ fn layout_from(
                 style: a.style,
                 hard_break: false,
                 link: a.link.clone(),
+                node: a.node,
+                cursor: a.cursor,
             });
         }
     }
@@ -3949,6 +4144,8 @@ fn layout_from(
             link: w.link.clone(),
             fixed: false,
             clip: None,
+            node: w.node,
+            cursor: w.cursor,
         });
         if w.style.underline {
             underline_rects.push((x, y + lh - 2.0, ww, 1.0, w.style.color, false));
@@ -3999,11 +4196,12 @@ fn layout_from(
             shadows: Vec::new(),
             open_line: x > 0.0,
             // text-only path (inline continuation): no box tree was laid
-            // → no form controls, no focus, no values
+            // → no form controls, no focus, no values, no hover targets
             forms: Vec::new(),
             focused: None,
             form_values: HashMap::new(),
             sticky: Vec::new(),
+            hover_targets: Vec::new(),
         },
         x,
     )
@@ -4019,6 +4217,8 @@ mod tests {
             style: Style::new(),
             hard_break: hard,
             link: None,
+            node: None,
+            cursor: None,
         }
     }
 
@@ -4221,6 +4421,8 @@ mod tests {
             },
             hard_break: false,
             link: None,
+            node: None,
+            cursor: None,
         };
         // width fits only ~2 chars → would wrap without nowrap
         let l = layout(&[a], 10.0, &|s, st| s.len() as f32 * st.size * 0.5);
@@ -6401,6 +6603,104 @@ line</textarea></div>"#,
         // scroll respected: the same viewport point maps 100px down the doc
         assert_eq!(l.hit_test_form(x + w / 2.0, y + h / 2.0 - 100.0, 100.0), Some(0));
         assert_eq!(l.hit_test_form(x + w / 2.0, y + h / 2.0, 100.0), None);
+    }
+
+    // ---- hover hit-testing + cursor ----
+
+    /// DOM node id of the element carrying `id=<want>` — hover targets
+    /// carry node ids, so tests need the stable ones.
+    fn id_by_attr(dom: &Dom, want: &str) -> u32 {
+        (0..dom.nodes.len() as u32)
+            .find(|&n| dom.attr(n, "id") == Some(want))
+            .unwrap_or_else(|| panic!("no element with id={want}"))
+    }
+
+    #[test]
+    fn hover_hit_test_returns_node_and_later_box_wins() {
+        // shortcut: plain blocks size to content (declared `height` only
+        // applies to replaced elements) — min-height is the honored floor
+        let markup = "<div id=\"c\" style=\"width:50px;min-height:200px\"></div>\
+            <div id=\"a\" style=\"position:absolute;left:10px;top:10px;width:50px;min-height:50px\"></div>\
+            <div id=\"b\" style=\"position:absolute;left:10px;top:10px;width:50px;min-height:50px;cursor:pointer\"></div>";
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse("");
+        let (c, b) = (id_by_attr(&dom, "c"), id_by_attr(&dom, "b"));
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_in(&mut root, 300.0, 200.0, &m4);
+        // a and b overlap at (15,15); b is LATER in tree order so it wins
+        // the reverse scan — and its inline `cursor:pointer` rides along
+        assert_eq!(
+            l.hit_hover(15.0, 15.0, 0.0),
+            Some((b, Some(Cursor::Pointer)))
+        );
+        // scroll math (same as the form/link hit-tests): viewport y=-85
+        // with scroll=100 is document y=15 → still over b
+        assert_eq!(
+            l.hit_hover(15.0, -85.0, 100.0),
+            Some((b, Some(Cursor::Pointer)))
+        );
+        // scrolled down: document y=115 falls in the tall static box c
+        // (no cursor declared → None), past a/b's 50px band
+        assert_eq!(l.hit_hover(15.0, 15.0, 100.0), Some((c, None)));
+        // outside every element box: the root (body/document) box covers
+        // this point but is filtered — it must never become the hover cell
+        assert_eq!(l.hit_hover(250.0, 100.0, 0.0), None);
+    }
+
+    #[test]
+    fn hover_text_run_targets_carry_node_and_cursor() {
+        // min-height, not height (declared height only applies to replaced
+        // elements) — the empty area below the text line is still a target
+        let markup =
+            r#"<div id="c" style="width:200px;min-height:60px">ab<span id="s" style="cursor:text">cd</span></div>"#;
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse("");
+        let (c, s) = (id_by_attr(&dom, "c"), id_by_attr(&dom, "s"));
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_in(&mut root, 300.0, 200.0, &m4);
+        // the span's text is its OWN run target: node = the span, cursor
+        // inherited down the box tree at build time
+        let cd = l.runs.iter().find(|r| r.text == "cd").expect("cd run");
+        assert_eq!(
+            l.hit_hover(cd.x + 1.0, cd.y + 1.0, 0.0),
+            Some((s, Some(Cursor::Text)))
+        );
+        // empty area of the div (below the text line): the BOX target,
+        // which declared no cursor
+        assert_eq!(l.hit_hover(150.0, 50.0, 0.0), Some((c, None)));
+    }
+
+    #[test]
+    fn cursor_inherits_down_the_box_tree_at_build() {
+        let markup = r#"<div id="d"><p id="p"><span id="s">x</span></p></div>"#;
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse("div { cursor: crosshair }");
+        let (d, p, s) = (id_by_attr(&dom, "d"), id_by_attr(&dom, "p"), id_by_attr(&dom, "s"));
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        // the declaring box…
+        let div_box = &root.children[0];
+        assert_eq!(div_box.node, Some(d));
+        assert_eq!(div_box.bx.cursor, Some(Cursor::Crosshair));
+        // …the intermediate <p>, which declares nothing (cursor is not a
+        // cascade-inherited property — build threads the parent's value)…
+        let p_box = &div_box.children[0];
+        assert_eq!(p_box.node, Some(p));
+        assert_eq!(p_box.bx.cursor, Some(Cursor::Crosshair));
+        // …and the flattened <span>'s text leaf: node = the span (its
+        // containing element), cursor already stamped
+        let leaf = &p_box.children[0];
+        assert!(leaf.is_text && leaf.text == "x");
+        assert_eq!(leaf.node, Some(s));
+        assert_eq!(leaf.bx.cursor, Some(Cursor::Crosshair));
+        // no declaration anywhere above → None, not a default pointer
+        let bare_dom = crate::html::parse(r#"<div id="d2"><span id="s2">x</span></div>"#);
+        let s2 = id_by_attr(&bare_dom, "s2");
+        let bare = boxes_of(r#"<div id="d2"><span id="s2">x</span></div>"#, "");
+        let div_box = &bare.children[0];
+        assert_eq!(div_box.bx.cursor, None);
+        let leaf = &div_box.children[0];
+        assert_eq!(leaf.node, Some(s2));
+        assert_eq!(leaf.bx.cursor, None);
     }
 
     #[test]

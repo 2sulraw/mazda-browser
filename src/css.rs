@@ -1,7 +1,9 @@
 //! CSS subset (Phase 1b, PLAN Recommendations §2): stylesheet text is parsed
 //! ONCE into a rule list with precompiled selectors — never re-parsed per element.
-//! shortcut: dynamic pseudo-classes (`:hover`, `:focus`, …) drop their whole
-//! selector (static ones — `:link`, `:visited`, `:root`,
+//! shortcut: dynamic pseudo-classes other than `:hover` (`:focus`, `:active`, …)
+//! drop their whole selector (`:hover` parses and is evaluated against the
+//! sheet's hover cell, see [`Sheet::set_hovered`]; static ones — `:link`,
+//! `:visited`, `:root`,
 //! `:host(...)` (bound to the component whose `<style>` declared it), `:not(...)`
 //! incl. comma lists, `:is(...)`, `:where(...)`, `:first-child`, `:last-child`,
 //! `:nth-child(...)` — participate in the cascade). `::before`/`::after` (and
@@ -111,6 +113,47 @@ pub enum Clear {
     Left,
     Right,
     All,
+}
+
+/// CSS `cursor` — the pointer shape shown over a box. `None` (undeclared
+/// or an unrecognized keyword) means "inherit from the DOM ancestors",
+/// which is also what an invalid declaration must do (it's dropped), so
+/// the two are indistinguishable by design.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Cursor {
+    Default,
+    Pointer,
+    Text,
+    Move,
+    Crosshair,
+    NotAllowed,
+    Help,
+    Grab,
+    ColResize,
+    RowResize,
+}
+
+/// Parse a `cursor` declaration: cursor lists may carry fallbacks —
+/// `pointer, default` — so walk the comma-separated items and take the
+/// first supported keyword. Unknown-only → None = the declaration is
+/// dropped and the value inherits (an invalid declaration must behave
+/// like an undeclared one). shortcut: `zoom-in`/`progress`/… and the
+/// `url()` form aren't modeled (an item with `url(` just doesn't parse,
+/// so a later fallback keyword still wins).
+fn parse_cursor(v: &str) -> Option<Cursor> {
+    v.split(',').find_map(|item| match item.split_whitespace().next().unwrap_or("") {
+        "default" => Some(Cursor::Default),
+        "pointer" => Some(Cursor::Pointer),
+        "text" => Some(Cursor::Text),
+        "move" => Some(Cursor::Move),
+        "crosshair" => Some(Cursor::Crosshair),
+        "not-allowed" => Some(Cursor::NotAllowed),
+        "help" => Some(Cursor::Help),
+        "grab" => Some(Cursor::Grab),
+        "col-resize" => Some(Cursor::ColResize),
+        "row-resize" => Some(Cursor::RowResize),
+        _ => None,
+    })
 }
 
 /// CSS `vertical-align` of an inline-level box within its line. `Len` is a
@@ -307,6 +350,11 @@ pub struct BoxStyle {
     /// CSS `transform` — visual-only paint transform of this box's
     /// rendering (see [`Transform`]); None = no transform
     pub transform: Option<Transform>,
+    /// CSS `cursor` — pointer shape over this box. Inherited: layout
+    /// threads the nearest ancestor's declared value down at build time,
+    /// so a resolved box carries the effective value and None means
+    /// "nothing in the chain declared it"
+    pub cursor: Option<Cursor>,
     /// Bitmask of [`decl`] flags: which box properties the author CSS
     /// actually declared. Lets UA control chrome (`control_chrome` in
     /// layout.rs) fill only the properties the author left initial, so an
@@ -395,19 +443,25 @@ impl Default for BoxStyle {
             valign: VAlign::Baseline,
             z: None,
             transform: None,
+            cursor: None,
             declared: 0,
             content: None,
         }
     }
 }
 
-/// One static pseudo-class the cascade can evaluate without interaction
-/// state. Dynamic/state pseudo-classes (`:hover`, `:focus`, …) are NOT
-/// representable — a selector containing one is dropped at parse time (a
-/// `:hover` rule that always matched would paint hover styles permanently).
-/// Pseudo-elements ARE: see [`PseudoEl`] on [`Seg`].
+/// One pseudo-class the cascade evaluates. `:hover` reads the sheet's
+/// hover cell ([`Sheet::set_hovered`]); the rest are static markup state.
+/// Dynamic/state pseudo-classes other than `:hover` (`:focus`, `:active`, …)
+/// are NOT representable — a selector containing one is dropped at parse
+/// time (a `:focus` rule that always matched would paint focus styles
+/// permanently). Pseudo-elements ARE: see [`PseudoEl`] on [`Seg`].
 #[derive(Clone)]
 enum Pseudo {
+    /// `:hover` — the element the pointer is on (or, shortcut: an element
+    /// whose hovered descendant/ancestor chain passes through it — see
+    /// `pseudo_matches`). Matches nothing while no cell is set.
+    Hover,
     /// `:link` — an element carrying an `href` (the common case `<a href>`).
     Link,
     /// `:visited` — a link the user has actually visited. Visit history isn't
@@ -468,7 +522,8 @@ struct Seg {
     id: Option<String>,
     classes: Vec<String>,
     attrs: Vec<(String, Option<String>)>,
-    /// static pseudo-classes that must ALL hold for this segment
+    /// pseudo-classes that must ALL hold for this segment (`:hover` reads
+    /// the sheet's hover cell, the others are static state)
     pseudos: Vec<Pseudo>,
     /// `:not(...)` exclusions — the element must match NONE of these simple
     /// selectors (each parsed by `parse_compound`)
@@ -499,6 +554,18 @@ pub struct Sheet {
     /// see them — a `p::before` rule must not style the `p` — and so pages
     /// without pseudo rules pay nothing extra.
     pseudo: [Vec<Rule>; 2],
+    /// `:hover` rules whose LAST segment carries the flag (and no
+    /// pseudo-element), cascade-sorted like `rules`. Kept apart so a page
+    /// with no pointer on it skips them entirely; `cascade_rules` merges
+    /// them back into exact (spec, order) order while a cell is set.
+    /// `li:hover::before` stays in `pseudo` (the pseudo-element bucket
+    /// wins the partition) with its Hover flag riding the Seg — only
+    /// `resolve_pseudo` reads it there.
+    hover: Vec<Rule>,
+    /// the leaf DOM node the pointer is on (set by the shell before each
+    /// re-cascade); None = nothing is hovered, so no `:hover` matches.
+    /// Cell (not mut): `resolve` runs on `&Sheet` throughout layout.
+    hovered: std::cell::Cell<Option<u32>>,
     /// cascade-ordered `(selector, value)` pairs for `color-scheme` only.
     /// The property is consulted for every element but declared on very few
     /// rules, so `resolve` walks this tiny slice instead of the full rule list.
@@ -619,10 +686,17 @@ fn parse_font_face(block: &str, base: &str) -> Option<FontFace> {
 }
 
 impl Sheet {
-    /// Total parsed rules — element rules plus the `::before`/`::after`
-    /// buckets.
+    /// Total parsed rules — element rules plus the `:hover` and the
+    /// `::before`/`::after` buckets.
     pub fn rule_count(&self) -> usize {
-        self.rules.len() + self.pseudo[0].len() + self.pseudo[1].len()
+        self.rules.len() + self.hover.len() + self.pseudo[0].len() + self.pseudo[1].len()
+    }
+
+    /// Set the hovered leaf node (the shell hit-tests the pointer each
+    /// frame and re-cascades through [`Self::resolve`] after calling this).
+    /// `None` clears it — no `:hover` matches then.
+    pub fn set_hovered(&self, node: Option<u32>) {
+        self.hovered.set(node);
     }
 
     /// Wire the loader's shared stack table so `Style::fam_stack` ids resolved
@@ -689,6 +763,7 @@ impl Sheet {
         let root_pol = dom.attr(html, "class").and_then(theme_polarity);
         self.root_pol = root_pol; // fallback theme for light-dark() below
         self.vars.clear();
+        let hover = self.hovered.get();
         for (name, defs) in &self.var_defs {
             // winner among definitions whose selector applies to the real
             // <html> element — those ARE the root's custom properties
@@ -707,7 +782,7 @@ impl Sheet {
                 // the polarity tokens are a guess, the DOM is the truth (a list
                 // like `:root,.skin-invert,.notheme` reads dark by token but is
                 // the page's own light palette)
-                let applies = root_pol.is_some() && sel_applies_to_root(dom, html, sel);
+                let applies = root_pol.is_some() && sel_applies_to_root(dom, html, sel, hover);
                 if contradicts && !applies {
                     continue;
                 }
@@ -813,6 +888,7 @@ const KNOWN: &[&str] = &[
     "vertical-align",
     "z-index",
     "transform",
+    "cursor",
     // SVG paint properties — the rasterizer supports these; kept in decls so
     // Sheet::class_paint can resolve class-colored inline-SVG children
     // (fill/stroke/… on <path>/<rect>), which the text cascade never reaches
@@ -915,9 +991,10 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                     });
                     order += 1;
                 }
-                // selectors we can't parse (dynamic pseudo-classes,
-                // pseudo-elements, malformed syntax) are dropped,
-                // but the rule still applies via its other comma-separated parts
+                // selectors we can't parse (state pseudo-classes other
+                // than :hover, unknown pseudo-elements, malformed syntax)
+                // are dropped, but the rule still applies via its other
+                // comma-separated parts
             }
         }
         i = cb + 1;
@@ -928,12 +1005,24 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     // them out so the origin element's cascade, class_paint and the
     // color-scheme slice below never see a `p::before` rule. Each bucket
     // keeps the (spec, order) order — the subset of a sorted list is sorted.
+    // `:hover` rules are pulled out the same way (into `hover`), but only
+    // when the flag sits on the LAST segment and no pseudo-element closes
+    // the selector: `li:hover::before` styles a generated box, so the
+    // pseudo bucket wins that partition (its Hover flag still evaluates,
+    // via `resolve_pseudo`), and `a:hover span` keeps its hover on a middle
+    // segment where it stays in `rules` (it can never match with no cell
+    // set anyway — the split only spares pointer-free pages the walk).
     let mut pseudo: [Vec<Rule>; 2] = [Vec::new(), Vec::new()];
+    let mut hover = Vec::new();
     let mut plain = Vec::with_capacity(rules.len());
     for r in rules {
         let kind = r.segs.last().and_then(|s| s.pseudo_el);
+        let last_hover = r.segs.last().is_some_and(|s| {
+            s.pseudo_el.is_none() && s.pseudos.iter().any(|p| matches!(p, Pseudo::Hover))
+        });
         match kind {
             Some(k) => pseudo[k.idx()].push(r),
+            None if last_hover => hover.push(r),
             None => plain.push(r),
         }
     }
@@ -956,6 +1045,8 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         rules,
         schemes,
         pseudo,
+        hover,
+        hovered: std::cell::Cell::new(None),
         vars,
         var_defs,
         root_pol: None,
@@ -1064,7 +1155,51 @@ fn match_brace(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// Merge of the plain rule list with the `:hover` bucket, keyed by the
+/// cascade order `(spec, order)` both were sorted by — iterating the two
+/// sorted slices in step yields exactly the order a single sorted list
+/// would, so a hover rule interleaves with the rest at its own
+/// specificity/source position instead of trumping everything after it.
+struct MergeRules<'a> {
+    plain: std::slice::Iter<'a, Rule>,
+    hover: std::slice::Iter<'a, Rule>,
+}
+
+impl<'a> Iterator for MergeRules<'a> {
+    type Item = &'a Rule;
+    fn next(&mut self) -> Option<&'a Rule> {
+        match (self.plain.as_slice().first(), self.hover.as_slice().first()) {
+            (Some(p), Some(h)) => {
+                if (p.spec, p.order) <= (h.spec, h.order) {
+                    self.plain.next()
+                } else {
+                    self.hover.next()
+                }
+            }
+            (Some(_), None) => self.plain.next(),
+            (None, Some(_)) => self.hover.next(),
+            (None, None) => None,
+        }
+    }
+}
+
 impl Sheet {
+    /// Every rule the cascade must walk for one element, in exact
+    /// `(spec, order)` order: [`Self::rules`] merged with [`Self::hover`]
+    /// while a hover cell is set, plain rules alone otherwise (a `:hover`
+    /// selector can't match with no cell, so the bucket is skipped whole).
+    fn cascade_rules(&self) -> MergeRules<'_> {
+        let hover: &[Rule] = if self.hovered.get().is_some() {
+            &self.hover
+        } else {
+            &[]
+        };
+        MergeRules {
+            plain: self.rules.iter(),
+            hover: hover.iter(),
+        }
+    }
+
     /// Cascade every matching rule + the inline `style` attribute over `base`.
     /// The parent font-size defaults to `base.size` (correct wherever `base` is
     /// the true parent style); callers that pass a UA-adjusted base (headings)
@@ -1096,8 +1231,8 @@ impl Sheet {
         let dark = scheme.unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK));
         let mut color_declared = false;
 
-        for rule in &self.rules {
-            if !matches(dom, node, &rule.segs) {
+        for rule in self.cascade_rules() {
+            if !matches(dom, node, &rule.segs, self.hovered.get()) {
                 continue;
             }
             for d in &rule.decls {
@@ -1173,7 +1308,7 @@ impl Sheet {
         let dark = scheme.unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK));
         let mut color_declared = false;
         for rule in rules {
-            if !matches(dom, node, &rule.segs) {
+            if !matches(dom, node, &rule.segs, self.hovered.get()) {
                 continue;
             }
             for d in &rule.decls {
@@ -1214,7 +1349,7 @@ impl Sheet {
     fn own_scheme(&self, dom: &Dom, node: u32, inline: Option<&str>) -> Option<String> {
         let mut val: Option<String> = None;
         for (segs, v) in &self.schemes {
-            if matches(dom, node, segs) {
+            if matches(dom, node, segs, self.hovered.get()) {
                 // same var() substitution resolve applies to every declaration
                 val = Some(if v.contains("var(") {
                     subst_vars(v, &self.vars, 0)
@@ -1387,13 +1522,14 @@ fn selector_polarity(sel: &str) -> Option<bool> {
 /// over ones scoped to a different theme state (`html.skin-theme-clientpref-os`
 /// vars on a clientpref-day page never apply in a real browser). `:root`
 /// parses like any other selector now and matches the root by parentage.
-fn sel_applies_to_root(dom: &Dom, html: u32, sel: &str) -> bool {
+fn sel_applies_to_root(dom: &Dom, html: u32, sel: &str, hover: Option<u32>) -> bool {
     split_selectors(sel).iter().any(|p| {
         parse_selector(p)
             .map(|segs| {
                 // a pseudo-element rule's custom props live on the
                 // generated box, not the root — it can't set the theme
-                segs.last().is_some_and(|s| s.pseudo_el.is_none()) && matches(dom, html, &segs)
+                segs.last().is_some_and(|s| s.pseudo_el.is_none())
+                    && matches(dom, html, &segs, hover)
             })
             .unwrap_or(false)
     })
@@ -1944,6 +2080,9 @@ fn apply_decl(
             bx.z = if v == "auto" { None } else { v.parse::<i32>().ok() };
         }
         "transform" => bx.transform = parse_transform(&d.1, vp),
+        // unknown keyword → None = the declaration is dropped and the
+        // value inherits (see parse_cursor)
+        "cursor" => bx.cursor = parse_cursor(&d.1),
         _ => {}
     }
     false
@@ -2951,9 +3090,13 @@ fn flush<'a>(tokens: &mut Vec<&'a str>, s: &'a str, start: usize, end: usize) {
 }
 
 /// True if `s` is a state/interaction pseudo-class the static cascade can
-/// never evaluate: no element is hovered/focused during a style-only pass, so
-/// these never match — which makes their `:not(...)` negation vacuously true
+/// never evaluate: no element is focused during a style-only pass, so these
+/// never match — which makes their `:not(...)` negation vacuously true
 /// (skip links styled `:not(:focus)` keep working).
+///
+/// `:hover` is NOT here — it parses (see [`Pseudo::Hover`]) and is evaluated
+/// against the sheet's hover cell at cascade time, so `:not(:hover)` is a
+/// real (negated) match too.
 ///
 /// Note: `:enabled`/`:disabled` are NOT here — they are markup state (the
 /// `disabled` attribute), which the static cascade evaluates directly.
@@ -2966,7 +3109,7 @@ fn is_dynamic_pseudo(s: &str) -> bool {
     }
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "hover" | "focus" | "focus-within" | "focus-visible" | "active" | "checked"
+        "focus" | "focus-within" | "focus-visible" | "active" | "checked"
             | "target" | "default" | "required" | "optional"
             | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
             | "read-only" | "read-write" | "placeholder-shown"
@@ -3169,8 +3312,8 @@ fn parse_compound(s: &str) -> Option<Seg> {
                 // single-colon spelling record the pseudo-element on the
                 // segment; pseudo-CLASSES may precede it
                 // (`li:first-child::before` — static ones match as always,
-                // dynamic ones still drop the rule below), but nothing may
-                // follow it.
+                // `:hover` matches the hover cell, other dynamic ones still
+                // drop the rule below), but nothing may follow it.
                 let double = i + 1 < b.len() && b[i + 1] == ':';
                 i += if double { 2 } else { 1 };
                 let st = i;
@@ -3232,6 +3375,10 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     // attribute), not interaction state — statically evaluable.
                     ("enabled", None) => seg.pseudos.push(Pseudo::Enabled),
                     ("disabled", None) => seg.pseudos.push(Pseudo::Disabled),
+                    // interaction state — evaluated against the sheet's
+                    // hover cell at cascade time (nothing matches while
+                    // the cell is None)
+                    ("hover", None) => seg.pseudos.push(Pseudo::Hover),
                     // the root element: a direct child of the document root
                     ("root", None) => seg.pseudos.push(Pseudo::Root),
                     ("first-child", None) => seg.pseudos.push(Pseudo::FirstChild),
@@ -3303,9 +3450,10 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         }
                         seg.pseudos.push(Pseudo::Is(alts, counts));
                     }
-                    // dynamic/state pseudo-classes (:hover, :focus, …) and
-                    // anything unknown: not statically evaluable — the whole
-                    // selector is dropped (module docs)
+                    // state pseudo-classes other than :hover (:focus,
+                    // :active, …) and anything unknown: not statically
+                    // evaluable — the whole selector is dropped (module
+                    // docs)
                     _ => return None,
                 }
             }
@@ -3366,11 +3514,12 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
     (ids, cls, tags)
 }
 
-/// Right-to-left selector match against the ancestor chain.
-fn matches(dom: &Dom, node: u32, segs: &[Seg]) -> bool {
+/// Right-to-left selector match against the ancestor chain. `hover` is the
+/// sheet's hover cell — only a `:hover` pseudo-class reads it.
+fn matches(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> bool {
     let mut idx = segs.len() - 1;
     let mut cur = node;
-    if !seg_matches(dom, cur, &segs[idx]) {
+    if !seg_matches(dom, cur, &segs[idx], hover) {
         return false;
     }
     while idx > 0 {
@@ -3382,7 +3531,7 @@ fn matches(dom: &Dom, node: u32, segs: &[Seg]) -> bool {
                 return false; // reached document root
             }
             cur = parent;
-            if seg_matches(dom, cur, &segs[idx]) {
+            if seg_matches(dom, cur, &segs[idx], hover) {
                 break;
             }
             if need_child {
@@ -3393,7 +3542,7 @@ fn matches(dom: &Dom, node: u32, segs: &[Seg]) -> bool {
     true
 }
 
-fn seg_matches(dom: &Dom, node: u32, seg: &Seg) -> bool {
+fn seg_matches(dom: &Dom, node: u32, seg: &Seg, hover: Option<u32>) -> bool {
     // `slot[name=X]` also matches the light-DOM nodes projected into that
     // slot (elements carrying `slot="X"`): flat shadow expansion leaves the
     // slotted children as siblings of the empty <slot>, so a rule styling
@@ -3442,21 +3591,31 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg) -> bool {
         }
     }
     for p in &seg.pseudos {
-        if !pseudo_matches(dom, node, p) {
+        if !pseudo_matches(dom, node, p, hover) {
             return false;
         }
     }
     // `:not(X)` — the element must match NONE of the excluded selectors
     for n in &seg.nots {
-        if seg_matches(dom, node, n) {
+        if seg_matches(dom, node, n, hover) {
             return false;
         }
     }
     true
 }
 
-fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo) -> bool {
+fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool {
     match p {
+        // the pointer's leaf node: the hovered element itself OR an
+        // element the hover chain passes through — two directions, so a
+        // deep hit lights its whole ancestor chain (`tr:hover td`) while
+        // the cascade's "cell = a descendant lights the box" direction
+        // also holds (shortcut: a descendant of a hovered BOX that
+        // doesn't contain the pointer matches too — hit-testing only
+        // lights the deepest box, not every intermediate one)
+        Pseudo::Hover => hover.is_some_and(|h| {
+            ancestor_or_self(dom, node, h) || ancestor_or_self(dom, h, node)
+        }),
         // an element carrying an href
         Pseudo::Link => dom.attr(node, "href").is_some(),
         // visit history isn't modeled — a fresh render has no visited links
@@ -3489,7 +3648,7 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo) -> bool {
             }
         }
         // ANY alternate compound selector matches
-        Pseudo::Is(alts, _) => alts.iter().any(|alt| seg_matches(dom, node, alt)),
+        Pseudo::Is(alts, _) => alts.iter().any(|alt| seg_matches(dom, node, alt, hover)),
         // the host of the component that declared this rule: an element with
         // a direct <style> child whose text contains the exact `:host(...)`
         // selector text (flat shadow expansion splices that style into the
@@ -3504,8 +3663,25 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo) -> bool {
                         )
                     })
             });
-            owns_style && seg_matches(dom, node, arg)
+            owns_style && seg_matches(dom, node, arg, hover)
         }
+    }
+}
+
+/// Is `want` the node `from` itself or one of its DOM ancestors? Walks
+/// parent links; terminates at the document root (node 0's parent is
+/// itself, so a node that isn't in the tree stops immediately).
+fn ancestor_or_self(dom: &Dom, from: u32, want: u32) -> bool {
+    let mut cur = from;
+    loop {
+        if cur == want {
+            return true;
+        }
+        let parent = dom.nodes[cur as usize].parent;
+        if parent == cur || parent == 0 {
+            return false;
+        }
+        cur = parent;
     }
 }
 
@@ -3874,7 +4050,8 @@ mod tests {
         let sheet = parse("a:hover { color: #111111 } p { color: #222222 }");
         let dom = dom_of("<p></p><a href=x></a>");
         assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0x222222);
-        // the dropped :hover rule must not paint its color on the anchor either
+        // `:hover` parses but no cell is set here, so it must not paint
+        // its color on the anchor (covered fully by hover_cell_tests)
         let a = by_tag(&dom, "a");
         assert_ne!(sheet.resolve(&dom, a, Style::new(), None).style.color, 0x111111);
     }
@@ -4519,9 +4696,11 @@ mod tests {
     fn colon_inside_attribute_value_is_not_a_pseudo() {
         assert!(parse_selector(r#"a[href^="http:"]"#).is_some());
         assert!(parse_selector(r#".data-\:x"#).is_some());
-        // dynamic pseudo-classes still drop the selector; pseudo-elements
-        // parse (covered by pseudo_element_selectors below)
-        assert!(parse_selector("a:hover").is_none());
+        // `:hover` parses now (evaluated against the hover cell, covered
+        // by hover_cell_tests below); pseudo-elements parse (covered by
+        // pseudo_element_selectors below)
+        assert!(parse_selector("a:hover").is_some());
+        assert!(parse_selector("a:focus").is_none()); // still drops
         assert!(parse_selector("li::before").is_some());
         assert!(parse_selector(".plain .other").is_some());
     }
@@ -4533,10 +4712,12 @@ mod tests {
         assert!(parse_selector("li:before").is_some());
         assert!(parse_selector("li::after").is_some());
         // bare = `*::before`; a pseudo-class may precede the pseudo-element
-        // (static ones match as always; dynamic :hover drops the whole rule)
+        // (static ones match as always; `:hover` parses with its flag riding
+        // the segment — the rule lands in the pseudo bucket, see
+        // hover_bucket_partition below; other dynamic ones drop the rule)
         assert!(parse_selector("::before").is_some());
         assert!(parse_selector("li:first-child::before").is_some());
-        assert!(parse_selector("li:hover::before").is_none());
+        assert!(parse_selector("li:hover::before").is_some());
         // other pseudo-elements are out of scope and still drop
         assert!(parse_selector("li::marker").is_none());
         assert!(parse_selector("li::placeholder").is_none());
@@ -4593,6 +4774,111 @@ mod tests {
                 .resolve_pseudo(&dom, li, Style::new(), PseudoEl::Before)
                 .is_some_and(|o| o.display_none)
         );
+    }
+
+    #[test]
+    fn hover_bucket_partition_and_pseudo_composition() {
+        // `a:hover` → the hover bucket; `li:hover::before` → the pseudo
+        // bucket (the pseudo-element wins the partition, Hover rides along)
+        let sheet = parse(
+            "a:hover { color: #111111 } \
+             p { color: #222222 } \
+             li:hover::before { content: \"*\" }",
+        );
+        assert_eq!(sheet.rule_count(), 3, "every rule parses");
+        // origin cascade never sees either hover rule
+        let dom = dom_of("<p>x</p><li>y</li><a href=z>l</a>");
+        let a = by_tag(&dom, "a");
+        assert_ne!(sheet.resolve(&dom, a, Style::new(), None).style.color, 0x111111);
+        // the pseudo bucket holds `li:hover::before` and its Hover flag
+        // evaluates there too: no cell → no content, cell = li → content
+        let li = by_tag(&dom, "li");
+        let pe = sheet
+            .resolve_pseudo(&dom, li, Style::new(), PseudoEl::Before)
+            .expect("bucket non-empty");
+        assert!(pe.bx.content.is_none(), "no cell set");
+        sheet.set_hovered(Some(li));
+        let pe = sheet
+            .resolve_pseudo(&dom, li, Style::new(), PseudoEl::Before)
+            .expect("bucket non-empty");
+        assert_eq!(pe.bx.content.as_deref(), Some("\"*\""), "cell matches");
+        // and the hover bucket rule matches its own element with the cell set
+        sheet.set_hovered(Some(a));
+        assert_eq!(sheet.resolve(&dom, a, Style::new(), None).style.color, 0x111111);
+    }
+
+    #[test]
+    fn hover_cell_cascades_over_ancestor_chain() {
+        // one page sheet, one hover cell — exactly how layout drives it
+        let sheet = parse("a:hover { color: #111111 } div:hover { color: #333333 }");
+        let dom = dom_of("<div id=w><p><a id=x>in</a></p><a id=y>sib</a></div>");
+        let x = by_attr(&dom, "id", "x");
+        let y = by_attr(&dom, "id", "y");
+        let w = by_attr(&dom, "id", "w");
+        // cell None: nothing matches
+        assert_ne!(sheet.resolve(&dom, x, Style::new(), None).style.color, 0x111111);
+        assert_ne!(sheet.resolve(&dom, w, Style::new(), None).style.color, 0x333333);
+        // cell = x: the element itself matches…
+        sheet.set_hovered(Some(x));
+        assert_eq!(sheet.resolve(&dom, x, Style::new(), None).style.color, 0x111111);
+        // …a sibling with no ancestor relation to the cell doesn't…
+        assert_ne!(sheet.resolve(&dom, y, Style::new(), None).style.color, 0x111111);
+        // …and so does an element on the cell's ancestor chain (`tr:hover td`
+        // style: a rule on a container matches when the pointer is inside)
+        assert_eq!(
+            sheet.resolve(&dom, w, Style::new(), None).style.color,
+            0x333333
+        );
+        // cell = a descendant lights the container too (the other direction)
+        sheet.set_hovered(Some(y));
+        assert_eq!(
+            sheet.resolve(&dom, w, Style::new(), None).style.color,
+            0x333333
+        );
+        // clearing the cell stops every match again
+        sheet.set_hovered(None);
+        assert_ne!(sheet.resolve(&dom, x, Style::new(), None).style.color, 0x111111);
+        assert_ne!(sheet.resolve(&dom, w, Style::new(), None).style.color, 0x333333);
+    }
+
+    #[test]
+    fn cursor_declarations_parse_and_inherit() {
+        let sheet = parse(
+            "a { cursor: pointer } p { cursor: text } \
+             div { cursor: bogus } span { cursor: help, default }",
+        );
+        let dom = dom_of("<a href=x></a><p></p><div></div><span></span>");
+        let bx_of = |tag: &str| {
+            let n = by_tag(&dom, tag);
+            sheet.resolve(&dom, n, Style::new(), None).bx.cursor
+        };
+        assert_eq!(bx_of("a"), Some(Cursor::Pointer));
+        assert_eq!(bx_of("p"), Some(Cursor::Text));
+        // unknown keyword → declaration dropped (None = inherit, and no
+        // ancestor declared one here, so None either way)
+        assert_eq!(bx_of("div"), None);
+        // a fallback list: the first supported keyword wins
+        assert_eq!(bx_of("span"), Some(Cursor::Help));
+        // undeclared → None
+        assert_eq!(sheet.resolve(&dom, by_tag(&dom, "a"), Style::new(), None).bx.cursor, Some(Cursor::Pointer));
+    }
+
+    #[test]
+    fn cursor_inherits_from_ancestor_declaration() {
+        // layout stamps the effective value at build time; here we verify
+        // the declaration lands on the declaring element's BoxStyle so the
+        // build-time walk has something to inherit
+        let sheet = parse("div { cursor: crosshair }");
+        let dom = dom_of("<div><p><span>x</span></p></div>");
+        let div = by_tag(&dom, "div");
+        assert_eq!(
+            sheet.resolve(&dom, div, Style::new(), None).bx.cursor,
+            Some(Cursor::Crosshair)
+        );
+        // an undeclared descendant resolves to None at cascade time —
+        // layout's build walk (layout.rs) threads the ancestor's value
+        let span = by_tag(&dom, "span");
+        assert_eq!(sheet.resolve(&dom, span, Style::new(), None).bx.cursor, None);
     }
 
     #[test]
