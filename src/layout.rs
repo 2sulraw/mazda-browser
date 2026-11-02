@@ -1204,6 +1204,16 @@ fn build_into(
                     out.push(g);
                     continue;
                 }
+                // display:contents — the element generates no box of its own;
+                // its children (and their text) are hoisted into the parent
+                // flow, so a grid/flex parent treats them as direct items.
+                // Pseudo-elements are dropped with the box (spec: contents
+                // boxes generate none) and margins/padding/borders are
+                // ignored. shortcut: on the root/body it still makes a box.
+                if outcome.bx.display == Display::Contents {
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, out);
+                    continue;
+                }
                 // ::before/::after generated content — cascaded once here
                 // against this element's computed style (attr() needs the
                 // DOM), inserted as its first/last child in the flow
@@ -5119,7 +5129,9 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         n.open = false;
         return;
     }
-    let nc = if n.bx.cols.is_empty() { 1 } else { n.bx.cols.len() };
+    // area-template columns (rows may be ragged; a missing cell is empty)
+    let area_cols = n.bx.areas.iter().map(|r| r.len()).max().unwrap_or(0);
+    let nc = n.bx.cols.len().max(area_cols).max(1);
     // resolve each item's (row, c0, c1) — needs only the column COUNT, so it
     // runs BEFORE track widths are resolved (content tracks are sized from
     // the items placed in them)
@@ -5135,29 +5147,59 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         let e = line("-end").filter(|&e| e > s).unwrap_or(s + 1);
         Some((s, e.min(nc)))
     };
+    // `grid-area: <name>` → the bounding rect of that name in
+    // `grid-template-areas`, as (row0, row1, col0, col1) with exclusive ends
+    // (a name repeated across rows/columns spans them)
+    let area_rect = |name: &str| -> Option<(usize, usize, usize, usize)> {
+        let (mut r0, mut r1, mut c0, mut c1) = (usize::MAX, 0usize, usize::MAX, 0usize);
+        let mut found = false;
+        for (r, row) in n.bx.areas.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if cell.as_deref() == Some(name) {
+                    found = true;
+                    r0 = r0.min(r);
+                    r1 = r1.max(r + 1);
+                    c0 = c0.min(c);
+                    c1 = c1.max(c + 1);
+                }
+            }
+        }
+        found.then_some((r0, r1, c0.min(nc), c1.min(nc)))
+    };
     let mut col_row = vec![0usize; nc]; // next free row per column (named)
     let mut ar = 0usize; // auto cursor row
     let mut ac = 0usize; // auto cursor col
-    let mut spots: Vec<(usize, usize, usize)> = Vec::with_capacity(items.len());
+    // (row0, row1, col0, col1) — row1/col1 exclusive
+    let mut spots: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(items.len());
     for it in &items {
-        let named = match it {
-            Item::Grp(i) => n.children[*i]
-                .bx
-                .grid_col
-                .as_deref()
-                .and_then(resolve_col),
-            Item::Text(..) => None,
+        let (area, named) = match it {
+            Item::Grp(i) => {
+                let b = &n.children[*i].bx;
+                (
+                    b.grid_area.as_deref().and_then(|nm| area_rect(nm)),
+                    b.grid_col.as_deref().and_then(|nm| resolve_col(nm)),
+                )
+            }
+            Item::Text(..) => (None, None),
         };
-        spots.push(match named {
-            Some((s, e)) => {
+        spots.push(match (area, named) {
+            // a named AREA wins over line placement: its cell rect can span
+            // rows (the sidebar of a header/body/sidebar template)
+            (Some((r0, r1, c0, c1)), _) => {
+                for c in c0..c1 {
+                    col_row[c] = col_row[c].max(r1);
+                }
+                (r0, r1, c0, c1)
+            }
+            (None, Some((s, e))) => {
                 let r = (s..e).map(|c| col_row[c]).max().unwrap_or(0);
                 for c in s..e {
                     col_row[c] = r + 1;
                 }
-                (r, s, e)
+                (r, r + 1, s, e)
             }
-            None => {
-                let sp = (ar, ac, (ac + 1).min(nc));
+            (None, None) => {
+                let sp = (ar, ar + 1, ac, (ac + 1).min(nc));
                 ac += 1;
                 if ac >= nc {
                     ac = 0;
@@ -5167,15 +5209,24 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             }
         });
     }
+    // explicit columns, else one auto (content-sized) track per area column,
+    // else the single full-width implicit track
+    let tracks: Vec<Track> = if !n.bx.cols.is_empty() {
+        n.bx.cols.clone()
+    } else if area_cols > 0 {
+        vec![Track::Auto; nc]
+    } else {
+        Vec::new()
+    };
     // Per-column measured widths for `auto`/`min-content`/`max-content`/
     // `minmax(…)`: min-content = widest unbreakable word, max-content = the
     // item on one line, both outer (padding/border/margins). shortcut: a
     // multi-column span contributes its full width to every covered column.
-    let (col_min, col_max): (Vec<f32>, Vec<f32>) = if n.bx.cols.iter().any(track_intrinsic) {
+    let (col_min, col_max): (Vec<f32>, Vec<f32>) = if tracks.iter().any(track_intrinsic) {
         let mut lo = vec![0.0f32; nc];
         let mut hi = vec![0.0f32; nc];
         for (i, it) in items.iter().enumerate() {
-            let (_, c0, c1) = spots[i];
+            let (_, _, c0, c1) = spots[i];
             let wmin = item_min_content(n, it, n.w, measure);
             let wmax = item_max_content(n, it, n.w, measure);
             for col in c0..c1.min(nc) {
@@ -5187,10 +5238,10 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     } else {
         (Vec::new(), Vec::new())
     };
-    let cols: Vec<f32> = if n.bx.cols.is_empty() {
+    let cols: Vec<f32> = if tracks.is_empty() {
         vec![n.w]
     } else {
-        resolve_tracks(&n.bx.cols, n.w, n.bx.gap_col, &col_min, &col_max)
+        resolve_tracks(&tracks, n.w, n.bx.gap_col, &col_min, &col_max)
     };
     // x offset + width of columns [c0, c1)
     let span_xw = |c0: usize, c1: usize| {
@@ -5198,7 +5249,7 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         let w: f32 = cols[c0..c1].iter().sum::<f32>() + n.bx.gap_col * (c1 - c0 - 1) as f32;
         (x, w)
     };
-    let nrows = spots.iter().map(|s| s.0).max().unwrap_or(0) + 1;
+    let nrows = spots.iter().map(|s| s.1).max().unwrap_or(1);
     // percent row tracks need a definite grid height; otherwise they are auto
     let row_avail_h = match n.bx.height {
         Some(Len::Px(h)) => h,
@@ -5210,10 +5261,10 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         let mut row_h = 0.0f32;
         let mut marks: Vec<(usize, usize, f32)> = Vec::with_capacity(nc); // run_start, ul_start, h
         let mut row_items: Vec<usize> = (0..items.len()).filter(|&i| spots[i].0 == r).collect();
-        row_items.sort_by_key(|&i| spots[i].1);
+        row_items.sort_by_key(|&i| spots[i].2);
         let mut cell_ios: Vec<bool> = Vec::with_capacity(nc);
         for &idx in &row_items {
-            let (_, c0, c1) = spots[idx];
+            let (_, r_end, c0, c1) = spots[idx];
             let (dx, w) = span_xw(c0, c1);
             let x = n.x + dx;
             let rs = runs.len();
@@ -5236,7 +5287,13 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             };
             marks.push((rs, us, ih));
             cell_ios.push(io);
-            row_h = row_h.max(ih);
+            // a row-spanning item paints from its start row; it does not
+            // stretch the rows it covers (they're sized by single-row items),
+            // so a tall spanning sidebar can overhang its last row. shortcut:
+            // no span-aware row distribution.
+            if r_end == r + 1 {
+                row_h = row_h.max(ih);
+            }
         }
         // a declared row track is a height floor (the tallest cell still wins)
         if let Some(t) = n.bx.rows.get(r) {
@@ -6469,6 +6526,125 @@ mod tests {
         layout_tree(&mut n, 300.0, &m4);
         assert_eq!(n.children[0].y, 0.0);
         assert_eq!(n.children[1].y, 100.0, "second row starts after 100px");
+    }
+
+    #[test]
+    fn display_contents_hoists_children_into_the_grid() {
+        // `.wrap{display:contents}` generates no box: its children ARE the
+        // grid's items, so three text boxes land in three columns instead of
+        // the whole wrapper occupying one cell (the MDN layout class).
+        let markup = "<div id=g><div id=w>\
+            <div id=a>AAAA</div><div id=b>BBBB</div><div id=c>CCCC</div>\
+            </div></div>";
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse(
+            "#g{display:grid;grid-template-columns:1fr 1fr 1fr} #w{display:contents}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        layout_in(&mut root, 300.0, 200.0, &m4);
+        let g = root
+            .children
+            .iter()
+            .find(|b| b.node == Some(id_by_attr(&dom, "g")))
+            .expect("grid box");
+        assert_eq!(g.children.len(), 3, "contents wrapper contributes no box");
+        let col = g.w / 3.0;
+        let x: Vec<f32> = g.children.iter().map(|c| c.x).collect();
+        assert_eq!(x, vec![0.0, col, 2.0 * col], "three columns, not one cell");
+    }
+
+    #[test]
+    fn display_contents_keeps_inline_text_in_flow() {
+        // an inline element with contents contributes its children to the
+        // surrounding line, with no wrapper box of its own
+        let markup = "<p id=p>a<span id=s>b<b id=b>c</b>d</span>e</p>";
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse("#s{display:contents}");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        layout_in(&mut root, 300.0, 200.0, &m4);
+        let p = &root.children[0];
+        // the wrapper box is gone: every child is a text leaf in the line
+        assert!(p.children.iter().all(|c| c.is_text));
+        let text: String = p.children.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(text, "abcde");
+    }
+
+    #[test]
+    fn grid_area_places_items_into_the_named_cells() {
+        let boxed = |area: Option<&str>, t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    grid_area: area.map(str::to_string),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Fr(1.0); 3],
+                // sidebar spans both rows; header and body share the last
+                // column (the reference-layout shape, no site hardcoding)
+                areas: vec![
+                    vec![Some("side".into()), None, Some("head".into())],
+                    vec![Some("side".into()), None, Some("body".into())],
+                ],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![
+            boxed(Some("head"), "H"),
+            boxed(Some("body"), "B"),
+            boxed(Some("side"), "S"),
+        ];
+        let l = layout_tree(&mut n, 300.0, &m4);
+        assert_eq!(n.children[0].x, 200.0, "header in the third column");
+        assert_eq!(n.children[0].y, 0.0);
+        assert_eq!(n.children[1].x, 200.0, "body shares that column");
+        assert!(n.children[1].y > 0.0, "body is on the second row");
+        assert_eq!(n.children[2].x, 0.0, "sidebar in the first column");
+        assert_eq!(n.children[2].y, 0.0);
+        assert!(l.runs.iter().any(|r| r.text == "S"));
+    }
+
+    #[test]
+    fn grid_area_name_without_a_cell_falls_back_to_auto_placement() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Fr(1.0); 2],
+                areas: vec![vec![Some("only".into()), None]],
+                ..BoxStyle::default()
+            },
+        );
+        let mut a = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grid_area: Some("missing".into()),
+                ..BoxStyle::default()
+            },
+        );
+        a.children = vec![leaf("a")];
+        let mut b = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        b.children = vec![leaf("b")];
+        n.children = vec![a, b];
+        layout_tree(&mut n, 300.0, &m4);
+        // unknown name → ordinary auto flow: first free cell, then the next
+        assert_eq!(n.children[0].x, 0.0);
+        assert_eq!(n.children[1].x, 150.0);
     }
 
     #[test]

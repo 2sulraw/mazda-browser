@@ -83,6 +83,9 @@ pub enum Display {
     Block,
     Flex,
     Grid,
+    /// `display: contents` — the element itself generates no box; its
+    /// children are hoisted into the parent's flow (layout::build_into).
+    Contents,
 }
 
 /// HTML table role. Set from the tag in [`ua_box`] and consumed by
@@ -318,6 +321,11 @@ pub struct BoxStyle {
     /// this grid item's `grid-column: <name>` — resolved against the
     /// container's `col_lines` (`name-start`…`name-end`) at layout
     pub grid_col: Option<String>,
+    /// `grid-template-areas` rows of cell names; `None` = an empty `.` cell.
+    /// Items name a cell with `grid-area` and are placed into its rect.
+    pub areas: Vec<Vec<Option<String>>>,
+    /// this grid item's `grid-area: <name>` (a custom ident)
+    pub grid_area: Option<String>,
     pub width: Option<Len>,
     pub max_width: Option<Len>,
     /// `box-sizing`: false = border-box (the engine default AND the CSS
@@ -524,6 +532,8 @@ impl Default for BoxStyle {
             rows: Vec::new(),
             col_lines: Vec::new(),
             grid_col: None,
+            areas: Vec::new(),
+            grid_area: None,
             width: None,
             max_width: None,
             content_box: false,
@@ -1015,6 +1025,8 @@ const KNOWN: &[&str] = &[
     "column-gap",
     "grid-template-columns",
     "grid-template-rows",
+    "grid-template-areas",
+    "grid-area",
     "grid-column",
     "width",
     "max-width",
@@ -1968,6 +1980,9 @@ fn apply_decl(
             "flex" => bx.display = Display::Flex,
             "grid" => bx.display = Display::Grid,
             "block" => bx.display = Display::Block,
+            // display:contents — no box of its own; layout hoists the
+            // children into the parent flow (see layout::build_into)
+            "contents" => bx.display = Display::Contents,
             // inline-block: a real box that still sits on the text line
             // (layout.rs `block()` places `inline` boxes mid-line)
             "inline-block" => bx.display = Display::InlineBlock,
@@ -2067,6 +2082,48 @@ fn apply_decl(
             bx.col_lines = lines;
         }
         "grid-template-rows" => bx.rows = parse_tracks(&d.1, vp).0,
+        // `grid-template-areas: "a b" "c d"` — one quoted string per row,
+        // whitespace-separated names, a run of dots is an empty cell. Only
+        // whole quoted rows are read; an unquoted value (or `none`) clears.
+        "grid-template-areas" => {
+            bx.areas.clear();
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            let mut rest = d.1.as_str();
+            while let Some(open) = rest.find('"') {
+                let Some(close) = rest[open + 1..].find('"') else { break };
+                let row = &rest[open + 1..open + 1 + close];
+                rows.push(
+                    row.split_whitespace()
+                        .map(|t| {
+                            if !t.is_empty() && t.bytes().all(|b| b == b'.') {
+                                None
+                            } else {
+                                Some(t.to_string())
+                            }
+                        })
+                        .collect(),
+                );
+                rest = &rest[open + 1 + close + 1..];
+            }
+            if !rows.is_empty() {
+                bx.areas = rows;
+            }
+        }
+        // `grid-area: <name>` — a plain custom ident places the item into the
+        // matching `grid-template-areas` cell. numeric `1 / 2 / 3 / 4` and
+        // `span …` forms stay unparsed (shortcut: line-number placement not
+        // modeled here; `grid-column: <line-name>` covers the template's
+        // bracketed lines).
+        "grid-area" => {
+            let first = d.1.split('/').next().unwrap_or("").trim();
+            if !first.is_empty()
+                && first != "auto"
+                && first != "span"
+                && !first.parse::<i32>().is_ok()
+            {
+                bx.grid_area = Some(first.to_string());
+            }
+        }
         // item placement into named lines: `grid-column: content` spans the
         // [content-start]…[content-end] pair from the container's template
         "grid-column" => {
@@ -6152,10 +6209,11 @@ mod tests {
             ".row { display: flex; flex-direction: column; gap: 8px 12px; justify-content: center; align-items: end }\
              .grid { display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: 10px 1fr; column-gap: 5px }\
              .box { width: 300px; max-width: 50%; margin: 0 auto }\
-             .inl { display: inline }",
+             .inl { display: inline }\
+             .contents { display: contents }",
         );
         let dom = dom_of(
-            r#"<div class=row></div><div class=grid></div><div class=box></div><div class=inl></div><div class=nocls></div>"#,
+            r#"<div class=row></div><div class=grid></div><div class=box></div><div class=inl></div><div class=contents></div><div class=nocls></div>"#,
         );
         let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
 
@@ -6180,9 +6238,37 @@ mod tests {
         assert!(k.margin_x_auto, "`margin: 0 auto` → auto centering");
 
         assert_eq!(bx("inl").display, Display::Inline);
+        assert_eq!(bx("contents").display, Display::Contents);
         // no declarations → Auto (follow the tag)
         let plain = sheet.resolve(&dom, by_attr(&dom, "class", "nocls"), Style::new(), None);
         assert_eq!(plain.bx.display, Display::Auto);
+    }
+
+    #[test]
+    fn grid_template_areas_and_grid_area_parse() {
+        let sheet = parse(
+            ".g { grid-template-areas: \"side head\" \"side body\" } \
+             .s { grid-area: side }",
+        );
+        let dom = dom_of(r#"<div class=g></div><div class=s></div>"#);
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert_eq!(
+            g.areas,
+            vec![
+                vec![Some("side".to_string()), Some("head".to_string())],
+                vec![Some("side".to_string()), Some("body".to_string())],
+            ]
+        );
+        let s = sheet.resolve(&dom, by_attr(&dom, "class", "s"), Style::new(), None).bx;
+        assert_eq!(s.grid_area.as_deref(), Some("side"));
+        // `.` cells are empty
+        let sheet = parse(".g { grid-template-areas: \"a . b\" }");
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert_eq!(g.areas, vec![vec![Some("a".to_string()), None, Some("b".to_string())]]);
+        // numeric / span forms are not named areas
+        let sheet = parse(".s { grid-area: 1 / 2 / 3 / 4 }");
+        let s = sheet.resolve(&dom, by_attr(&dom, "class", "s"), Style::new(), None).bx;
+        assert_eq!(s.grid_area, None);
     }
 
     #[test]
