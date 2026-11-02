@@ -4984,32 +4984,6 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         }
     }
     let natural_sum: f32 = widths.iter().sum();
-    // flex-grow: hand the row's free space to growable items (weighted by
-    // their factor) BEFORE justify-content runs, so the line is full and
-    // justify finds nothing left to distribute. Wrapped rows grow per line
-    // in a real engine; not modeled (each line keeps natural widths).
-    if !n.bx.wrap {
-        let free = (n.w - natural_sum - gaps).max(0.0);
-        if free > 0.0 {
-            let total: f32 = items
-                .iter()
-                .filter_map(|it| match it {
-                    Item::Grp(i) => Some(n.children[*i].bx.grow.max(0.0)),
-                    Item::Text(..) => None,
-                })
-                .sum();
-            if total > 0.0 {
-                for (idx, it) in items.iter().enumerate() {
-                    if let Item::Grp(i) = it {
-                        let g = n.children[*i].bx.grow.max(0.0);
-                        if g > 0.0 {
-                            widths[idx] += free * g / total;
-                        }
-                    }
-                }
-            }
-        }
-    }
     // nowrap shrinks to fit; wrap keeps natural widths and breaks lines
     if !n.bx.wrap && natural_sum + gaps > n.w && natural_sum > 0.0 {
         let scale = ((n.w - gaps).max(0.0)) / natural_sum;
@@ -5035,6 +5009,38 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
     } else {
         vec![0..k]
     };
+    // flex-grow: hand each line's free space to its growable items (weighted
+    // by their factor) BEFORE justify-content runs, so the line is full and
+    // justify finds nothing left to distribute. Per line, not per row: a
+    // wrapped row grows each line against the same content width (a
+    // `flex-grow:1` item on a short line fills that line to the edge) — this
+    // is also what makes Wikipedia's wrapped header right-align its end.
+    for line in &lines {
+        let nl = line.len() as f32;
+        let used: f32 = line.clone().map(|i| widths[i]).sum::<f32>() + gap * (nl - 1.0).max(0.0);
+        let free = (n.w - used).max(0.0);
+        if free <= 0.0 {
+            continue;
+        }
+        let total: f32 = line
+            .clone()
+            .filter_map(|idx| match items[idx] {
+                Item::Grp(i) => Some(n.children[i].bx.grow.max(0.0)),
+                Item::Text(..) => None,
+            })
+            .sum();
+        if total <= 0.0 {
+            continue;
+        }
+        for idx in line.clone() {
+            if let Item::Grp(i) = items[idx] {
+                let g = n.children[i].bx.grow.max(0.0);
+                if g > 0.0 {
+                    widths[idx] += free * g / total;
+                }
+            }
+        }
+    }
     let mut y = n.y;
     let mut total_h = 0.0f32;
     let mut last_open = false;
@@ -5084,17 +5090,45 @@ fn flex_line(
     let k = line.len();
     let used: f32 = line.clone().map(|i| widths[i]).sum::<f32>() + gap * (k as f32 - 1.0).max(0.0);
     let free = (n.w - used).max(0.0);
-    let (x_off, extra) = match n.bx.justify {
-        Justify::Center => (free * 0.5, 0.0),
-        Justify::End => (free, 0.0),
-        Justify::SpaceBetween if k > 1 => (0.0, free / (k as f32 - 1.0)),
-        _ => (0.0, 0.0), // Start
+    // auto margins absorb the line's free space BEFORE justify-content runs
+    // (CSS flex layout): `margin-left: auto` on the last item pushes it to the
+    // right edge no matter what justify says. Wikipedia's header relies on it.
+    let autos: usize = line
+        .clone()
+        .map(|idx| match items[idx] {
+            Item::Grp(i) => {
+                n.children[i].bx.margin_l_auto as usize + n.children[i].bx.margin_r_auto as usize
+            }
+            Item::Text(..) => 0,
+        })
+        .sum();
+    let auto_share = if autos > 0 { free / autos as f32 } else { 0.0 };
+    let (x_off, extra) = if autos > 0 {
+        (0.0, 0.0)
+    } else {
+        match n.bx.justify {
+            Justify::Center => (free * 0.5, 0.0),
+            Justify::End => (free, 0.0),
+            Justify::SpaceBetween if k > 1 => (0.0, free / (k as f32 - 1.0)),
+            _ => (0.0, 0.0), // Start
+        }
     };
     let mut row_h = 0.0f32;
     let mut x = n.x + x_off;
     let mut marks: Vec<(usize, usize, f32)> = Vec::with_capacity(k); // run_start, ul_start, h
     for idx in line.clone() {
         let w = widths[idx];
+        // leading auto margin, then the item, then its trailing one
+        let (la, ra) = match items[idx] {
+            Item::Grp(i) => (
+                n.children[i].bx.margin_l_auto,
+                n.children[i].bx.margin_r_auto,
+            ),
+            Item::Text(..) => (false, false),
+        };
+        if la {
+            x += auto_share;
+        }
         let rs = runs.len();
         let us = uls.len();
         let (ih, io) = match items[idx] {
@@ -5119,7 +5153,7 @@ fn flex_line(
         marks.push((rs, us, ih));
         row_h = row_h.max(ih);
         *last_open = io;
-        x += w + gap + extra;
+        x += w + gap + extra + if ra { auto_share } else { 0.0 };
     }
     // cross-axis align: shift each item (runs slice + box coords) into row_h
     for (idx, &(rs, us, h)) in marks.iter().enumerate() {
@@ -6232,6 +6266,48 @@ mod tests {
     }
 
     #[test]
+    fn flex_row_wrap_grows_each_line() {
+        // Free space is distributed per LINE, not across the whole wrapped
+        // row: the second line's `flex-grow:1` item fills that line even
+        // though the first line has no growable item. Wikipedia's header is
+        // `flex-wrap:wrap` and right-aligns its end this way.
+        let fixed = |px: f32| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(px)),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf("aaaaa")];
+            g
+        };
+        // auto width (5 chars = 20px) so `place` accepts the grown slot
+        let mut grower = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grow: 1.0,
+                ..BoxStyle::default()
+            },
+        );
+        grower.children = vec![leaf("aaaaa")];
+        let mut root = flex_row(
+            vec![fixed(60.0), fixed(60.0), grower],
+            BoxStyle {
+                wrap: true,
+                ..BoxStyle::default()
+            },
+        );
+        layout_tree(&mut root, 100.0, &m4);
+        assert_eq!(root.children[1].x, 0.0, "second item starts the second line");
+        assert_eq!(root.children[2].x, 60.0, "grows from the line's used width");
+        assert_eq!(root.children[2].w, 40.0, "growable item fills line 2");
+        assert_eq!(root.children[0].w, 60.0, "line 1 has no growable item");
+    }
+
+    #[test]
     fn flex_row_justify_center() {
         let mut root = flex_row(
             vec![leaf("ab")],
@@ -6419,6 +6495,41 @@ mod tests {
         assert_eq!(n.children[0].w, 284.0, "grow item = 300 - 16");
         assert_eq!(n.children[0].x, 0.0, "starts at the row's left edge");
         assert_eq!(n.children[1].x, 284.0, "fixed item after it");
+    }
+
+    #[test]
+    fn flex_auto_margins_absorb_free_space() {
+        // `margin-left: auto` pushes an item to the row's right edge under
+        // justify-content: flex-start — Wikipedia's header account links.
+        let mut left = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        left.children = vec![leaf("aa")];
+        let mut right = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                margin_l_auto: true,
+                ..BoxStyle::default()
+            },
+        );
+        right.children = vec![leaf("bbbb")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![left, right];
+        layout_tree(&mut n, 300.0, &m4);
+        assert_eq!(n.children[0].x, 0.0, "first item stays at the start");
+        assert_eq!(n.children[1].x, 284.0, "auto margin takes all the free space");
     }
 
     #[test]

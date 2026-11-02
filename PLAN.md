@@ -913,6 +913,21 @@ curve matters more than the baseline (near-flat as tabs grow).
   unchanged.
   Tests: default **550**, `engine-b + woff2` **554**
   (`custom_properties_cascade_per_element_and_inherit`).
+  **(j) flex per-line `flex-grow` + auto margins** — free space in a flex row
+  is now given to growable items on EACH line of a wrapped row instead of
+  being skipped for `flex-wrap` containers (the old shortcut: "wrapped rows
+  grow per line in a real engine; not modeled"). Wikipedia's
+  `header.vector-header` is `flex-wrap:wrap`, so its `div.vector-header-end`
+  (`flex-grow:1`, natural 247 px) never widened and the account links /
+  search box sat mid-header; it now grows to 667 px and right-aligns them.
+  `margin-left/right:auto` also absorb the line's free space before
+  `justify-content` (CSS flex layout), so an auto-margin item pins to the
+  edge whatever `justify` says.
+  Live: Wikipedia article header right-aligned (14973 runs, 107.4 MB debug);
+  MDN unchanged (656 rules, 2943 runs, 81.5 MB debug).
+  shortcut: cross-size `align-items: stretch` still does not reflow.
+  Tests: default **552**, `engine-b + woff2` **556**
+  (`flex_row_wrap_grows_each_line`, `flex_auto_margins_absorb_free_space`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study

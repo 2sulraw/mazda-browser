@@ -2929,7 +2929,7 @@ fn layout_page(
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "[box] {}{} x={:.0} y={:.0} w={:.0} h={:.0} disp={:?} pos={:?}{}{}{}",
+                "[box] {}{} x={:.0} y={:.0} w={:.0} h={:.0} disp={:?} pos={:?}{}{}{}{}{}{}",
                 "  ".repeat(depth),
                 what,
                 b.x,
@@ -2944,6 +2944,16 @@ fn layout_page(
                     format!(
                         " width={:?} max={:?} cb={} pad={:?} border={:?}",
                         b.bx.width, b.bx.max_width, b.bx.content_box, b.bx.pad, b.bx.border
+                    )
+                } else {
+                    String::new()
+                },
+                if b.bx.grow > 0.0 { format!(" grow={}", b.bx.grow) } else { String::new() },
+                if b.bx.wrap { " wrap".to_string() } else { String::new() },
+                if b.bx.margin_x_auto || b.bx.margin_l_auto || b.bx.margin_r_auto {
+                    format!(
+                        " auto=l{}r{}",
+                        b.bx.margin_l_auto as u8, b.bx.margin_r_auto as u8
                     )
                 } else {
                     String::new()
