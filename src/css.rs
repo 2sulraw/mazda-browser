@@ -199,6 +199,25 @@ pub enum BgPos {
     Px(f32),
 }
 
+/// CSS `object-fit` — how a replaced element's content fills the box it was
+/// given. `Fill` is the initial value and the engine's long-standing
+/// stretch-to-box behavior, so an undeclared image paints byte-identically.
+/// shortcut: only content `<img>` boxes (and inline SVG, which rides the
+/// same slot) honor this — `<video>`/`<canvas>` are not image slots yet.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ObjFit {
+    /// exact stretch to the box (initial)
+    Fill,
+    /// aspect-preserving letterbox inside the box
+    Contain,
+    /// aspect-preserving crop to the box
+    Cover,
+    /// natural pixel size, no scaling
+    None,
+    /// the smaller of `None` and `Contain`
+    ScaleDown,
+}
+
 /// `background-repeat`. Stored as `Option`: `None` (undeclared) keeps the
 /// engine's long-standing single draw at the computed position/size —
 /// shortcut: the CSS initial value is `repeat`, which tiles, but an
@@ -291,6 +310,20 @@ pub struct BoxStyle {
     /// `background-repeat` — None = undeclared (single draw, see
     /// [`BgRepeat`]); Some(...) tiles on the named axis/axes at paint
     pub bg_repeat: Option<BgRepeat>,
+    /// `object-fit` — how a replaced element's content fills its box (see
+    /// [`ObjFit`]); initial `fill` = the engine's old exact stretch
+    pub obj_fit: ObjFit,
+    /// `object-position` [x, y] — same two forms as [`bg_pos`]; initial
+    /// 50% 50% (centered). Only meaningful when `object-fit` ≠ fill
+    pub obj_pos: [BgPos; 2],
+    /// `aspect-ratio` as width / height; None = `auto` (no constraint).
+    /// On a box with ONE declared axis the other comes from this ratio; on
+    /// an `<img>` with neither axis declared the intrinsic ratio still wins.
+    /// shortcut: `aspect-ratio: auto <ratio>` keeps the ratio and drops the
+    /// content-derived-half nuance; flex/grid stretch still decides the
+    /// cross axis (the ratio only feeds the `place()` axis derivation), and
+    /// intrinsic min/max sizes are not consulted.
+    pub aspect_ratio: Option<f32>,
     /// `mask-image: url(…)` — the raw target, fetched/decoded as this box's
     /// `is_mask` placeholder child (same pipeline as [`bg_image`]). A LIVE
     /// mask placeholder REPLACES the box's own background at paint: the
@@ -436,6 +469,9 @@ impl Default for BoxStyle {
             bg_size: BgSize::Auto,
             bg_pos: [BgPos::Pct(0.0); 2], // top-left
             bg_repeat: None,
+            obj_fit: ObjFit::Fill,
+            obj_pos: [BgPos::Pct(50.0); 2], // centered
+            aspect_ratio: None,
             mask_image: None,
             mask_size: BgSize::Auto,
             mask_pos: [BgPos::Pct(0.0); 2], // top-left
@@ -849,6 +885,9 @@ const KNOWN: &[&str] = &[
     "background-size",
     "background-position",
     "background-repeat",
+    "object-fit",
+    "object-position",
+    "aspect-ratio",
     "mask",
     "mask-image",
     "mask-size",
@@ -1703,6 +1742,11 @@ fn apply_decl(
         "background-size" => bx.bg_size = parse_bg_size(&d.1, vp),
         "background-position" => bx.bg_pos = parse_bg_pos(&d.1, vp),
         "background-repeat" => bx.bg_repeat = parse_bg_repeat(&d.1),
+        // replaced-content geometry: the fit mode picks the content rect
+        // inside the declared box, the position anchors the letterbox/crop
+        "object-fit" => bx.obj_fit = parse_object_fit(&d.1),
+        "object-position" => bx.obj_pos = parse_object_pos(&d.1, vp),
+        "aspect-ratio" => bx.aspect_ratio = parse_aspect_ratio(&d.1),
         // mask: the image that shapes this box's OWN background — stored
         // exactly like the background longhands and fetched as the box's
         // `is_mask` placeholder child (see `BoxStyle::mask_image` for the
@@ -2628,6 +2672,71 @@ fn parse_bg_pos(v: &str, vp: (f32, f32)) -> [BgPos; 2] {
         out[0].unwrap_or(BgPos::Pct(center)),
         out[1].unwrap_or(BgPos::Pct(center)),
     ]
+}
+
+/// `object-fit` → [`ObjFit`]. The five keywords map directly; anything else
+/// (including `initial`/`unset` and invalid junk) is the initial `fill`.
+fn parse_object_fit(v: &str) -> ObjFit {
+    match v.trim() {
+        "contain" => ObjFit::Contain,
+        "cover" => ObjFit::Cover,
+        "none" => ObjFit::None,
+        "scale-down" => ObjFit::ScaleDown,
+        _ => ObjFit::Fill,
+    }
+}
+
+/// `object-position` → [x, y]. Same axis grammar as [`parse_bg_pos`] (so
+/// `%`, px and the center/left/right/top/bottom keywords all work), but the
+/// CSS initial/one-value default is `center` on the missing axis (spec:
+/// `object-position: 10px` = `10px center`), unlike background-position's
+/// lone-length 0% quirk.
+fn parse_object_pos(v: &str, vp: (f32, f32)) -> [BgPos; 2] {
+    let toks = joined_tokens(v);
+    let valid = toks
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.as_str(),
+                "left" | "right" | "top" | "bottom" | "center"
+            ) || parse_len(t, vp).is_some()
+        })
+        .count();
+    if valid == 0 {
+        return [BgPos::Pct(50.0); 2]; // invalid → initial center
+    }
+    let mut p = parse_bg_pos(v, vp);
+    if toks.len() == 1 {
+        match toks[0].as_str() {
+            "top" | "bottom" => p[0] = BgPos::Pct(50.0),
+            _ => p[1] = BgPos::Pct(50.0),
+        }
+    }
+    p
+}
+
+/// `aspect-ratio` → width / height. `auto` (also `initial`/`unset`) and
+/// unparseable values → None (no constraint). A single number is the ratio;
+/// `<w> / <h>` is divided (a zero side drops the declaration).
+/// shortcut: `auto <ratio>` keeps the ratio and drops the content-derived
+/// half of the spec's `auto` keyword.
+fn parse_aspect_ratio(v: &str) -> Option<f32> {
+    let norm = v.replace('/', " ");
+    let mut nums: Vec<f32> = Vec::new();
+    for t in norm.split_whitespace() {
+        match t {
+            "auto" | "initial" | "unset" => continue,
+            _ => match t.parse::<f32>() {
+                Ok(n) if n.is_finite() => nums.push(n),
+                _ => return None, // unknown token — declaration dropped
+            },
+        }
+    }
+    match nums.as_slice() {
+        [r] if *r > 0.0 => Some(*r),
+        [w, h] if *w > 0.0 && *h > 0.0 => Some(w / h),
+        _ => None,
+    }
 }
 
 /// Geometry tokens of the `background` shorthand → (repeat, position, size),
@@ -6180,6 +6289,59 @@ mod tests {
         assert_eq!(d.bg_repeat, None);
         assert_eq!(d.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
         assert_eq!(d.bg_size, BgSize::Auto);
+    }
+
+    // ---- object-fit / object-position / aspect-ratio ----
+
+    #[test]
+    fn object_fit_position_and_aspect_ratio_parse() {
+        let sheet = parse(
+            ".a { object-fit: contain } .b { object-fit: cover } \
+             .c { object-fit: none } .d { object-fit: scale-down } \
+             .e { object-fit: bogus } .f { object-fit: fill } \
+             .g { object-position: 10px 20px } .h { object-position: center } \
+             .i { object-position: 100% 0% } .j { object-position: top } \
+             .k { aspect-ratio: 16 / 9 } .l { aspect-ratio: 1.5 } \
+             .m { aspect-ratio: auto } .n { aspect-ratio: 2 / 3 } \
+             .o { aspect-ratio: auto 4 / 3 } .p { aspect-ratio: nope } \
+             .q { object-position: bogus }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>\
+             <div class=e></div><div class=f></div><div class=g></div><div class=h></div>\
+             <div class=i></div><div class=j></div><div class=k></div><div class=l></div>\
+             <div class=m></div><div class=n></div><div class=o></div><div class=p></div>\
+             <div class=q></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("a").obj_fit, ObjFit::Contain);
+        assert_eq!(bx("b").obj_fit, ObjFit::Cover);
+        assert_eq!(bx("c").obj_fit, ObjFit::None);
+        assert_eq!(bx("d").obj_fit, ObjFit::ScaleDown);
+        // invalid and explicit fill both leave the initial value
+        assert_eq!(bx("e").obj_fit, ObjFit::Fill);
+        assert_eq!(bx("f").obj_fit, ObjFit::Fill);
+        assert_eq!(bx("g").obj_pos, [BgPos::Px(10.0), BgPos::Px(20.0)]);
+        assert_eq!(bx("h").obj_pos, [BgPos::Pct(50.0), BgPos::Pct(50.0)]);
+        assert_eq!(bx("i").obj_pos, [BgPos::Pct(100.0), BgPos::Pct(0.0)]);
+        // one-value object-position centers the missing axis (10px = 10px center)
+        assert_eq!(bx("j").obj_pos, [BgPos::Pct(50.0), BgPos::Pct(0.0)]);
+        assert_eq!(bx("k").aspect_ratio, Some(16.0 / 9.0));
+        assert_eq!(bx("l").aspect_ratio, Some(1.5));
+        assert_eq!(bx("m").aspect_ratio, None);
+        assert_eq!(bx("n").aspect_ratio, Some(2.0 / 3.0));
+        // `auto <ratio>` keeps the ratio (content-derived half dropped)
+        assert_eq!(bx("o").aspect_ratio, Some(4.0 / 3.0));
+        assert_eq!(bx("p").aspect_ratio, None, "invalid → auto");
+        assert_eq!(
+            bx("q").obj_pos,
+            [BgPos::Pct(50.0), BgPos::Pct(50.0)],
+            "invalid position → initial center"
+        );
+        // undeclared → initial fill / 50% 50% / auto
+        let q = bx("a");
+        assert_eq!(q.obj_pos, [BgPos::Pct(50.0), BgPos::Pct(50.0)]);
+        assert_eq!(q.aspect_ratio, None);
     }
 
     // ---- mask / mask-image / mask geometry ----
