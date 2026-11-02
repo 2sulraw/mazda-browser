@@ -688,6 +688,57 @@ curve matters more than the baseline (near-flat as tabs grow).
   related). Note: `data:` image URLs are skipped as an unknown format for
   EVERY format (PNG included) — a pre-existing image-source gap, unrelated to
   WebP (`36d4b35` pushed).
+- [x] **Wave 7 (three parallel worktrees) — real table layout, object-fit/aspect-ratio,
+  modern image sources** (all from `91cb007`; merged `cd76ec5` → `02fba80` →
+  `0794a6b`):
+  **(a) table layout** (`cd76ec5`, +13 tests) — tables were plain block stacks
+  (every cell full-width, vertically stacked); now a `TableRole` drives a real
+  grid: rows collected from `<tr>` and from `thead`/`tbody`/`tfoot` in visual
+  order (caption above), cells placed on columns, UA 2px `border-spacing` +
+  1px cell padding + bold/centered `th`. `table-layout: auto` sizes each column
+  to its content: the per-column max of each cell's max-content width and its
+  min-content (widest unbreakable word + padding/border), `colspan=n` spreading
+  its width over n columns, declared `width` (CSS px and the legacy attribute)
+  acting as a column floor; the table shrink-wraps to the column sum, and when
+  that exceeds the container the columns shrink proportionally but never below
+  their floors (water-filling), so a long word overflows instead of squashing.
+  `table-layout: fixed` takes the first row's declared widths. `separate`
+  honors `border-spacing`; `collapse` removes the gaps and overlaps adjacent
+  cells' borders by the wider side so the shared edge paints once. Cell
+  `vertical-align` (CSS or the `valign` attribute) works against row height.
+  Shortcuts: `rowspan` parsed but not laid out, no anonymous cells, percentage
+  widths only as a linear share, `caption-side: bottom`, collapsed-border
+  conflict resolution approximate (later cell in tree order wins), author
+  `display: table*` not modeled (`colgroup`/`col` dropped).
+  **(b) object-fit / object-position / aspect-ratio** (`e08e946`, +6 tests) —
+  `fit_content_rect()` maps the intrinsic size into the box for
+  fill/contain/cover/none/scale-down with `object-position` anchoring (% or px);
+  `cover`/`none` decode once at content size and `image::crop` extracts the
+  visible window, so the draw entry is exactly the box intersection; a declared
+  width or height plus `aspect-ratio` derives the other axis (plain boxes and
+  images both). Shortcuts: padding box as the fit area, no `<video>`/`<canvas>`,
+  nearest-neighbour only, `aspect-ratio: auto <ratio>` content half dropped,
+  budget charged at content size.
+  **(c) modern image sources** (`87ee69c`, +16 tests) — root cause of the
+  `data:` skip: every image URL went through `resolve`, which rejects non-http
+  schemes, so the bytes never reached the sniffer; `resolve_img` now passes
+  `data:` through untouched in probe AND decode (PNG/JPEG/WebP/base64 or
+  percent-encoded SVG all decode), and CSS `url(data:…;base64,…)` no longer
+  breaks declaration splitting. `srcset`/`<picture>` are resolved at build
+  time into the ONE url the image box carries: the first `<source>` whose
+  `type` is decodable and whose `min/max-width` media query matches, else the
+  `<img>`'s `srcset` (smallest `w` ≥ the slot width, `x` → 1x, `sizes` first
+  parseable length else viewport), else `src`. IMAGE Accept now advertises
+  `image/webp`. Shortcuts: viewport-width-only selection (no DPR, no `sizes`
+  media conditions), media queries limited to width, no AVIF/JPEG-XL, no lazy
+  scheduling.
+  Tests: default **511**, `engine-b + woff2` **515**. Live: wiki Rust article
+  **112.2 MB** (14973 runs; infobox now a real two-column label/value grid
+  instead of a stacked list, 315 images, 0 format skips); a data-URL page
+  renders both a PNG and a WebP `<img>` inline; `<ol start>`/bullets verified
+  earlier. Note: a `data:` page re-laid out ~10× in 18 s (no pointer input) —
+  not seen on http pages (2-3×), filed as a shell wake-up quirk to watch
+  (`0794a6b` pushed).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -774,6 +825,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 6 (list markers, WebP, WOFF2) | Wikipedia Main Page | 106.9 MB (1646 runs; +13.3 MB = the WOFF2 webfonts the UI copy advertises; site serif active, 25 images decoded, 0 format skips) |
 | 2026-11-02 | wave 6 | MDN `/Web/CSS/list-style-type` | 101.5 MB (4687 runs; 177 images, 0 format skips, markers render) |
 | 2026-11-02 | wave 6 | local HTTP WebP page | 72.8 MB (12 runs; VP8X+ALPH decoded at 320x240, alpha visible) |
+| 2026-11-02 | wave 7 (table layout, object-fit/aspect-ratio, image sources) | Wikipedia Rust article | 112.2 MB (14973 runs; infobox renders as a real two-column table, 315 images, 0 format skips; +9.5 MB vs wave 5 = WOFF2 site fonts) |
+| 2026-11-02 | wave 7 | data: URL page | 68.8 MB (8 runs; PNG + WebP data images decoded inline) |
 
 ### Phase 1c (Track A) findings
 
