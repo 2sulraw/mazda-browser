@@ -513,6 +513,203 @@ fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|w| w.eq_ignore_ascii_case(needle))
 }
 
+// ---------- snapshot serialization (Phase 3) ----------
+// A parsed DOM is the expensive half of a navigation (fetch + tokenize +
+// tree build). Serializing it lets a tab switch restore the tree instead of
+// re-fetching. Layout is cheap and viewport-dependent, so it is NOT stored.
+
+/// On-disk snapshot version. Bump whenever the byte layout changes: a stale
+/// file then fails the version check and is treated as a miss, never as a
+/// mis-parse.
+pub const SNAP_VERSION: u16 = 1;
+const SNAP_MAGIC: &[u8; 4] = b"MDOM";
+/// Refuse absurd node counts before allocating (corrupt/hostile file).
+const SNAP_MAX_NODES: usize = 4_000_000;
+const SNAP_MAX_ATTRS: usize = 1_000_000;
+
+fn snap_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Length-prefixed UTF-8 (u32 length: attribute values can be data: URLs).
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Bounds-checked reader: every accessor returns None past the end.
+struct Reader<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.p.checked_add(n)?;
+        let s = self.b.get(self.p..end)?;
+        self.p = end;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn str(&mut self) -> Option<String> {
+        let n = self.u32()? as usize;
+        Some(std::str::from_utf8(self.take(n)?).ok()?.to_string())
+    }
+}
+
+impl Dom {
+    /// Serialize the whole arena: magic + version + tag table + nodes, with a
+    /// trailing FNV-1a hash so a truncated/bit-rotted file is a clean miss.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.nodes.len() * 12 + 64);
+        out.extend_from_slice(SNAP_MAGIC);
+        put_u16(&mut out, SNAP_VERSION);
+        put_u32(&mut out, self.tags.len() as u32);
+        for t in &self.tags {
+            put_str(&mut out, t);
+        }
+        put_u32(&mut out, self.nodes.len() as u32);
+        for n in &self.nodes {
+            put_u32(&mut out, n.parent);
+            put_u32(&mut out, n.children.len() as u32);
+            for &c in &n.children {
+                put_u32(&mut out, c);
+            }
+            match &n.kind {
+                NodeKind::Element(t, attrs) => {
+                    out.push(0);
+                    put_u16(&mut out, t.0);
+                    put_u32(&mut out, attrs.len() as u32);
+                    for (k, v) in attrs.iter() {
+                        put_str(&mut out, k);
+                        put_str(&mut out, v);
+                    }
+                }
+                NodeKind::Text(s) => {
+                    out.push(1);
+                    put_str(&mut out, s);
+                }
+            }
+        }
+        let h = snap_hash(&out);
+        out.extend_from_slice(&h.to_le_bytes());
+        out
+    }
+
+    /// Inverse of `to_bytes`. None on any structural problem (bad magic,
+    /// wrong version, hash mismatch, out-of-range index, invalid UTF-8,
+    /// trailing bytes) — the caller treats None as a cache miss.
+    pub fn from_bytes(data: &[u8]) -> Option<Dom> {
+        // magic + version + hash at minimum
+        if data.len() < SNAP_MAGIC.len() + 2 + 8 {
+            return None;
+        }
+        let (body, tail) = data.split_at(data.len() - 8);
+        let want = u64::from_le_bytes(tail.try_into().ok()?);
+        if snap_hash(body) != want {
+            return None;
+        }
+        let mut r = Reader { b: body, p: 0 };
+        if r.take(SNAP_MAGIC.len())? != SNAP_MAGIC {
+            return None;
+        }
+        if r.u16()? != SNAP_VERSION {
+            return None;
+        }
+        let ntags = r.u32()? as usize;
+        if ntags > u16::MAX as usize + 1 {
+            return None;
+        }
+        let mut tags: Vec<Box<str>> = Vec::with_capacity(ntags.min(4096));
+        let mut tag_index = std::collections::HashMap::new();
+        for i in 0..ntags {
+            let s: Box<str> = r.str()?.into();
+            // a duplicate would make tag ids ambiguous
+            if tag_index.insert(s.clone(), i as u16).is_some() {
+                return None;
+            }
+            tags.push(s);
+        }
+        let nnodes = r.u32()? as usize;
+        if nnodes == 0 || nnodes > SNAP_MAX_NODES {
+            return None;
+        }
+        let mut nodes: Vec<Node> = Vec::with_capacity(nnodes.min(65_536));
+        for _ in 0..nnodes {
+            let parent = r.u32()?;
+            let nc = r.u32()? as usize;
+            if nc > nnodes {
+                return None;
+            }
+            let mut children = Vec::with_capacity(nc.min(4096));
+            for _ in 0..nc {
+                children.push(r.u32()?);
+            }
+            let kind = match r.u8()? {
+                0 => {
+                    let t = r.u16()?;
+                    if t as usize >= tags.len() {
+                        return None;
+                    }
+                    let na = r.u32()? as usize;
+                    if na > SNAP_MAX_ATTRS {
+                        return None;
+                    }
+                    let mut attrs = Vec::with_capacity(na.min(1024));
+                    for _ in 0..na {
+                        attrs.push((r.str()?, r.str()?));
+                    }
+                    NodeKind::Element(TagId(t), attrs.into_boxed_slice())
+                }
+                1 => NodeKind::Text(r.str()?),
+                _ => return None,
+            };
+            nodes.push(Node { parent, children, kind });
+        }
+        if r.p != body.len() {
+            return None; // trailing junk
+        }
+        // links must be consistent in both directions; otherwise layout's
+        // parent walks and the hit test would see a tree that never existed
+        for (i, n) in nodes.iter().enumerate() {
+            if n.parent as usize >= nnodes || (i != 0 && n.parent == i as u32) {
+                return None;
+            }
+            for &c in &n.children {
+                let c = c as usize;
+                if c >= nnodes || nodes[c].parent != i as u32 {
+                    return None;
+                }
+            }
+        }
+        if nodes[0].parent != 0 {
+            return None;
+        }
+        Some(Dom { nodes, tags, tag_index })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +1072,117 @@ mod tests {
             "svg markup leaked into text runs: {runs:?}"
         );
         assert!(runs.iter().any(|r| r.contains("ok")), "button label text must survive: {runs:?}");
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_the_tree() {
+        let html = r#"<body class="a b"><p id=x data-v="1 2">hi &amp; bye</p><img src="data:image/png;base64,AAA"><div><span>deep</span></div></body>"#;
+        let dom = parse(html);
+        let bytes = dom.to_bytes();
+        let back = Dom::from_bytes(&bytes).expect("snapshot must load");
+
+        assert_eq!(back.nodes.len(), dom.nodes.len());
+        assert_eq!(back.tags.len(), dom.tags.len());
+        for i in 0..dom.nodes.len() {
+            let (a, b) = (&dom.nodes[i], &back.nodes[i]);
+            assert_eq!(a.parent, b.parent, "parent of node {i}");
+            assert_eq!(a.children, b.children, "children of node {i}");
+            assert_eq!(dom.tag(i as u32), back.tag(i as u32), "tag of node {i}");
+            match (&a.kind, &b.kind) {
+                (NodeKind::Text(x), NodeKind::Text(y)) => assert_eq!(x, y),
+                (NodeKind::Element(ta, aa), NodeKind::Element(tb, ab)) => {
+                    assert_eq!(ta.0, tb.0);
+                    assert_eq!(aa, ab, "attrs of node {i}");
+                }
+                _ => panic!("kind changed at node {i}"),
+            }
+        }
+        // the interned tag table is rebuilt: attribute lookup still works
+        assert_eq!(back.attr(1, "CLASS"), Some("a b"));
+        assert_eq!(back.attr(2, "data-v"), Some("1 2"));
+        assert_eq!(back.body_root(), dom.body_root());
+    }
+
+    #[test]
+    fn snapshot_rejects_corrupt_or_truncated_files() {
+        let dom = parse("<body><p>ok</p></body>");
+        let bytes = dom.to_bytes();
+
+        // truncated at every interesting boundary: always None, never a panic
+        for cut in [0, 3, 4, 6, 9, bytes.len() / 2, bytes.len() - 1] {
+            assert!(Dom::from_bytes(&bytes[..cut]).is_none(), "truncation at {cut}");
+        }
+        // a flipped payload byte breaks the trailing hash
+        let mut flipped = bytes.clone();
+        flipped[10] ^= 0xFF;
+        assert!(Dom::from_bytes(&flipped).is_none());
+        // a flipped hash byte breaks it too
+        let mut bad_hash = bytes.clone();
+        let last = bad_hash.len() - 1;
+        bad_hash[last] ^= 0x01;
+        assert!(Dom::from_bytes(&bad_hash).is_none());
+        // trailing junk is not silently accepted
+        let mut junk = bytes.clone();
+        junk.push(0);
+        assert!(Dom::from_bytes(&junk).is_none());
+        // wrong magic
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        assert!(Dom::from_bytes(&magic).is_none());
+    }
+
+    #[test]
+    fn snapshot_rejects_inconsistent_links() {
+        // Build a valid snapshot, then re-hash a hand-edited tree: a child
+        // whose parent points elsewhere must be refused, not laid out.
+        let dom = parse("<body><p>x</p></body>");
+        let mut bytes = dom.to_bytes();
+        let body_len = bytes.len() - 8;
+        let body = &mut bytes[..body_len];
+        // node 1 = <body>, node 2 = <p>: rewrite node 2's parent to 0
+        // (layout + hit test assume parent/child agreement)
+        let pos = node_start(body, 2);
+        body[pos..pos + 4].copy_from_slice(&0u32.to_le_bytes());
+        let h = snap_hash(body);
+        let n = bytes.len();
+        bytes[n - 8..].copy_from_slice(&h.to_le_bytes());
+        assert!(Dom::from_bytes(&bytes).is_none());
+    }
+
+    /// Byte offset of node `idx` in a snapshot body (test-only helper: walks
+    /// the variable-length records instead of guessing).
+    fn node_start(body: &[u8], idx: usize) -> usize {
+        let mut r = Reader { b: body, p: 0 };
+        r.take(4).unwrap();
+        r.u16().unwrap();
+        let ntags = r.u32().unwrap();
+        for _ in 0..ntags {
+            r.str().unwrap();
+        }
+        r.u32().unwrap(); // node count
+        for _ in 0..idx {
+            skip_node(&mut r);
+        }
+        r.p
+    }
+
+    fn skip_node(r: &mut Reader) {
+        r.u32().unwrap(); // parent
+        for _ in 0..r.u32().unwrap() {
+            r.u32().unwrap();
+        }
+        match r.u8().unwrap() {
+            0 => {
+                r.u16().unwrap();
+                for _ in 0..r.u32().unwrap() {
+                    r.str().unwrap();
+                    r.str().unwrap();
+                }
+            }
+            _ => {
+                r.str().unwrap();
+            }
+        }
     }
 }
 

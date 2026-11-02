@@ -217,6 +217,12 @@ struct App {
     /// scrollbar drag in progress: distance from the pointer to the thumb's
     /// top edge, in viewport units. None = not dragging.
     bar_grab: Option<f32>,
+    /// pointer position at the previous frame. `:hover` is re-evaluated only
+    /// when the pointer moved (or a button went down): re-evaluating it after
+    /// our OWN relayout fed a loop on real pages — the hovered box shifts its
+    /// children under a still pointer, the next hit test lands on a sibling,
+    /// which shifts it too, and the page re-lays out forever.
+    last_ptr: Option<egui::Pos2>,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -382,14 +388,19 @@ impl App {
             settings_open: false,
             hovered: None,
             hover_wait: false,
-        bar_grab: None,
+            bar_grab: None,
+            last_ptr: None,
         };
-        app.dispatch(&url, pw, ph, 0.0);
+        // Startup on a previously visited URL counts as a restore: the DOM
+        // snapshot skips the fetch exactly like a tab switch (scripts still
+        // re-run, so listeners and dynamic content behave as on a fresh load).
+        app.dispatch(&url, pw, ph, 0.0, true);
         app
     }
 
     /// Queue a load of `url` on the worker thread (never blocks the UI).
-    fn dispatch(&mut self, url: &str, pw: usize, ph: usize, scroll: f32) {
+    /// `restore` = try the DOM snapshot before fetching (tab switch / back).
+    fn dispatch(&mut self, url: &str, pw: usize, ph: usize, scroll: f32, restore: bool) {
         let id = self.nav.begin();
         eprintln!("[nav] queued load {url} (#{id}, viewport {pw}x{ph})");
         let req = LoadReq::Load {
@@ -399,6 +410,7 @@ impl App {
             vh: page_h(ph),
             engine: self.conf.engine,
             fonts: self.conf.fonts,
+            restore,
         };
         // receiver only drops when the worker thread is gone
         if self.jobs.send(req).is_err() {
@@ -521,7 +533,7 @@ impl App {
                     // plain script nav on a concurrently-fetched page: the
                     // target was never fetched — re-dispatch it as a load
                     eprintln!("[js] script navigated to {nav_url}");
-                    self.dispatch(&nav_url, pw, ph, 0.0);
+                    self.dispatch(&nav_url, pw, ph, 0.0, false);
                     continue;
                 }
             }
@@ -647,7 +659,7 @@ impl App {
     /// Load `url` into the active tab: push history, reset scroll.
     fn navigate(&mut self, url: &str, pw: usize, ph: usize) {
         self.back_stack.push(self.page.url.clone());
-        self.dispatch(url, pw, ph, 0.0);
+        self.dispatch(url, pw, ph, 0.0, false);
         self.tabs[self.active].url = url.to_string();
         self.address = url.to_string();
     }
@@ -655,7 +667,8 @@ impl App {
     /// Load `url` into the active tab WITHOUT touching history (tab switch /
     /// close / back), restoring `scroll`.
     fn reload_active(&mut self, url: &str, pw: usize, ph: usize, scroll: f32) {
-        self.dispatch(url, pw, ph, scroll);
+        // tab switch / close / back: the snapshot avoids re-fetching the page
+        self.dispatch(url, pw, ph, scroll, true);
         self.tabs[self.active].url = url.to_string();
         self.address = url.to_string();
     }
@@ -783,6 +796,26 @@ fn cursor_icon_of(c: css::Cursor) -> egui::CursorIcon {
         css::Cursor::ColResize => egui::CursorIcon::ResizeHorizontal,
         css::Cursor::RowResize => egui::CursorIcon::ResizeVertical,
     }
+}
+
+/// Should a change of the hit-tested node cost a relayout?
+///
+/// - `pointer_active`: `:hover` is re-evaluated only when the pointer moved
+///   (or a button went down). A still pointer must NOT re-hover: after our own
+///   relayout the hovered box can shift its children out from under it, the
+///   next hit test lands on a sibling, and the page re-lays out forever (a
+///   real article reproduced this at ~4 s per pass).
+/// - `busy`: another job is in flight — retry next frame (self-healing).
+/// - `scrolling`: content slides under a still pointer, so every frame would
+///   "change hover" and each change costs a full re-layout.
+fn hover_should_relayout(
+    new_hovered: Option<u32>,
+    hovered: Option<u32>,
+    pointer_active: bool,
+    busy: bool,
+    scrolling: bool,
+) -> bool {
+    pointer_active && new_hovered != hovered && !busy && !scrolling
 }
 
 impl eframe::App for App {
@@ -1150,6 +1183,12 @@ impl eframe::App for App {
                     // link hit-test above, and rebuild when the effective
                     // hovered set changed
                     let hover_pos = ui.input(|i| i.pointer.hover_pos());
+                    // Browsers update :hover on pointer motion, not on layout
+                    // — see `last_ptr`. A press also counts (same spot, new
+                    // target under the pointer, e.g. after an overlay closed).
+                    let ptr_active =
+                        hover_pos != self.last_ptr || ui.input(|i| i.pointer.any_pressed());
+                    self.last_ptr = hover_pos;
                     let inside = hover_pos.filter(|p| resp.rect.contains(*p));
                     let over_bar = inside.map_or(false, in_bar);
                     let hit = inside.filter(|_| !over_bar).and_then(|p| {
@@ -1180,18 +1219,7 @@ impl eframe::App for App {
                     } else {
                         hit.map(|(n, _)| n)
                     };
-                    if new_hovered != self.hovered
-                        // skip while another job is in flight and retry next
-                        // frame (self-healing); a hover change is a full
-                        // re-cascade + rebuild — shortcut: no incremental
-                        // invalidation, so a wiki page costs tens of ms
-                        && self.pending.is_none()
-                        && self.pending_link.is_none()
-                        // and skip mid-scroll: the content slides under a
-                        // still pointer, so every frame "changes hover" and
-                        // each change would cost a full page re-layout
-                        && !ui.input(|i| i.is_scrolling())
-                    {
+                    if hover_should_relayout(new_hovered, self.hovered, ptr_active, self.pending.is_some() || self.pending_link.is_some(), ui.input(|i| i.is_scrolling())) {
                         self.hovered = new_hovered;
                         self.dispatch_relayout(pw, ph);
                         self.hover_wait = true;
@@ -1229,7 +1257,7 @@ impl eframe::App for App {
                                 // of OTHER tabs happens on their next load;
                                 // this reload covers the current one
                                 let target = self.page.url.clone();
-                                self.dispatch(&target, pw, ph, 0.0);
+                                self.dispatch(&target, pw, ph, 0.0, false);
                             }
                             ui_chrome::SettingsEvent::SetFonts(choice) => {
                                 self.conf.fonts = choice;
@@ -1387,9 +1415,12 @@ enum LoadReq {
         /// page keeps its runtime; this only matters for loads.
         engine: EngineChoice,
         /// webfont policy for this load (`A` = site fonts, `B` = system
-        /// fonts only). Like `engine`, a relayout/event never switches it —
+        /// fonts only). Like `engine`, a relayout/event never switches it -
         /// the settings choice applies on the NEXT navigation.
         fonts: FontsChoice,
+        /// Phase 3: restore the DOM snapshot instead of re-fetching when one
+        /// exists (tab switch / back). A fresh navigation passes false.
+        restore: bool,
     },
     /// re-cascade + re-layout the kept page (resize / DOM change / hover
     /// change), carrying the UI's live form state + hover cell forward
@@ -2007,17 +2038,17 @@ fn process_job(
         fonts.set_choice(choice);
     }
     match job {
-        LoadReq::Load { url, max_w, vh, .. } => {
+        LoadReq::Load { url, max_w, vh, restore, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = layout::FormState::default();
-            let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
+            let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), *restore);
             (r.0, r.1, false, r.2, r.3)
         }
         LoadReq::Relayout { url, max_w, vh, forms, hover, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
+                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), false);
                 return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
@@ -2036,7 +2067,7 @@ fn process_job(
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
+                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), false);
                 return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
@@ -2159,7 +2190,7 @@ fn process_job(
                                     SubmitMethod::Get => {
                                         eprintln!("[nav] queued load (form GET {})", sub.target);
                                         let (wire, script_nav, panicked, nav_done) =
-                                            do_load(kept, fonts, &sub.target, *max_w, *vh, job.engine());
+                                            do_load(kept, fonts, &sub.target, *max_w, *vh, job.engine(), false);
                                         if let Some(s) = &script_nav {
                                             // the fetched page's scripts asked for
                                             // a plain nav: it wins (the ordinary
@@ -2304,8 +2335,9 @@ fn do_load(
     max_w: f32,
     vh: f32,
     engine: EngineChoice,
+    restore: bool,
 ) -> (Option<PageWire>, Option<String>, bool, bool) {
-    let (dom, css_text, faces) = fetch_and_parse(url);
+    let (dom, css_text, faces) = fetch_and_parse(url, restore);
     let (wire, nav, form_nav) = settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces);
     if let Some(f) = form_nav {
         // an inline script form.submit()ed a POST during the load — the
@@ -2385,15 +2417,22 @@ fn do_load_full(
 
 /// Parse an HTML source + collect its stylesheets (`fetch_and_parse`'s back
 /// half, reused for POST responses so the stylesheet handling exists once).
+/// The parsed tree is snapshotted BEFORE scripts run: a restore replays the
+/// scripts, so listeners/state are rebuilt exactly as on a fresh load.
 fn parse_source_with_styles(url: &str, source: String) -> (html::Dom, String, Vec<css::FontFace>) {
     let dom = html::parse(&source);
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
+    let (css_text, faces) = styles_for(&dom, url);
+    (dom, css_text, faces)
+}
 
-    // Phase 1b: collect every stylesheet in document order — <style> blocks
-    // (usually in <head>, which body_root skips) and external <link>s — then
-    // parse ONCE into precompiled selectors.
+/// Collect every stylesheet in document order — `<style>` blocks (usually in
+/// `<head>`, which body_root skips) and external `<link>`s — then parse ONCE
+/// into precompiled selectors. Split from parsing so a DOM restored from a
+/// snapshot re-collects styles without re-parsing HTML.
+fn styles_for(dom: &html::Dom, url: &str) -> (String, Vec<css::FontFace>) {
     let mut sources = Vec::new();
-    collect_sheets(&dom, 0, &mut sources);
+    collect_sheets(dom, 0, &mut sources);
     let mut css_text = String::new();
     let mut ext_count = 0usize;
     // `@font-face` defs collected per-sheet: the cascade concatenates sheets,
@@ -2427,7 +2466,7 @@ fn parse_source_with_styles(url: &str, source: String) -> (html::Dom, String, Ve
         css_text.len(),
         ext_count
     );
-    (dom, css_text, faces)
+    (css_text, faces)
 }
 
 /// The shared back half of every load (plain fetch or a POST submission's
@@ -2771,7 +2810,21 @@ fn collect_form_names(dom: &html::Dom) -> HashMap<u32, String> {
 
 /// Fetch + parse one page's HTML and every stylesheet (network + parse —
 /// the expensive half of the pipeline, done once per navigation).
-fn fetch_and_parse(url: &str) -> (html::Dom, String, Vec<css::FontFace>) {
+fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::FontFace>) {
+    // Phase 3: a tab switch / back restores the snapshot instead of
+    // re-fetching + re-tokenizing. The tree is the PRE-SCRIPT one, so
+    // `settle_load` still replays the page's scripts (listeners intact).
+    if restore {
+        if let Some(dom) = snapshot_read(url) {
+            eprintln!(
+                "[dom] restored snapshot for {url} ({} nodes, no fetch)",
+                dom.nodes.len()
+            );
+            let (css_text, faces) = styles_for(&dom, url);
+            return (dom, css_text, faces);
+        }
+        eprintln!("[dom] no snapshot for {url} — fetching");
+    }
     let source = match fetch(url) {
         Ok((bytes, ct)) => {
             let s = html::decode_html(&bytes, ct.as_deref());
@@ -2785,10 +2838,16 @@ fn fetch_and_parse(url: &str) -> (html::Dom, String, Vec<css::FontFace>) {
         }
         Err(e) => {
             eprintln!("[nav] fetch failed for {url}: {e}");
-            format!("<p>Failed to load: {e}</p>")
+            // never snapshot an error page: a later restore would show it
+            // forever even after the site came back
+            return parse_source_with_styles(url, format!("<p>Failed to load: {e}</p>"));
         }
     };
-    parse_source_with_styles(url, source)
+    let dom = html::parse(&source);
+    eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
+    snapshot_write(url, &dom);
+    let (css_text, faces) = styles_for(&dom, url);
+    (dom, css_text, faces)
 }
 
 /// Cascade + box tree + layout + image decode — the re-runnable half.
@@ -3481,6 +3540,66 @@ fn cache_write_in(
     let mut out = format!("{now}\n{}\n", ct.unwrap_or("")).into_bytes();
     out.extend_from_slice(bytes);
     let _ = std::fs::write(dir.join(cache_key(url)), out);
+}
+
+// ---------- DOM snapshots (Phase 3) ----------
+// A tab switch used to re-fetch + re-tokenize the page. The parsed tree is
+// now serialized to `mazda-cache\dom\<url hash>` and restored instead;
+// stylesheets are re-collected from the restored tree (their bytes are in the
+// HTTP disk cache) so media queries still see the live viewport.
+// shortcut: keyed by URL only (no validators/expiry beyond the HTTP cache's
+// TTL for the sheets), one file per page, oldest-mtime eviction at the cap.
+
+const SNAP_MAX_FILES: usize = 48;
+/// Per-file cap: a page whose DOM serializes larger than this isn't worth
+/// the disk write; it just loads normally next time.
+const SNAP_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn snapshot_dir() -> std::path::PathBuf {
+    cache_dir().join("dom")
+}
+
+/// None on any miss/corruption — callers fall back to a normal fetch.
+fn snapshot_read(url: &str) -> Option<html::Dom> {
+    // inline documents are local + tiny: re-parsing is cheaper than disk I/O
+    if url.starts_with("data:") {
+        return None;
+    }
+    let data = std::fs::read(snapshot_dir().join(cache_key(url))).ok()?;
+    if data.len() > SNAP_MAX_BYTES {
+        return None;
+    }
+    html::Dom::from_bytes(&data)
+}
+
+fn snapshot_write(url: &str, dom: &html::Dom) {
+    if url.starts_with("data:") {
+        return; // probes must not evict real pages from the store
+    }
+    let bytes = dom.to_bytes();
+    if bytes.len() > SNAP_MAX_BYTES {
+        eprintln!("[dom] snapshot for {url} too large ({} KB), not saved", bytes.len() / 1024);
+        return;
+    }
+    let dir = snapshot_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    // same oldest-mtime eviction as the HTTP cache
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = rd
+            .flatten()
+            .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+            .collect();
+        if files.len() >= SNAP_MAX_FILES {
+            files.sort_by_key(|(_, t)| *t);
+            for (p, _) in files.iter().take(files.len() + 1 - SNAP_MAX_FILES) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    match std::fs::write(dir.join(cache_key(url)), &bytes) {
+        Ok(()) => eprintln!("[dom] snapshot saved for {url} ({} KB)", bytes.len() / 1024),
+        Err(e) => eprintln!("[dom] snapshot write failed for {url}: {e}"),
+    }
 }
 
 fn fetch(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
@@ -4926,6 +5045,7 @@ mod tests {
             vh: 100.0,
             engine: EngineChoice::A,
             fonts: FontsChoice::B,
+            restore: false,
         };
         assert_eq!(load.fonts_choice(), Some(FontsChoice::B));
         let re = LoadReq::Relayout {
@@ -5501,6 +5621,7 @@ mod tests {
             vh: 1.0,
             engine: EngineChoice::A,
             fonts: FontsChoice::A,
+            restore: false,
         };
     }
 
@@ -5559,7 +5680,7 @@ mod tests {
     /// never dropped and breaks both collapsing runs.
     #[test]
     fn coalesce_batch_superseded_runs() {
-        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, engine: EngineChoice::A, fonts: FontsChoice::A };
+        let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, engine: EngineChoice::A, fonts: FontsChoice::A, restore: false };
         let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default(), hover: None, engine: EngineChoice::A };
         let ev = |id, kind: &str| LoadReq::Event {
             id,
@@ -5598,12 +5719,33 @@ mod tests {
         assert_eq!(out.len(), 3, "mixed kinds never merge");
     }
 
+    /// Hover must not re-dispatch when the pointer is still: the hit test
+    /// after our own relayout can land on a different node, which used to
+    /// feed an endless relayout loop on a real article (one pass per layout,
+    /// ~4 s each). Only pointer motion (or a press) may change `:hover`;
+    /// busy jobs retry next frame; scrolling never re-hovers.
+    #[test]
+    fn hover_relayout_needs_pointer_motion() {
+        // still pointer, hit changed by our own relayout → no new job
+        assert!(!hover_should_relayout(Some(2), Some(1), false, false, false));
+        // pointer moved onto another node → relayout
+        assert!(hover_should_relayout(Some(2), Some(1), true, false, false));
+        // unchanged hit → nothing to do even when moving
+        assert!(!hover_should_relayout(Some(1), Some(1), true, false, false));
+        // a job is already in flight → self-heal next frame
+        assert!(!hover_should_relayout(Some(2), Some(1), true, true, false));
+        // mid-scroll: content slides under a still pointer
+        assert!(!hover_should_relayout(Some(2), Some(1), true, false, true));
+        // leaving the page (Some → None) still needs a motion
+        assert!(hover_should_relayout(None, Some(1), true, false, false));
+        assert!(!hover_should_relayout(None, Some(1), false, false, false));
+    }
+
     /// The unified wake budget: wait until the earliest due JS work; never
     /// less than ~1ms even for a momentarily-passed deadline (busy-spin
     /// guard); long idle block when nothing is scheduled.
     #[test]
-    fn recv_budget_never_spins_and_blocks_idle() {
-        let now = Instant::now();
+    fn recv_budget_never_spins_and_blocks_idle() {        let now = Instant::now();
         assert_eq!(recv_budget(None, now), Duration::from_secs(3600));
         // past deadline → clamps to the 1ms floor (no zero/zero wake loop)
         assert_eq!(recv_budget(Some(now - Duration::from_secs(5)), now), Duration::from_millis(1));

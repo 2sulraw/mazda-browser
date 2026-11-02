@@ -1013,8 +1013,42 @@ curve matters more than the baseline (near-flat as tabs grow).
   Tests: default **563**, `engine-b + woff2` **567**
   (`sub_and_sup_shift_the_baseline_and_shrink`, `del_and_s_paint_a_strike_line`,
   `text_decoration_line_parses_through_the_cascade`).
+  **(o) Phase 3 groundwork — DOM snapshots** — a tab switch re-fetched and
+  re-tokenized the page. `html::Dom` now serializes to bytes (magic `MDOM`,
+  version, interned tag table, per-node parent/children/kind, u32
+  length-prefixed text + attribute strings, trailing FNV-1a hash) and back;
+  `from_bytes` validates every index, tag id, UTF-8 string and the
+  parent⇄child agreement, so truncation, a flipped byte, trailing junk or a
+  wrong version are all a clean miss. The worker writes the PRE-SCRIPT tree
+  to `%LOCALAPPDATA%\mazda-cache\dom\<url hash>` after a normal GET (48
+  files, oldest-mtime eviction, 16 MB per-file cap; `data:` URLs are never
+  stored and error pages are never snapshotted), and `LoadReq::Load` carries
+  a `restore` flag: tab switch / close / back and startup pass true and skip
+  fetch + parse, then re-collect stylesheets (`styles_for`, split out of
+  `parse_source_with_styles`) and **re-run the page's scripts**, so listeners
+  and dynamic content behave exactly as on a fresh load.
+  Live: the Wikipedia Rust article restored from a 1347 KB snapshot —
+  worker time **11.8 s → 4.1 s**, identical 19239 nodes, 1646 rules,
+  **14973 runs**, 315 images, 105–114 MB debug (no RAM change; the snapshot
+  never lives on the heap after load); example.com 684 → 43 ms, 25 runs.
+  Found + fixed while verifying: a still pointer kept re-hovering after each
+  relayout (the hovered box shifts its children out from under it, the next
+  hit test lands on a sibling, forever — one full article layout per 4 s).
+  `hover_should_relayout` now dispatches only on pointer motion or a press;
+  the busy/scrolling guards stay.
+  shortcut: the snapshot is keyed by URL only (the same TTL bet the HTTP disk
+  cache already makes), the restored tree is the pre-script one so scripts
+  replay (listeners are never serialized), and stylesheets are still
+  re-fetched from the HTTP disk cache on restore.
+  Tests: default **567**, `engine-b + woff2` **571**
+  (`snapshot_round_trip_preserves_the_tree`,
+  `snapshot_rejects_corrupt_or_truncated_files`,
+  `snapshot_rejects_inconsistent_links`, `hover_relayout_needs_pointer_motion`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
+  — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
+  skips fetch+parse; layout is still recomputed per viewport (it must be), and
+  cookies / hibernation-on-pressure / a real tab store are open.
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
 
 ## Recommendations logged (from "translate HTML/CSS to Rust" discussion)
@@ -1111,7 +1145,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 8m (`clip-path: inset()`) | data: URL `sr-only` probe | 54.7 MB (4 runs; both hidden labels clipped away, both visible strings paint) |
 | 2026-11-03 | wave 8m (`clip-path: inset()`) | MDN `/Web/CSS/list-style-type` | 76.1–80.0 MB (2773 runs, 11 images; unchanged) |
 | 2026-11-03 | wave 8n (sub/sup + line-through/overline) | data: URL decoration probe | 54.7 MB (28 runs; H₂O, mc², struck and overlined runs all paint) |
-| 2026-11-03 | wave 8n (sub/sup + line-through/overline) | Wikipedia Rust article | 96.3–116.1 MB (14973 runs, 315 images; layout identical, `[n]` markers raised) |
+| 2026-11-03 | wave 8n (sub/sup + line-through/overline) | Wikipedia Rust article | 96.3-116.1 MB (14973 runs, 315 images; layout identical, `[n]` markers raised) |
+| 2026-11-03 | wave 9 (DOM snapshots + restore) | Wikipedia Rust article (fresh load, snapshot saved 1347 KB) | 109.4 MB (14973 runs, 315 images; worker 11.8 s) |
+| 2026-11-03 | wave 9 (DOM snapshots + restore) | Wikipedia Rust article (restored, no fetch) | 105.4-114.9 MB (19239 nodes, 14973 runs, 315 images; worker 4.1 s) |
+| 2026-11-03 | wave 9 (DOM snapshots + restore) | example.com (restored) | 62.9 MB (25 runs; worker 43 ms vs 684 ms fresh) |
 
 ### Phase 1c (Track A) findings
 
