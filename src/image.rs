@@ -178,6 +178,31 @@ pub fn downscale(src: &ImageData, w: u32, h: u32) -> ImageData {
     ImageData { w, h, px }
 }
 
+/// Crop `src` to the pixel window `[x0, x1) × [y0, y1)` (clamped to the
+/// image, never empty). `object-fit: cover`/`none` decode at the content
+/// rect first, then trim the part outside the element's box here so the
+/// draw list only carries visible pixels.
+pub fn crop(src: &ImageData, x0: u32, y0: u32, x1: u32, y1: u32) -> ImageData {
+    if src.w == 0 || src.h == 0 {
+        return ImageData {
+            w: 1,
+            h: 1,
+            px: vec![0],
+        };
+    }
+    let x0 = x0.min(src.w - 1);
+    let y0 = y0.min(src.h - 1);
+    let x1 = x1.clamp(x0 + 1, src.w);
+    let y1 = y1.clamp(y0 + 1, src.h);
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut px = Vec::with_capacity((w * h) as usize);
+    for y in y0..y1 {
+        let row = (y * src.w) as usize;
+        px.extend_from_slice(&src.px[row + x0 as usize..row + x1 as usize]);
+    }
+    ImageData { w, h, px }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +352,21 @@ mod tests {
         assert_eq!(d.px, vec![0xff00_0000]);
         let d2 = downscale(&src, 2, 2); // same size = no-op
         assert_eq!(d2.px, src.px);
+    }
+
+    #[test]
+    fn crop_keeps_requested_window_and_clamps() {
+        let src = ImageData {
+            w: 3,
+            h: 2,
+            px: vec![1, 2, 3, 4, 5, 6],
+        };
+        let c = crop(&src, 1, 0, 3, 2);
+        assert_eq!((c.w, c.h), (2, 2));
+        assert_eq!(c.px, vec![2, 3, 5, 6]);
+        // out-of-range windows clamp instead of panicking
+        let c = crop(&src, 0, 1, 99, 99);
+        assert_eq!((c.w, c.h), (3, 1));
+        assert_eq!(c.px, vec![4, 5, 6]);
     }
 }

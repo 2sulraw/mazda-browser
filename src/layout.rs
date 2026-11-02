@@ -5,7 +5,7 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor,
-    Dir, Display, Float, Justify, Len, Pos, PseudoEl, Sheet, TableRole, Track, VAlign,
+    Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track, VAlign,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -421,6 +421,54 @@ impl ImgSlot {
     }
 }
 
+/// Resolve `object-fit`/`object-position` into (content rect, crop window)
+/// inside `bx` (the replaced element's padding box). The content rect keeps
+/// the intrinsic aspect ratio for every mode but `fill`; `object-position`
+/// anchors it with the same `(box − content) × %` formula background-position
+/// uses, so `cover` crops symmetrically at the default 50%/50%. The crop
+/// window is the intersection with the box — Some only when the content
+/// overflows, so decode knows to trim it.
+/// shortcut: subpixel filtering is out of scope (nearest-neighbour resample);
+/// the fit area is the padding box (same as `background-size`), so a padded
+/// replaced box letterboxes inside its border, not strictly its content box.
+fn fit_content_rect(
+    fit: ObjFit,
+    pos: [BgPos; 2],
+    bx: (f32, f32, f32, f32),
+    iw: f32,
+    ih: f32,
+) -> ((f32, f32, f32, f32), Option<(f32, f32, f32, f32)>) {
+    let (bx, by, bw, bh) = bx;
+    if fit == ObjFit::Fill {
+        return ((bx, by, bw, bh), None);
+    }
+    let iw = iw.max(1.0);
+    let ih = ih.max(1.0);
+    let s = match fit {
+        ObjFit::Fill => unreachable!(),
+        ObjFit::Contain => (bw / iw).min(bh / ih),
+        ObjFit::Cover => (bw / iw).max(bh / ih),
+        ObjFit::None => 1.0,
+        ObjFit::ScaleDown => (bw / iw).min(bh / ih).min(1.0),
+    };
+    let (cw, ch) = ((iw * s).max(0.0), (ih * s).max(0.0));
+    let ox = match pos[0] {
+        BgPos::Pct(p) => (bw - cw) * p / 100.0,
+        BgPos::Px(v) => v,
+    };
+    let oy = match pos[1] {
+        BgPos::Pct(p) => (bh - ch) * p / 100.0,
+        BgPos::Px(v) => v,
+    };
+    let rect = (bx + ox, by + oy, cw, ch);
+    // crop window = content ∩ box; None when the content fits (nothing to
+    // trim), which keeps `contain`/`scale-down` on the plain draw path
+    let (x0, y0) = (rect.0.max(bx), rect.1.max(by));
+    let (x1, y1) = ((rect.0 + cw).min(bx + bw), (rect.1 + ch).min(by + bh));
+    let clipped = x0 > rect.0 || y0 > rect.1 || x1 < rect.0 + cw || y1 < rect.1 + ch;
+    (rect, clipped.then_some((x0, y0, x1, y1)))
+}
+
 /// What a form-control box does — decides hit-test semantics, focus
 /// painting and the value shown. Built from the element tag + `type`
 /// attribute during [`build`].
@@ -541,6 +589,14 @@ pub struct BoxNode {
     pub node: Option<u32>,
     /// `<img>` replacement data (None for every other box)
     pub img: Option<ImgSlot>,
+    /// object-fit content rect in document coords — where the image's pixels
+    /// actually go. None = the box itself (initial `fill` / no declaration),
+    /// which keeps the legacy draw path byte-identical.
+    pub img_fit: Option<(f32, f32, f32, f32)>,
+    /// visible sub-window (content rect ∩ padding box) when the fit mode
+    /// overflows the box (`cover`/`none`): decode crops to it. None = no
+    /// crop (the content fits, or `fill`).
+    pub img_clip: Option<(f32, f32, f32, f32)>,
     /// form-control identity (input/textarea/button/select): None for
     /// every other box; carried into the laid output as a [`FormBox`]
     pub form: Option<FormCtl>,
@@ -580,6 +636,8 @@ impl BoxNode {
             link: None,
             node: None,
             img: None,
+            img_fit: None,
+            img_clip: None,
             form: None,
             inline: false,
             children: Vec::new(),
@@ -607,6 +665,8 @@ impl BoxNode {
             link,
             node: None,
             img: None,
+            img_fit: None,
+            img_clip: None,
             form: None,
             inline: false,
             children: Vec::new(),
@@ -2396,11 +2456,17 @@ fn collect_paint(
                         }
                     }
                     _ => {
-                        // single draw at (x, y, w, h) — content <img>, a
-                        // no-repeat / undeclared-repeat background, or a
-                        // de-slotted one (0×0, culled above)
-                        let q = m.map_rect((n.x, n.y, n.w, n.h));
-                        if let Some(q) = cull_rect(q, content_clip) {
+                        // single draw at the object-fit content rect (the
+                        // box itself under the initial `fill`), cropped to
+                        // the fit window when cover/none overflow it
+                        let src = n.img_fit.unwrap_or((n.x, n.y, n.w, n.h));
+                        let q = m.map_rect(src);
+                        let win = match (content_clip, n.img_clip.map(|c| m.map_win(c))) {
+                            (None, w) => w,
+                            (Some(a), Some(b)) => Some(clip_intersect(a, b)),
+                            (Some(a), None) => Some(a),
+                        };
+                        if let Some(q) = cull_rect(q, win) {
                             imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
                             img_z.push(z);
                         }
@@ -3288,6 +3354,18 @@ fn place(
     if let Some(m) = n.bx.max_width {
         w = w.min(resolve_len(m, avail));
     }
+    // aspect-ratio with one declared axis derives the other. A declared
+    // height + ratio sets the width here (an auto block width would
+    // otherwise fill the container); a declared width derives the height
+    // after content placement below.
+    if n.bx.width.is_none() {
+        if let (Some(h), Some(r)) = (n.bx.height, n.bx.aspect_ratio) {
+            w = resolve_len(h, avail) * r;
+            if let Some(m) = n.bx.max_width {
+                w = w.min(resolve_len(m, avail));
+            }
+        }
+    }
     // table width: auto shrink-wraps the columns; a declared width is
     // shared over them. Pads/borders are resolved here (against the width
     // we know) so the plan sees the real content constraint.
@@ -3301,7 +3379,11 @@ fn place(
         w = plan.used + pl + pr + bl + br;
     }
     // replaced element with known intrinsic size: width unless overridden
-    if n.img.is_some() && n.bx.width.is_none() {
+    // (a declared height + aspect-ratio above already resolved the width)
+    if n.img.is_some()
+        && n.bx.width.is_none()
+        && (n.bx.height.is_none() || n.bx.aspect_ratio.is_none())
+    {
         if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
             w = (iw as f32).min(avail);
         }
@@ -3348,11 +3430,17 @@ fn place(
     // known, so %-sizes/%-positions resolve against the final box)
     if n.img.is_some() {
         // replaced element: no children — height from declared height,
-        // else aspect ratio of the content width (no size known: 0 → invisible)
-        n.h = match (n.bx.height, n.img.as_ref().and_then(ImgSlot::dims)) {
-            (Some(l), _) => resolve_len(l, avail),
-            (None, Some((iw, ih))) => n.w * ih as f32 / (iw as f32).max(1.0),
-            (None, None) => 0.0,
+        // else the declared aspect ratio, else the intrinsic ratio of the
+        // content width (no size known: 0 → invisible)
+        n.h = match n.bx.height {
+            Some(l) => resolve_len(l, avail),
+            None => match n.bx.aspect_ratio {
+                Some(r) => n.w / r,
+                None => match n.img.as_ref().and_then(ImgSlot::dims) {
+                    Some((iw, ih)) => n.w * ih as f32 / (iw as f32).max(1.0),
+                    None => 0.0,
+                },
+            },
         };
     } else {
         match (n.bx.display, n.bx.dir) {
@@ -3361,6 +3449,19 @@ fn place(
             (Display::Grid, _) => grid(n, measure, runs, uls),
             _ if n.bx.table == TableRole::Table => table_layout(n, measure, runs, uls, flt),
             _ => block(n, measure, runs, uls, flt), // Block / Auto(block tag)
+        }
+        // aspect-ratio with auto height: the box keeps the ratio from its
+        // content width and its content is laid out inside (content taller
+        // than the ratio box overflows, per spec — no min-height rescuing
+        // here beyond the explicit `min-height` floor below). A declared
+        // height + ratio pins that height (blocks otherwise ignore `height`).
+        // shortcut: flex/grid cross-axis stretch still decides its own axis
+        // (the ratio only feeds this place() derivation).
+        if let Some(r) = n.bx.aspect_ratio {
+            n.h = match n.bx.height {
+                Some(l) => resolve_len(l, avail),
+                None => n.w / r,
+            };
         }
     }
     // min-height: floor the content height. A flex column with vertical
@@ -3395,6 +3496,24 @@ fn place(
     n.x = bx0;
     n.y = by0;
     n.w = w;
+    // object-fit content rect for a content <img>: `fill` (or no slot) keeps
+    // the legacy box draw byte-identically, every other mode computes the
+    // letterbox/crop inside the padding box and (for cover/none) the visible
+    // window decode trims to.
+    if n.img.is_some() && !n.is_bg && !n.is_mask && n.bx.obj_fit != ObjFit::Fill {
+        if let Some((iw, ih)) = n.img.as_ref().and_then(ImgSlot::dims) {
+            let fit_box = (
+                n.x + bl,
+                n.y + bt,
+                (n.w - bl - br).max(0.0),
+                (n.h - bt - bb).max(0.0),
+            );
+            let (rect, clip) =
+                fit_content_rect(n.bx.obj_fit, n.bx.obj_pos, fit_box, iw as f32, ih as f32);
+            n.img_fit = Some(rect);
+            n.img_clip = clip;
+        }
+    }
     // background-image placeholders: sized per `background-size` and
     // anchored per `background-position` inside this box's padding box —
     // placed AFTER content layout so %-sizes/%-positions resolve against
@@ -6519,6 +6638,17 @@ mod tests {
         n
     }
 
+    /// group box carrying a decoded image of the given intrinsic size.
+    fn img_sized(bx: BoxStyle, w: u32, h: u32) -> BoxNode {
+        let mut n = BoxNode::group(Style::new(), bx);
+        n.img = Some(ImgSlot::Ready(std::rc::Rc::new(crate::image::ImageData {
+            w,
+            h,
+            px: vec![0; (w * h) as usize],
+        })));
+        n
+    }
+
     #[test]
     fn img_uses_intrinsic_size_clamped_to_avail() {
         let mut n = img_box(BoxStyle::default());
@@ -6553,6 +6683,180 @@ mod tests {
         });
         layout_tree(&mut n, 300.0, &m4);
         assert!((n.h - 80.0).abs() < 0.01, "h={}", n.h);
+    }
+
+    // ---- object-fit / object-position / aspect-ratio ----
+
+    #[test]
+    fn object_fit_content_rect_for_8x6_in_100x100() {
+        let bx = (0.0, 0.0, 100.0, 100.0);
+        let c = [BgPos::Pct(50.0); 2];
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+
+        // fill = exact stretch (today's behavior)
+        let (r, clip) = fit_content_rect(ObjFit::Fill, c, bx, 8.0, 6.0);
+        assert_eq!(r, bx);
+        assert!(clip.is_none());
+
+        // contain = letterbox: 100×75 at y = 12.5
+        let (r, clip) = fit_content_rect(ObjFit::Contain, c, bx, 8.0, 6.0);
+        assert!(near(r.2, 100.0) && near(r.3, 75.0), "r={r:?}");
+        assert!(near(r.1, 12.5), "centered y={}", r.1);
+        assert!(clip.is_none(), "contained content does not crop");
+
+        // cover = crop: 133.3×100 at x = −16.67, clipped to the box
+        let (r, clip) = fit_content_rect(ObjFit::Cover, c, bx, 8.0, 6.0);
+        assert!(near(r.0, -16.6667) && near(r.2, 133.3333), "r={r:?}");
+        assert!(near(r.3, 100.0), "r={r:?}");
+        assert_eq!(clip, Some((0.0, 0.0, 100.0, 100.0)));
+
+        // none = natural size, centered
+        let (r, _) = fit_content_rect(ObjFit::None, c, bx, 8.0, 6.0);
+        assert!(near(r.0, 46.0) && near(r.1, 47.0), "r={r:?}");
+        assert_eq!((r.2, r.3), (8.0, 6.0));
+
+        // scale-down = the smaller of none and contain
+        let (r, _) = fit_content_rect(ObjFit::ScaleDown, c, bx, 10.0, 10.0);
+        assert_eq!((r.2, r.3), (10.0, 10.0), "small image stays natural");
+        let (r, _) = fit_content_rect(ObjFit::ScaleDown, c, bx, 200.0, 200.0);
+        assert_eq!((r.2, r.3), (100.0, 100.0), "large image contains");
+    }
+
+    #[test]
+    fn object_position_anchors_the_contained_rect() {
+        let bx = (0.0, 0.0, 100.0, 100.0);
+        // 0% 0% pins the letterbox to the top-left
+        let (r, _) = fit_content_rect(
+            ObjFit::Contain,
+            [BgPos::Pct(0.0), BgPos::Pct(0.0)],
+            bx,
+            8.0,
+            6.0,
+        );
+        assert_eq!((r.0, r.1), (0.0, 0.0));
+        // px lengths offset from the box edge
+        let (r, _) = fit_content_rect(
+            ObjFit::Contain,
+            [BgPos::Px(10.0), BgPos::Px(20.0)],
+            bx,
+            8.0,
+            6.0,
+        );
+        assert_eq!((r.0, r.1), (10.0, 20.0));
+    }
+
+    #[test]
+    fn object_fit_place_sets_content_rect_and_clip() {
+        let mut n = img_sized(
+            BoxStyle {
+                width: Some(Len::Px(100.0)),
+                height: Some(Len::Px(100.0)),
+                obj_fit: ObjFit::Contain,
+                ..BoxStyle::default()
+            },
+            8,
+            6,
+        );
+        layout_tree(&mut n, 300.0, &m4);
+        let r = n.img_fit.expect("contain computes a content rect");
+        assert!((r.1 - 12.5).abs() < 0.01 && (r.3 - 75.0).abs() < 0.01, "r={r:?}");
+        assert!(n.img_clip.is_none());
+        // the paint entry follows the content rect (letterboxed, not full box)
+        let img = &layout_tree(&mut n, 300.0, &m4).images;
+        assert_eq!(img.len(), 1);
+        assert!((img[0].1 - 12.5).abs() < 0.01 && (img[0].3 - 75.0).abs() < 0.01);
+
+        let mut c = img_sized(
+            BoxStyle {
+                width: Some(Len::Px(100.0)),
+                height: Some(Len::Px(100.0)),
+                obj_fit: ObjFit::Cover,
+                ..BoxStyle::default()
+            },
+            8,
+            6,
+        );
+        layout_tree(&mut c, 300.0, &m4);
+        let r = c.img_fit.expect("cover computes a content rect");
+        assert!((r.0 + 16.6667).abs() < 0.01 && (r.2 - 133.3333).abs() < 0.01, "r={r:?}");
+        assert_eq!(c.img_clip, Some((0.0, 0.0, 100.0, 100.0)));
+        let cov = &layout_tree(&mut c, 300.0, &m4).images;
+        assert_eq!(cov.len(), 1);
+        assert_eq!(
+            (cov[0].0, cov[0].1, cov[0].2, cov[0].3),
+            (0.0, 0.0, 100.0, 100.0),
+            "cover draws only the clipped window"
+        );
+
+        // no object-fit declaration → legacy box draw, byte-identical
+        let mut plain = img_sized(BoxStyle::default(), 8, 6);
+        layout_tree(&mut plain, 300.0, &m4);
+        assert!(plain.img_fit.is_none() && plain.img_clip.is_none());
+        assert_eq!((plain.w, plain.h), (8.0, 6.0));
+    }
+
+    #[test]
+    fn aspect_ratio_derives_the_missing_axis() {
+        // <img> width + ratio → height
+        let mut a = img_sized(
+            BoxStyle {
+                width: Some(Len::Px(320.0)),
+                aspect_ratio: Some(16.0 / 9.0),
+                ..BoxStyle::default()
+            },
+            8,
+            6,
+        );
+        layout_tree(&mut a, 600.0, &m4);
+        assert!((a.w - 320.0).abs() < 0.01 && (a.h - 180.0).abs() < 0.01, "a={}x{}", a.w, a.h);
+
+        // <img> height + ratio → width
+        let mut b = img_sized(
+            BoxStyle {
+                height: Some(Len::Px(50.0)),
+                aspect_ratio: Some(2.0),
+                ..BoxStyle::default()
+            },
+            8,
+            6,
+        );
+        layout_tree(&mut b, 600.0, &m4);
+        assert!((b.w - 100.0).abs() < 0.01 && (b.h - 50.0).abs() < 0.01, "b={}x{}", b.w, b.h);
+
+        // plain boxes derive the same way (content laid out inside)
+        let mut c = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                width: Some(Len::Px(320.0)),
+                aspect_ratio: Some(16.0 / 9.0),
+                ..BoxStyle::default()
+            },
+        );
+        layout_tree(&mut c, 600.0, &m4);
+        assert!((c.w - 320.0).abs() < 0.01 && (c.h - 180.0).abs() < 0.01, "c={}x{}", c.w, c.h);
+
+        let mut d = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                height: Some(Len::Px(50.0)),
+                aspect_ratio: Some(2.0),
+                ..BoxStyle::default()
+            },
+        );
+        layout_tree(&mut d, 600.0, &m4);
+        assert!((d.w - 100.0).abs() < 0.01 && (d.h - 50.0).abs() < 0.01, "d={}x{}", d.w, d.h);
+
+        // auto (None) keeps the intrinsic ratio
+        let mut e = img_sized(
+            BoxStyle {
+                width: Some(Len::Px(320.0)),
+                ..BoxStyle::default()
+            },
+            8,
+            6,
+        );
+        layout_tree(&mut e, 600.0, &m4);
+        assert!((e.h - 240.0).abs() < 0.01, "e.h={}", e.h);
     }
 
     #[test]

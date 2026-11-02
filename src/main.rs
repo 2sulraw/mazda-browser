@@ -2811,8 +2811,13 @@ fn decode_images(
     if let Some(layout::ImgSlot::Probed { src, .. }) = own {
         let src = src.to_string();
         let inline = src.starts_with('<'); // inline <svg> markup — no URL
-        let dw = n.w.round().max(1.0) as u32;
-        let dh = n.h.round().max(1.0) as u32;
+        // object-fit: decode at the CONTENT rect (the box itself under the
+        // initial fill); a cover/none overflow is cropped to its visible
+        // window below. shortcut: the budget is charged at content size, so
+        // a hugely oversized cover crop is skipped like any big image.
+        let (fx, fy, fw, fh) = n.img_fit.unwrap_or((n.x, n.y, n.w, n.h));
+        let dw = fw.round().max(1.0) as u32;
+        let dh = fh.round().max(1.0) as u32;
         let px = (dw as usize) * (dh as usize);
         if px <= *budget {
             let bytes = if inline {
@@ -2841,9 +2846,42 @@ fn decode_images(
                         (true, Some(c)) => layout::tint_image(&img, c),
                         _ => img,
                     };
-                    laid.images
-                        .push((n.x, n.y, n.w, n.h, std::rc::Rc::new(img), fixed));
-                    count += 1;
+                    // cover/none: keep only the part inside the element's
+                    // box; the draw rect shrinks to that window (nearest
+                    // sampling maps the crop across it exactly)
+                    let (img, draw) = match n.img_clip {
+                        Some((cx0, cy0, cx1, cy1)) if cx1 > cx0 && cy1 > cy0 => {
+                            // content-space coordinate → crop pixel index
+                            let map = |p: f32, origin: f32, span: f32, n: u32, up: bool| {
+                                let f = (p - origin) / span.max(1.0) * n as f32;
+                                let f = if up { f.ceil() } else { f.floor() };
+                                f.clamp(0.0, n as f32) as u32
+                            };
+                            (
+                                image::crop(
+                                    &img,
+                                    map(cx0, fx, fw, img.w, false),
+                                    map(cy0, fy, fh, img.h, false),
+                                    map(cx1, fx, fw, img.w, true),
+                                    map(cy1, fy, fh, img.h, true),
+                                ),
+                                Some((cx0, cy0, cx1 - cx0, cy1 - cy0)),
+                            )
+                        }
+                        Some(_) => (img, None), // wholly outside the box
+                        None => (img, Some((fx, fy, fw, fh))),
+                    };
+                    if let Some(draw) = draw {
+                        laid.images.push((
+                            draw.0,
+                            draw.1,
+                            draw.2,
+                            draw.3,
+                            std::rc::Rc::new(img),
+                            fixed,
+                        ));
+                        count += 1;
+                    }
                 }
             }
         }
