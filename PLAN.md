@@ -856,6 +856,25 @@ curve matters more than the baseline (near-flat as tabs grow).
   `.baseline-indicator.high` green vs `.removing` red) paints every variant
   with whichever block appears last — the "Widely available" pill is red.
   Per-element custom-property cascade is the next CSS wave.
+  **(g) flex-grow + the `:nth-*-of-type` family** (`83cd0a5`, `fa27dd2`) —
+  `flex-grow` (longhand and the first slot of the `flex:` shorthand; `none` =
+  0, `auto` = 1) distributes a non-wrapping row's free space among growable
+  items by factor *before* `justify-content` runs. Plain Wikipedia relies on
+  `flex-grow: 1` on the page heading inside a `justify-content: flex-end`
+  title bar: without it the title box sat at x=528 (pushed right against the
+  language menu) and wrapped to two lines; it now starts at the bar's left
+  edge and stays on one line, as the reference shows. `flex-basis` and
+  `flex-shrink` are still not modeled (the base width is the item's natural
+  size). `:nth-last-child()`/`:nth-of-type()`/`:nth-last-of-type()` (sharing
+  the `an+b` evaluator with `:nth-child`) unblock MDN's
+  `.breadcrumbs li:not(:nth-last-child(-n+2))` trim rule and common
+  table/list striping.
+  Tests: default **548**, `engine-b + woff2` **552**. Live (release,
+  `engine-b + woff2`): MDN `/Web/CSS/list-style-type` **83.2 MB** (2943 runs;
+  baseline card 704px, no stray TOC/breadcrumb underlines, side padding and
+  title chip present, search button inside its min-content track); plain
+  Wikipedia Rust article **103.9 MB** (14973 runs, 315 images; page heading
+  now starts at the title bar's left edge on one line).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -946,6 +965,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 7 | data: URL page | 68.8 MB (8 runs; PNG + WebP data images decoded inline) |
 | 2026-11-02 | wave 8 (grid tracks, CSS math, scrollbar) | Wikipedia Rust article | 105.0 MB (14973 runs; same layout as wave 7, 315 images, 0 format skips) |
 | 2026-11-02 | wave 8 | MDN `/Web/CSS/list-style-type` | 88.7 MB (4687 runs; `display:contents` + named grid areas give the real 3-column layout; outer box-shadow hole culls the gray band under sidebar/TOC; remaining: column widths, search widget stacking) |
+| 2026-11-02 | wave 8f (media math, full `:is()`, logical box props, of-type, min-content) | MDN `/Web/CSS/list-style-type` | 83.2 MB (2943 runs; the `<1072px` media gate finally applies, so the wide sidebar is hidden — 1744 fewer runs; 704px baseline card, clean TOC/breadcrumb links, side padding, title chip, search button in its track; remaining: variant custom-property colors, search-pill wrap) |
+| 2026-11-02 | wave 8g (flex-grow, nth-of-type family) | Wikipedia Rust article | 103.9 MB (14973 runs, 315 images; `flex-grow:1` puts the page heading at the title bar's left edge on one line) |
 
 ### Phase 1c (Track A) findings
 
