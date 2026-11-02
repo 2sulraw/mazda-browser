@@ -125,6 +125,14 @@ struct App {
     conf: Conf,
     /// the ⚙ settings overlay is open (drawn + interactive)
     settings_open: bool,
+    /// hovered leaf DOM node from the last frame's hit test — the sheet's
+    /// hover cell travels with each relayout (`LoadReq::Relayout::hover`);
+    /// cleared on navigation. None = nothing hovered.
+    hovered: Option<u32>,
+    /// a hover relayout is in flight — keep polling fast until its result
+    /// lands (a relayout doesn't set `pending`, so the 1 Hz tick alone
+    /// would delay the hover repaint by up to a second)
+    hover_wait: bool,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -203,6 +211,7 @@ impl App {
                 forms: Vec::new(),
                 focused: None,
                 form_values: Default::default(),
+                hover_targets: Vec::new(),
             },
             bg: BG,
         };
@@ -247,6 +256,8 @@ impl App {
             pending_link: None,
             conf,
             settings_open: false,
+            hovered: None,
+            hover_wait: false,
         };
         app.dispatch(&url, pw, ph, 0.0);
         app
@@ -271,10 +282,13 @@ impl App {
         self.expect_nav = true;
         // a fresh navigation clears form focus/values (worker starts clean)
         self.forms = layout::FormState::default();
+        // …and the hover cell (the new page's worker side starts at None)
+        self.hovered = None;
     }
 
-    /// Queue a re-layout of the current page (resize / form typing). Keeps
-    /// scroll + address bar; carries the live form state forward.
+    /// Queue a re-layout of the current page (resize / form typing / hover
+    /// change). Keeps scroll + address bar; carries the live form state
+    /// AND the current hover cell forward.
     fn dispatch_relayout(&mut self, pw: usize, ph: usize) {
         let id = self.nav.begin();
         let url = self.page.url.clone();
@@ -284,6 +298,7 @@ impl App {
             max_w: page_w(pw),
             vh: page_h(ph),
             forms: self.forms.clone(),
+            hover: self.hovered,
             engine: self.conf.engine,
         };
         if self.jobs.send(req).is_err() {
@@ -351,6 +366,9 @@ impl App {
                 eprintln!("[nav] dropped stale result #{} (want #{})", done.id, self.nav.next);
                 continue;
             }
+            // accepted ⇒ dispatched at/after our newest hover job, so its
+            // page carries the current hover cell — the wait is over
+            self.hover_wait = false;
             if done.panicked {
                 eprintln!("[nav] load #{} failed (pipeline panic)", done.id);
                 continue;
@@ -427,6 +445,8 @@ impl App {
                 self.tabs[self.active].url = self.page.url.clone();
                 self.tabs[self.active].scroll = self.scroll;
                 self.address = self.page.url.clone();
+                // fresh page: its worker side starts with hover = None
+                self.hovered = None;
             } else {
                 // relayout/event: keep scroll (clamped to new height) and
                 // don't clobber whatever the user is typing in the address
@@ -582,6 +602,22 @@ fn route_key(key: egui::Key, has_field_focus: bool, address_focused: bool) -> Ke
 /// The in-flight load we still accept a result for.
 struct PendingNav {
     scroll: f32,
+}
+
+/// Map a cascaded `cursor` keyword to the egui pointer icon.
+fn cursor_icon_of(c: css::Cursor) -> egui::CursorIcon {
+    match c {
+        css::Cursor::Default => egui::CursorIcon::Default,
+        css::Cursor::Pointer => egui::CursorIcon::PointingHand,
+        css::Cursor::Text => egui::CursorIcon::Text,
+        css::Cursor::Move => egui::CursorIcon::Move,
+        css::Cursor::Crosshair => egui::CursorIcon::Crosshair,
+        css::Cursor::NotAllowed => egui::CursorIcon::NotAllowed,
+        css::Cursor::Help => egui::CursorIcon::Help,
+        css::Cursor::Grab => egui::CursorIcon::Grab,
+        css::Cursor::ColResize => egui::CursorIcon::ResizeHorizontal,
+        css::Cursor::RowResize => egui::CursorIcon::ResizeVertical,
+    }
 }
 
 impl eframe::App for App {
@@ -919,6 +955,42 @@ impl eframe::App for App {
                             }
                         }
                     }
+
+                    // hover: read the pointer (input is read-only here —
+                    // never synthesized), hit-test with the SAME math as the
+                    // link hit-test above, and rebuild when the effective
+                    // hovered set changed
+                    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+                    let inside = hover_pos.filter(|p| resp.rect.contains(*p));
+                    let hit = inside.and_then(|p| {
+                        let rx = p.x - resp.rect.min.x - PADDING as f32;
+                        let my_doc = p.y - resp.rect.min.y - PADDING as f32;
+                        self.page.laid.hit_hover(rx, my_doc, self.scroll)
+                    });
+                    if inside.is_some() {
+                        // cursor follows the hit; no hit (page background)
+                        // = Default. Only written inside the page image —
+                        // over the chrome egui's own per-frame output wins
+                        let icon = hit
+                            .and_then(|(_, c)| c)
+                            .map(cursor_icon_of)
+                            .unwrap_or(egui::CursorIcon::Default);
+                        ui.ctx().set_cursor_icon(icon);
+                    }
+                    let new_hovered = hit.map(|(n, _)| n);
+                    if new_hovered != self.hovered
+                        // skip while another job is in flight and retry next
+                        // frame (self-healing); a hover change is a full
+                        // re-cascade + rebuild — shortcut: no incremental
+                        // invalidation, so a wiki page costs tens of ms
+                        && self.pending.is_none()
+                        && self.pending_link.is_none()
+                    {
+                        self.hovered = new_hovered;
+                        self.dispatch_relayout(pw, ph);
+                        self.hover_wait = true;
+                        ui.ctx().request_repaint();
+                    }
                 }
 
                 // RSS overlay, bottom-right (small and dim)
@@ -1015,9 +1087,13 @@ impl eframe::App for App {
             self.title = title.clone();
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
-        // while a load or a link-click decision is in flight, poll fast so
-        // the result lands promptly; otherwise the RSS overlay ticks at 1 Hz
-        ui.ctx().request_repaint_after(if self.pending.is_some() || self.pending_link.is_some() {
+        // while a load, a link-click decision or a hover relayout is in
+        // flight, poll fast so the result lands promptly; otherwise the RSS
+        // overlay ticks at 1 Hz
+        ui.ctx().request_repaint_after(if self.pending.is_some()
+            || self.pending_link.is_some()
+            || self.hover_wait
+        {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(1)
@@ -1084,14 +1160,17 @@ enum LoadReq {
         /// page keeps its runtime; this only matters for loads.
         engine: EngineChoice,
     },
-    /// re-cascade + re-layout the kept page (resize / DOM change), carrying
-    /// the UI's live form state forward
+    /// re-cascade + re-layout the kept page (resize / DOM change / hover
+    /// change), carrying the UI's live form state + hover cell forward
     Relayout {
         id: u64,
         url: String,
         max_w: f32,
         vh: f32,
         forms: layout::FormState,
+        /// hovered leaf DOM node (the sheet's `:hover` cell) — the shell
+        /// re-dispatches when its hit test changes the effective set
+        hover: Option<u32>,
         engine: EngineChoice,
     },
     /// a form control was activated (click/submit) or a text field changed:
@@ -1232,6 +1311,8 @@ struct PageWire {
     /// node id → `name` attribute, built worker-side (the UI thread has no
     /// DOM access) so `[form] submit name=value` logging works in the shell
     form_names: HashMap<u32, String>,
+    /// hover hit-test targets (rect + node + cursor + fixed), tree order
+    hover_targets: Vec<layout::HoverTarget>,
 }
 
 /// One laid-out text run without `Rc` (link href as a plain `String`).
@@ -1320,6 +1401,7 @@ fn page_to_wire(
         focused: p.laid.focused,
         form_values: p.laid.form_values,
         form_names,
+        hover_targets: p.laid.hover_targets,
     }
 }
 
@@ -1341,6 +1423,9 @@ fn wire_to_page(w: PageWire) -> Page {
                     link: r.link.map(std::rc::Rc::from),
                     fixed: r.fixed,
                     clip: r.clip,
+                    // hover identity rides `hover_targets`, not the runs
+                    node: None,
+                    cursor: None,
                 })
                 .collect(),
             height: w.height,
@@ -1358,6 +1443,7 @@ fn wire_to_page(w: PageWire) -> Page {
             forms: w.forms,
             focused: w.focused,
             form_values: w.form_values,
+            hover_targets: w.hover_targets,
         },
     }
 }
@@ -1385,6 +1471,11 @@ struct KeptPage {
     /// choice is the one that must apply (same answer as `job.engine()`
     /// for jobs).
     engine: EngineChoice,
+    /// last hover cell a Relayout job set (None on a fresh page): events,
+    /// scrolls and timer re-layouts re-cascade with it. Shortcut: a
+    /// mismatched full load resets this to None while the shell may still
+    /// hold a node — the next pointer move re-syncs (self-heals).
+    hover: Option<u32>,
 }
 
 /// The single long-lived loader thread. Owns its own `Fonts` (font types
@@ -1566,7 +1657,7 @@ fn fire_due(
     // engine of the kept page (form-submission loads fired from timer/rAF
     // turns re-run the full pipeline and must use the same runtime choice)
     let engine = kept.as_ref().map(|k| k.engine).unwrap_or(EngineChoice::A);
-    let KeptPage { dom, scripts, css_text, faces, url, .. } = kept.as_mut().unwrap();
+    let KeptPage { dom, scripts, css_text, faces, url, hover, .. } = kept.as_mut().unwrap();
     let (mw, vh) = *last_geom;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scripts
@@ -1637,7 +1728,7 @@ fn fire_due(
     }
     if dirty {
         let (page, form_names) = layout_page(
-            &*dom, css_text, faces, url, fonts, mw, vh, last_forms,
+            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover,
         );
         let stacks = fonts.stacks.borrow().clone();
         let out_faces = collect_out_faces(fonts);
@@ -1670,7 +1761,7 @@ fn process_job(
             let r = do_load(kept, fonts, url, *max_w, *vh, job.engine());
             (r.0, r.1, false, r.2, r.3)
         }
-        LoadReq::Relayout { url, max_w, vh, forms, .. } => {
+        LoadReq::Relayout { url, max_w, vh, forms, hover, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
@@ -1678,8 +1769,11 @@ fn process_job(
                 return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
+            // remember the cell: every later job (event/scroll/timer)
+            // re-cascades with it until the next Relayout updates it
+            kp.hover = *hover;
             let (page, form_names) = layout_page(
-                &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms,
+                &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, *hover,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -1841,7 +1935,7 @@ fn process_job(
             }
             // always re-layout: the event likely changed the DOM
             let (page, form_names) = layout_page(
-                &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms,
+                &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, kp.hover,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -1895,6 +1989,7 @@ fn process_job(
                     }
                 let (page, fnames) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
+                    kp.hover,
                 );
                 (page, fnames)
             };
@@ -2096,7 +2191,7 @@ fn settle_load(
     css_text: String,
     faces: Vec<css::FontFace>,
 ) -> (Option<PageWire>, Option<String>, Option<runtime::FormNav>) {
-    let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None, engine };
+    let mut kp = KeptPage { url: url.to_string(), dom, css_text, faces, scripts: None, engine, hover: None };
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = scripts.run_scripts(&mut kp.dom);
@@ -2109,6 +2204,8 @@ fn settle_load(
     let (page, form_names) = layout_page(
         &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
         &layout::FormState::default(),
+        // fresh page: the shell clears its hover cell on navigation too
+        None,
     );
     let stacks = fonts.stacks.borrow().clone();
     let out_faces = collect_out_faces(fonts);
@@ -2443,6 +2540,7 @@ fn layout_page(
     max_w: f32,
     vh: f32,
     state: &layout::FormState,
+    hover: Option<u32>,
 ) -> (Page, HashMap<u32, String>) {
     let root = dom.body_root();
     // media queries evaluate against the window's CSS pixel width
@@ -2450,6 +2548,8 @@ fn layout_page(
     let mut sheet = css::parse_for(css_text, viewport);
     // viewport units (vh/vw/vmin/vmax) resolve against the real window size
     sheet.set_viewport(viewport, vh);
+    // the hover cell (shell hit test) — `:hover` rules match against it
+    sheet.set_hovered(hover);
     eprintln!("[css] {} rules", sheet.rule_count());
     // cascade writes font-family stack ids into the font picker's own table
     sheet.set_stacks(fonts.stacks.clone());
@@ -2479,11 +2579,20 @@ fn layout_page(
     // cascade over the body element itself: page bg + initial inherited style
     // (spec: the canvas background comes from <body> if it has one, else
     // <html>'s — body wins per the HTML spec)
-    let body = sheet.resolve(dom, root, Style::new(), dom.attr(root, "style"));
+    let mut body = sheet.resolve(dom, root, Style::new(), dom.attr(root, "style"));
     let bg = body
         .bg
         .or_else(|| sheet.resolve(dom, html_el, Style::new(), dom.attr(html_el, "style")).bg)
         .unwrap_or(BG);
+    // `cursor` inherits down the DOM at box-build time (layout.rs threads
+    // the effective value from box to box) — <html> is body's only
+    // ancestor, so seed body's undeclared cursor from its cascade
+    if body.bx.cursor.is_none() {
+        body.bx.cursor = sheet
+            .resolve(dom, html_el, Style::new(), dom.attr(html_el, "style"))
+            .bx
+            .cursor;
+    }
 
     let mut root_box = layout::build(dom, root, body.style, body.bx, &sheet);
     eprintln!(
@@ -3843,6 +3952,8 @@ mod tests {
                 link: Some(std::rc::Rc::from("https://example.com/x")),
                 fixed: false,
                 clip: None,
+                node: None,
+                cursor: None,
             }],
             height: 123.0,
             underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
@@ -3873,6 +3984,12 @@ mod tests {
             forms: Vec::new(),
             focused: None,
             form_values: Default::default(),
+            hover_targets: vec![layout::HoverTarget {
+                rect: (1.0, 2.0, 30.0, 14.0),
+                node: 7,
+                cursor: Some(css::Cursor::Pointer),
+                fixed: false,
+            }],
         };
         let page = Page {
             url: "https://example.com/".into(),
@@ -3913,6 +4030,13 @@ mod tests {
         assert_eq!(page.laid.shadows[0].blur, 2.0);
         assert_eq!(page.laid.rects.len(), 1);
         assert_eq!(page.laid.underline_rects.len(), 1);
+        // hover hit-test targets ride the wire (the shell has no box tree)
+        assert_eq!(page.laid.hover_targets.len(), 1);
+        assert_eq!(page.laid.hover_targets[0].node, 7);
+        assert_eq!(
+            page.laid.hover_targets[0].cursor,
+            Some(css::Cursor::Pointer)
+        );
     }
 
     /// Form interaction state must survive the worker→UI hop: focus, typed
@@ -4179,6 +4303,7 @@ mod tests {
             faces: Vec::new(),
             scripts: Some(scripts),
             engine: EngineChoice::A,
+            hover: None,
         });
         let mut fonts = Fonts::load();
         let mut last_geom = (0.0_f32, 0.0_f32);
@@ -4227,6 +4352,7 @@ mod tests {
                 faces: Vec::new(),
                 scripts: Some(scripts),
                 engine: EngineChoice::A,
+                hover: None,
             })
         };
         let mut fonts2 = Fonts::load();
@@ -4277,6 +4403,7 @@ mod tests {
             max_w: 100.0,
             vh: 200.0,
             forms: layout::FormState::default(),
+            hover: None,
             engine: EngineChoice::A,
         };
         let sc = LoadReq::Scroll { url: "https://example.com/".into(), y: 12.0 };
@@ -4359,7 +4486,7 @@ mod tests {
     #[test]
     fn coalesce_batch_superseded_runs() {
         let load = |id| LoadReq::Load { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, engine: EngineChoice::A };
-        let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default(), engine: EngineChoice::A };
+        let relo = |id| LoadReq::Relayout { id, url: "https://x.com/".into(), max_w: 1.0, vh: 1.0, forms: layout::FormState::default(), hover: None, engine: EngineChoice::A };
         let ev = |id, kind: &str| LoadReq::Event {
             id,
             url: "https://x.com/".into(),
