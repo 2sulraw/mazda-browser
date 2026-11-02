@@ -650,13 +650,20 @@ enum Pseudo {
     FirstChild,
     /// `:last-child` — last element child of its parent.
     LastChild,
+    /// `:first-of-type` — first element child carrying this element's tag.
+    FirstOfType,
+    /// `:last-of-type` — last element child carrying this element's tag.
+    LastOfType,
+    /// `:only-child` — the parent's sole element child.
+    OnlyChild,
     /// `:nth-child(an+b)` — 1-based element-sibling index satisfies the
     /// formula for some whole n >= 0.
     NthChild(i32, i32),
     /// `:is(...)`/`:where(...)` — the element may match ANY of the alternate
-    /// compound selectors. The flag is `counts`: `:is` contributes its most
-    /// specific argument's specificity, `:where` contributes none.
-    Is(Vec<Seg>, bool),
+    /// selectors (each a full descendant/child chain, e.g.
+    /// `:is(.toc a):not(:hover)`). The flag is `counts`: `:is` contributes its
+    /// most specific argument's specificity, `:where` contributes none.
+    Is(Vec<Vec<Seg>>, bool),
     /// `:host(...)` — the host of the component whose `<style>` declared this
     /// selector. Boxed argument = the compound inside the parens; the String
     /// is the verbatim `:host(...)` source text, used to locate that style.
@@ -1049,6 +1056,15 @@ const KNOWN: &[&str] = &[
     "margin-inline",
     "margin-inline-start",
     "margin-inline-end",
+    "margin-block",
+    "margin-block-start",
+    "margin-block-end",
+    "padding-inline",
+    "padding-block",
+    "padding-inline-start",
+    "padding-inline-end",
+    "padding-block-start",
+    "padding-block-end",
     "border-radius",
     "border",
     "border-width",
@@ -2208,12 +2224,73 @@ fn apply_decl(
             bx.pad = parse_sides(&d.1, vp);
             bx.declared |= decl::PAD;
         }
+        // logical-axis shorthands — writing-mode is assumed horizontal-tb
+        // (`inline` = left/right, `block` = top/bottom; `direction: rtl`
+        // would swap the inline pair). 1 value = both sides, 2 = start then
+        // end. These are everywhere in modern sheets: MDN's page grid gets
+        // its side padding from `padding-inline`, so dropping them left the
+        // content flush with the window.
+        "padding-inline" => {
+            let tok = joined_tokens(&d.1);
+            let l = tok.first().and_then(|s| parse_len(s, vp)).unwrap_or(Len::Px(0.0));
+            let r = tok.get(1).and_then(|s| parse_len(s, vp)).unwrap_or(l);
+            bx.pad[3] = l;
+            bx.pad[1] = r;
+            bx.declared |= decl::PAD;
+        }
+        "padding-block" => {
+            let tok = joined_tokens(&d.1);
+            let t = tok.first().and_then(|s| parse_len(s, vp)).unwrap_or(Len::Px(0.0));
+            let b = tok.get(1).and_then(|s| parse_len(s, vp)).unwrap_or(t);
+            bx.pad[0] = t;
+            bx.pad[2] = b;
+            bx.declared |= decl::PAD;
+        }
+        "padding-inline-start" => {
+            bx.pad[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "padding-inline-end" => {
+            bx.pad[1] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "padding-block-start" => {
+            bx.pad[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "padding-block-end" => {
+            bx.pad[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::PAD;
+        }
+        "margin-inline" => {
+            let tok = joined_tokens(&d.1);
+            let start = tok.first().map(String::as_str).unwrap_or("0");
+            let end = tok.get(1).map(String::as_str).unwrap_or(start);
+            bx.margin_l_auto = start == "auto";
+            bx.margin_r_auto = end == "auto";
+            if !bx.margin_l_auto {
+                bx.margin[3] = parse_len(start, vp).unwrap_or(Len::Px(0.0));
+            }
+            if !bx.margin_r_auto {
+                bx.margin[1] = parse_len(end, vp).unwrap_or(Len::Px(0.0));
+            }
+            bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
+        }
+        "margin-block" => {
+            let tok = joined_tokens(&d.1);
+            let t = tok.first().and_then(|s| parse_len(s, vp)).unwrap_or(Len::Px(0.0));
+            let b = tok.get(1).and_then(|s| parse_len(s, vp)).unwrap_or(t);
+            bx.margin[0] = t;
+            bx.margin[2] = b;
+        }
+        "margin-block-start" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
+        "margin-block-end" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         // longhand auto: per-side flag; `margin_x_auto` (centering) is
         // recomputed so `margin-left: auto; margin-right: auto` still
         // centers regardless of declaration order
         "margin-top" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
         "margin-bottom" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
-        "margin-left" | "margin-inline" | "margin-inline-start" => {
+        "margin-left" | "margin-inline-start" => {
             if d.1.contains("auto") {
                 bx.margin_l_auto = true;
                 bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
@@ -4229,6 +4306,9 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     ("root", None) => seg.pseudos.push(Pseudo::Root),
                     ("first-child", None) => seg.pseudos.push(Pseudo::FirstChild),
                     ("last-child", None) => seg.pseudos.push(Pseudo::LastChild),
+                    ("first-of-type", None) => seg.pseudos.push(Pseudo::FirstOfType),
+                    ("last-of-type", None) => seg.pseudos.push(Pseudo::LastOfType),
+                    ("only-child", None) => seg.pseudos.push(Pseudo::OnlyChild),
                     ("nth-child", Some(a)) => {
                         let (a_, b_) = parse_nth(&a)?;
                         seg.pseudos.push(Pseudo::NthChild(a_, b_));
@@ -4281,18 +4361,22 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     ("host", None) => return None,
                     ("is" | "where", Some(a)) => {
                         // each comma-separated alternate must match; :where()
-                        // contributes no specificity, :is() its best argument
+                        // contributes no specificity, :is() its best argument.
+                        // The argument is a FULL selector, not just a compound:
+                        // sites write `:is(.toc a):not(:hover)` and
+                        // `:is(.card summary) .pill` constantly; dropping those
+                        // rules silently lost whole component styles.
                         let counts = name == "is";
                         let mut alts = Vec::new();
-                        for part in a.split(',') {
-                            // shortcut: compound args only — combinators or
-                            // nested comma lists inside :is()/:where() drop
-                            // the whole selector
-                            let alt = parse_compound(part.trim())?;
-                            if alt.pseudo_el.is_some() {
+                        for part in split_selectors(&a) {
+                            let alt = parse_selector(part)?;
+                            if alt.iter().any(|s| s.pseudo_el.is_some()) {
                                 return None; // invalid — see the :not() note
                             }
                             alts.push(alt);
+                        }
+                        if alts.is_empty() {
+                            return None;
                         }
                         seg.pseudos.push(Pseudo::Is(alts, counts));
                     }
@@ -4331,7 +4415,7 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
             match p {
                 Pseudo::Is(alts, counts) => {
                     if *counts {
-                        let best = alts.iter().map(|a| spec_of(std::slice::from_ref(a))).max();
+                        let best = alts.iter().map(|a| spec_of(a)).max();
                         if let Some((i, c, t)) = best {
                             ids += i;
                             cls += c;
@@ -4474,6 +4558,11 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
+        Pseudo::FirstOfType => matches!(element_type_index(dom, node), Some((1, _))),
+        Pseudo::LastOfType => {
+            matches!(element_type_index(dom, node), Some((i, t)) if i == t)
+        }
+        Pseudo::OnlyChild => matches!(element_children(dom, node), Some((_, 1))),
         Pseudo::LastChild => {
             let Some((idx, elems)) = element_children(dom, node) else {
                 return false;
@@ -4494,7 +4583,7 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
             }
         }
         // ANY alternate compound selector matches
-        Pseudo::Is(alts, _) => alts.iter().any(|alt| seg_matches(dom, node, alt, hover)),
+        Pseudo::Is(alts, _) => alts.iter().any(|alt| matches(dom, node, alt, hover)),
         // the host of the component that declared this rule: an element with
         // a direct <style> child whose text contains the exact `:host(...)`
         // selector text (flat shadow expansion splices that style into the
@@ -4570,6 +4659,31 @@ fn element_children(dom: &Dom, node: u32) -> Option<(usize, usize)> {
 
 fn element_sibling_index(dom: &Dom, node: u32) -> Option<usize> {
     element_children(dom, node).map(|(idx, _)| idx)
+}
+
+/// 1-based (position, total) among ELEMENT siblings carrying this element's
+/// tag — the underlying position for `:first-of-type` / `:last-of-type`.
+fn element_type_index(dom: &Dom, node: u32) -> Option<(usize, usize)> {
+    let parent = dom.nodes[node as usize].parent;
+    if parent == node {
+        return None; // document root
+    }
+    let tag = dom.tag(node);
+    let mut idx = 0usize;
+    let mut total = 0usize;
+    for &c in &dom.nodes[parent as usize].children {
+        if matches!(dom.nodes[c as usize].kind, NodeKind::Element(..)) && dom.tag(c) == tag {
+            total += 1;
+            if c == node {
+                idx = total;
+            }
+        }
+    }
+    if idx == 0 {
+        None
+    } else {
+        Some((idx, total))
+    }
 }
 
 // ---------- helpers ----------
@@ -4718,21 +4832,22 @@ fn media_single(q: &str, vw: f32) -> bool {
         .all(|part| media_feature(part.trim(), vw))
 }
 
-/// Root font size for rem/em lengths in media queries (CSS spec: root font).
-const ROOT_PX: f32 = 16.0;
+/// Viewport HEIGHT media queries resolve `vh` units against. Sheets are parsed
+/// once per page load (see [`parse_for`]), so this is the shell's default
+/// window height — the same fixed-window assumption the width already makes.
+const MEDIA_VH: f32 = 700.0;
 
-fn media_len(v: &str) -> Option<f32> {
-    let v = v.trim();
-    if let Some(n) = v.strip_suffix("px") {
-        return n.trim().parse().ok();
+/// One media length: px/rem/em/unitless AND math (`calc()`/`min()`/`max()`/
+/// `clamp()`, nesting included) + viewport units, resolved against the real
+/// viewport width. Sites routinely gate their responsive layout on
+/// `(width < calc(1rem * 2 + 15rem + 2rem + 31rem))`, which used to fail the
+/// parse and silently drop the whole block.
+fn media_len(v: &str, vw: f32) -> Option<f32> {
+    match parse_len(v, (vw, MEDIA_VH))? {
+        Len::Px(p) if p.is_finite() => Some(p),
+        // `%` has no meaning in a media feature; anything else is invalid
+        _ => None,
     }
-    if let Some(n) = v.strip_suffix("rem") {
-        return n.trim().parse::<f32>().ok().map(|f| f * ROOT_PX);
-    }
-    if let Some(n) = v.strip_suffix("em") {
-        return n.trim().parse::<f32>().ok().map(|f| f * ROOT_PX);
-    }
-    v.parse().ok() // bare number = px
 }
 
 /// One `(…)` feature. Unknown features return false (block skipped), which
@@ -4757,8 +4872,8 @@ fn media_feature(part: &str, vw: f32) -> bool {
             "hover" => v == "hover",
             "pointer" => v == "fine",
             "orientation" => v == "landscape", // 1000x700 window
-            "min-width" => media_len(v).map(|px| vw >= px).unwrap_or(false),
-            "max-width" => media_len(v).map(|px| vw <= px).unwrap_or(false),
+            "min-width" => media_len(v, vw).map(|px| vw >= px).unwrap_or(false),
+            "max-width" => media_len(v, vw).map(|px| vw <= px).unwrap_or(false),
             // the OS preference — one honest global (see PREFERS_DARK)
             "prefers-color-scheme" => match v {
                 "dark" => PREFERS_DARK,
@@ -4779,7 +4894,7 @@ fn media_feature(part: &str, vw: f32) -> bool {
         if let Some((l, r)) = inner.split_once(op) {
             let num = |s: &str| {
                 let s = s.trim();
-                if s == "width" { Some(vw) } else { media_len(s) }
+                if s == "width" { Some(vw) } else { media_len(s, vw) }
             };
             let (Some(a), Some(b)) = (num(l), num(r)) else {
                 return false;
@@ -5062,6 +5177,64 @@ mod tests {
             w.resolve(&dom, node, Style::new(), None).style.color,
             0x222222
         );
+    }
+
+    #[test]
+    fn is_selector_arguments_may_be_full_descendant_chains() {
+        // MDN writes `:is(.reference-toc a):not(:hover){text-decoration:none}`
+        // constantly — a compound-only :is() dropped every such rule, which
+        // (among other things) left every sidebar/TOC link underlined.
+        let sheet = parse(
+            ":is(.toc a):not(.current) { color: #111111 } \
+             :is(.card summary) b { color: #222222 }",
+        );
+        let dom = dom_of(
+            r#"<nav class="toc"><a id="in" href="/x">x</a></nav>
+               <a id="out" href="/y">y</a>
+               <div class="card"><summary><b id="bb">z</b></summary></div>"#,
+        );
+        let col = |id: &str| sheet.resolve(&dom, by_attr(&dom, "id", id), Style::new(), None).style.color;
+        assert_eq!(col("in"), 0x111111, "`.toc a` inside :is() matches");
+        assert_eq!(col("out"), 0x000000, "a link outside .toc does not");
+        assert_eq!(col("bb"), 0x222222, "compound-inside-chain :is()");
+        // `.current` is excluded by the trailing :not()
+        let sheet = parse(":is(.toc a):not(.current) { color: #111111 }");
+        let dom = dom_of(r#"<nav class="toc"><a id="in" class="current">x</a></nav>"#);
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "id", "in"), Style::new(), None).style.color,
+            0x000000
+        );
+        // specificity comes from the whole argument: `.toc a` = (0,1,1), so
+        // a later :is() rule of the same shape wins on source order (a
+        // zero-specificity :where-like reading would keep #222222)
+        let sheet = parse(".toc a { color: #222222 } :is(.toc a) { color: #111111 }");
+        let dom = dom_of(r#"<nav class="toc"><a id="in">x</a></nav>"#);
+        assert_eq!(
+            sheet.resolve(&dom, by_attr(&dom, "id", "in"), Style::new(), None).style.color,
+            0x111111,
+            "the :is() argument carries its own class+type specificity"
+        );
+    }
+
+    #[test]
+    fn of_type_and_only_child_pseudos() {
+        // MDN's `h1 code:first-of-type` chip and menu `li:only-child` rules
+        // used to be dropped as unknown pseudo-classes.
+        let sheet = parse(
+            "p:first-of-type { color: #111111 } p:last-of-type { color: #222222 } \
+             span:first-of-type { color: #444444 } span:only-child { color: #333333 }",
+        );
+        let dom = dom_of(
+            "<div><h2>h</h2><p id=a>a</p><p id=b>b</p></div>\
+             <div><span id=c>c</span></div>\
+             <div><span id=d>d</span><span id=e>e</span></div>",
+        );
+        let col = |id: &str| sheet.resolve(&dom, by_attr(&dom, "id", id), Style::new(), None).style.color;
+        assert_eq!(col("a"), 0x111111, "first p of its type");
+        assert_eq!(col("b"), 0x222222, "last p of its type");
+        assert_eq!(col("c"), 0x333333, "only child");
+        assert_eq!(col("d"), 0x444444, "first span of its type");
+        assert_eq!(col("e"), 0x000000, "neither first nor only");
     }
 
     #[test]
@@ -5797,8 +5970,31 @@ mod tests {
         assert_eq!(parse(not).rule_count(), 0);
         // rules after the media block still parse (stray '}' consumed)
         let after = "@media (max-width: 640px) { p { display: none } } q { color: #222222 }";
-        let q = dom_of("<q></q>");
-        assert_eq!(style_for_tag(&parse(after), &q, "q").color, 0x222222);
+        let tag = dom_of("<q></q>");
+        assert_eq!(style_for_tag(&parse(after), &tag, "q").color, 0x222222);
+    }
+
+    #[test]
+    fn media_range_queries_resolve_math_lengths() {
+        // MDN's responsive gate: (width < calc(1rem * 2 + 15rem + 2rem + 31rem))
+        // = 32 + 240 + 32 + 496 = 800px. A calc() here used to fail the parse
+        // and silently drop the whole block.
+        let q = "(width < calc(1rem*2 + 15rem + 2rem + 31rem))";
+        let dom = dom_of("<p></p>");
+        let sheet = parse_for(&format!("@media {q} {{ p {{ color: #111111 }} }}"), 700.0);
+        assert_eq!(style_for_tag(&sheet, &dom, "p").color, 0x111111, "700 < 800");
+        let sheet = parse_for(&format!("@media {q} {{ p {{ color: #111111 }} }}"), 1000.0);
+        assert_eq!(sheet.rule_count(), 0, "1000 >= 800: block skipped");
+        // three-column threshold: 1rem*2 + (15rem+2rem)*2 + 31rem = 1072px
+        let three = "@media (width < calc(1rem*2 + (15rem + 2rem)*2 + 31rem)) \
+                     { p { color: #111111 } }";
+        assert_eq!(style_for_tag(&parse_for(three, 1000.0), &dom, "p").color, 0x111111);
+        assert_eq!(parse_for(three, 1200.0).rule_count(), 0);
+        // math also works in the classic `min-width` form and with viewport units
+        let minw = "@media (min-width: calc(30rem + 10vw)) { p { color: #111111 } }";
+        // 480 + 10% of 660 = 546
+        assert_eq!(style_for_tag(&parse_for(minw, 660.0), &dom, "p").color, 0x111111);
+        assert_eq!(parse_for(minw, 500.0).rule_count(), 0);
     }
 
     #[test]
@@ -6300,6 +6496,32 @@ mod tests {
         assert!(!bx("c").content_box, "unknown value keeps false");
         assert!(!bx("d").content_box, "undeclared keeps the default false");
         assert!(!BoxStyle::default().content_box, "default = border-box");
+    }
+
+    #[test]
+    fn logical_padding_and_margin_map_to_physical_sides() {
+        // writing-mode: horizontal-tb — inline = left/right, block = top/bottom.
+        // 1 value = both sides; 2 = start then end (CSS logical shorthands).
+        let sheet = parse(
+            ".a { padding-inline: 10px 20px; padding-block: 30px } \
+             .b { margin-inline: 7px; margin-block: 3px 5px } \
+             .c { padding-inline-start: 4px; padding-block-end: 6px; margin-block-start: 2px } \
+             .d { margin-inline: auto } .e { margin-inline: 1px auto }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div><div class=e></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        // pad = [top, right, bottom, left]
+        assert_eq!(bx("a").pad, [Len::Px(30.0), Len::Px(20.0), Len::Px(30.0), Len::Px(10.0)]);
+        assert_eq!(bx("b").margin, [Len::Px(3.0), Len::Px(7.0), Len::Px(5.0), Len::Px(7.0)]);
+        let c = bx("c");
+        assert_eq!((c.pad[0], c.pad[2], c.pad[3]), (Len::Px(0.0), Len::Px(6.0), Len::Px(4.0)));
+        assert_eq!(c.margin[0], Len::Px(2.0));
+        // both-auto centers; one auto absorbs the free space on its side
+        assert!(bx("d").margin_x_auto);
+        assert!(!bx("e").margin_x_auto);
+        assert!(bx("e").margin_r_auto && !bx("e").margin_l_auto);
     }
 
     #[test]

@@ -211,14 +211,13 @@ fn scroll_from_thumb(doc_h: f32, page: f32, y: f32) -> f32 {
 /// 0x00RRGGBB framebuffer → egui ColorImage (RGBA, opaque).
 fn pixels_to_image(pixels: &[u32], w: usize, h: usize) -> egui::ColorImage {
     debug_assert_eq!(pixels.len(), w * h);
-    let mut rgba = Vec::with_capacity(pixels.len() * 4);
-    for &p in pixels {
-        rgba.push((p >> 16) as u8); // R
-        rgba.push((p >> 8) as u8); // G
-        rgba.push(p as u8); // B
-        rgba.push(255);
-    }
-    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+    // one pass into the ColorImage's own buffer: the old byte-vec version
+    // allocated twice and pushed 4 bytes per pixel (half a scroll frame)
+    let rgba: Vec<egui::Color32> = pixels
+        .iter()
+        .map(|&p| egui::Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, p as u8))
+        .collect();
+    egui::ColorImage::new([w, h], rgba)
 }
 
 impl App {
@@ -517,7 +516,12 @@ impl App {
         // (window resize) followed by a scroll repaint used to leave the
         // texture dims stale and trip the color-image length assertion
         self.last_size = (pw, ph);
-        self.pixels = vec![self.page.bg; pw * ph];
+        // reuse the buffer: a scroll repaint used to allocate pw*ph again
+        if self.pixels.len() != pw * ph {
+            self.pixels = vec![self.page.bg; pw * ph];
+        } else {
+            self.pixels.fill(self.page.bg);
+        }
         render(
             &mut self.pixels,
             pw,
@@ -1104,6 +1108,10 @@ impl eframe::App for App {
                         // invalidation, so a wiki page costs tens of ms
                         && self.pending.is_none()
                         && self.pending_link.is_none()
+                        // and skip mid-scroll: the content slides under a
+                        // still pointer, so every frame "changes hover" and
+                        // each change would cost a full page re-layout
+                        && !ui.input(|i| i.is_scrolling())
                     {
                         self.hovered = new_hovered;
                         self.dispatch_relayout(pw, ph);
@@ -1220,6 +1228,12 @@ impl eframe::App for App {
         if title != self.title {
             self.title = title.clone();
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        // wheel momentum lives in egui's smoothed delta, which only advances
+        // when a frame runs: without this, one wheel notch applied a slice of
+        // its delta and then sat still until the next input event
+        if ui.input(|i| i.is_scrolling()) {
+            ui.ctx().request_repaint();
         }
         // while a load, a link-click decision or a hover relayout is in
         // flight, poll fast so the result lands promptly; otherwise the RSS
@@ -2790,6 +2804,57 @@ fn layout_page(
         working_set_mb(),
         laid.runs.len()
     );
+    // MAZDA_DUMP_BOXES=2 walks the laid-out box tree: tag.class, rect, display,
+    // position, tracks. The fastest way to answer "who is this box and why is it
+    // that wide" without guessing from a screenshot.
+    if std::env::var("MAZDA_DUMP_BOXES").as_deref() == Ok("2") {
+        fn walk(b: &layout::BoxNode, dom: &html::Dom, depth: usize) {
+            let what = match b.node {
+                Some(n) => {
+                    let cls = dom.attr(n, "class").unwrap_or("");
+                    if cls.is_empty() {
+                        dom.tag(n).to_string()
+                    } else {
+                        format!("{}.{}", dom.tag(n), cls)
+                    }
+                }
+                None if b.is_text => format!("\"{}\"", b.text),
+                None => "(anon)".to_string(),
+            };
+            let cols = b
+                .bx
+                .cols
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "[box] {}{} x={:.0} y={:.0} w={:.0} h={:.0} disp={:?} pos={:?}{}{}{}",
+                "  ".repeat(depth),
+                what,
+                b.x,
+                b.y,
+                b.w,
+                b.h,
+                b.bx.display,
+                b.bx.pos,
+                if cols.is_empty() { String::new() } else { format!(" cols=[{cols}]") },
+                if b.bx.grid_area.is_some() { format!(" area={:?}", b.bx.grid_area) } else { String::new() },
+                if b.bx.width.is_some() || b.bx.max_width.is_some() {
+                    format!(
+                        " width={:?} max={:?} cb={} pad={:?} border={:?}",
+                        b.bx.width, b.bx.max_width, b.bx.content_box, b.bx.pad, b.bx.border
+                    )
+                } else {
+                    String::new()
+                },
+            );
+            for c in &b.children {
+                walk(c, dom, depth + 1);
+            }
+        }
+        walk(&root_box, dom, 0);
+    }
     if let Ok(v) = std::env::var("MAZDA_DUMP_RUNS") {
         eprintln!("[layout] total height={:.0}", laid.height);
         let all = v == "2"; // MAZDA_DUMP_RUNS=2 dumps every run, not just 6
@@ -2797,13 +2862,34 @@ fn layout_page(
             if !all && i >= 6 {
                 break;
             }
-            eprintln!("[run {i}] y={:.0} x={:.0} text={:?}", r.y, r.x, r.text);
+            eprintln!(
+                "[run {i}] y={:.0} x={:.0} w={:.0} ul={} text={:?}",
+                r.y,
+                r.x,
+                r.width,
+                r.style.underline as u8,
+                r.text
+            );
         }
         for (i, r) in laid.runs.iter().filter(|r| r.link.is_some()).enumerate() {
             eprintln!(
                 "[link {i}] y={:.0} x={:.0} w={:.0} href={:?} text={:?}",
                 r.y, r.x, r.width, r.link, r.text
             );
+        }
+        // underline channel: text-decoration bars (a rect channel entry here is
+        // a decoration, not a border/background)
+        for (i, u) in laid.underline_rects.iter().enumerate() {
+            eprintln!("[ul {i}] x={:.0} y={:.0} w={:.0} h={:.0} c={:06x}", u.0, u.1, u.2, u.3, u.4);
+        }
+        if std::env::var("MAZDA_DUMP_BOXES").is_ok() {
+            // background/border rects in paint order (z is the stacking key)
+            for (i, r) in laid.rects.iter().enumerate() {
+                eprintln!(
+                    "[rect {i}] x={:.0} y={:.0} w={:.0} h={:.0} c={:06x} z={:.0}",
+                    r.0, r.1, r.2, r.3, r.4, r.5
+                );
+            }
         }
     }
     let form_names = collect_form_names(dom);
@@ -3388,6 +3474,24 @@ struct Fonts {
     webfont_bytes: std::cell::Cell<usize>,
     /// monotonically increasing access stamp (see [`PageFace::last_use`])
     webfont_clock: std::cell::Cell<u64>,
+    /// Rasterized glyph coverage for the CURRENT page, keyed by (font
+    /// identity, glyph, size, 1/4-px pen fraction). Scroll repaints used to
+    /// re-outline every visible glyph each frame; this makes them a blit.
+    glyphs: std::cell::RefCell<HashMap<GlyphKey, Rc<GlyphMask>>>,
+}
+
+/// (font address, glyph id, size bits, pen x fraction, pen y fraction) —
+/// each in 1/4 px steps, which is all ab_glyph's rasterizer can tell apart.
+type GlyphKey = (usize, u16, u32, u8, u8);
+
+/// One rasterized glyph at a fixed subpixel offset: coverage bytes plus the
+/// integer pixel origin relative to the pen's floor.
+struct GlyphMask {
+    w: usize,
+    h: usize,
+    ox: i32,
+    oy: i32,
+    cov: Vec<u8>,
 }
 
 /// One page's `@font-face` definition with its lazily-fetched font.
@@ -3607,6 +3711,7 @@ impl Fonts {
             webfont_cap: WEBFONT_BUDGET,
             webfont_bytes: std::cell::Cell::new(0),
             webfont_clock: std::cell::Cell::new(0),
+            glyphs: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -3623,6 +3728,9 @@ impl Fonts {
         self.faces.clear();
         self.webfont_bytes.set(0);
         self.webfont_clock.set(0);
+        // glyph masks are keyed by font address + size: a new page may reuse
+        // an address, so never carry them across a navigation
+        self.glyphs.borrow_mut().clear();
         // reset the shared stack table BEFORE any early return: the cascade
         // (running later in `layout_page`) pushes this page's stacks into it,
         // so stale names/id slots must never survive a navigation
@@ -3674,6 +3782,58 @@ impl Fonts {
         } else {
             &self.regular
         }
+    }
+
+    /// Cached raster of one glyph at a pen position. The pen is snapped to a
+    /// 1/4-px grid so a whole page's text reuses a handful of masks per glyph
+    /// (ab_glyph only resolves positions that differ in that grid anyway).
+    /// shortcut: flat cap, clear-all at 8192 masks (per-page text is smaller).
+    fn glyph_mask(
+        &self,
+        font: &FontVec,
+        id: ab_glyph::GlyphId,
+        scale: PxScale,
+        x: f32,
+        baseline: f32,
+    ) -> Option<Rc<GlyphMask>> {
+        let frac = |v: f32| -> u8 {
+            let f = ((v - v.floor()) * 4.0).round() as u8;
+            if f == 4 {
+                0
+            } else {
+                f
+            }
+        };
+        let (fx, fy) = (frac(x), frac(baseline));
+        let key = (font as *const FontVec as usize, id.0, scale.x.to_bits(), fx, fy);
+        if let Some(m) = self.glyphs.borrow().get(&key) {
+            return Some(m.clone());
+        }
+        let position = ab_glyph::point(fx as f32 * 0.25, fy as f32 * 0.25);
+        let glyph = ab_glyph::Glyph { id, scale, position };
+        let outlined = font.outline_glyph(glyph)?;
+        let b = outlined.px_bounds();
+        let (w, h) = (b.width() as usize, b.height() as usize);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut cov = vec![0u8; w * h];
+        outlined.draw(|gx, gy, c| {
+            cov[gy as usize * w + gx as usize] = (c * 255.0).clamp(0.0, 255.0) as u8;
+        });
+        let m = Rc::new(GlyphMask {
+            w,
+            h,
+            ox: b.min.x as i32,
+            oy: b.min.y as i32,
+            cov,
+        });
+        let mut cache = self.glyphs.borrow_mut();
+        if cache.len() >= 8192 {
+            cache.clear();
+        }
+        cache.insert(key, m.clone());
+        Some(m)
     }
 
     /// Font that actually has a glyph for `ch`: the element's `font-family`
@@ -3959,6 +4119,19 @@ fn render(
             }
             let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + top + y).max(0.0));
             let r = rad.min(w * 0.5).min(h * 0.5);
+            let (sxi, syi) = (sx.max(0.0) as usize, sy as usize);
+            // square corners: one row fill per line instead of per-pixel math
+            if r <= 0.5 {
+                let (xa, xb) = (sxi, (sx.max(0.0) as usize + w.max(0.0) as usize).min(width));
+                for dy in 0..h.max(0.0) as usize {
+                    let py = syi + dy;
+                    if py >= height || xa >= xb {
+                        break;
+                    }
+                    buf[py * width + xa..py * width + xb].fill(color);
+                }
+                continue;
+            }
             for dy in 0..h.max(0.0) as usize {
                 let py = (sy as usize) + dy;
                 if py >= height {
@@ -4121,38 +4294,45 @@ fn draw_text(
         let font = fonts.pick_font_for(ch, style);
         let scaled = font.as_scaled(scale);
         let id = font.glyph_id(ch);
-        let glyph = ab_glyph::Glyph {
-            id,
-            scale,
-            position: ab_glyph::point(x, baseline),
-        };
         let advance = scaled.h_advance(id);
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
+        // cached coverage (rasterized once per glyph per subpixel offset)
+        if let Some(m) = fonts.glyph_mask(&font, id, scale, x, baseline) {
+            let gx0 = x.floor() as i32 + m.ox;
+            let gy0 = baseline.floor() as i32 + m.oy;
             if let Some((cx0, cy0, cx1, cy1)) = clip {
-                if bounds.max.x <= cx0
-                    || bounds.min.x >= cx1
-                    || bounds.max.y <= cy0
-                    || bounds.min.y >= cy1
+                if (gx0 + m.w as i32) as f32 <= cx0
+                    || gx0 as f32 >= cx1
+                    || (gy0 + m.h as i32) as f32 <= cy0
+                    || gy0 as f32 >= cy1
                 {
                     x += advance + gap;
                     continue; // glyph entirely outside the clip window
                 }
             }
-            outlined.draw(|gx, gy, coverage| {
-                if coverage <= 0.0 {
-                    return;
+            for gy in 0..m.h {
+                let dy = gy0 + gy as i32;
+                if dy < 0 {
+                    continue;
                 }
-                let dx = bounds.min.x as isize + gx as isize;
-                let dy = bounds.min.y as isize + gy as isize;
-                if dx >= 0 && (dx as usize) < width && dy >= 0 {
-                    let idx = dy as usize * width + dx as usize;
+                let row = dy as usize * width;
+                if row >= buf.len() {
+                    continue;
+                }
+                for gx in 0..m.w {
+                    let cov = m.cov[gy * m.w + gx];
+                    if cov == 0 {
+                        continue;
+                    }
+                    let dx = gx0 + gx as i32;
+                    if dx < 0 || dx as usize >= width {
+                        continue;
+                    }
+                    let idx = row + dx as usize;
                     if idx < buf.len() {
-                        let a = (coverage * 255.0).clamp(0.0, 255.0) as u8;
-                        blend(&mut buf[idx], style.color, a);
+                        blend(&mut buf[idx], style.color, cov);
                     }
                 }
-            });
+            }
         }
         x += advance + gap;
     }

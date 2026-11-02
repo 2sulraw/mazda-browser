@@ -397,6 +397,13 @@ fn is_block(tag: &str) -> bool {
             | "dt" | "dd" | "table" | "tr" | "td" | "th" | "caption" | "form" | "fieldset"
             | "thead" | "tbody" | "tfoot"
             | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "hr" | "address" | "center"
+            // HTML's block-level UA display set (details/summary/dialog/…).
+            // Missing tags used to fall through to the INLINE path: an
+            // unstyled <details> shrink-wrapped to its max-content width and
+            // overflowed its column (any card built on <details> is a box).
+            | "details" | "summary" | "dialog" | "menu" | "legend" | "optgroup"
+            | "option" | "dir" | "listing" | "xmp" | "plaintext" | "search" | "hgroup"
+            | "colgroup"
     )
 }
 
@@ -2957,6 +2964,24 @@ fn table_grid(n: &BoxNode) -> (Vec<TRow>, usize) {
 /// shortcut: letter/word spacing is not added to word widths here, and a
 /// nested table measures its max-content width (conservative floor).
 fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
+    if !n.is_text {
+        // A declared px width IS this box's min-content: a fixed-width
+        // control never gets narrower than its width no matter how short
+        // its label. Ignoring it measured a `width:80px` search button at
+        // its text's min-content (~18px), so the grid track sized to that
+        // and the button overflowed the header. Border-box by default;
+        // content-box adds padding+border (same rule as place()).
+        if let Some(Len::Px(p)) = n.bx.width {
+            return if n.bx.content_box {
+                p + resolve_len(n.bx.pad[3], avail)
+                    + resolve_len(n.bx.pad[1], avail)
+                    + resolve_len(n.bx.border[3], avail)
+                    + resolve_len(n.bx.border[1], avail)
+            } else {
+                p
+            };
+        }
+    }
     let content = if n.is_text {
         if n.hard_break {
             0.0
@@ -2971,7 +2996,11 @@ fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
     } else if n.bx.table == TableRole::Table {
         natural_w(n, avail, measure)
     } else {
-        let mut m = 0.0f32;
+        // A non-wrapping flex ROW puts its items side by side, so its
+        // min-content width is their SUM (plus gaps) — max() under-measured
+        // every icon+label control and every auto-width toolbar.
+        let flex_row = n.bx.display == Display::Flex && n.bx.dir == Dir::Row && !n.bx.wrap;
+        let (mut m, mut k) = (0.0f32, 0usize);
         for c in &n.children {
             if c.is_bg || c.is_mask || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
                 continue;
@@ -2981,7 +3010,15 @@ fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
             } else {
                 min_content_w(c, avail, measure)
             };
-            m = m.max(cw);
+            if flex_row {
+                m += cw;
+                k += 1;
+            } else {
+                m = m.max(cw);
+            }
+        }
+        if flex_row {
+            m += n.bx.gap_col * (k as f32 - 1.0).max(0.0);
         }
         m
     };
@@ -6304,6 +6341,69 @@ mod tests {
         assert!((x("DD") - 92.0).abs() < 0.01, "col3 x={}", x("DD"));
     }
 
+    #[test]
+    fn min_content_honors_declared_widths_and_flex_row_sums() {
+        // A fixed-width control never gets narrower than its width: MDN's
+        // 80px search button sized its MinContent header track to the label's
+        // ~18px instead, so the button overflowed the header.
+        let mut btn = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(80.0)),
+                ..BoxStyle::default()
+            },
+        );
+        btn.children = vec![leaf("Go")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::MinContent],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![btn];
+        layout_tree(&mut n, 400.0, &m4);
+        assert_eq!(n.children[0].w, 80.0, "declared width is the min-content");
+
+        // A non-wrapping flex ROW is the SUM of its items (+ gap), not the
+        // widest one — icon+label controls and auto toolbars under-measured.
+        let fixed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(40.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut flex = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Row,
+                gap_col: 4.0,
+                ..BoxStyle::default()
+            },
+        );
+        flex.children = vec![fixed("a"), fixed("b")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::MinContent],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![flex];
+        layout_tree(&mut n, 400.0, &m4);
+        assert_eq!(n.children[0].w, 84.0, "40 + 4 + 40 inline flex row");
+    }
+
     /// A grid of one block item per text, laid out at `width`.
     fn grid_case(
         cols: Vec<Track>,
@@ -8477,10 +8577,13 @@ mod tests {
         let root = tree_of("<div><option>Bare</option></div>");
         assert!(controls(&root).is_empty(), "no box for a stray <option>");
         let div = &root.children[0];
-        assert!(
-            div.children.iter().any(|c| c.is_text && c.text == "Bare"),
-            "its text still flows into the parent"
-        );
+        // `<option>` is display:block in the UA sheet, so its text lives in a
+        // child box — either way it must still render, not vanish with the
+        // control chrome that would have wrapped it.
+        fn has(b: &BoxNode) -> bool {
+            (b.is_text && b.text == "Bare") || b.children.iter().any(has)
+        }
+        assert!(has(div), "its text still flows into the parent");
     }
 
     #[test]
@@ -9097,6 +9200,21 @@ line</textarea></div>"#,
         let dom = crate::html::parse(markup);
         let sheet = crate::css::parse(css);
         build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet)
+    }
+
+    #[test]
+    fn details_and_summary_are_block_boxes() {
+        // `<details>` is display:block in the UA sheet. Treated as an inline
+        // tag it shrink-wrapped to max-content (763px inside a 300px column)
+        // and every card built on it overflowed the page.
+        let mut root = boxes_of(
+            r#"<div id="w" style="width:300px"><details id="d"><summary>s</summary><p>x</p></details></div>"#,
+            "",
+        );
+        layout_tree(&mut root, 400.0, &m4);
+        let d = &root.children[0].children[0];
+        assert_eq!(d.w, 300.0, "details fills its container, not max-content");
+        assert!(!d.inline, "details is block-level");
     }
 
     // ---- ::before/::after generated content ----
