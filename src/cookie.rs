@@ -93,6 +93,11 @@ impl Jar {
         if name.is_empty() || name.bytes().any(|b| b <= 0x20 || b == b'=') {
             return false;
         }
+        // Per-cookie size cap (the spec's 4096-byte suggestion): without it a
+        // hostile server could park ~12 MB in a full jar and the disk file.
+        if name.len() + value.len() > 4096 {
+            return false;
+        }
         let mut domain_attr: Option<String> = None;
         let mut path_attr: Option<String> = None;
         let mut secure = false;
@@ -561,14 +566,16 @@ pub fn request_header(url: &str) -> Option<String> {
 pub fn store_response(url: &str, headers: &[String]) {
     let mut jar = lock();
     let now = now_secs();
-    let mut changed = false;
+    let mut changed = 0usize;
     for h in headers {
-        changed |= jar.set_cookie(url, h, now);
+        if jar.set_cookie(url, h, now) {
+            changed += 1;
+        }
     }
-    if changed {
+    if changed > 0 {
         save(&jar);
         if let Some(u) = UrlParts::parse(url) {
-            eprintln!("[cookie] stored {} for {}", headers.len(), u.host);
+            eprintln!("[cookie] set {changed} for {}", u.host);
         }
     }
 }
@@ -791,6 +798,14 @@ mod tests {
         // a JS write cannot mark a cookie HttpOnly
         j.js_set("https://example.com/docs/page", "b=2; HttpOnly", 3);
         assert_eq!(j.js_get("https://example.com/docs/other", 4), "a=1; b=2");
+    }
+
+    #[test]
+    fn oversized_cookies_are_rejected() {
+        let mut j = jar();
+        let big = format!("k={}", "v".repeat(5000));
+        assert!(!j.set_cookie("https://example.com/", &big, 1));
+        assert!(j.cookies.is_empty());
     }
 
     #[test]

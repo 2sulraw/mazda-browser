@@ -1089,7 +1089,8 @@ curve matters more than the baseline (near-flat as tabs grow).
   header on every GET/POST (page, stylesheet, script, image, font), captures
   every `Set-Cookie` value through `resp.all` (a login sets several at once)
   and persists to `%LOCALAPPDATA%\mazda-cache\cookies`. The jar is capped at
-  3000 cookies (expired evicted first, then oldest-created), the file is
+  3000 cookies with 4096 bytes per cookie (expired evicted first, then
+  oldest-created), the file is
   written at most once per second, and a change made inside that second is
   **deferred** (dirty flag flushed from the frame loop) rather than dropped —
   dropping it lost a script's `document.setCookie` on every page that also
@@ -1110,7 +1111,7 @@ curve matters more than the baseline (near-flat as tabs grow).
   cookies set on a redirect hop are lost (the client follows redirects
   internally), and the jar is one profile-wide store with no per-site
   partition.
-  Tests: default **587**, `engine-b + woff2` **591**
+  Tests: default **588**, `engine-b + woff2` **592**
   (`set_and_send_respects_path`,
   `domain_attr_covers_subdomains_but_not_siblings`,
   `secure_cookies_only_go_over_https`, `http_only_is_hidden_from_script`,
@@ -1121,6 +1122,7 @@ curve matters more than the baseline (near-flat as tabs grow).
   `text_round_trip_preserves_cookies`,
   `corrupt_persisted_lines_are_skipped`,
   `js_set_uses_the_document_directory_and_js_get_hides_http_only`,
+  `oversized_cookies_are_rejected`,
   `malformed_set_cookie_lines_are_ignored`,
   `url_parts_handle_ports_userinfo_and_ipv6`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
