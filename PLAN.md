@@ -928,6 +928,28 @@ curve matters more than the baseline (near-flat as tabs grow).
   shortcut: cross-size `align-items: stretch` still does not reflow.
   Tests: default **552**, `engine-b + woff2` **556**
   (`flex_row_wrap_grows_each_line`, `flex_auto_margins_absorb_free_space`).
+  **(k) `:has()`, attribute operators, exact-fit wrapping** — `:has(...)`
+  parses as a relative selector list: a leading `>` / `+` / `~` anchors the
+  argument's leftmost compound to a child / the next element sibling / any
+  later sibling, no combinator means any descendant; specificity follows
+  `:is()`. That recovered MDN's `.pill:has(+.browsers)`,
+  `li:has(details)`, `:not(:has(>li>details))` and
+  `.breadcrumbs-bar:has(…)` rules (656 → 664 rules on the CSS reference
+  page). Attribute selectors gained `~=`, `|=`, `^=`, `$=` and `*=`
+  (`[class*=interactive-example]` inside a `:has()` needed it).
+  A word that exactly fills its line no longer wraps: the shrink-to-fit
+  max-content width and the line's per-word sum differ in the last float
+  digit, and the bare `>` split MDN's uppercased, letter-spaced "WIDELY
+  AVAILABLE" pill onto two lines (the comparison now allows 0.01 px).
+  Live: MDN CSS reference unchanged apart from the one-line pill (664 rules,
+  2773 runs, 84.2 MB debug); Wikipedia article unchanged (1646 rules, 14973
+  runs, 101–118 MB debug across runs — RSS noise).
+  shortcut: `:has()` honors only a LEADING combinator inside the argument (a
+  `+`/`~` between compounds isn't tokenized yet); the attribute `i` flag is
+  not modeled; `:has()` walks the candidate subtree per element match.
+  Tests: default **554**, `engine-b + woff2` **558**
+  (`has_pseudo_matches_descendant_child_and_siblings`, `attr_selectors`,
+  `word_filling_the_line_exactly_does_not_wrap`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study

@@ -4983,6 +4983,7 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
             }
         }
     }
+
     let natural_sum: f32 = widths.iter().sum();
     // nowrap shrinks to fit; wrap keeps natural widths and breaks lines
     if !n.bx.wrap && natural_sum + gaps > n.w && natural_sum > 0.0 {
@@ -5685,7 +5686,12 @@ fn layout_from(
         // same rule draw_text replays per glyph (main.rs), so what wraps
         // here is exactly what paints there
         let ww = measure(&w.text, &w.style) + spacing_extra(&w.text, &w.style);
-        if x > line_x0 && x + ww > line_max && w.style.ws.wrap() {
+        // a word that EXACTLY fills the line must not wrap: the shrink-to-fit
+        // max-content width and this line's per-word sum can differ in the
+        // last float digit (a letter-spaced, uppercased pill measured 96.31454
+        // and its words summed to 96.31454 + 1e-5), and `>` on that would
+        // split "WIDELY AVAILABLE" onto two lines inside its own pill
+        if x > line_x0 && x + ww > line_max + 0.01 && w.style.ws.wrap() {
             y += line_height;
             x = 0.0;
             line_x0 = 0.0; // wrapped line starts at the box edge (indent is first-line only)
@@ -5833,6 +5839,25 @@ mod tests {
         let l2 = layout(&[mk_atom("a", false), mk_atom(" ", false), mk_atom("b", false)], 500.0, &|s, _| s.len() as f32 * 4.0);
         assert_eq!(l2.runs.len(), 2);
         assert!(l2.runs[1].x > l2.runs[0].x + l2.runs[0].width, "ws-only atom separates");
+    }
+
+    #[test]
+    fn word_filling_the_line_exactly_does_not_wrap() {
+        // MDN's baseline pill: "Widely available" uppercased with
+        // letter-spacing, sized to its own max-content width. The width and
+        // the per-word line sum differ in the last float digit, and a bare
+        // `>` wrapped the pill onto two lines.
+        let style = Style {
+            letter_spacing: 0.4,
+            ..Style::new()
+        };
+        let mut atom = mk_atom("WIDELY AVAILABLE", false);
+        atom.style = style;
+        let measure = |s: &str, _: &Style| s.len() as f32 * 4.0;
+        let exact = measure("WIDELY AVAILABLE", &style) + spacing_extra("WIDELY AVAILABLE", &style);
+        let l = layout(&[atom], exact, &measure);
+        assert_eq!(l.runs.len(), 2, "the two words (a collapsed space is advance-only)");
+        assert!(l.runs.iter().all(|r| r.y == 0.0), "nothing wrapped");
     }
 
     #[test]

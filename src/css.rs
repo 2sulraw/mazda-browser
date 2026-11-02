@@ -681,6 +681,34 @@ enum Pseudo {
     /// selector. Boxed argument = the compound inside the parens; the String
     /// is the verbatim `:host(...)` source text, used to locate that style.
     Host(Box<Seg>, String),
+    /// `:has(...)` — the element has, as a descendant / child / following
+    /// sibling, an element matching one of the alternates. Each alternate
+    /// keeps the relation its leading combinator picked (see [`Rel`]).
+    Has(Vec<(Rel, Vec<Seg>)>),
+}
+
+/// How a `:has()` argument anchors to the subject element: `:has(.x)` (any
+/// descendant), `:has(> .x)` (a child), `:has(+ .x)` (the next element
+/// sibling), `:has(~ .x)` (any later element sibling).
+#[derive(Clone, Copy, PartialEq)]
+enum Rel {
+    Descendant,
+    Child,
+    Next,
+    Sibling,
+}
+
+/// Attribute selector operator — `[attr]`, `[attr=v]`, `[attr~=v]`,
+/// `[attr|=v]`, `[attr^=v]`, `[attr$=v]`, `[attr*=v]`.
+#[derive(Clone, Copy, PartialEq)]
+enum AttrOp {
+    Exists,
+    Equals,
+    Includes,
+    Dash,
+    Prefix,
+    Suffix,
+    Contains,
 }
 
 /// A generated pseudo-element: `::before`/`::after`, plus the legacy
@@ -714,7 +742,7 @@ struct Seg {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
-    attrs: Vec<(String, Option<String>)>,
+    attrs: Vec<(String, AttrOp, Option<String>)>,
     /// pseudo-classes that must ALL hold for this segment (`:hover` reads
     /// the sheet's hover cell, the others are static state)
     pseudos: Vec<Pseudo>,
@@ -4364,14 +4392,39 @@ fn parse_compound(s: &str) -> Option<Seg> {
             }
             '[' => {
                 i += 1;
+                // name, stopping at `]` or the operator (`=`, `~=`, `|=`,
+                // `^=`, `$=`, `*=`) — the operator chars end the name scan
                 let st = i;
-                while i < b.len() && b[i] != ']' && b[i] != '=' {
+                while i < b.len()
+                    && b[i] != ']'
+                    && b[i] != '='
+                    && !matches!(b[i], '~' | '|' | '^' | '$' | '*')
+                {
                     i += 1;
                 }
-                let name: String = b[st..i].iter().collect::<String>().to_ascii_lowercase();
+                let name: String = b[st..i]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut op = AttrOp::Exists;
+                if i < b.len() {
+                    if b[i] == '=' {
+                        op = AttrOp::Equals;
+                        i += 1;
+                    } else if i + 1 < b.len() && b[i + 1] == '=' {
+                        op = match b[i] {
+                            '~' => AttrOp::Includes,
+                            '|' => AttrOp::Dash,
+                            '^' => AttrOp::Prefix,
+                            '$' => AttrOp::Suffix,
+                            _ => AttrOp::Contains,
+                        };
+                        i += 2;
+                    }
+                }
                 let mut val = None;
-                if i < b.len() && b[i] == '=' {
-                    i += 1;
+                if op != AttrOp::Exists {
                     let quote = if i < b.len() && (b[i] == '"' || b[i] == '\'') {
                         let q = b[i];
                         i += 1;
@@ -4394,7 +4447,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                 if name.is_empty() {
                     return None;
                 }
-                seg.attrs.push((name, val));
+                seg.attrs.push((name, op, val));
             }
             ':' => {
                 let pstart = i;
@@ -4561,6 +4614,38 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         }
                         seg.pseudos.push(Pseudo::Is(alts, counts));
                     }
+                    // `:has(...)` — relative selector list. A leading `>`,
+                    // `+` or `~` picks the relation, none means "any
+                    // descendant". The relation constrains where the
+                    // argument's LEFTMOST compound sits, exactly like the
+                    // `:scope` anchor CSS defines.
+                    // shortcut: only a LEADING combinator — a `+`/`~` between
+                    // compounds inside the argument isn't tokenized by
+                    // `parse_selector`, so such an alternate drops the rule.
+                    ("has", Some(a)) => {
+                        let mut rels = Vec::new();
+                        for part in split_selectors(&a) {
+                            let p = part.trim();
+                            if p.is_empty() {
+                                continue;
+                            }
+                            let (rel, rest) = match p.as_bytes()[0] {
+                                b'>' => (Rel::Child, p[1..].trim()),
+                                b'+' => (Rel::Next, p[1..].trim()),
+                                b'~' => (Rel::Sibling, p[1..].trim()),
+                                _ => (Rel::Descendant, p),
+                            };
+                            let segs = parse_selector(rest)?;
+                            if segs.iter().any(|s| s.pseudo_el.is_some()) {
+                                return None; // invalid — see the :not() note
+                            }
+                            rels.push((rel, segs));
+                        }
+                        if rels.is_empty() {
+                            return None;
+                        }
+                        seg.pseudos.push(Pseudo::Has(rels));
+                    }
                     // state pseudo-classes other than :hover (:focus,
                     // :active, …) and anything unknown: not statically
                     // evaluable — the whole selector is dropped (module
@@ -4604,6 +4689,16 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
                         }
                     }
                 }
+                // `:has()` takes its most specific argument's specificity,
+                // like `:is()`
+                Pseudo::Has(rels) => {
+                    let best = rels.iter().map(|(_, a)| spec_of(a)).max();
+                    if let Some((i, c, t)) = best {
+                        ids += i;
+                        cls += c;
+                        tags += t;
+                    }
+                }
                 // `:host()` counts as a pseudo-class plus its argument's
                 Pseudo::Host(arg, _) => {
                     cls += 1;
@@ -4628,10 +4723,17 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
 /// Right-to-left selector match against the ancestor chain. `hover` is the
 /// sheet's hover cell — only a `:hover` pseudo-class reads it.
 fn matches(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> bool {
+    leftmost_match(dom, node, segs, hover).is_some()
+}
+
+/// `matches`, returning the node that matched the selector's LEFTMOST
+/// compound — `:has()` needs it to check the relation its leading
+/// combinator names (the right end is always `node`).
+fn leftmost_match(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> Option<u32> {
     let mut idx = segs.len() - 1;
     let mut cur = node;
     if !seg_matches(dom, cur, &segs[idx], hover) {
-        return false;
+        return None;
     }
     while idx > 0 {
         let need_child = segs[idx].child;
@@ -4639,18 +4741,125 @@ fn matches(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> bool {
         loop {
             let parent = dom.nodes[cur as usize].parent;
             if parent == 0 {
-                return false; // reached document root
+                return None; // reached document root
             }
             cur = parent;
             if seg_matches(dom, cur, &segs[idx], hover) {
                 break;
             }
             if need_child {
-                return false; // direct parent didn't match
+                return None; // direct parent didn't match
             }
         }
     }
-    true
+    Some(cur)
+}
+
+/// Does `node` satisfy `:has(rel segs…)`? Walks the candidate elements the
+/// relation admits and checks the argument with its leftmost compound
+/// anchored to `node`.
+fn has_match(dom: &Dom, node: u32, rel: Rel, segs: &[Seg], hover: Option<u32>) -> bool {
+    match rel {
+        Rel::Descendant | Rel::Child => {
+            // every element below `node`; the relation check then rejects
+            // the candidates whose leftmost compound isn't a descendant /
+            // child of `node`
+            let mut stack: Vec<u32> = dom.nodes[node as usize].children.clone();
+            while let Some(c) = stack.pop() {
+                if is_element(dom, c)
+                    && leftmost_match(dom, c, segs, hover)
+                        .is_some_and(|lm| rel_holds(dom, lm, node, rel))
+                {
+                    return true;
+                }
+                stack.extend_from_slice(&dom.nodes[c as usize].children);
+            }
+            false
+        }
+        Rel::Next => next_element_sibling(dom, node)
+            .is_some_and(|s| subtree_any(dom, s, segs, hover, node, rel)),
+        Rel::Sibling => {
+            let mut s = next_element_sibling(dom, node);
+            while let Some(x) = s {
+                if subtree_any(dom, x, segs, hover, node, rel) {
+                    return true;
+                }
+                s = next_element_sibling(dom, x);
+            }
+            false
+        }
+    }
+}
+
+/// `root` or — for the sibling relations, whose argument may extend below
+/// the sibling — any of its descendants matches `segs` with its leftmost
+/// compound anchored to `anchor` by `rel`.
+fn subtree_any(
+    dom: &Dom,
+    root: u32,
+    segs: &[Seg],
+    hover: Option<u32>,
+    anchor: u32,
+    rel: Rel,
+) -> bool {
+    let mut stack: Vec<u32> = vec![root];
+    while let Some(c) = stack.pop() {
+        if is_element(dom, c)
+            && leftmost_match(dom, c, segs, hover)
+                .is_some_and(|lm| rel_holds(dom, lm, anchor, rel))
+        {
+            return true;
+        }
+        stack.extend_from_slice(&dom.nodes[c as usize].children);
+    }
+    false
+}
+
+/// Does `cur` stand in `rel` to `anchor` (the `:has()` subject)?
+fn rel_holds(dom: &Dom, cur: u32, anchor: u32, rel: Rel) -> bool {
+    match rel {
+        Rel::Descendant => cur != anchor && ancestor_or_self(dom, cur, anchor),
+        Rel::Child => dom.nodes[cur as usize].parent == anchor,
+        Rel::Next => next_element_sibling(dom, anchor) == Some(cur),
+        Rel::Sibling => {
+            let parent = dom.nodes[anchor as usize].parent;
+            if parent == 0 || parent == anchor || dom.nodes[cur as usize].parent != parent {
+                return false;
+            }
+            // anchor must precede cur among the parent's children
+            let mut seen = false;
+            for &c in &dom.nodes[parent as usize].children {
+                if c == anchor {
+                    seen = true;
+                } else if seen && c == cur {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn is_element(dom: &Dom, node: u32) -> bool {
+    matches!(dom.nodes[node as usize].kind, NodeKind::Element(..))
+}
+
+/// The next ELEMENT sibling of `node` (text nodes skipped) — the anchor
+/// `:has(+ …)` needs. None for the document root or a last child.
+fn next_element_sibling(dom: &Dom, node: u32) -> Option<u32> {
+    let parent = dom.nodes[node as usize].parent;
+    if parent == node {
+        return None;
+    }
+    let mut seen = false;
+    for &c in &dom.nodes[parent as usize].children {
+        if c == node {
+            seen = true;
+        } else if seen && is_element(dom, c) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 fn seg_matches(dom: &Dom, node: u32, seg: &Seg, hover: Option<u32>) -> bool {
@@ -4662,7 +4871,7 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg, hover: Option<u32>) -> bool {
     // ::slotted() isn't modeled either)
     let projected = seg.tag.as_deref() == Some("slot")
         && dom.tag(node) != "slot"
-        && seg.attrs.iter().any(|(n, v)| {
+        && seg.attrs.iter().any(|(n, _, v)| {
             n == "name"
                 && v.as_ref()
                     .is_some_and(|w| dom.attr(node, "slot").is_some_and(|g| g.eq_ignore_ascii_case(w)))
@@ -4686,19 +4895,32 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg, hover: Option<u32>) -> bool {
             return false;
         }
     }
-    for (name, want) in &seg.attrs {
+    for (name, op, want) in &seg.attrs {
         if projected && name == "name" {
             continue; // `name` was matched against the node's `slot` attr
         }
-        match dom.attr(node, name) {
-            Some(v) => {
-                if let Some(w) = want {
-                    if !v.eq_ignore_ascii_case(w) {
-                        return false;
-                    }
-                }
+        let Some(v) = dom.attr(node, name) else {
+            return false;
+        };
+        let Some(w) = want else { continue }; // `[attr]` — presence only
+        let ok = match op {
+            AttrOp::Exists => true,
+            AttrOp::Equals => v.eq_ignore_ascii_case(w),
+            AttrOp::Includes => v.split_whitespace().any(|t| t.eq_ignore_ascii_case(w)),
+            // the value must be ASCII-lowercased for the substring ops, so
+            // slice boundaries never land mid-UTF-8 (attr values may be
+            // non-ASCII; `w` is already lowercased at parse time)
+            AttrOp::Dash => {
+                let sv = v.to_ascii_lowercase();
+                sv == *w
+                    || (sv.starts_with(w.as_str()) && sv.as_bytes().get(w.len()) == Some(&b'-'))
             }
-            None => return false,
+            AttrOp::Prefix => v.to_ascii_lowercase().starts_with(w.as_str()),
+            AttrOp::Suffix => v.to_ascii_lowercase().ends_with(w.as_str()),
+            AttrOp::Contains => v.to_ascii_lowercase().contains(w),
+        };
+        if !ok {
+            return false;
         }
     }
     for p in &seg.pseudos {
@@ -4777,6 +4999,10 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
         }
         // ANY alternate compound selector matches
         Pseudo::Is(alts, _) => alts.iter().any(|alt| matches(dom, node, alt, hover)),
+        // any alternate has its element in the named relation
+        Pseudo::Has(rels) => rels
+            .iter()
+            .any(|(rel, segs)| has_match(dom, node, *rel, segs, hover)),
         // the host of the component that declared this rule: an element with
         // a direct <style> child whose text contains the exact `:host(...)`
         // selector text (flat shadow expansion splices that style into the
@@ -5417,6 +5643,41 @@ mod tests {
             0x111111,
             "the :is() argument carries its own class+type specificity"
         );
+    }
+
+    #[test]
+    fn has_pseudo_matches_descendant_child_and_siblings() {
+        // MDN styles baseline pills with `.pill:has(+.browsers)`, hides
+        // specification rows with `li:has(details)`, and un-indents the
+        // sidebar with `:not(:has(>li>details))`.
+        let sheet = parse(
+            ".card:has(.hidden) { color: #111111 } \
+             li:has(details) { color: #222222 } \
+             .outer:has(> .inner) { color: #333333 } \
+             .nest:has(> .inner) { color: #444444 } \
+             .pill:has(+ .browsers) { color: #555555 } \
+             .nest:not(:has(> .inner)) { color: #666666 }",
+        );
+        let dom = dom_of(
+            r#"<div class="card" id="c1"><p class="hidden">h</p></div>
+               <div class="card" id="c2"><p>n</p></div>
+               <ul><li id="l1"><details>d</details></li><li id="l2">plain</li></ul>
+               <div class="nest" id="n1"><div class="outer" id="o1"><div class="inner">i</div></div></div>
+               <span class="pill" id="p1">p</span><span class="browsers">b</span>"#,
+        );
+        let col = |id: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        assert_eq!(col("c1"), 0x111111, ":has(descendant) matches");
+        assert_eq!(col("c2"), 0x000000, ":has(descendant) rejects a miss");
+        assert_eq!(col("l1"), 0x222222, ":has(details)");
+        assert_eq!(col("l2"), 0x000000, "sibling li without details");
+        assert_eq!(col("o1"), 0x333333, ":has(> child)");
+        assert_eq!(col("n1"), 0x666666, ":has(> child) needs a DIRECT child");
+        assert_eq!(col("p1"), 0x555555, ":has(+ .browsers) adjacent sibling");
     }
 
     #[test]
@@ -6373,6 +6634,33 @@ mod tests {
         assert_eq!(sheet.resolve(&dom, inputs[1], Style::new(), None).style.color, 0x222222);
         assert!(sheet.resolve(&dom, inputs[2], Style::new(), None).style.italic);
         assert!(!sheet.resolve(&dom, inputs[3], Style::new(), None).style.italic);
+
+        // substring/word operators — MDN's `.code-example:has(.hidden,
+        // [class*=interactive-example])` needs `*=`
+        let sheet = parse(
+            "a[href^='/en'] { color: #111111 } \
+             a[href$='.css'] { color: #222222 } \
+             a[href*='docs'] { color: #333333 } \
+             div[class~='chip'] { color: #444444 } \
+             span[lang|=en] { color: #555555 }",
+        );
+        let dom = dom_of(
+            r#"<a id="a1" href="/en-US/x">a</a>
+               <a id="a2" href="/static/x.css">b</a>
+               <a id="a3" href="/q?docs=1">c</a>
+               <div id="d1" class="chip big">d</div>
+               <div id="d2" class="chips">e</div>
+               <span id="s1" lang="en-GB">f</span>
+               <span id="s2" lang="english">g</span>"#,
+        );
+        let col = |id: &str| sheet.resolve(&dom, by_attr(&dom, "id", id), Style::new(), None).style.color;
+        assert_eq!(col("a1"), 0x111111, "^=");
+        assert_eq!(col("a2"), 0x222222, "$=");
+        assert_eq!(col("a3"), 0x333333, "*=");
+        assert_eq!(col("d1"), 0x444444, "~= whole word");
+        assert_eq!(col("d2"), 0x000000, "~= rejects a substring word");
+        assert_eq!(col("s1"), 0x555555, "|= lang prefix");
+        assert_eq!(col("s2"), 0x000000, "|= needs the dash boundary");
     }
 
     // ---- box properties (Track A) ----
