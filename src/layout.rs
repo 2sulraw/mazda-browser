@@ -800,6 +800,10 @@ fn paints_chrome(bx: &BoxStyle) -> bool {
         || bx.border.iter().any(|&l| nz(l))
         || nz(bx.pad[1])
         || nz(bx.pad[3])
+        // a clip window is defined by the box's own geometry, so an inline
+        // that declares one needs a real box (plain inline flow would
+        // flatten it away and lose the clip)
+        || bx.clip_path.is_some()
 }
 
 /// The `kind` pseudo-element box for `node`, or None when it generates no
@@ -2845,15 +2849,33 @@ fn cull_rect(
 /// `%` offsets resolve against the border box (spec says lengths only;
 /// lenient parse).
 fn clip_rect_window(n: &BoxNode) -> Option<(f32, f32, f32, f32)> {
-    let c = n.bx.clip_rect?;
-    if n.bx.pos == Pos::Static {
-        return None;
+    // `clip: rect()` — positioned boxes only (CSS 2.1), offsets from the
+    // border-box top-left
+    let legacy = n
+        .bx
+        .clip_rect
+        .filter(|_| n.bx.pos != Pos::Static)
+        .map(|c| {
+            (
+                n.x + resolve_len(c[3], n.w),
+                n.y + resolve_len(c[0], n.h),
+                n.x + resolve_len(c[1], n.w),
+                n.y + resolve_len(c[2], n.h),
+            )
+        });
+    // `clip-path: inset()` — any element, insets from each border-box edge
+    let path = n.bx.clip_path.map(|c| {
+        (
+            n.x + resolve_len(c[3], n.w),
+            n.y + resolve_len(c[0], n.h),
+            n.x + n.w - resolve_len(c[1], n.w),
+            n.y + n.h - resolve_len(c[2], n.h),
+        )
+    });
+    match (legacy, path) {
+        (Some(a), Some(b)) => Some(clip_intersect(a, b)),
+        (a, b) => a.or(b),
     }
-    let x0 = n.x + resolve_len(c[3], n.w);
-    let y0 = n.y + resolve_len(c[0], n.h);
-    let x1 = n.x + resolve_len(c[1], n.w);
-    let y1 = n.y + resolve_len(c[2], n.h);
-    Some((x0, y0, x1, y1))
 }
 
 fn leaf_atom(n: &BoxNode) -> Atom {
@@ -8461,6 +8483,43 @@ mod tests {
         let run = l.runs.iter().find(|r| r.text == "deep").expect("deep run");
         let (_, _, x1, _) = run.clip.expect("clipped");
         assert!((x1 - 100.0).abs() < 0.01, "run window x1={x1} = composed");
+    }
+
+    #[test]
+    fn clip_path_inset_hides_visually_hidden_labels() {
+        // the pattern in the wild is `position:absolute` + `clip-path:
+        // inset(50%)` (no legacy `clip`), and `clip-path` applies to ANY
+        // element — a static box included, which `clip: rect()` does not.
+        let dom = crate::html::parse(r#"<span class="vh">Menu</span><p>page</p>"#);
+        let sheet = crate::css::parse(".vh { width: 40px; clip-path: inset(50%) }");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "Menu").expect("label run");
+        let (x0, y0, x1, y1) = run.clip.expect("inset(50%) clips the run");
+        assert!(
+            x1 <= x0 || y1 <= y0,
+            "a 50% inset leaves a zero-area window: ({x0},{y0},{x1},{y1})"
+        );
+        assert!(
+            l.runs.iter().find(|r| r.text == "page").unwrap().clip.is_none(),
+            "sibling content stays unclipped"
+        );
+    }
+
+    #[test]
+    fn clip_path_inset_maps_each_edge() {
+        // `inset(0 5px)` = vertical 0, horizontal 5: the window is the
+        // border box narrowed by 5px on the left AND right (not a shift).
+        let dom = crate::html::parse(r#"<span class="vh">Menu</span>"#);
+        let sheet = crate::css::parse(".vh { width: 40px; clip-path: inset(0 5px) }");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "Menu").expect("label run");
+        let (x0, _, x1, _) = run.clip.expect("inset clips");
+        let span = l.rects.iter().find(|r| r.1 <= run.y && r.1 + r.3 > run.y);
+        let box_x = span.map(|r| r.0).unwrap_or(0.0);
+        assert!((x0 - (box_x + 5.0)).abs() < 0.01, "left inset 5: x0={x0} box={box_x}");
+        assert!((x1 - (box_x + 35.0)).abs() < 0.01, "right inset 5: x1={x1}");
     }
 
     #[test]

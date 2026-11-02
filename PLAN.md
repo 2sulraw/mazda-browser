@@ -971,6 +971,28 @@ curve matters more than the baseline (near-flat as tabs grow).
   Tests: default **557**, `engine-b + woff2` **561**
   (`button_lays_out_its_children`, `button_keeps_generated_content`,
   `author_text_align_overrides_the_button_default`).
+  **(m) `clip-path: inset()`** — the modern visually-hidden idiom
+  (`position:absolute; width:1px; height:1px; overflow:hidden;
+  clip-path:inset(50%)`, used by Tailwind's `sr-only` and Radix/Chakra)
+  parsed to nothing, so hidden labels painted. `clip-path` now parses
+  `inset(t r b l)` (1/2/3/4 values, px and %, `round` dropped) into
+  `BoxStyle::clip_path`; the layout clip window is the border box inset by
+  those edges, intersected with any legacy `clip: rect()` (which stays
+  positioned-only, per CSS 2.1). `clip` also accepts the legacy
+  space-separated `rect(0 0 0 0)` form. An inline that declares a clip now
+  forces a box (`paints_chrome`) — flattening it away lost the window.
+  Live: a probe page with two `sr-only` labels paints only the two visible
+  strings; MDN unchanged (664 rules, 2773 runs, 11 images, 76–91 MB debug).
+  shortcut: other shapes (`circle`/`ellipse`/`polygon`/`path`/`url()`),
+  `round` radii, `margin-box`/`content-box` reference boxes, and hit-test
+  clipping are not modeled.
+  Note: Wikipedia's header labels ("Main menu", "Search") still show —
+  its static CSS carries no `position:absolute` for
+  `.vector-dropdown-label-text`; the reference gets the 1px box from a
+  class its JS adds, so that one is a script-runtime gap, not a CSS one.
+  Tests: default **560**, `engine-b + woff2` **564**
+  (`clip_path_inset_parses_edges`, `clip_path_inset_hides_visually_hidden_labels`,
+  `clip_path_inset_maps_each_edge`).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
@@ -1066,6 +1088,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-02 | wave 8h (relayout image memo) | Wikipedia Rust article | 98.7 MB first layout (14973 runs); relayouts after it report `315 drawn (0 decoded, 315 from the memo)` - the 104 → 118 MB climb was that decode churn |
 | 2026-11-03 | wave 8l (`<button>` container) | MDN `/Web/CSS/list-style-type` | 91.0 MB (2773 runs, 11 images - the search button's inline `<svg>` magnifier now lays out and paints) |
 | 2026-11-03 | wave 8l (`<button>` container) | Wikipedia Rust article | 106.7 MB (14973 runs, 315 images; pixel-unchanged) |
+| 2026-11-03 | wave 8m (`clip-path: inset()`) | data: URL `sr-only` probe | 54.7 MB (4 runs; both hidden labels clipped away, both visible strings paint) |
+| 2026-11-03 | wave 8m (`clip-path: inset()`) | MDN `/Web/CSS/list-style-type` | 76.1–80.0 MB (2773 runs, 11 images; unchanged) |
 
 ### Phase 1c (Track A) findings
 

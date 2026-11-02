@@ -423,6 +423,14 @@ pub struct BoxStyle {
     /// hides everything). Honored only on positioned boxes (spec: applies
     /// to absolutely positioned elements); `auto`/unparseable → None.
     pub clip_rect: Option<[Len; 4]>,
+    /// `clip-path: inset(top right bottom left)` — insets from each edge of
+    /// the border-box (percentages resolve against that box). Unlike
+    /// `clip: rect()`, a path applies to ANY element, positioned or not,
+    /// which is exactly how `.visually-hidden` hides its label
+    /// (`clip-path: inset(50%)` = a zero-area window). Other shapes
+    /// (`circle`/`ellipse`/`polygon`/`url()`) and the `round` syntax are
+    /// dropped (shortcut: no shape rasterization, no rounded clip).
+    pub clip_path: Option<[Len; 4]>,
     /// CSS position (non-static boxes leave normal flow)
     pub pos: Pos,
     /// top, right, bottom, left — None = unspecified (absolute keeps its
@@ -568,6 +576,7 @@ impl Default for BoxStyle {
             bcolor: None, // currentcolor
             clip: false,
             clip_rect: None,
+            clip_path: None,
             pos: Pos::Static,
             inset: [None; 4],
             shadows: Vec::new(),
@@ -1163,6 +1172,7 @@ const KNOWN: &[&str] = &[
     "overflow-x",
     "overflow-y",
     "clip",
+    "clip-path",
     "box-shadow",
     "float",
     "clear",
@@ -2354,6 +2364,9 @@ fn apply_decl(
         // ZERO-AREA window: the classic skip-link hide. Applied only to
         // positioned boxes (spec); `none`/`auto`/garbage → None (no clip).
         "clip" => bx.clip_rect = parse_clip_rect(&d.1, vp),
+        // `clip-path: inset(...)` — applies to ANY element (unlike `clip`),
+        // which is how `.visually-hidden` hides its label
+        "clip-path" => bx.clip_path = parse_inset_path(&d.1, vp),
         "height" => bx.height = parse_len(&d.1, vp).filter(|_| d.1 != "auto"),
         "min-height" => {
             if let Some(l) = parse_len(&d.1, vp).filter(|_| d.1 != "auto") {
@@ -2952,18 +2965,55 @@ fn parse_sides(v: &str, vp: (f32, f32)) -> [Len; 4] {
     }
 }
 
+/// `clip-path: inset(top right bottom left)` → the four edge insets as
+/// [`Len`]s (a single value applies to all four edges, like `margin`).
+/// `none`, an unparseable value, and every other shape function
+/// (`circle()`/`ellipse()`/`polygon()`/`path()`/`url()`) → None = no clip
+/// (shortcut: no shape rasterization). A trailing `round <radius>` is
+/// consumed and dropped (shortcut: clips are always rectangular).
+fn parse_inset_path(v: &str, vp: (f32, f32)) -> Option<[Len; 4]> {
+    let v = v.trim().to_ascii_lowercase();
+    let inner = v.strip_prefix("inset(")?.strip_suffix(')')?;
+    // drop `round ...` — only the rectangle matters here
+    let inner = match inner.find("round") {
+        Some(i) => &inner[..i],
+        None => inner,
+    };
+    let parts: Vec<&str> = inner.split_whitespace().filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut l = [Len::Px(0.0); 4];
+    for (i, p) in parts.iter().enumerate() {
+        l[i] = parse_len(p, vp)?;
+    }
+    // 1 → all, 2 → v h, 3 → t h b, 4 → t r b l
+    let (t, r, b, le) = match parts.len() {
+        1 => (l[0], l[0], l[0], l[0]),
+        2 => (l[0], l[1], l[0], l[1]),
+        3 => (l[0], l[1], l[2], l[1]),
+        _ => (l[0], l[1], l[2], l[3]),
+    };
+    Some([t, r, b, le])
+}
+
 /// `clip: rect(top, right, bottom, left)` → four [`Len`] offsets from the
 /// element's border-box top-left (all four measured from that corner, so
-/// `rect(1px,1px,1px,1px)` is a zero-area window). Anything else — `none`,
-/// a non-rect value, not exactly 4 comma-separated parts, or an unparseable
-/// part (including `auto`) → None = no clip.
+/// `rect(1px,1px,1px,1px)` is a zero-area window). Both the comma form and
+/// the legacy space-separated form are accepted. Anything else — `none`,
+/// a non-rect value, not exactly 4 parts, or an unparseable part
+/// (including `auto`) → None = no clip.
 /// shortcut: `auto` slots are unparseable instead of CSS 2.1's per-edge
 /// semantics (top/left≈0, right/bottom=no clip) — real skip-link patterns
 /// specify all four edges.
 fn parse_clip_rect(v: &str, vp: (f32, f32)) -> Option<[Len; 4]> {
     let v = v.trim().to_ascii_lowercase();
     let inner = v.strip_prefix("rect(")?.strip_suffix(')')?;
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let mut parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    // legacy `rect(0 0 0 0)` — no commas
+    if parts.len() == 1 {
+        parts = inner.split_whitespace().collect();
+    }
     if parts.len() != 4 {
         return None;
     }
@@ -5925,6 +5975,44 @@ mod tests {
         assert_eq!(get("g").clip_rect, None, "wrong arity → no clip");
         assert_eq!(get("z").clip_rect, None, "garbage → no clip");
         assert_eq!(get("q").clip_rect, None, "auto slot → no clip (shortcut)");
+    }
+
+    #[test]
+    fn clip_path_inset_parses_edges() {
+        let sheet = parse(
+            ".p { clip-path: inset(1px 2px 3px 4px) } \
+             .two { clip-path: inset(10% 2px) } \
+             .one { clip-path: inset(50%) } \
+             .rnd { clip-path: inset(0 round 5px) } \
+             .none { clip-path: none } \
+             .circle { clip-path: circle(50%) } \
+             .junk { clip-path: inset(a b) }",
+        );
+        let dom = dom_of(
+            "<div class=p></div><div class=two></div><div class=one></div>\
+             <div class=rnd></div><div class=none></div><div class=circle></div>\
+             <div class=junk></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).bx;
+        assert_eq!(
+            get("p").clip_path,
+            Some([Len::Px(1.0), Len::Px(2.0), Len::Px(3.0), Len::Px(4.0)]),
+            "inset(top right bottom left)"
+        );
+        assert_eq!(
+            get("two").clip_path,
+            Some([Len::Pct(10.0), Len::Px(2.0), Len::Pct(10.0), Len::Px(2.0)]),
+            "two values = vertical horizontal"
+        );
+        assert_eq!(get("one").clip_path, Some([Len::Pct(50.0); 4]), "one value = all edges");
+        assert_eq!(
+            get("rnd").clip_path,
+            Some([Len::Px(0.0); 4]),
+            "`round` radius is dropped, the rectangle stays"
+        );
+        assert_eq!(get("none").clip_path, None, "none → no clip");
+        assert_eq!(get("circle").clip_path, None, "non-inset shapes are ignored (shortcut)");
+        assert_eq!(get("junk").clip_path, None, "unparseable → no clip");
     }
 
     #[test]
