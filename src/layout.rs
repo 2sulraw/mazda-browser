@@ -5,7 +5,7 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor,
-    Dir, Display, Float, Justify, Len, Pos, PseudoEl, Sheet, Track, VAlign,
+    Dir, Display, Float, Justify, Len, Pos, PseudoEl, Sheet, TableRole, Track, VAlign,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -267,7 +267,13 @@ fn style_for(tag: &str, base: Style) -> Style {
             s.size = (base.size * 1.15).max(17.0);
             s.bold = true;
         }
-        "b" | "strong" | "th" => s.bold = true,
+        "b" | "strong" => s.bold = true,
+        // UA table header: bold and centered (the cells' inline content
+        // lines up centered unless the author sets `text-align`)
+        "th" => {
+            s.bold = true;
+            s.text_align = 1;
+        }
         "i" | "em" | "cite" | "var" => s.italic = true,
         "u" | "ins" => s.underline = true,
         "code" | "kbd" | "samp" | "tt" => {
@@ -388,6 +394,7 @@ fn is_block(tag: &str) -> bool {
         "p" | "div" | "section" | "article" | "header" | "footer" | "nav" | "aside"
             | "main" | "blockquote" | "figure" | "figcaption" | "ul" | "ol" | "li" | "dl"
             | "dt" | "dd" | "table" | "tr" | "td" | "th" | "caption" | "form" | "fieldset"
+            | "thead" | "tbody" | "tfoot"
             | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "hr" | "address" | "center"
     )
 }
@@ -1193,6 +1200,39 @@ fn build_into(
                             .map_or(false, |a| a.trim().eq_ignore_ascii_case("center"));
                         if center && !g.bx.margin_x_auto && g.bx.margin == [Len::Px(0.0); 4] {
                             g.bx.margin_x_auto = true;
+                        }
+                    }
+                    // cell spans + the presentational `valign` hint (lower
+                    // precedence than author CSS: only when no
+                    // `vertical-align` declaration landed). `rowspan` is
+                    // carried but not laid out yet (see table_layout).
+                    if matches!(tag, "td" | "th") {
+                        // legacy width="120" / width="40%" hint, same
+                        // precedence rule as the table's own attribute
+                        if g.bx.declared & decl::WIDTH == 0 {
+                            g.bx.width = dom.attr(child, "width").and_then(attr_len);
+                        }
+                        g.bx.colspan = dom
+                            .attr(child, "colspan")
+                            .and_then(|v| v.trim().parse::<u16>().ok())
+                            .filter(|&n| n >= 1)
+                            .unwrap_or(1);
+                        g.bx.rowspan = dom
+                            .attr(child, "rowspan")
+                            .and_then(|v| v.trim().parse::<u16>().ok())
+                            .filter(|&n| n >= 1)
+                            .unwrap_or(1);
+                        if g.bx.declared & decl::VALIGN == 0 {
+                            g.bx.valign = match dom
+                                .attr(child, "valign")
+                                .map(|v| v.trim().to_ascii_lowercase())
+                                .as_deref()
+                            {
+                                Some("top") => VAlign::Top,
+                                Some("middle") => VAlign::Middle,
+                                Some("bottom") => VAlign::Bottom,
+                                _ => g.bx.valign,
+                            };
                         }
                     }
                     // background-image: placeholder rides the <img> pipeline
@@ -2705,6 +2745,511 @@ fn shift_tree(n: &mut BoxNode, dx: f32, dy: f32) {
 /// box, or the viewport for `position: fixed`.
 type CB = (f32, f32, f32, f32);
 
+// ---- tables -------------------------------------------------------------
+//
+// The table model is deliberately small but real: a `table` box owns a grid
+// of `tr` rows (optionally inside `thead`/`tbody`/`tfoot` groups) filled by
+// `td`/`th` cells. Column widths come from cell CONTENT (CSS
+// `table-layout: auto`), cells may span columns, and the two border models
+// differ in geometry (separate spacing vs. collapsed single lines).
+//
+// Column-width algorithm (documented because it is the whole point):
+//   1. For every cell measure its max-content outer width (`natural_w`) and
+//      its min-content width (`min_content_w`: the widest unbreakable word
+//      plus padding/border). A `colspan=n` cell contributes its width split
+//      evenly over the n columns it covers.
+//   2. Per column take the maxima of both passes -> (max_j, min_j).
+//   3. The table's content width:
+//      - declared `width`: use it verbatim (percent/px already resolved);
+//      - auto: shrink-wrap to `sum(max_j) + spacing`; if that exceeds the
+//        available width, shrink proportionally down to the min floor (if
+//        even the floor overflows, the table overflows the container).
+//   4. Distribute the column pool proportionally to `max_j`, holding any
+//      column that would fall below `min_j` at its floor and re-sharing the
+//      remainder (water-filling). Extra space (declared width larger than
+//      the content) is shared in the same proportion.
+//
+// `table-layout: fixed` skips 1-4's content pass: the FIRST row decides the
+// grid (colspan-aware) and each column takes its first-row cell's declared
+// `width` (split over the span) or an equal share of what is left. Later
+// rows never widen a column.
+//
+// shortcut: no anonymous cells are synthesized for stray text, and a
+// column whose cells are all empty gets zero width.
+// shortcut: percentage cell/column widths are ignored as sizing hints
+// (linear distribution only -- resolving them against the table they feed
+// is cyclic); a fixed-layout table with `width: auto` uses its content
+// width as the pool instead of a separate shrink-to-fit pass, and its
+// column COUNT comes from the widest row (later rows never widen a column,
+// but a cell past the first row's last column still opens a new one).
+// shortcut: `rowspan` is parsed and carried on the cell but NOT laid out --
+// the cell occupies its own row only (full row span needs a row-spanning
+// height distribution pass; documented honestly here).
+// shortcut: collapsed-border conflict resolution is approximate -- adjacent
+// cells are positioned to overlap by `max(right border of the left cell,
+// left border of the right cell)` so the shared edge paints once at the
+// wider width; the later cell in tree order wins the overlap (its color
+// paints on top) rather than the spec's border-style/width cell comparison.
+// The table's OWN border is not folded into the grid: it keeps its box at
+// the table edge while the cells collapse against each other.
+// `caption-side: bottom` is unsupported (captions always render above).
+
+/// One row of the table grid and where its cells sit.
+struct TRow {
+    /// `thead`/`tbody`/`tfoot` box index in the table's children; None for a
+    /// `<tr>` that is a direct table child (the parser/implicit tbody case).
+    group: Option<usize>,
+    /// row box index inside the group (or inside the table when group=None)
+    row: usize,
+    /// (cell index inside the row box, first grid column, colspan)
+    cells: Vec<(usize, usize, usize)>,
+}
+
+fn row_box<'a>(n: &'a BoxNode, r: &TRow) -> &'a BoxNode {
+    match r.group {
+        Some(g) => &n.children[g].children[r.row],
+        None => &n.children[r.row],
+    }
+}
+
+fn row_box_mut<'a>(n: &'a mut BoxNode, r: &TRow) -> &'a mut BoxNode {
+    match r.group {
+        Some(g) => &mut n.children[g].children[r.row],
+        None => &mut n.children[r.row],
+    }
+}
+
+/// Rows in PAINT/LAYOUT order: head groups first, then body rows (including
+/// rows that are direct table children), then foot groups. Cells inside a
+/// row get sequential grid columns (colspan-aware).
+fn table_grid(n: &BoxNode) -> (Vec<TRow>, usize) {
+    let mut head: Vec<TRow> = Vec::new();
+    let mut body: Vec<TRow> = Vec::new();
+    let mut foot: Vec<TRow> = Vec::new();
+    for (gi, ch) in n.children.iter().enumerate() {
+        let bucket = match ch.bx.table {
+            TableRole::Head => Some(&mut head),
+            TableRole::Body => Some(&mut body),
+            TableRole::Foot => Some(&mut foot),
+            _ => None,
+        };
+        if let Some(bucket) = bucket {
+            for (ri, row) in ch.children.iter().enumerate() {
+                if row.bx.table == TableRole::Row {
+                    bucket.push(TRow { group: Some(gi), row: ri, cells: Vec::new() });
+                }
+            }
+        } else if ch.bx.table == TableRole::Row {
+            body.push(TRow { group: None, row: gi, cells: Vec::new() });
+        }
+    }
+    let mut rows = head;
+    rows.extend(body);
+    rows.extend(foot);
+    let mut ncols = 0usize;
+    for r in &mut rows {
+        let rb = row_box(n, r);
+        let mut col = 0usize;
+        for (ci, c) in rb.children.iter().enumerate() {
+            if c.bx.table == TableRole::Cell {
+                let span = c.bx.colspan.max(1) as usize;
+                r.cells.push((ci, col, span));
+                col += span;
+            }
+        }
+        ncols = ncols.max(col);
+    }
+    (rows, ncols)
+}
+
+/// Min-content outer width: the widest unbreakable word (text), the intrinsic
+/// width (replaced box / inline-level box, which cannot split across lines),
+/// or the max over block children, plus padding + border.
+/// shortcut: letter/word spacing is not added to word widths here, and a
+/// nested table measures its max-content width (conservative floor).
+fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
+    let content = if n.is_text {
+        if n.hard_break {
+            0.0
+        } else {
+            n.text
+                .split_whitespace()
+                .map(|w| measure(w, &n.style))
+                .fold(0.0f32, f32::max)
+        }
+    } else if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
+        iw as f32
+    } else if n.bx.table == TableRole::Table {
+        natural_w(n, avail, measure)
+    } else {
+        let mut m = 0.0f32;
+        for c in &n.children {
+            if c.is_bg || c.is_mask || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
+                continue;
+            }
+            let cw = if c.inline {
+                natural_w(c, avail, measure)
+            } else {
+                min_content_w(c, avail, measure)
+            };
+            m = m.max(cw);
+        }
+        m
+    };
+    if n.is_text {
+        return content;
+    }
+    content
+        + resolve_len(n.bx.pad[3], avail)
+        + resolve_len(n.bx.pad[1], avail)
+        + resolve_len(n.bx.border[3], avail)
+        + resolve_len(n.bx.border[1], avail)
+}
+
+/// Resolved table geometry shared by the width pass (`place`) and the
+/// placement pass (`table_layout`).
+struct TablePlan {
+    /// border-box width of each column
+    cols: Vec<f32>,
+    /// used CONTENT width of the table (columns + spacing - collapse overlap)
+    used: f32,
+    /// widest left/right border per column (collapse overlap between cols)
+    col_bl: Vec<f32>,
+    col_br: Vec<f32>,
+    /// widest top/bottom border per row (collapse overlap between rows)
+    row_bt: Vec<f32>,
+    row_bb: Vec<f32>,
+}
+
+/// Water-filling distribution: shares proportional to `max`, no column below
+/// `min`. Columns pinned at `min` leave the rest of the pool to the others.
+fn distribute_widths(max: &[f32], min: &[f32], pool: f32) -> Vec<f32> {
+    let n = max.len();
+    let mut out = vec![0.0f32; n];
+    let mut fixed = vec![false; n];
+    loop {
+        let used_fixed: f32 = (0..n).filter(|&j| fixed[j]).map(|j| min[j]).sum();
+        let rem = (pool - used_fixed).max(0.0);
+        let free = (0..n).filter(|&j| !fixed[j]).count();
+        let wsum: f32 = (0..n).filter(|&j| !fixed[j]).map(|j| max[j]).sum();
+        let mut changed = false;
+        for j in 0..n {
+            if fixed[j] {
+                continue;
+            }
+            let share = if wsum > 0.0 {
+                max[j] / wsum * rem
+            } else if free > 0 {
+                rem / free as f32
+            } else {
+                0.0
+            };
+            if share < min[j] {
+                fixed[j] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let used_fixed: f32 = (0..n).filter(|&j| fixed[j]).map(|j| min[j]).sum();
+    let rem = (pool - used_fixed).max(0.0);
+    let wsum: f32 = (0..n).filter(|&j| !fixed[j]).map(|j| max[j]).sum();
+    let free = (0..n).filter(|&j| !fixed[j]).count();
+    for j in 0..n {
+        out[j] = if fixed[j] {
+            min[j]
+        } else if wsum > 0.0 {
+            max[j] / wsum * rem
+        } else if free > 0 {
+            rem / free as f32
+        } else {
+            0.0
+        };
+    }
+    out
+}
+
+/// Max-content OUTER width of a table cell: inline siblings accumulate on
+/// one line (`natural_w` restarts its run at every inline box, which would
+/// undercount a cell like `<b>ab</b>cd`), `<br>` flushes the line, and block
+/// children are measured as their own lines. Padding + border are added.
+fn cell_max_content(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
+    let mut m = 0.0f32;
+    let mut line = 0.0f32;
+    for c in &n.children {
+        if c.is_bg || c.is_mask || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
+            continue;
+        }
+        if c.is_text {
+            if c.hard_break {
+                m = m.max(line);
+                line = 0.0;
+            } else {
+                line += natural_w(c, avail, measure);
+            }
+        } else if c.inline {
+            line += natural_w(c, avail, measure)
+                + resolve_len(c.bx.margin[3], avail)
+                + resolve_len(c.bx.margin[1], avail);
+        } else {
+            m = m.max(line).max(natural_w(c, avail, measure));
+            line = 0.0;
+        }
+    }
+    m.max(line)
+        + resolve_len(n.bx.pad[3], avail)
+        + resolve_len(n.bx.pad[1], avail)
+        + resolve_len(n.bx.border[3], avail)
+        + resolve_len(n.bx.border[1], avail)
+}
+
+/// Declared `width` usable as a column hint. A percentage is skipped (its
+/// base is the table width this pass feeds -- see the shortcut above).
+fn declared_w(n: &BoxNode) -> Option<f32> {
+    match n.bx.width {
+        Some(Len::Px(v)) => Some(v.max(0.0)),
+        _ => None,
+    }
+}
+
+fn table_plan(
+    n: &BoxNode,
+    avail: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> TablePlan {
+    let (rows, ncols) = table_grid(n);
+    let mut cmax = vec![0.0f32; ncols];
+    let mut cmin = vec![0.0f32; ncols];
+    let mut col_bl = vec![0.0f32; ncols];
+    let mut col_br = vec![0.0f32; ncols];
+    let mut row_bt = vec![0.0f32; rows.len()];
+    let mut row_bb = vec![0.0f32; rows.len()];
+    for (ri, r) in rows.iter().enumerate() {
+        let rb = row_box(n, r);
+        for &(ci, col, span) in &r.cells {
+            let c = &rb.children[ci];
+            // an explicit width is this engine's border-box width, exactly
+            // the column's unit; natural_w would add padding on top
+            let w = declared_w(c).unwrap_or_else(|| cell_max_content(c, avail, measure));
+            let mw = min_content_w(c, avail, measure);
+            let share = w / span as f32;
+            let mshare = mw / span as f32;
+            for j in col..col + span {
+                cmax[j] = cmax[j].max(share);
+                cmin[j] = cmin[j].max(mshare);
+            }
+            // explicit cell `width` is a MINIMUM for its column in auto
+            // layout (cmax already includes it through natural_w); fixed
+            // layout reads the first row's widths separately below
+            if !n.bx.table_fixed {
+                if let Some(hw) = declared_w(c) {
+                    for j in col..col + span {
+                        cmin[j] = cmin[j].max(hw / span as f32);
+                    }
+                }
+            }
+            // collapse needs the widest border on each grid edge; a colspan
+            // cell's outer borders are folded into its first/last column
+            let b = |i: usize| resolve_len(c.bx.border[i], avail);
+            col_bl[col] = col_bl[col].max(b(3));
+            col_br[col + span - 1] = col_br[col + span - 1].max(b(1));
+            row_bt[ri] = row_bt[ri].max(b(0));
+            row_bb[ri] = row_bb[ri].max(b(2));
+        }
+    }
+    if ncols == 0 {
+        return TablePlan { cols: vec![], used: 0.0, col_bl, col_br, row_bt, row_bb };
+    }
+    let collapse = n.bx.border_collapse;
+    let hs = if collapse {
+        0.0
+    } else {
+        resolve_len(n.bx.border_spacing[0], avail)
+    };
+    // border-spacing also pads the outer edges of the table
+    let gaps = if collapse { 0.0 } else { hs * (ncols as f32 + 1.0) };
+    let mut overlaps = 0.0f32;
+    if collapse {
+        for j in 0..ncols - 1 {
+            overlaps += col_br[j].max(col_bl[j + 1]);
+        }
+    }
+    let smax: f32 = cmax.iter().sum();
+    let smin: f32 = cmin.iter().sum();
+    let natural = smax + gaps - overlaps;
+    // target = the table's content width
+    let target = if n.bx.width.is_some() {
+        avail.max(0.0)
+    } else if natural <= avail {
+        natural
+    } else {
+        // shrink to the available width, never below the min-content floor
+        avail.max(smin + gaps - overlaps)
+    };
+    if n.bx.table_fixed {
+        // first row decides: declared widths (a colspan cell's width split
+        // over its span), remaining columns share the rest equally
+        let mut fixed: Vec<Option<f32>> = vec![None; ncols];
+        if let Some(r) = rows.first() {
+            let rb = row_box(n, r);
+            for &(ci, col, span) in &r.cells {
+                if let Some(hw) = declared_w(&rb.children[ci]) {
+                    for j in col..col + span {
+                        fixed[j] = Some(hw / span as f32);
+                    }
+                }
+            }
+        }
+        let known: f32 = fixed.iter().flatten().sum();
+        let free = fixed.iter().filter(|w| w.is_none()).count();
+        let share = if free > 0 {
+            ((target - gaps + overlaps - known).max(0.0)) / free as f32
+        } else {
+            0.0
+        };
+        let cols: Vec<f32> = fixed.iter().map(|w| w.unwrap_or(share)).collect();
+        // declared first-row widths can exceed the table's own width; the
+        // table then grows to their sum, like a real fixed table does
+        let used = cols.iter().sum::<f32>() + gaps - overlaps;
+        return TablePlan { cols, used, col_bl, col_br, row_bt, row_bb };
+    }
+    let pool = (target - gaps + overlaps).max(0.0);
+    let cols = distribute_widths(&cmax, &cmin, pool);
+    let used = cols.iter().sum::<f32>() + gaps - overlaps;
+    TablePlan { cols, used, col_bl, col_br, row_bt, row_bb }
+}
+
+/// Lay out a `table` box's content (called from `place` with `n.x`/`n.y` at
+/// the content origin and `n.w` the content width). Captions render first
+/// (above), then head rows, body rows, foot rows; each row's height is its
+/// tallest cell and shorter cells fill the row, aligning their content per
+/// `vertical-align` (`baseline` renders as top -- shortcut: first-line
+/// baseline alignment across cells is not modeled).
+fn table_layout(
+    n: &mut BoxNode,
+    measure: &dyn Fn(&str, &Style) -> f32,
+    runs: &mut Vec<PositionedRun>,
+    uls: &mut Vec<UR>,
+    flt: &[Flt],
+) {
+    let plan = table_plan(n, n.w, measure);
+    let (rows, _) = table_grid(n);
+    let collapse = n.bx.border_collapse;
+    let hs = if collapse {
+        0.0
+    } else {
+        resolve_len(n.bx.border_spacing[0], n.w)
+    };
+    let vs = if collapse {
+        0.0
+    } else {
+        resolve_len(n.bx.border_spacing[1], n.w)
+    };
+    let (nx, nw) = (n.x, n.w);
+    // captions above the grid (in child order)
+    let mut y = n.y;
+    for i in 0..n.children.len() {
+        if n.children[i].bx.table == TableRole::Caption {
+            let adv = place(&mut n.children[i], nx, y, nw, measure, runs, uls, flt);
+            y += adv;
+        }
+    }
+    // column x offsets: separate adds the spacing, collapse pulls neighbours
+    // together by the shared border width
+    let mut xs = Vec::with_capacity(plan.cols.len());
+    let mut cx = nx + hs;
+    for j in 0..plan.cols.len() {
+        xs.push(cx);
+        cx += plan.cols[j];
+        if j + 1 < plan.cols.len() {
+            cx += if collapse {
+                -plan.col_br[j].max(plan.col_bl[j + 1])
+            } else {
+                hs
+            };
+        }
+    }
+    if !collapse {
+        y += vs;
+    }
+    let mut group_ext: Vec<Option<(f32, f32)>> = vec![None; n.children.len()];
+    for (ri, r) in rows.iter().enumerate() {
+        let row_y = y;
+        let (nx, nw) = (n.x, n.w);
+        // row boxes/backgrounds span the table; cell placement is manual
+        let rb = row_box_mut(n, r);
+        let mut rowh = 0.0f32;
+        for &(ci, col, span) in &r.cells {
+            // the column span's wide: its last column's right edge minus
+            // its first column's left edge (gaps/overlaps included)
+            let cw = xs[col + span - 1] + plan.cols[col + span - 1] - xs[col];
+            let cell = &mut rb.children[ci];
+            // the column width is authoritative; a declared cell width was
+            // already folded into the plan as a hint
+            let saved = cell.bx.width.take();
+            place(cell, xs[col], row_y, cw, measure, runs, uls, flt);
+            cell.bx.width = saved;
+            rowh = rowh.max(cell.h);
+        }
+        // vertical-align: keep the cell's border box at the row's full
+        // height and move only its CONTENT (children + runs) down
+        for &(ci, ..) in &r.cells {
+            let cell = &mut rb.children[ci];
+            let dy = match cell.bx.valign {
+                VAlign::Middle => (rowh - cell.h).max(0.0) * 0.5,
+                VAlign::Bottom => (rowh - cell.h).max(0.0),
+                _ => 0.0, // top/baseline/length/sub/super: content stays put
+            };
+            if dy != 0.0 {
+                for ch in &mut cell.children {
+                    shift_tree(ch, 0.0, dy);
+                }
+                let (a, b) = cell.run_range;
+                for run in &mut runs[a as usize..b as usize] {
+                    run.y += dy;
+                }
+                let (a, b) = cell.ul_range;
+                for u in &mut uls[a as usize..b as usize] {
+                    u.1 += dy;
+                }
+            }
+            cell.h = rowh;
+        }
+        rb.x = nx;
+        rb.w = nw;
+        rb.y = row_y;
+        rb.h = rowh;
+        if let Some(g) = r.group {
+            let e = group_ext[g].get_or_insert((row_y, row_y + rowh));
+            e.0 = e.0.min(row_y);
+            e.1 = e.1.max(row_y + rowh);
+        }
+        y = row_y + rowh;
+        if ri + 1 < rows.len() {
+            y += if collapse {
+                -plan.row_bb[ri].max(plan.row_bt[ri + 1])
+            } else {
+                vs
+            };
+        } else if !collapse {
+            y += vs; // bottom spacing
+        }
+    }
+    for (gi, ext) in group_ext.iter().enumerate() {
+        if let Some((top, bot)) = *ext {
+            let g = &mut n.children[gi];
+            g.x = nx;
+            g.w = nw;
+            g.y = top;
+            g.h = bot - top;
+        }
+    }
+    n.h = y - n.y;
+}
+
+
 /// Place one node. `avail` = containing block's content width.
 /// Returns the outer vertical advance (margin-top + border-box height +
 /// margin-bottom) so block flow can stack siblings without overlap.
@@ -2742,6 +3287,18 @@ fn place(
     }
     if let Some(m) = n.bx.max_width {
         w = w.min(resolve_len(m, avail));
+    }
+    // table width: auto shrink-wraps the columns; a declared width is
+    // shared over them. Pads/borders are resolved here (against the width
+    // we know) so the plan sees the real content constraint.
+    if n.bx.table == TableRole::Table {
+        let pl = resolve_len(n.bx.pad[3], w);
+        let pr = resolve_len(n.bx.pad[1], w);
+        let bl = resolve_len(n.bx.border[3], w);
+        let br = resolve_len(n.bx.border[1], w);
+        let inner = (w - pl - pr - bl - br).max(0.0);
+        let plan = table_plan(n, inner, measure);
+        w = plan.used + pl + pr + bl + br;
     }
     // replaced element with known intrinsic size: width unless overridden
     if n.img.is_some() && n.bx.width.is_none() {
@@ -2802,6 +3359,7 @@ fn place(
             (Display::Flex, Dir::Row) => flex_row(n, measure, runs, uls),
             (Display::Flex, Dir::Column) => flex_col(n, measure, runs, uls),
             (Display::Grid, _) => grid(n, measure, runs, uls),
+            _ if n.bx.table == TableRole::Table => table_layout(n, measure, runs, uls, flt),
             _ => block(n, measure, runs, uls, flt), // Block / Auto(block tag)
         }
     }
@@ -3177,6 +3735,11 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
     }
     if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
         return iw as f32; // intrinsic (padding added by the wrapper)
+    }
+    // table: its shrink-to-fit width is the planned column total (never the
+    // widest child, which would undercount the columns next to each other)
+    if n.bx.table == TableRole::Table {
+        return table_plan(n, avail, measure).used;
     }
     match (n.bx.display, n.bx.dir) {
         (Display::Flex, Dir::Row) => {
@@ -8189,6 +8752,314 @@ line</textarea></div>"#,
         let t = &styled.children[0];
         assert_eq!(t.w, 400.0, "author width wins over the attribute");
         assert_eq!(t.x, 10.0, "author margin wins over align=center");
+    }
+
+    // ---- table layout: columns from content, spans, border model ----
+
+    #[test]
+    fn pages_without_tables_keep_their_paint_snapshot() {
+        // regression guard: the table branches activate only for boxes with
+        // a `Table` role, so a page with none paints exactly as before the
+        // table work (exact values, not a tolerance)
+        let mut root = boxes_of(
+            r#"<div class=a>alpha</div><p class=b>beta <b>bold</b></p>"#,
+            ".a{width:120px;background:#112233}.b{width:90px;background:#445566}",
+        );
+        let l = layout_tree(&mut root, 400.0, &m4);
+        assert_eq!(
+            l.rects,
+            vec![
+                (0.0, 0.0, 120.0, 20.25, 0x11_22_33, 0.0, false),
+                (0.0, 29.25, 90.0, 20.25, 0x44_55_66, 0.0, false),
+            ]
+        );
+        let runs: Vec<(String, f32, f32, f32)> = l
+            .runs
+            .iter()
+            .map(|r| (r.text.clone(), r.x, r.y, r.width))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                ("alpha".to_string(), 0.0, 0.0, 20.0),
+                ("beta".to_string(), 0.0, 29.25, 16.0),
+                ("bold".to_string(), 20.0, 29.25, 16.0),
+            ]
+        );
+    }
+
+    /// First row's `td`/`th` cells of a plain `<table><tr>...` fixture (UA
+    /// cell padding 1px each side, so 2px is included in every natural
+    /// width). Whitespace text boxes inside the row are skipped.
+    fn row_cells(root: &BoxNode) -> Vec<&BoxNode> {
+        root.children[0].children[0]
+            .children
+            .iter()
+            .filter(|c| c.bx.table == TableRole::Cell)
+            .collect()
+    }
+
+    #[test]
+    fn table_columns_size_to_per_column_content_maxima() {
+        let mut root = boxes_of(
+            r#"<table><tr><td>ab</td><td>abcdef</td></tr></table>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 800.0, &m4);
+        let t = &root.children[0];
+        // 2 chars = 8px text + 2px UA padding; 6 chars = 24 + 2
+        let cells = row_cells(&root);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].w, 10.0, "column 0 sized to its content");
+        assert_eq!(cells[1].w, 26.0, "column 1 sized to its own content");
+        // auto table shrink-wraps: 10 + 26 + three 2px border-spacing gaps
+        assert_eq!(t.w, 42.0, "table hugs its columns");
+        assert_eq!(cells[0].x, 2.0, "UA border-spacing pads the left edge");
+        assert_eq!(cells[1].x, 14.0, "10px cell + 2px gap + 2px gap");
+        assert!(l.runs.iter().any(|r| r.text == "ab"));
+    }
+
+    #[test]
+    fn cell_max_content_accumulates_inline_siblings() {
+        // inline boxes must not reset the line width: `<b>ab</b>cd` is one
+        // 4-char run (generic natural_w would see only 2 chars on each side)
+        let mut root = boxes_of(
+            r#"<table><tr><td><b>ab</b>cd</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let cell = &row_cells(&root)[0];
+        assert_eq!(cell.w, 16.0 + 2.0, "8px + 8px text + 2px UA padding");
+        // a <br> flushes the line: width is the WIDEST line, not their sum
+        let mut broken = boxes_of(
+            r#"<table><tr><td>abcd<br>ef</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut broken, 800.0, &m4);
+        let cell = &row_cells(&broken)[0];
+        assert_eq!(cell.w, 16.0 + 2.0, "max line, not abcd+ef");
+    }
+
+    #[test]
+    fn long_unbreakable_word_widens_column_and_table_overflows() {
+        // 40 chars = 160px, wider than the 100px container; min-content is
+        // the word itself, so the table must NOT squash it
+        let word = "a".repeat(40);
+        let mut root = boxes_of(
+            &format!(r#"<table><tr><td>{word}</td></tr></table>"#),
+            "",
+        );
+        layout_tree(&mut root, 100.0, &m4);
+        let t = &root.children[0];
+        let cell = &row_cells(&root)[0];
+        assert!(t.w > 100.0, "table overflows the 100px container: {}", t.w);
+        assert!(
+            cell.w >= 160.0,
+            "cell keeps the unbreakable word width: {}",
+            cell.w
+        );
+    }
+
+    #[test]
+    fn colspan_cell_spans_both_column_widths() {
+        let mut root = boxes_of(
+            r#"<table><tr><td>a</td><td>bb</td></tr><tr><td colspan="2">cccc</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let t = &root.children[0];
+        let first = &t.children[0].children;
+        let span = &t.children[1].children[0];
+        // first row: 6px and 10px columns; the colspan cell takes both plus
+        // the 2px gap between them, starting where the first column starts
+        assert_eq!(span.x, first[0].x, "colspan cell starts at column 0");
+        assert_eq!(
+            span.w,
+            first[0].w + first[1].w + 2.0,
+            "colspan=2 covers both column widths plus the inner gap"
+        );
+    }
+
+    #[test]
+    fn border_spacing_adds_the_gap_between_cells() {
+        let mut root = boxes_of(
+            r#"<table style="border-spacing:10px"><tr><td>a</td><td>bb</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let cells = row_cells(&root);
+        assert_eq!(cells[0].x, 10.0, "outer spacing on the left edge");
+        assert_eq!(
+            cells[1].x - (cells[0].x + cells[0].w),
+            10.0,
+            "the declared 10px gap sits between the cells"
+        );
+        assert_eq!(root.children[0].w, 6.0 + 10.0 + 3.0 * 10.0);
+    }
+
+    #[test]
+    fn border_collapse_removes_the_spacing_and_shares_the_border() {
+        let mut root = boxes_of(
+            r#"<table style="border-collapse:collapse"><tr><td>a</td><td>bb</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let cells = row_cells(&root);
+        assert_eq!(
+            cells[1].x,
+            cells[0].x + cells[0].w,
+            "collapse leaves no gap between cell boxes"
+        );
+        assert_eq!(root.children[0].w, 16.0, "6px + 10px, no spacing");
+        // with 1px borders the right border of cell 0 and the left border of
+        // cell 1 overlap, so the shared line paints once at 1px
+        let mut bordered = boxes_of(
+            r#"<table style="border-collapse:collapse"><tr><td>a</td><td>bb</td></tr></table>"#,
+            "td { border:1px solid #000 }",
+        );
+        layout_tree(&mut bordered, 800.0, &m4);
+        let c = row_cells(&bordered);
+        assert_eq!(
+            c[1].x,
+            c[0].x + c[0].w - 1.0,
+            "adjacent borders overlap by the wider 1px line"
+        );
+    }
+
+    #[test]
+    fn vertical_align_middle_centers_cell_content_in_a_taller_row() {
+        let mut root = boxes_of(
+            r#"<table><tr><td>one<br>two</td><td style="vertical-align:middle">x</td></tr></table>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 800.0, &m4);
+        let row = &root.children[0].children[0];
+        let x_run = l.runs.iter().find(|r| r.text == "x").expect("x run");
+        let line_h = x_run.style.line_height();
+        let row_mid = row.y + row.h * 0.5;
+        let run_mid = x_run.y + line_h * 0.5;
+        assert!(
+            (run_mid - row_mid).abs() < 1.0,
+            "middle cell text centered: run_mid={run_mid} row_mid={row_mid}"
+        );
+        // both cells fill the row's height (backgrounds/borders span it)
+        let cells = row_cells(&root);
+        assert_eq!(cells[1].h, row.h, "short cell stretched to the row");
+        assert_eq!(cells[0].h, row.h);
+    }
+
+    #[test]
+    fn explicit_table_width_is_distributed_proportionally_to_content() {
+        let mut root = boxes_of(
+            r#"<table style="width:600px"><tr><td>a</td><td>bb</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let t = &root.children[0];
+        let cells = row_cells(&root);
+        assert_eq!(t.w, 600.0, "declared width is the table width");
+        let total: f32 = cells.iter().map(|c| c.w).sum();
+        assert_eq!(total + 3.0 * 2.0, 600.0, "columns + gaps fill the width");
+        assert!(
+            cells[1].w > cells[0].w,
+            "extra space follows the content maxima: {} vs {}",
+            cells[0].w,
+            cells[1].w
+        );
+    }
+
+    #[test]
+    fn fixed_layout_uses_equal_columns_from_the_first_row() {
+        let mut root = boxes_of(
+            r#"<table style="table-layout:fixed;width:300px"><tr><td>a</td><td>bbbbbbbb</td></tr><tr><td>cccccccccccc</td><td>d</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let t = &root.children[0];
+        let r0 = &t.children[0].children;
+        let r1 = &t.children[1].children;
+        // 300px - three 2px border-spacing gaps = 294, split equally; the
+        // second row's long text must NOT widen its column
+        assert_eq!(r0[0].w, 147.0);
+        assert_eq!(r0[1].w, 147.0);
+        assert_eq!(r1[0].w, 147.0, "later content does not widen a fixed column");
+        assert_eq!(t.children[0].w, 300.0, "row boxes span the declared width");
+    }
+
+    #[test]
+    fn fixed_layout_honors_first_row_declared_widths() {
+        let mut root = boxes_of(
+            r#"<table style="table-layout:fixed;width:300px"><tr><td style="width:100px">a</td><td>bb</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let cells = row_cells(&root);
+        assert_eq!(cells[0].w, 100.0, "declared first-row width is used as-is");
+        // remaining pool: 300 - 3 * 2px spacing - 100
+        assert_eq!(cells[1].w, 194.0, "the free column takes the rest");
+        assert_eq!(root.children[0].w, 300.0);
+    }
+
+    #[test]
+    fn explicit_cell_width_is_a_column_floor_in_auto_layout() {
+        let mut root = boxes_of(
+            r#"<table><tr><td style="width:100px">a</td><td>b</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let cells = row_cells(&root);
+        assert_eq!(cells[0].w, 100.0, "declared width widens the column");
+        assert_eq!(cells[1].w, 6.0, "the other column keeps its content width");
+        assert_eq!(root.children[0].w, 112.0, "100 + 6 + three 2px gaps");
+        // in a narrow container the hint is a floor, so the table overflows
+        let mut narrow = boxes_of(
+            r#"<table><tr><td style="width:100px">a</td><td>b</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut narrow, 60.0, &m4);
+        let narrow_cells = row_cells(&narrow);
+        assert_eq!(narrow_cells[0].w, 100.0, "width hint survives shrinking");
+        assert!(
+            narrow.children[0].w > 60.0,
+            "table overflows instead of shrinking the hinted column"
+        );
+        // the legacy HTML width attribute maps to the same hint
+        let mut attr = boxes_of(
+            r#"<table><tr><td width="100">a</td><td>b</td></tr></table>"#,
+            "",
+        );
+        layout_tree(&mut attr, 800.0, &m4);
+        assert_eq!(row_cells(&attr)[0].w, 100.0, "width attribute is a hint");
+    }
+
+    #[test]
+    fn thead_caption_and_tfoot_render_in_document_order_regardless_of_markup() {
+        // markup order is tfoot, caption, tbody: layout must put the
+        // caption above the head/body rows and the foot last
+        let mut root = boxes_of(
+            r#"<table><tfoot><tr><td>foot</td></tr></tfoot><caption>cap</caption><tbody><tr><td>body</td></tr></tbody></table>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let t = &root.children[0];
+        let captions: Vec<&BoxNode> = t
+            .children
+            .iter()
+            .filter(|c| c.bx.table == crate::css::TableRole::Caption)
+            .collect();
+        let tfoot = t
+            .children
+            .iter()
+            .find(|c| c.bx.table == crate::css::TableRole::Foot)
+            .expect("tfoot box");
+        let tbody = t
+            .children
+            .iter()
+            .find(|c| c.bx.table == crate::css::TableRole::Body)
+            .expect("tbody box");
+        assert!(!captions.is_empty());
+        assert!(captions[0].y < tbody.y, "caption above the rows");
+        assert!(tfoot.y > tbody.y, "tfoot after the body rows");
     }
 
     // ---- typography: text-transform / letter-spacing / word-spacing /

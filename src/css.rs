@@ -63,6 +63,24 @@ pub enum Display {
     Grid,
 }
 
+/// HTML table role. Set from the tag in [`ua_box`] and consumed by
+/// layout.rs's table algorithm (`place` dispatches a `Table` box to
+/// `table_layout` instead of the block stack).
+/// shortcut: author `display: table/table-row/table-cell/...` is NOT
+/// modeled — only the HTML elements get a role (`colgroup`/`col` are
+/// dropped too), so a div-based table stays a plain block stack.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TableRole {
+    None,
+    Table,
+    Caption,
+    Head,
+    Body,
+    Foot,
+    Row,
+    Cell,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Dir {
     Row,
@@ -365,6 +383,28 @@ pub struct BoxStyle {
     /// (see block()'s `indent_left`), undeclared/invalid = 0 = today's
     /// flush-left first line.
     pub text_indent: Len,
+    /// Table role from the tag (see [`TableRole`]); layout.rs's table
+    /// algorithm owns the geometry of a `Table` subtree.
+    pub table: TableRole,
+    /// `colspan` attribute (>= 1). A cell spans this many column widths.
+    pub colspan: u16,
+    /// `rowspan` attribute, parsed and carried; layout currently IGNORES
+    /// it (see `table_layout`'s shortcut), so a rowspan cell occupies only
+    /// its own row.
+    pub rowspan: u16,
+    /// `border-collapse: collapse`. false = `separate` (the initial value):
+    /// cells are separated by `border-spacing` (UA 2px), borders stay
+    /// per-cell. true = adjacent cell boxes overlap by their shared border
+    /// widths so the pair paints as one line (see `table_layout`).
+    pub border_collapse: bool,
+    /// `border-spacing` (horizontal, vertical). Only used when
+    /// `border_collapse` is false; the UA value for `<table>` is 2px.
+    pub border_spacing: [Len; 2],
+    /// `table-layout: fixed`. false = `auto` (the initial value): columns
+    /// size from cell content. true = column count and widths come from the
+    /// FIRST row (declared cell `width`s, equal shares for the rest), and
+    /// later rows never widen a column.
+    pub table_fixed: bool,
     /// Bitmask of [`decl`] flags: which box properties the author CSS
     /// actually declared. Lets UA control chrome (`control_chrome` in
     /// layout.rs) fill only the properties the author left initial, so an
@@ -392,6 +432,9 @@ pub mod decl {
     pub const RADIUS: u32 = 1 << 4;
     pub const MIN_HEIGHT: u32 = 1 << 5;
     pub const WIDTH: u32 = 1 << 6;
+    /// author `vertical-align` — lets an HTML `valign` attribute fill the
+    /// property only when CSS left it initial (table cells)
+    pub const VALIGN: u32 = 1 << 7;
 }
 
 /// One outer `box-shadow`: offset, blur, spread, color. `color: None` =
@@ -455,6 +498,12 @@ impl Default for BoxStyle {
             transform: None,
             cursor: None,
             text_indent: Len::Px(0.0),
+            table: TableRole::None,
+            colspan: 1,
+            rowspan: 1,
+            border_collapse: false,
+            border_spacing: [Len::Px(0.0); 2],
+            table_fixed: false,
             declared: 0,
             content: None,
         }
@@ -464,14 +513,36 @@ impl Default for BoxStyle {
 /// UA box defaults for a tag — the non-inherited half of what a UA sheet
 /// would provide. This engine has no textual UA sheet: inherited defaults
 /// live in layout's `style_for` (headings, links, `<pre>`, list types), and
-/// the only element-level box default the list work needs is the classic
-/// 40px start padding on `<ul>`/`<ol>`, the gutter `outside` markers hang
-/// into. An author `padding*` wins (it sets [`decl::PAD`]); an author
-/// `padding-top` alone keeps this left edge, like a real UA rule would.
+/// the element-level box defaults live here: the classic 40px start padding
+/// on `<ul>`/`<ol>` (the gutter `outside` markers hang into), and the HTML
+/// table model — roles for `table`/`caption`/`thead`/`tbody`/`tfoot`/`tr`/
+/// `td`/`th`, the UA 2px `border-spacing` on a separate table, and the UA
+/// 1px cell padding. An author declaration wins (it sets [`decl::PAD`] or
+/// the property field); an author `padding-top` alone keeps this left edge,
+/// like a real UA rule would.
 fn ua_box(tag: &str) -> BoxStyle {
     let mut b = BoxStyle::default();
-    if matches!(tag, "ul" | "ol") {
-        b.pad[3] = Len::Px(40.0);
+    match tag {
+        "ul" | "ol" => b.pad[3] = Len::Px(40.0),
+        "table" => {
+            b.table = TableRole::Table;
+            // initial `border-spacing: 2px` (separate model); author
+            // `border-collapse: collapse` makes layout ignore it
+            b.border_spacing = [Len::Px(2.0), Len::Px(2.0)];
+        }
+        "caption" => b.table = TableRole::Caption,
+        "thead" => b.table = TableRole::Head,
+        "tbody" => b.table = TableRole::Body,
+        "tfoot" => b.table = TableRole::Foot,
+        "tr" => b.table = TableRole::Row,
+        "td" | "th" => {
+            b.table = TableRole::Cell;
+            // UA cell padding (HTML rendering section); overriding
+            // `padding` replaces it wholesale because the cascade writes
+            // all four slots for the shorthand
+            b.pad = [Len::Px(1.0); 4];
+        }
+        _ => {}
     }
     b
 }
@@ -901,6 +972,9 @@ const KNOWN: &[&str] = &[
     "border-right",
     "border-bottom",
     "border-left",
+    "border-collapse",
+    "border-spacing",
+    "table-layout",
     "position",
     "top",
     "right",
@@ -2063,6 +2137,24 @@ fn apply_decl(
                 bx.declared |= decl::BCOLOR;
             }
         }
+        // table border model (layout.rs `table_layout`): collapse overlaps
+        // adjacent cell boxes so their shared border paints once; separate
+        // keeps `border-spacing` between/around cells. `separate` and
+        // unknown keywords both select the initial model.
+        "border-collapse" => bx.border_collapse = d.1.trim() == "collapse",
+        // 1 or 2 lengths: horizontal [vertical]. The vertical value only
+        // affects the separate model; `%` resolves against the table width
+        // at layout time like every other stored length.
+        "border-spacing" => {
+            let vals: Vec<&str> = d.1.split_whitespace().collect();
+            if let Some(h) = vals.first().and_then(|t| parse_len(t, vp)) {
+                let v = vals.get(1).and_then(|t| parse_len(t, vp)).unwrap_or(h);
+                bx.border_spacing = [h, v];
+            }
+        }
+        // `fixed` takes column widths from the first row and ignores later
+        // content; `auto` (initial) and unknown keywords keep content sizing
+        "table-layout" => bx.table_fixed = d.1.trim() == "fixed",
         // flow control (layout.rs `block()`): the box leaves normal flow at
         // the current line's edge; unknown keywords — incl. the L4
         // `inline-start`/`inline-end` sides we don't model — → none
@@ -2091,7 +2183,10 @@ fn apply_decl(
                 "sub" => VAlign::Sub,
                 "super" => VAlign::Super,
                 v => parse_len(v, vp).map(VAlign::Len).unwrap_or(VAlign::Baseline),
-            }
+            };
+            // lets a `valign` ATTRIBUTE fill the property only when the
+            // cascade did not declare it (table cells)
+            bx.declared |= decl::VALIGN;
         }
         "position" => {
             bx.pos = match d.1.trim() {
