@@ -55,11 +55,12 @@
 //!   `integrity`, `referrerPolicy`) are live accessors on every element
 //!   wrapper: reads return the attribute (or ""), writes call
 //!   `setAttribute`; they are installed over the snapshot props.
-//! - `document.cookie` is an accessor in the real API, and property
-//!   accessors cannot be intercepted — so the page-facing surface is
-//!   `document.getCookie()` / `document.setCookie(str)`. The cookies
-//!   themselves are real: `src/cookie.rs` persists a jar, HttpOnly values
-//!   stay hidden from script, and every network request sends them.
+//! - `document.cookie` is a real accessor (getter returns the jar's
+//!   script-visible `name=value; ...` string, the setter stores one
+//!   `Set-Cookie` line for the page URL). The older `document.getCookie()` /
+//!   `document.setCookie(str)` pair still exists for internal callers. The
+//!   cookies themselves are real: `src/cookie.rs` persists a jar, HttpOnly
+//!   values stay hidden from script, and every network request sends them.
 //! - `localStorage` == `sessionStorage` (merged) and lives in worker RAM
 //!   for the current page only: it is dropped on navigation, never written
 //!   to disk. A real disk-backed store is a later wave. `length` is a
@@ -583,9 +584,8 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
                 js::Val::new_array(h.by_tag(&name).into_iter().map(wrap_element).collect())
             }))
         }
-        // `document.cookie` is an accessor in the real API; the interpreter
-        // has no accessor hooks, so the page-facing pair is get/setCookie
-        // (documented in the module header).
+        // the `document.cookie` accessor pair; the plain get/setCookie
+        // methods still exist for internal callers (module header)
         D_COOKIE_GET => Ok(runtime::host(|h| str_val(&h.cookie_get()))),
         D_COOKIE_SET => {
             if let Some(s) = args.first().map(|v| v.to_string()) {
@@ -1182,6 +1182,17 @@ impl PageScripts {
         doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
         doc.set("getCookie", Val::Native(ids.doc_cookie_get));
         doc.set("setCookie", Val::Native(ids.doc_cookie_set));
+        // `document.cookie` — the property the web actually reads. The plain
+        // get/set pair above predates accessor support; real pages do
+        // `document.cookie.match(...)`, which threw "of undefined" and killed
+        // Wikipedia's client-preference bootstrap.
+        doc.set(
+            "cookie",
+            Val::Acc(Rc::new(js::AccEntry {
+                getter: Some(Val::Native(ids.doc_cookie_get)),
+                setter: Some(Val::Native(ids.doc_cookie_set)),
+            })),
+        );
         // no incremental loader: by the time scripts run, parsing is finished
         doc.set("readyState", str_val("complete"));
         // null outside a `<script>`; set/cleared around each script turn
@@ -1889,6 +1900,21 @@ mod tests {
         assert!(turn.dirty, "setTextContent must mark the page dirty");
         let p = query_all_dom(&dom, "#t")[0];
         assert_eq!(child_text(&dom, p), "new");
+    }
+
+    #[test]
+    fn document_cookie_reads_as_a_string() {
+        // Wikipedia's client-preference bootstrap does
+        // `document.cookie.match(...)`; an undefined cookie killed the whole
+        // inline script. Reading must always yield a string.
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.t = typeof document.cookie;
+                window.m = document.cookie.match(/enwiki/);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "t"), "string");
     }
 
     #[test]

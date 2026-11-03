@@ -1669,6 +1669,52 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | react.dev | 158.3 MB (1534 runs; dark theme, hero copy and buttons; Next router still logs `parsePath`) |
 | 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | svelte.dev | 127.4 MB (291 runs; pixel-unchanged) |
 | 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | Wikipedia `/wiki/Main_Page` | 103.2 MB (1433 runs; unchanged, same 2 script errors) |
+| 2026-11-03 | wave 22 (flex/float measure + document.cookie) | react.dev | 150.6 MB (1534 runs; 167.4 MB on an earlier run — this page swings ~10 MB; hero h1 78px centred, buttons inline; no router error left) |
+| 2026-11-03 | wave 22 (flex/float measure + document.cookie) | svelte.dev | 91.9 MB (291 runs; pixel-unchanged) |
+| 2026-11-03 | wave 22 (flex/float measure + document.cookie) | MDN homepage | 98.5 MB (615 runs; unchanged; same single bundle `length` error) |
+| 2026-11-03 | wave 22 (flex/float measure + document.cookie) | Wikipedia `/wiki/Main_Page` | 105.7 MB (1434 runs; **zero `[js]` errors**; search toggle inside its box, no overlap with the personal links) |
+
+### Wave 22 findings
+
+- **`width: auto` must reset an earlier `width`.** The shorthand cascade kept
+  the old `decl::WIDTH`/`bx.width`, so `w-full sm:w-auto` stayed full width.
+  react.dev's hero buttons now size to their labels instead of spanning the row.
+- **Column-flex items with `align-self` ≠ stretch are shrink-to-fit and their
+  MARGIN box is centred** (previously `place()` got the full width and only the
+  box was shifted, so a centred `h1` spanned the page).
+- **`+` adjacent-sibling combinator** implemented (`Seg.adj`); Wikipedia's
+  `.cdx-button span + span` rule now hides the duplicated button labels.
+- **`inline-flex`/`inline-grid`** keep their inner flex/grid layout but sit on
+  the surrounding line (`BoxStyle.inline_box`) instead of opening a block line.
+- **Flex/grid items are block formatting contexts** (`BoxNode.bfc`): floats
+  inside them are contained and `block()` grows the box to the lowest float.
+  `overflow` ≠ visible already behaved that way and now shares the flag.
+- **Flex-row `min-height` centres items vertically** (`align-items: center/
+  end`), so icon glyphs sit in the middle of their 44px buttons.
+- **`natural_w` now clamps by `min-width`/`max-width`.** A float's prefer-width
+  comes from the intrinsic measure; Wikipedia's search toggle is an empty span
+  with a 44px touch-target minimum, so it measured 6px, the float:right sat 37px
+  past its box and overlapped "Donate"/"Create account". Fixing the measure
+  fixes both the width (44) and the position (right-aligned with the search box).
+- **`document.cookie` is a real accessor** (the getter/setter pair already
+  existed as `getCookie`/`setCookie`). Reading it returned `undefined`, so
+  Wikipedia's client-preference bootstrap threw `Cannot read property 'match' of
+  undefined` and its whole inline script died — the page actions row lost the
+  bookmark icon and the skin classes stayed at the no-JS defaults.
+- **`String.prototype.lastIndexOf` / `Array.prototype.lastIndexOf`** added; the
+  mediawiki startup loader calls `modules[i].lastIndexOf('.')` and threw
+  `undefined is not a function` (line 14, col 682), which stopped every module
+  bundle on every Wikipedia page. `/w/load.php` now runs clean and the page logs
+  **no script errors at all**.
+- **Known gaps after wave 22**: MDN's client bundle still throws `Cannot read
+  property 'length' of undefined` (reported column lands inside a CSS string, so
+  the position mapping, not the read, is suspect); SVG `<text>`/`textPath` are
+  not painted (MDN's mandala); Chrome-side geometry shows the Vector 2022 menu
+  landmark is 20px wide while its 44px button overflows it — ours reserves 44,
+  so the logo sits 24px further right; no clip/mask/filter/pattern/`use`; no real
+  `symbol` primitive, BigInt, `new.target`, class static blocks, `#x in obj`,
+  typed arrays, or live module bindings; `Set`/`Map` iterators are emulated by
+  core-js.
 
 ### Wave 21 findings
 

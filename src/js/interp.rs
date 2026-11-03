@@ -1800,6 +1800,35 @@ pub(crate) fn call_method(
             let idx = char_index_of(&s, &needle, from);
             Ok(Val::Num(idx.map(|i| i as f64).unwrap_or(-1.0)))
         }
+        StrLastIndexOf => {
+            let s = need_str(this)?;
+            let needle = arg_str(args, 0);
+            let chars: Vec<char> = s.chars().collect();
+            let search: Vec<char> = needle.chars().collect();
+            // `position` caps the START index of the match; absent (or NaN)
+            // means "anywhere", so start from the last possible slot
+            let max_start = chars.len().saturating_sub(search.len());
+            let from = match args.get(1) {
+                None | Some(Val::Undefined) => max_start,
+                Some(v) => {
+                    let n = v.to_number();
+                    if n.is_nan() {
+                        max_start
+                    } else if n < 0.0 {
+                        0
+                    } else {
+                        (n as usize).min(max_start)
+                    }
+                }
+            };
+            if search.is_empty() {
+                return Ok(Val::Num(from.min(chars.len()) as f64));
+            }
+            let idx = (0..=from)
+                .rev()
+                .find(|&start| chars[start..start + search.len()] == search[..]);
+            Ok(Val::Num(idx.map(|i| i as f64).unwrap_or(-1.0)))
+        }
         StrIncludes => {
             let s = need_str(this)?;
             let needle = arg_str(args, 0);

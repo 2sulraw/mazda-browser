@@ -159,6 +159,7 @@ pub(crate) fn install(e: &mut JsEngine) {
         "sort",
         "reverse",
         "splice",
+        "lastIndexOf",
     ]
     .iter()
     .enumerate()
@@ -1443,6 +1444,7 @@ const A_EVERY: u16 = 14;
 const A_SORT: u16 = 15;
 const A_REVERSE: u16 = 16;
 const A_SPLICE: u16 = 17;
+const A_LASTINDEXOF: u16 = 18;
 const A_ISARRAY: u16 = 100;
 
 /// Own-property check that also understands array indices/length.
@@ -1744,8 +1746,40 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                 .collect();
             Val::Str(Rc::from(parts.join(&sep).as_str()))
         }
-        A_INDEXOF | A_INCLUDES => {
+        A_INDEXOF | A_INCLUDES | A_LASTINDEXOF => {
             let needle = args.first().cloned().unwrap_or(Val::Undefined);
+            let items = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                }
+            };
+            if idx == A_LASTINDEXOF {
+                // `position` caps the START index of the match (default: end)
+                let last = items.len().saturating_sub(1);
+                let from = match args.get(1) {
+                    None | Some(Val::Undefined) => last,
+                    Some(v) => {
+                        let n = v.to_number();
+                        if n.is_nan() {
+                            last
+                        } else if n < 0.0 {
+                            // relative to the end, like the spec
+                            ((items.len() as f64 + n).max(-1.0)) as usize
+                        } else {
+                            (n as usize).min(last)
+                        }
+                    }
+                };
+                if items.is_empty() {
+                    return Ok(Val::Num(-1.0));
+                }
+                let found = (0..=from)
+                    .rev()
+                    .find(|&i| strict_eq(&items[i], &needle));
+                return Ok(Val::Num(found.map(|i| i as f64).unwrap_or(-1.0)));
+            }
             let from = args.get(1).map_or(0, |v| {
                 let n = v.to_number();
                 if n.is_nan() || n < 0.0 {
@@ -1754,13 +1788,6 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                     n as usize
                 }
             });
-            let items = {
-                let b = o.borrow();
-                match &b.kind {
-                    ObjKind::Array(items) => items.clone(),
-                    _ => Vec::new(),
-                }
-            };
             let found = items
                 .iter()
                 .skip(from)
@@ -2020,6 +2047,7 @@ const STR_METHODS: &[(&str, Meth)] = &[
     ("slice", Meth::StrSlice),
     ("substring", Meth::StrSlice),
     ("indexOf", Meth::StrIndexOf),
+    ("lastIndexOf", Meth::StrLastIndexOf),
     ("includes", Meth::StrIncludes),
     ("split", Meth::StrSplit),
     ("replace", Meth::StrReplace),

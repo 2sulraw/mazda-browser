@@ -632,6 +632,11 @@ pub struct BoxNode {
     /// `<textarea>`) and for author `display: inline-block`; `block()` is
     /// the only flow that reads it
     pub inline: bool,
+    /// this box establishes a block formatting context (a flex/grid ITEM,
+    /// or `overflow` ≠ visible): floats inside it are contained, so the box
+    /// grows to their bottom edge. Set by the flex/grid placement and read
+    /// by `block()`.
+    pub bfc: bool,
     pub children: Vec<BoxNode>,
     // layout output (absolute CSS px)
     pub x: f32,
@@ -666,6 +671,7 @@ impl BoxNode {
             img_clip: None,
             form: None,
             inline: false,
+            bfc: false,
             children: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -695,6 +701,7 @@ impl BoxNode {
             img_clip: None,
             form: None,
             inline: false,
+            bfc: false,
             children: Vec::new(),
             x: 0.0,
             y: 0.0,
@@ -800,6 +807,13 @@ fn mask_placeholder(url: &str, style: Style, parent: &BoxStyle) -> BoxNode {
     g
 }
 
+/// True when a box is inline-LEVEL: `display: inline-block` and the
+/// `inline-flex`/`inline-grid` pair (`bx.inline_box`) all sit on the
+/// surrounding text line and shrink to fit instead of filling the parent.
+fn inline_level(bx: &BoxStyle) -> bool {
+    bx.display == Display::InlineBlock || bx.inline_box
+}
+
 /// True when a box's style paints chrome (background, border, shadow,
 /// horizontal padding) — an INLINE element with chrome gets a real inline
 /// box instead of flattening into the parent flow, and a pseudo-element
@@ -866,6 +880,7 @@ fn pseudo_box(
         out.bx.display,
         Display::Block | Display::Flex | Display::Grid
     );
+    let inline_box = out.bx.inline_box;
     let boxed = stacked || chrome || out.bx.display == Display::InlineBlock;
     if !boxed && text.is_empty() {
         return None; // nothing visible (e.g. a lone `content: counter(x)`)
@@ -874,7 +889,7 @@ fn pseudo_box(
         let mut g = BoxNode::group(out.style, out.bx);
         g.node = Some(node);
         g.bx.cursor = cur;
-        g.inline = !stacked;
+        g.inline = !stacked || inline_box;
         let mut l = BoxNode::leaf(out.style, text, false, link);
         l.node = Some(node);
         l.bx.cursor = cur;
@@ -1080,9 +1095,9 @@ fn build_into(
                     if let Some(src) = crate::srcset::pick_img_source(dom, child, sheet.viewport_w()) {
                         g.img = Some(ImgSlot::Pending(std::rc::Rc::from(src.as_str())));
                     }
-                    // author `inline-block` on a replaced box sits on the
-                    // text line like any other inline-block
-                    g.inline = g.bx.display == Display::InlineBlock;
+                    // author `inline-block`/`inline-flex` on a replaced box
+                    // sits on the text line like any other inline-level box
+                    g.inline = inline_level(&g.bx);
                     out.push(g);
                     continue;
                 }
@@ -1127,7 +1142,7 @@ fn build_into(
                         g.bx.height = dom.attr(child, "height").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
                     }
                     g.img = Some(ImgSlot::Pending(std::rc::Rc::from(markup)));
-                    g.inline = g.bx.display == Display::InlineBlock;
+                    g.inline = inline_level(&g.bx);
                     out.push(g);
                     continue;
                 }
@@ -1145,7 +1160,7 @@ fn build_into(
                     g.bx.cursor = cur;
                     // UA default is inline-block (joins the surrounding text
                     // line); an author display opts out and stacks
-                    g.inline = matches!(g.bx.display, Display::Auto | Display::InlineBlock);
+                    g.inline = g.bx.display == Display::Auto || inline_level(&g.bx);
                     g.form = Some(FormCtl {
                         node: child,
                         kind: FormKind::Submit,
@@ -1276,7 +1291,7 @@ fn build_into(
                     // `display:inline-block` keeps that placement (inline-level
                     // in real engines too); `display:block/flex/grid` opts out
                     // and stacks.
-                    g.inline = matches!(g.bx.display, Display::Auto | Display::InlineBlock);
+                    g.inline = g.bx.display == Display::Auto || inline_level(&g.bx);
                     g.form = Some(FormCtl { node: child, kind, value: raw });
                     if let Some(t) = text {
                         let mut st = outcome.style;
@@ -1405,10 +1420,10 @@ fn build_into(
                     if let Some(b) = before {
                         g.children.push(b);
                     }
-                    // inline-block: a real box (background/border paint),
-                    // but placed ON the surrounding text line by block()'s
-                    // inline branch instead of stacking
-                    g.inline = g.bx.display == Display::InlineBlock;
+                    // inline-block / inline-flex: a real box (background/
+                    // border paint) placed ON the surrounding text line by
+                    // block()'s inline branch instead of stacking
+                    g.inline = inline_level(&g.bx);
                     build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
                     if let Some(a) = after {
                         g.children.push(a);
@@ -3617,15 +3632,22 @@ fn place(
     }
     // min-height: floor the content height. A flex column with vertical
     // `justify` pushes its stack into the freed space (hero uses
-    // `min-h-[560px] justify-end` so the NEXT outline floats above the pill).
+    // `min-h-[560px] justify-end` so the NEXT outline floats above the pill),
+    // and a centred single-line flex ROW centres its items in the same space
+    // (a 44px icon button must centre its 10px glyph).
     // shortcut: `%` min-height resolves against width, not the container
-    // height (real pages use px here).
+    // height (real pages use px here). `min-height` floors the CONTENT
+    // height (the engine's height model is content-box; widths are
+    // border-box), so a 44px icon button with a 1px border is 46 tall.
     if let Some(mh) = n.bx.min_height {
         let min_px = resolve_len(mh, avail);
         if n.h < min_px {
-            let dy = match (n.bx.display, n.bx.dir, n.bx.justify) {
-                (Display::Flex, Dir::Column, Justify::Center) => (min_px - n.h) * 0.5,
-                (Display::Flex, Dir::Column, Justify::End) => min_px - n.h,
+            let extra = min_px - n.h;
+            let dy = match (n.bx.display, n.bx.dir, n.bx.justify, n.bx.align) {
+                (Display::Flex, Dir::Column, Justify::Center, _) => extra * 0.5,
+                (Display::Flex, Dir::Column, Justify::End, _) => extra,
+                (Display::Flex, Dir::Row, _, Align::Center) if !n.bx.wrap => extra * 0.5,
+                (Display::Flex, Dir::Row, _, Align::End) if !n.bx.wrap => extra,
                 _ => 0.0,
             };
             if dy != 0.0 {
@@ -3983,11 +4005,23 @@ fn natural_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> 
     if n.is_text {
         return content;
     }
-    content
+    let mut w = content
         + resolve_len(n.bx.pad[3], avail)
         + resolve_len(n.bx.pad[1], avail)
         + resolve_len(n.bx.border[3], avail)
-        + resolve_len(n.bx.border[1], avail)
+        + resolve_len(n.bx.border[1], avail);
+    // `min-width`/`max-width` bound the USED width, so an intrinsic measure
+    // that feeds shrink-to-fit, float prefer-widths and flex item bases must
+    // clamp to them as well (`place()` already does). Wikipedia's icon button
+    // is an empty span with a 44px touch-target minimum: unmeasured, the
+    // float:right shrank to its border and hung 37px past the search box.
+    if let Some(m) = n.bx.max_width {
+        w = w.min(resolve_len(m, avail));
+    }
+    if let Some(m) = n.bx.min_width {
+        w = w.max(resolve_len(m, avail));
+    }
+    w
 }
 
 fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
@@ -5064,6 +5098,13 @@ fn block(
     if let Some((top, h, _)) = cont {
         y = top + h;
     }
+    // a block formatting context (flex/grid item, `overflow` ≠ visible)
+    // contains its own floats: the box grows down to the lowest float
+    if n.bfc || n.bx.clip {
+        for f in &floats[flt.len()..] {
+            y = y.max(f.y1);
+        }
+    }
     n.h = y - n.y;
     n.open = cont.is_some();
 }
@@ -5373,6 +5414,10 @@ fn flex_line(
                 // a % item's width was already converted to the row's exact
                 // reserved px above, so the slot width is the containing
                 // block measure — no re-resolution here
+                // a flex item establishes an independent formatting context:
+                // floats inside it are contained (Wikipedia's collapsed
+                // search button is a float:right only child)
+                n.children[i].bfc = true;
                 let adv = place(&mut n.children[i], x, y, w, measure, runs, uls, &[]);
                 (adv, n.children[i].open) // cross-size = margin box
             }
@@ -5441,11 +5486,29 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
                 (l.height, l.open_line)
             }
             Item::Grp(i) => {
-                let adv = place(&mut n.children[*i], n.x, y, n.w, measure, runs, uls, &[]);
+                // cross-axis sizing: `stretch` (the initial `align-items`)
+                // fills the line, while start/center/end size the item to
+                // fit-content. Passing the full width and only shifting it
+                // afterwards made react.dev's centred `h1` span the page.
                 let align = n.children[*i].bx.align_self.unwrap_or(n.bx.align);
+                let avail = if align == Align::Stretch {
+                    n.w
+                } else {
+                    let ml = resolve_len(n.children[*i].bx.margin[3], n.w);
+                    let mr = resolve_len(n.children[*i].bx.margin[1], n.w);
+                    (natural_w(&n.children[*i], n.w, measure) + ml + mr).min(n.w)
+                };
+                // a column flex item also establishes an independent
+                // formatting context (floats inside it are contained)
+                n.children[*i].bfc = true;
+                let adv = place(&mut n.children[*i], n.x, y, avail, measure, runs, uls, &[]);
+                // centre/end the MARGIN box, not just the border box
+                let ml = resolve_len(n.children[*i].bx.margin[3], n.w);
+                let mr = resolve_len(n.children[*i].bx.margin[1], n.w);
+                let outer = n.children[*i].w + ml + mr;
                 let dx = match align {
-                    Align::Center => (n.w - n.children[*i].w) * 0.5,
-                    Align::End => n.w - n.children[*i].w,
+                    Align::Center => (n.w - outer) * 0.5,
+                    Align::End => n.w - outer,
                     _ => 0.0,
                 };
                 if dx != 0.0 {
@@ -5639,6 +5702,8 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                     (l.height, l.open_line)
                 }
                 Item::Grp(i) => {
+                    // grid items establish an independent formatting context
+                    n.children[i].bfc = true;
                     let adv = place(&mut n.children[i], x, y, w, measure, runs, uls, &[]);
                     (adv, n.children[i].open)
                 }
@@ -6731,6 +6796,42 @@ mod tests {
     }
 
     #[test]
+    fn column_flex_centred_item_shrinks_to_fit_content() {
+        // react.dev's `h1.self-center.flex` in a column flex: centre aligns the
+        // margin box and sizes the item to fit-content, it does not stretch.
+        let mut item = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                align_self: Some(Align::Center),
+                ..BoxStyle::default()
+            },
+        );
+        item.children = vec![leaf("abcd")]; // 16px
+        let mut text = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                align_self: Some(Align::Center),
+                ..BoxStyle::default()
+            },
+        );
+        text.children = vec![leaf("abcdefghij")]; // 40px
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Flex,
+                dir: Dir::Column,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![item, text];
+        layout_tree(&mut n, 100.0, &m4);
+        assert_eq!(n.children[0].w, 16.0, "fit-content, not 100");
+        assert_eq!(n.children[1].w, 40.0);
+    }
+
+    #[test]
     fn flex_grow_fills_free_space() {
         // The growable item absorbs everything the fixed one leaves, so a
         // `justify-content: flex-end` row no longer pushes it into a corner
@@ -7789,6 +7890,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn float_right_honours_min_width_when_measuring() {
+        // a float whose content is empty but that declares a min-width must
+        // be measured AT that minimum, or its right edge overshoots the
+        // containing block (Wikipedia's 44px icon-only button)
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        let mut fl = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                float: Float::Right,
+                min_width: Some(Len::Px(44.0)),
+                ..BoxStyle::default()
+            },
+        );
+        fl.inline = true;
+        root.children = vec![fl];
+        layout_tree(&mut root, 300.0, &m4);
+        let f = &root.children[0];
+        assert!((f.w - 44.0).abs() < 0.01, "float w={} (expect 44)", f.w);
+        assert!((f.x - 256.0).abs() < 0.01, "float x={} (expect 256)", f.x);
     }
 
     #[test]
@@ -9403,17 +9526,17 @@ mod tests {
     }
 
     #[test]
-    fn inline_flex_and_inline_grid_still_stack_as_blocks() {
-        // shortcut: inline-flex/inline-grid map to Block (no inline layout
-        // mode) — they stack rather than sit mid-line; asserted so the
-        // known gap is explicit
+    fn inline_flex_sits_on_the_line_and_shrinks_to_fit() {
+        // a span with `display:inline-flex` is inline-level: both boxes share
+        // the text line and neither fills the block (they were Block before)
         let dom = crate::html::parse(r#"<div><span class="ib">A</span><span class="ib">B</span></div>"#);
-        let sheet = crate::css::parse(r#".ib { display: inline-flex; }"#);
+        let sheet = crate::css::parse(r#".ib { display: inline-flex }"#);
         let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
         let l = layout_tree(&mut root, 500.0, &m4);
         let a = l.runs.iter().find(|r| r.text == "A").expect("A run");
         let b = l.runs.iter().find(|r| r.text == "B").expect("B run");
-        assert!(b.y > a.y + 1.0, "inline-flex stacks (documented shortcut)");
+        assert!((a.y - b.y).abs() < 1.0, "both on one line (a={} b={})", a.y, b.y);
+        assert!(b.x > a.x, "B follows A on the line");
     }
 
     #[test]

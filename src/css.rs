@@ -302,6 +302,12 @@ pub struct Transform {
 #[derive(Clone, PartialEq, Debug)]
 pub struct BoxStyle {
     pub display: Display,
+    /// true for `display: inline-flex` / `inline-grid`: the box keeps its
+    /// Flex/Grid inner layout but is inline-LEVEL — it shrinks to fit and
+    /// sits on the surrounding text line instead of filling the parent.
+    /// Without this every icon button and pill in the web laid out as a
+    /// full-width block (Wikipedia's header menu button).
+    pub inline_box: bool,
     pub dir: Dir,
     pub justify: Justify,
     pub align: Align,
@@ -562,6 +568,7 @@ impl Default for BoxStyle {
     fn default() -> Self {
         BoxStyle {
             display: Display::Auto,
+            inline_box: false,
             dir: Dir::Row,
             justify: Justify::Start,
             align: Align::Stretch,
@@ -802,6 +809,9 @@ struct Seg {
     pseudo_el: Option<PseudoEl>,
     /// joined to the left segment by `>` (else descendant)
     child: bool,
+    /// joined to the left segment by `+` (immediately preceding element
+    /// sibling). Takes precedence over `child` — `+` implies the same parent.
+    adj: bool,
 }
 
 struct Rule {
@@ -2248,10 +2258,17 @@ fn apply_decl(
             // inline-block: a real box that still sits on the text line
             // (layout.rs `block()` places `inline` boxes mid-line)
             "inline-block" => bx.display = Display::InlineBlock,
-            // shortcut: inline-flex/inline-grid still stack as blocks — a
-            // real engine lays their flex/grid session out mid-line, which
-            // needs an inline layout mode this engine doesn't have yet
-            "inline-flex" | "inline-grid" => bx.display = Display::Block,
+            // inline-flex/inline-grid: same inner layout, inline-LEVEL box
+            // (shrink-to-fit, sits on the text line) — an icon button must
+            // not fill its parent the way a block flex would
+            "inline-flex" => {
+                bx.display = Display::Flex;
+                bx.inline_box = true;
+            }
+            "inline-grid" => {
+                bx.display = Display::Grid;
+                bx.inline_box = true;
+            }
             "inline" => bx.display = Display::Inline,
             _ => {}
         },
@@ -2450,7 +2467,13 @@ fn apply_decl(
             }
         }
         "width" => {
-            if let Some(l) = parse_len(&d.1, vp).filter(|_| d.1 != "auto") {
+            // `width: auto` must RESET an earlier declaration, not fall
+            // through to it: `w-full sm:w-auto` sets 100% then auto, and
+            // keeping the 100% stretched react.dev's hero buttons full width.
+            if d.1 == "auto" {
+                bx.width = None;
+                bx.declared &= !decl::WIDTH;
+            } else if let Some(l) = parse_len(&d.1, vp) {
                 bx.width = Some(l);
                 bx.declared |= decl::WIDTH;
             }
@@ -4541,9 +4564,9 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
     if s.is_empty() {
         return None;
     }
-    // Tokenize on whitespace and '>' — but NOT inside `(...)` (pseudo-class
-    // args like `:is(h1, h2)` or `:nth-child(2n + 1)` may contain both) or
-    // `[...]` (attribute values like `[title="a b"]`).
+    // Tokenize on whitespace, '>' and '+' — but NOT inside `(...)` (pseudo-
+    // class args like `:is(h1, h2)` or `:nth-child(2n + 1)` may contain
+    // them) or `[...]` (attribute values like `[title="a b"]`).
     // shortcut: paren/bracket depth isn't quote-aware — a `]` inside a
     // quoted attribute value unbalances the count (real selectors rarely do
     // this; split_selectors has the same shortcut).
@@ -4564,10 +4587,14 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
             b')' | b']' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        if depth == 0 && (bytes[i].is_ascii_whitespace() || bytes[i] == b'>') {
+        if depth == 0
+            && (bytes[i].is_ascii_whitespace() || bytes[i] == b'>' || bytes[i] == b'+')
+        {
             flush(&mut tokens, s, start, i);
             if bytes[i] == b'>' {
                 tokens.push(">");
+            } else if bytes[i] == b'+' {
+                tokens.push("+");
             }
             i += 1;
             start = i;
@@ -4579,6 +4606,7 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
 
     let mut segs: Vec<Seg> = Vec::new();
     let mut pending_child = false;
+    let mut pending_adj = false;
     for t in tokens {
         if t == ">" {
             if segs.is_empty() {
@@ -4587,9 +4615,18 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
             pending_child = true;
             continue;
         }
+        if t == "+" {
+            if segs.is_empty() {
+                return None; // stray combinator
+            }
+            pending_adj = true;
+            continue;
+        }
         let mut seg = parse_compound(t)?;
         seg.child = pending_child;
+        seg.adj = pending_adj;
         pending_child = false;
+        pending_adj = false;
         segs.push(seg);
     }
     if segs.is_empty() {
@@ -4613,6 +4650,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
         nots: Vec::new(),
         pseudo_el: None,
         child: false,
+        adj: false,
     };
     let b: Vec<char> = s.chars().collect();
     let mut i = 0usize;
@@ -5006,7 +5044,31 @@ fn leftmost_match(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> Opt
     }
     while idx > 0 {
         let need_child = segs[idx].child;
+        let need_adj = segs[idx].adj;
         idx -= 1;
+        if need_adj {
+            // `a + b`: the left compound must match b's immediately
+            // PRECEDING element sibling (text nodes skipped)
+            let parent = dom.nodes[cur as usize].parent;
+            if parent == cur {
+                return None;
+            }
+            let mut prev = None;
+            for &c in &dom.nodes[parent as usize].children {
+                if c == cur {
+                    break;
+                }
+                if is_element(dom, c) {
+                    prev = Some(c);
+                }
+            }
+            let sib = prev?;
+            if !seg_matches(dom, sib, &segs[idx], hover) {
+                return None;
+            }
+            cur = sib;
+            continue;
+        }
         loop {
             let parent = dom.nodes[cur as usize].parent;
             if parent == 0 {
@@ -5675,6 +5737,18 @@ mod tests {
     }
 
     #[test]
+    fn width_auto_resets_an_earlier_width() {
+        // `w-full sm:w-auto`: the breakpoint's `auto` must clear the 100%,
+        // not fall through to it (react.dev's hero buttons were full width)
+        let sheet = parse(".a { width: 100% } .b { width: auto }");
+        let dom = dom_of("<div class='a b'></div>");
+        let node = by_tag(&dom, "div");
+        let st = sheet.resolve(&dom, node, Style::new(), None);
+        assert!(st.bx.width.is_none(), "auto clears the width");
+        assert_eq!(st.bx.declared & decl::WIDTH, 0, "declared bit cleared too");
+    }
+
+    #[test]
     fn specificity_wins() {
         let sheet = parse("#a { color: #111111 } .b { color: #222222 } div { color: #333333 }");
         let dom = dom_of("<div id=a class=b></div>");
@@ -5702,6 +5776,35 @@ mod tests {
         let z = by_attr(&dom, "id", "z");
         assert_eq!(sheet2.resolve(&dom, y, Style::new(), None).style.color, 0x111111);
         assert_eq!(sheet2.resolve(&dom, z, Style::new(), None).style.color, 0x999999);
+    }
+
+    #[test]
+    fn adjacent_sibling_combinator() {
+        // `span + span` must not match a span that is the FIRST element child
+        // and must skip text nodes in between
+        let sheet = parse(
+            "label span + span { color: #111111 } label span { color: #999999 } \
+             p + q { color: #222222 } q { color: #999999 }",
+        );
+        let dom = dom_of(
+            "<label><span id=a></span> <span id=b></span></label><p></p><q id=c></q><q id=d></q>",
+        );
+        let a = by_attr(&dom, "id", "a");
+        let b = by_attr(&dom, "id", "b");
+        assert_eq!(sheet.resolve(&dom, a, Style::new(), None).style.color, 0x999999);
+        assert_eq!(
+            sheet.resolve(&dom, b, Style::new(), None).style.color,
+            0x111111,
+            "second span follows its sibling across a text node"
+        );
+        let c = by_attr(&dom, "id", "c");
+        let d = by_attr(&dom, "id", "d");
+        assert_eq!(sheet.resolve(&dom, c, Style::new(), None).style.color, 0x222222);
+        assert_eq!(
+            sheet.resolve(&dom, d, Style::new(), None).style.color,
+            0x999999,
+            "a + b only matches the immediately preceding sibling"
+        );
     }
 
     #[test]
@@ -7380,10 +7483,13 @@ mod tests {
         );
         let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
         assert_eq!(bx("ib").display, Display::InlineBlock);
-        // shortcut: inline-flex/inline-grid still collapse to Block (no
-        // inline layout mode yet)
-        assert_eq!(bx("iflex").display, Display::Block);
-        assert_eq!(bx("igrid").display, Display::Block);
+        // inline-flex/inline-grid keep their inner layout but are inline-LEVEL
+        assert_eq!(bx("iflex").display, Display::Flex);
+        assert!(bx("iflex").inline_box);
+        assert_eq!(bx("igrid").display, Display::Grid);
+        assert!(bx("igrid").inline_box);
+        assert!(!bx("ib").inline_box, "inline-block uses its own display");
+        assert!(!BoxStyle::default().inline_box);
     }
 
     #[test]

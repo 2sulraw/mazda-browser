@@ -664,6 +664,9 @@ fn array_methods() {
     assert_eq!(string("let a = [1,2,3,4]; a.filter(function(v) { return v % 2 == 0 }).join(',')"), "2,4");
     assert_eq!(num("let a = [1,2,3]; a.indexOf(2)"), 1.0);
     assert_eq!(num("let a = [1,2,3]; a.indexOf(9)"), -1.0);
+    assert_eq!(num("let a = [1,2,1]; a.lastIndexOf(1)"), 2.0);
+    assert_eq!(num("let a = [1,2,1]; a.lastIndexOf(1, 1)"), 0.0);
+    assert_eq!(num("let a = [1,2,1]; a.lastIndexOf(9)"), -1.0);
     assert_eq!(string("let a = [1,2,3]; a.slice(1).join(',')"), "2,3");
     assert_eq!(string("let a = [1,2]; a.concat([3], 4).join(',')"), "1,2,3,4");
     assert!(boolean("let a = [1,2]; a.includes(2)"));
@@ -692,6 +695,10 @@ fn string_methods() {
     assert_eq!(string("'hello'.slice(-2)"), "lo");
     assert_eq!(num("'hello'.indexOf('ll')"), 2.0);
     assert_eq!(num("'hello'.indexOf('z')"), -1.0);
+    assert_eq!(num("'hello'.lastIndexOf('l')"), 3.0);
+    assert_eq!(num("'hello'.lastIndexOf('l', 2)"), 2.0);
+    assert_eq!(num("'hello'.lastIndexOf('z')"), -1.0);
+    assert_eq!(num("'abc'.lastIndexOf('')"), 3.0);
     assert!(boolean("'hello'.includes('ell')"));
     assert!(boolean("'hello'.startsWith('he')"));
     assert!(boolean("'hello'.endsWith('lo')"));
