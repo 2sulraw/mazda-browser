@@ -3161,6 +3161,23 @@ fn content_min_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
             } else {
                 min_content_w(c, avail, measure)
             };
+            // a child's min-content contribution is its MARGIN box, exactly
+            // like the max-content one: negative margins shrink it. This is
+            // what lets a flex item's automatic minimum (min-width: auto)
+            // drop below the border box of its single child — Vector 2022's
+            // menu landmark stays 20px wide (44px button, `margin: 0 -12px`)
+            // instead of holding the logo 24px to the right.
+            let cw = cw
+                + (if c.bx.margin_l_auto {
+                    0.0
+                } else {
+                    resolve_len(c.bx.margin[3], avail)
+                })
+                + (if c.bx.margin_r_auto {
+                    0.0
+                } else {
+                    resolve_len(c.bx.margin[1], avail)
+                });
             if flex_row {
                 m += cw;
                 k += 1;
@@ -4159,7 +4176,20 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
             .filter(|c| {
                 !c.is_bg && !c.is_mask && !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed)
             })
-            .map(|c| natural_w(c, avail, measure))
+            .map(|c| {
+                // same margin-box contribution as the block branch
+                natural_w(c, avail, measure)
+                    + (if c.bx.margin_l_auto {
+                        0.0
+                    } else {
+                        resolve_len(c.bx.margin[3], avail)
+                    })
+                    + (if c.bx.margin_r_auto {
+                        0.0
+                    } else {
+                        resolve_len(c.bx.margin[1], avail)
+                    })
+            })
             .fold(0.0f32, f32::max),
         (Display::Grid, _) => {
             if n.bx.cols.is_empty() {
@@ -4172,6 +4202,19 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
         _ => {
             let mut m = 0.0f32;
             let mut run = 0.0f32;
+            // Formatting whitespace between boxes is not content: a container
+            // whose children are all block-level discards it entirely. Our
+            // text runs keep the source's newlines/tabs, and measuring them
+            // made Vector 2022's menu landmark 43.7px wide (the whitespace
+            // inside `<nav>`) on top of the 20px its button contributes —
+            // the logo sat 24px too far right.
+            let any_inline = n.children.iter().any(|c| {
+                !c.is_bg
+                    && !c.is_mask
+                    && !matches!(c.bx.pos, Pos::Absolute | Pos::Fixed)
+                    && ((!c.is_text && c.inline)
+                        || (c.is_text && !c.text.trim().is_empty()))
+            });
             for c in &n.children {
                 if c.is_bg
                     || c.is_mask
@@ -4180,20 +4223,31 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
                     continue; // out of flow: no contribution to shrink-to-fit
                 }
                 if c.is_text {
+                    if !any_inline && c.text.trim().is_empty() {
+                        continue; // formatting whitespace only
+                    }
                     run += natural_w(c, avail, measure);
                 } else {
-                    // inline children advance the line by their horizontal
-                    // margins (block()'s inline branch adds the same ml+mr
-                    // while laying out), so the shrink-to-fit measure must
-                    // count them or the box under-sizes and its right-hand
-                    // content is advanced past by siblings
-                    let w = if c.inline {
-                        natural_w(c, avail, measure)
-                            + resolve_len(c.bx.margin[3], avail)
-                            + resolve_len(c.bx.margin[1], avail)
-                    } else {
-                        natural_w(c, avail, measure)
-                    };
+                    // A child's max-content contribution is its MARGIN box:
+                    // inline children advance the line by their margins
+                    // (block()'s inline branch adds the same ml+mr), and a
+                    // block child's outer width counts them too. Negative
+                    // margins therefore SHRINK the parent — Vector 2022's menu
+                    // landmark is exactly that: a flex item whose only child
+                    // is the 44px button with `margin: 0 -12px`, so it
+                    // contributes 20px, not 44, and the logo lands 24px
+                    // further left. Auto margins take no space at all.
+                    let w = natural_w(c, avail, measure)
+                        + (if c.bx.margin_l_auto {
+                            0.0
+                        } else {
+                            resolve_len(c.bx.margin[3], avail)
+                        })
+                        + (if c.bx.margin_r_auto {
+                            0.0
+                        } else {
+                            resolve_len(c.bx.margin[1], avail)
+                        });
                     m = m.max(run).max(w);
                     run = 0.0;
                 }
@@ -8118,6 +8172,97 @@ mod tests {
         let f = &root.children[0];
         assert!((f.w - 44.0).abs() < 0.01, "float w={} (expect 44)", f.w);
         assert!((f.x - 256.0).abs() < 0.01, "float x={} (expect 256)", f.x);
+    }
+
+    #[test]
+    fn negative_block_child_margins_shrink_the_shrink_to_fit_parent() {
+        // Vector 2022's header: the site-menu landmark is a flex item whose
+        // only in-flow child is the button-sized dropdown with
+        // `margin: 0 -12px`. Its max-content contribution is the child's
+        // MARGIN box (44 - 24 = 20), so the logo starts at 20 + 20 gap;
+        // counting only the border box pushed every following header item
+        // 24px to the right.
+        let markup = "<div id=h>\n  <nav id=n>\n    <div id=d><span id=s></span></div>\n  </nav>\n  <div id=logo>LOGO</div>\n</div>";
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse(
+            "#h{display:flex;gap:20px} #d{margin:0 -12px} \
+             #s{display:inline-flex;min-width:44px}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        layout_in(&mut root, 600.0, 100.0, &m4);
+        let h = &root.children[0];
+        let find = |id: &str| {
+            h.children
+                .iter()
+                .find(|b| b.node == Some(id_by_attr(&dom, id)))
+                .unwrap_or_else(|| panic!("no box for #{id}"))
+        };
+        let nav = find("n");
+        assert!((nav.w - 20.0).abs() < 0.01, "landmark w={} (expect 20)", nav.w);
+        let logo = find("logo");
+        assert!(
+            (logo.x - 40.0).abs() < 0.01,
+            "logo x={} (expect 20 + 20 gap)",
+            logo.x
+        );
+    }
+
+    /// A negative left margin moves the border box left of its container and
+    /// widens it by the same 24px (the two -12px margins).
+    #[test]
+    fn negative_block_margin_shifts_the_box_left_of_its_container() {
+        // Vector 2022's dropdown sits 12px left of the 20px landmark it
+        // belongs to (`margin: 0 -12px`): the border box starts at the
+        // container's left edge MINUS the negative margin and is 44 wide.
+        let mut root = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(20.0)),
+                ..BoxStyle::default()
+            },
+        );
+        let mut child = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                height: Some(Len::Px(10.0)),
+                margin: [Len::Px(0.0), Len::Px(-12.0), Len::Px(0.0), Len::Px(-12.0)],
+                ..BoxStyle::default()
+            },
+        );
+        child.children = vec![leaf("x")];
+        root.children = vec![child];
+        layout_tree(&mut root, 200.0, &m4);
+        // root is width:20 at x=0, so the child starts at -12 and is 44 wide
+        assert!((root.children[0].x - (-12.0)).abs() < 0.01, "x={}", root.children[0].x);
+        assert!((root.children[0].w - 44.0).abs() < 0.01, "w={}", root.children[0].w);
+    }
+
+    /// Formatting whitespace between block-level boxes contributes no width
+    /// to a shrink-to-fit parent, while a real space between inline boxes
+    /// still separates them.
+    #[test]
+    fn formatting_whitespace_between_boxes_is_not_content() {
+        let markup = "<div id=h>\n  <div id=a>A</div>\n  <div id=b>BB</div>\n</div>";
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse("#h{display:inline-block}");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        layout_in(&mut root, 600.0, 100.0, &m4);
+        let h = &root.children[0];
+        assert!(
+            (h.w - 8.0).abs() < 0.01,
+            "whitespace-only lines must not widen the box: w={} (expect the widest 'BB')",
+            h.w
+        );
+        // …but whitespace between inline content is a real space
+        let markup = "<div id=h><b id=a>A</b> <b id=b>B</b></div>";
+        let dom = crate::html::parse(markup);
+        let sheet = crate::css::parse("#h{display:inline-block}");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        layout_in(&mut root, 600.0, 100.0, &m4);
+        let h = &root.children[0];
+        assert!((h.w - 12.0).abs() < 0.01, "inline space kept: w={}", h.w);
     }
 
     #[test]

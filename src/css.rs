@@ -7192,6 +7192,8 @@ mod tests {
         );
         // trailing junk / malformed → unresolvable
         assert_eq!(parse_len("calc(10px +)", VP), None);
+        // a single negative argument (Vector 2022's flush-left margin)
+        assert_eq!(parse_len("calc(-12px)", VP), Some(Len::Px(-12.0)));
     }
 
     #[test]
