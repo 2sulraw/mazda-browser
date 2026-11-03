@@ -1683,8 +1683,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 24 (intrinsic margin contributions) | rust-lang.org | 89.2 MB (452 boxes, 483 runs; pixel-unchanged) |
 | 2026-11-03 | wave 25 (box-sizing heights) | Wikipedia `/wiki/Main_Page` | 112.2 MB (1434 runs, 1347 boxes; restored snapshot; every 44px icon button now measures **44 tall** with its 1px border, previously 46 — `MAZDA_DUMP_BOXES=2` shows `label...cdx-button… h=44` and `a...search-toggle h=44`) |
 | 2026-11-03 | wave 25 (box-sizing heights) | MDN `/Web/CSS/list-style-type` | 88.7 MB (2773 runs; layout unchanged, same pre-existing bundle `length` error) |
-| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests - clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport - plus the new tokenizer test and the whole suite: default **707**, `engine-b + woff2` **711**) |
-| 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **725** pass / 0 fail; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
+| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests - clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport - plus the new tokenizer test and the whole suite: default **735**, `engine-b + woff2` **739** with all six waves merged) |
+| 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **735** pass / 0 fail after the other five waves merged; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
 
 ### Wave 29 findings
 
@@ -1734,6 +1734,15 @@ curve matters more than the baseline (near-flat as tabs grow).
   `toString`, `toBase64` only — no `map`/`filter`/`forEach`/`sort`/`indexOf`.
   `BigInt64Array`/`BigUint64Array` store through the same numeric conversion
   (i128 → f64) instead of a true 64-bit integer path.
+- **Two hot-path fixes from the audit.** `**` with a BigInt exponent answers
+  bases `0`/`1`/`-1` directly and rejects exponents above 127, instead of
+  multiplying up to `u32::MAX` times (`1n ** 4294967295n` used to spin for
+  ~4 billion iterations — the JS step budget does not cover builtin loops).
+  `new TypedArray(len)` reserves the zeroed bytes and wraps a view over them,
+  instead of building a `len`-element `Vec<Val>` (~24 B/element) first; the
+  `1<<24` element cap still applies. Guards:
+  `bigint_pow_does_not_spin_on_huge_exponents`,
+  `typed_array_length_ctor_zero_fills_without_a_value_vector`.
 - **Wave numbering note**: waves 27 (SVG paint pass) and 28 (TLS/media) landed
   first; this JS wave is 29.
 
@@ -1824,11 +1833,14 @@ curve matters more than the baseline (near-flat as tabs grow).
   region is a flat 10% bbox pad rather than `filterUnits`/`x`/`y`/`width`/
   `height`; `mask-type: alpha` is not read (luminance is assumed); no
   `feImage`, `feTurbulence`, `feMorphology`, `feComponentTransfer` or
-  `feTile`; `clip-rule` is always nonzero; `marker` and `text` remain skipped.
+  `feTile`; `clip-rule` is always nonzero; `marker` remains skipped. `<text>`
+  is still not rasterized by this pass: `text_runs()` hands the runs to the
+  shell, which owns the font metrics (wave 23).
 - **Verification note**: the full suite ran in a clean worktree at `HEAD`
   with only `src/svg.rs` + `src/html.rs` overlaid — concurrent sessions had
   `src/js/*` mid-edit in the shared tree, so those changes were deliberately
-  not pulled in. Default **707** tests, `engine-b + woff2` **711**, all pass.
+  not pulled in. With every wave merged the suite is **735** default and
+  **739** with `engine-b + woff2`, all pass.
 
 ### Wave 25 findings
 
@@ -1845,8 +1857,8 @@ curve matters more than the baseline (near-flat as tabs grow).
   content-box minimums were restated in border-box terms: checkbox/radio
   12 → 14 (still a 14×14 outer box), text inputs/buttons/submits/selects
   20 → 22 (still one 20px line plus the 2px UA border).
-- Tests: default **703** on the wave-25 base (**725** with waves 27-29 applied),
-  `engine-b + woff2` **707** on the base; five new guards
+- Tests: default **703** on the wave-25 base (**735** with waves 23-29
+  applied), `engine-b + woff2` **707** on the base (**739** merged); five new guards
   (`min_height_floors_the_border_box_by_default`,
   `min_height_content_box_floors_the_content`,
   `declared_height_follows_box_sizing`, `aspect_ratio_follows_box_sizing`,
