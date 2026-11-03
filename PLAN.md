@@ -1529,8 +1529,9 @@ curve matters more than the baseline (near-flat as tabs grow).
   store landed in wave 30 (the tab list persists across restarts and restores
   through the same snapshot path); submission fidelity landed in wave 31
   (radio groups, disabled controls, `<select>` values, the activated submit
-  button's pair). Still open: implicit submission picking the form's default
-  button, a file picker, `<select>` popup, label-for activations.
+  button's pair); wave 32 added label->control clicks and the implicit
+  submission's default-button rule. Still open: a file picker and a
+  `<select>` popup.
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
 
 ## Recommendations logged (from "translate HTML/CSS to Rust" discussion)
@@ -1692,6 +1693,35 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 30 (tab store) | Wikipedia `/wiki/JavaScript` | 100.1 / 101.9 MB (10943 runs, restored snapshot) against 99.6 / 100.0 MB from a HEAD build run back-to-back on the same URL - the delta is run noise; the store holds only the URL strings, the page itself is untouched |
 | 2026-11-03 | wave 30 (tab store) | live restart probe | 2-tab `session` file -> two pills (second active) and the active tab taken from its DOM snapshot (`[dom] restored snapshot ... (no fetch)`); an explicit URL argument starts a fresh one-tab session; 14 s of idle frames left the file's mtime unchanged; suite **737** default / **741** `engine-b + woff2` |
 | 2026-11-03 | wave 31 (form submission fidelity) | local `form31.html` probe (scripted `form.submit()`, no input synthesized) | `[js] form.submit() -> GET https://example.com/s?q=hi&lang=fr&region=Europe+wide` - the disabled input and the disabled `<fieldset>`'s control are gone, both `<select>`s submit (`selected` option value, label text with collapsed whitespace), suite **740** default / **744** `engine-b + woff2` |
+| 2026-11-03 | wave 32 (label activation + implicit submission) | local `form31.html` probe with a label + checked box | `[js] form.submit() -> GET ...?agree=1&q=hi&lang=fr&region=Europe+wide` (still no submitter pair for a scripted submit - regression-free); label->control resolution covered by an in-crate test over `collect_elements`; suite **741** default / **745** `engine-b + woff2` |
+
+### Wave 32 findings
+
+- **A click on `<label>` text now activates its control.** The worker already
+  walks every hit-test element for the inspector; it now also records
+  `ElementInfo.label_for` there, resolved once per `<label>` per page wire
+  (`label_control`: the `for=` target when that id names a labelable element,
+  else the label's first labelable descendant in tree order). The shell's
+  click path checks it after the link test and hands the control's own
+  `FormBox` to `on_form_click`, so a label behaves exactly like the control:
+  checkbox/radio toggle + listeners, text-field focus with its value seeded,
+  submit. The mapping is per *element inside* the label, so nested inline
+  children (`<label>Pick <span>one</span>...`) activate too.
+- **Label state travels with the page, not the DOM.** The shell has no DOM, so
+  the resolution rides the existing `ElementInfo` channel (8 bytes per hit-test
+  element) instead of a new wire field; no extra thread hop and no synthetic
+  input in the test path.
+- **Implicit submission names the form's default button.** `implicit_submitter`
+  maps the activated node to a submitter: a submit button names itself, a
+  text control (Enter) names the form's first enabled submit button - the
+  browser's "implicit submission clicks the default button" rule - and
+  `form.submit()` (the form is activated) names nobody. This replaced the
+  previous "only a clicked submit button is a pair" rule, which dropped a
+  server-visible pair on every Enter-key submission.
+- Honest gaps left in this area: a disabled first submit button is skipped
+  (correct) but a *label* pointing at a `<select>` still only blurs (no popup
+  exists), `for=` matching is by id only, and clicking a label whose control
+  is not laid out (display:none) does nothing.
 
 ### Wave 31 findings
 

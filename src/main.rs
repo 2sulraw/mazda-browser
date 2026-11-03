@@ -139,6 +139,10 @@ struct ElementInfo {
     attrs: Vec<(String, String)>,
     /// collapsed direct text content of the element (empty for containers)
     text: String,
+    /// when this element sits inside a `<label>` that names a form control,
+    /// that control's DOM node: a click on the label's text activates the
+    /// control exactly like a click on the control itself. None elsewhere.
+    label_for: Option<u32>,
 }
 
 impl ElementInfo {
@@ -172,13 +176,60 @@ fn collect_elements(
     targets: &[layout::HoverTarget],
 ) -> HashMap<u32, ElementInfo> {
     let mut out: HashMap<u32, ElementInfo> = HashMap::new();
+    // label node -> control it activates, resolved once per page wire
+    let mut labelled: HashMap<u32, Option<u32>> = HashMap::new();
     for t in targets {
         if out.contains_key(&t.node) || dom.tag(t.node) == "#text" {
             continue;
         }
-        out.insert(t.node, element_info(dom, t.node, t.rect, t.fixed));
+        let mut info = element_info(dom, t.node, t.rect, t.fixed);
+        if let Some(label) = label_ancestor(dom, t.node) {
+            info.label_for = *labelled
+                .entry(label)
+                .or_insert_with(|| label_control(dom, label));
+        }
+        out.insert(t.node, info);
     }
     out
+}
+
+/// Nearest `<label>` ancestor of `node` (the node itself counts).
+fn label_ancestor(dom: &html::Dom, node: u32) -> Option<u32> {
+    let mut cur = node;
+    loop {
+        if dom.tag(cur) == "label" {
+            return Some(cur);
+        }
+        if cur == 0 {
+            return None;
+        }
+        cur = dom.nodes[cur as usize].parent;
+    }
+}
+
+/// The control a `<label>` activates: its `for=` target when that id names a
+/// labelable element, else the first labelable descendant in tree order.
+fn label_control(dom: &html::Dom, label: u32) -> Option<u32> {
+    fn labelable(dom: &html::Dom, n: u32) -> bool {
+        matches!(dom.tag(n), "input" | "select" | "textarea" | "button")
+    }
+    if let Some(id) = dom.attr(label, "for").map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(n) = (1..dom.nodes.len() as u32).find(|&n| {
+            labelable(dom, n) && dom.attr(n, "id") == Some(id)
+        }) {
+            return Some(n);
+        }
+    }
+    let mut stack: Vec<u32> = dom.nodes[label as usize].children.iter().rev().copied().collect();
+    while let Some(n) = stack.pop() {
+        if labelable(dom, n) {
+            return Some(n);
+        }
+        for &c in dom.nodes[n as usize].children.iter().rev() {
+            stack.push(c);
+        }
+    }
+    None
 }
 
 fn element_info(
@@ -233,6 +284,7 @@ fn element_info(
         fixed,
         attrs,
         text: truncate_chars(&text, ELEMENT_TEXT_MAX),
+        label_for: None,
     }
 }
 
@@ -1059,6 +1111,16 @@ impl App {
         })?;
         let href = run.link.as_deref()?;
         resolve(&self.page.url, href)
+    }
+
+    /// The control a click at (x, y) reaches through a `<label>`: the pointer
+    /// sits on label content and the label names a laid-out control (the
+    /// worker resolves label -> control per page wire, see
+    /// `ElementInfo.label_for`). None when no label covers the point.
+    fn label_form_at(&self, x: f32, y: f32) -> Option<layout::FormBox> {
+        let (node, _) = self.page.laid.hit_hover(x, y, self.scroll)?;
+        let target = self.page.elements.get(&node)?.label_for?;
+        self.page.laid.forms.iter().find(|f| f.node == target).copied()
     }
 
     /// Select every laid-out text run (the "Select all" menu action). Empty
@@ -1964,6 +2026,12 @@ impl eframe::App for App {
                                         self.expect_nav = false;
                                         self.pending_link = Some((id, next));
                                     }
+                                } else if let Some(fb) = self.label_form_at(rx, my_doc) {
+                                    // a click on `<label>` content activates
+                                    // the control the label names - exactly the
+                                    // click path a control takes (checkbox/
+                                    // radio toggle, text focus, submit)
+                                    self.on_form_click(fb, pw, ph);
                                 } else {
                                     // click on empty space blurs any focused
                                     // field — firing its change listeners
@@ -3995,6 +4063,56 @@ pub(crate) struct SubmissionReq {
     pub body: String,
 }
 
+/// True when `node` is a submit button (`<button>` without a `type`, or with
+/// `type=submit`; `<input type=submit>`).
+fn is_submit_control(dom: &html::Dom, node: u32) -> bool {
+    match dom.tag(node) {
+        "button" => dom
+            .attr(node, "type")
+            .map(|t| t.eq_ignore_ascii_case("submit"))
+            .unwrap_or(true),
+        "input" => dom
+            .attr(node, "type")
+            .is_some_and(|t| t.eq_ignore_ascii_case("submit")),
+        _ => false,
+    }
+}
+
+/// True when `node` takes typed text - the controls whose Enter key performs
+/// the implicit submission (hidden/button/checkable kinds do not).
+fn is_text_control(dom: &html::Dom, node: u32) -> bool {
+    if dom.tag(node) == "textarea" {
+        return true;
+    }
+    if dom.tag(node) != "input" {
+        return false;
+    }
+    let ty = dom.attr(node, "type").unwrap_or("text").to_ascii_lowercase();
+    !matches!(
+        ty.as_str(),
+        "checkbox" | "radio" | "submit" | "reset" | "button" | "image" | "file" | "hidden"
+    )
+}
+
+/// Which control counts as the submitter of this submission. The activated
+/// submit button names itself; Enter in a text field is an implicit
+/// submission, which the browser performs by "clicking" the form's default
+/// (first enabled) submit button, so that button names itself; anything else
+/// (notably `form.submit()`, which activates the form itself) names nobody.
+fn implicit_submitter(dom: &html::Dom, form: u32, activated: u32) -> Option<u32> {
+    if is_submit_control(dom, activated) {
+        return Some(activated);
+    }
+    if !is_text_control(dom, activated) {
+        return None;
+    }
+    (1..dom.nodes.len() as u32).find(|&n| {
+        is_submit_control(dom, n)
+            && !control_disabled(dom, n)
+            && form_ancestor(dom, n) == Some(form)
+    })
+}
+
 /// Build the submission for the `<form>` that encloses `activated` (walk up
 /// from the submit button / the Enter-activated field). `live` holds the
 /// UI thread's typed values by node id (the value store rides every event
@@ -4006,7 +4124,7 @@ pub(crate) fn build_submission(
     base: &str,
 ) -> Option<SubmissionReq> {
     let form = form_ancestor(dom, activated)?;
-    let pairs = collect_form_pairs(dom, form, live, Some(activated));
+    let pairs = collect_form_pairs(dom, form, live, implicit_submitter(dom, form, activated));
     let body = urlencode_pairs(&pairs);
     let action = resolve_form_target(base, dom.attr(form, "action"))
         .or_else(|| resolve_form_target(base, None))
@@ -6750,6 +6868,7 @@ mod tests {
                     fixed: false,
                     attrs: vec![("href".into(), "/".into())],
                     text: "hello".into(),
+                    label_for: None,
                 },
             )]),
         };
@@ -7176,9 +7295,9 @@ mod tests {
         );
     }
 
-    /// Only the activated submit button contributes its pair; pressing
-    /// Enter in a text field (same builder, different `activated`) adds
-    /// nothing, which matches the shell's current implicit-submission rule.
+    /// The submitter of a submission: the clicked submit button, the form's
+    /// default button on an implicit (Enter) submission, and nobody for
+    /// `form.submit()` - which activates the form itself.
     #[test]
     fn activated_submit_button_adds_its_pair() {
         let dom = html::parse(
@@ -7199,8 +7318,31 @@ mod tests {
         let enter = build_submission(&dom, find("q"), &Default::default(), "https://e.com/")
             .expect("submission");
         assert_eq!(
-            enter.body, "q=x",
-            "a text-field activation names no submitter"
+            enter.body, "q=x&act=save",
+            "implicit submission names the form's default (first) submit button"
+        );
+        let form = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "form")
+            .unwrap();
+        assert_eq!(
+            build_submission(&dom, form, &Default::default(), "https://e.com/")
+                .unwrap()
+                .body,
+            "q=x",
+            "form.submit() activates the form: no submitter pair"
+        );
+        // a form with no submit button names nobody on Enter either
+        let dom3 = html::parse(
+            r#"<html><body><form action="/go"><input name="q" value="x"></form></body></html>"#,
+        );
+        let q3 = (1..dom3.nodes.len() as u32)
+            .find(|&i| dom3.attr(i, "name") == Some("q"))
+            .unwrap();
+        assert_eq!(
+            build_submission(&dom3, q3, &Default::default(), "https://e.com/")
+                .unwrap()
+                .body,
+            "q=x"
         );
         // `<input type=submit>` behaves the same, but a reset button never
         // becomes a pair
@@ -7228,6 +7370,79 @@ mod tests {
                 .body,
             "",
             "a reset button never submits"
+        );
+    }
+
+    /// A `<label>` names its control by `for=` or as its first labelable
+    /// descendant, and every hit-test element inside it carries that
+    /// control in `ElementInfo.label_for` - which is what the shell's click
+    /// path uses to turn a click on label text into a click on the control.
+    #[test]
+    fn labels_resolve_their_control_for_clicks() {
+        let dom = html::parse(
+            r#"<html><body><form>
+                <label for="cb1">Agree</label>
+                <input id="cb1" type="checkbox">
+                <label>Pick <span>one</span><input name="w" type="radio"></label>
+                <label for="missing">Broken</label>
+                <label>Just text</label>
+            </form></body></html>"#,
+        );
+        let find = |pred: &dyn Fn(&html::Dom, u32) -> bool| -> u32 {
+            (1..dom.nodes.len() as u32)
+                .find(|&i| pred(&dom, i))
+                .expect("node")
+        };
+        let agree = find(&|d, n| d.tag(n) == "label" && d.attr(n, "for") == Some("cb1"));
+        let cb1 = find(&|d, n| d.attr(n, "id") == Some("cb1"));
+        assert_eq!(label_control(&dom, agree), Some(cb1), "for= names the control");
+        let wrapped = find(&|d, n| {
+            d.tag(n) == "label" && d.attr(n, "for").is_none() && d.attr(n, "name").is_none()
+                && d.nodes[n as usize]
+                    .children
+                    .iter()
+                    .any(|&c| d.tag(c) == "span")
+        });
+        let radio = find(&|d, n| d.attr(n, "name") == Some("w"));
+        assert_eq!(
+            label_control(&dom, wrapped),
+            Some(radio),
+            "no for=: the first labelable descendant"
+        );
+        let span = find(&|d, n| d.tag(n) == "span");
+        assert_eq!(label_ancestor(&dom, span), Some(wrapped));
+        let broken = find(&|d, n| d.tag(n) == "label" && d.attr(n, "for") == Some("missing"));
+        assert_eq!(
+            label_control(&dom, broken),
+            None,
+            "a dangling for= with no control names nobody"
+        );
+        // the shell-facing form: every element inside the label maps to the
+        // control, including nested inline children
+        let targets = vec![
+            layout::HoverTarget {
+                rect: (0.0, 0.0, 10.0, 10.0),
+                node: span,
+                cursor: None,
+                fixed: false,
+            },
+            layout::HoverTarget {
+                rect: (0.0, 0.0, 40.0, 14.0),
+                node: agree,
+                cursor: None,
+                fixed: false,
+            },
+        ];
+        let els = collect_elements(&dom, &targets);
+        assert_eq!(
+            els.get(&span).unwrap().label_for,
+            Some(radio),
+            "nested label content still activates the control"
+        );
+        assert_eq!(
+            els.get(&agree).unwrap().label_for,
+            Some(cb1),
+            "the label element itself carries its control"
         );
     }
 
