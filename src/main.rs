@@ -3979,6 +3979,7 @@ fn layout_page(
         false,
         &mut sticky_next,
         imgs,
+        &fonts,
     );
     if n_px > 0 {
         eprintln!(
@@ -4193,6 +4194,7 @@ fn decode_slot(
     tint: Option<u32>,
     clip: Option<(f32, f32, f32, f32)>,
     fit: (f32, f32, f32, f32),
+    fonts: &Fonts,
 ) -> Option<Cached> {
     let (fx, fy, fw, fh) = fit;
     // inline <svg> markup arrives as its own bytes; everything else is fetched
@@ -4212,7 +4214,14 @@ fn decode_slot(
                 full
             }
         })
-        .or_else(|| svg::render(&bytes, dw, dh))?;
+        .or_else(|| {
+            let mut img = svg::render(&bytes, dw, dh)?;
+            // `<text>` is not in the vector rasterizer (it has no font
+            // metrics): paint the runs the parser handed us into the same
+            // buffer, on top of the shapes
+            paint_svg_text(&mut img, &svg::text_runs(&bytes, dw, dh), fonts);
+            Some(img)
+        })?;
     // a mask draws tinted with its box's background color (RGB replaced,
     // alpha kept) — no bg color, no tint
     let img = match tint {
@@ -4246,6 +4255,202 @@ fn decode_slot(
     Some(draw.map(|d| (Rc::new(img), d)))
 }
 
+fn paint_svg_text(img: &mut image::ImageData, runs: &[svg::TextRun], fonts: &Fonts) {
+    if runs.is_empty() || img.w == 0 || img.h == 0 {
+        return;
+    }
+    let width = img.w as usize;
+    for run in runs {
+        if run.text.is_empty() || run.size <= 0.0 || run.alpha <= 0.0 {
+            continue;
+        }
+        let mut style = Style::new();
+        style.size = run.size as f32;
+        style.color = run.color;
+        let scale = PxScale::from(style.size);
+        // advances come from the SAME picker the glyph blit uses, so the
+        // positions stay in step with the rasterized ink
+        let adv: Vec<f32> = run
+            .text
+            .chars()
+            .map(|ch| {
+                let font = fonts.pick_font_for(ch, &style);
+                font.as_scaled(scale).h_advance(font.glyph_id(ch))
+            })
+            .collect();
+        let total: f32 = adv.iter().sum();
+        match &run.path {
+            // plain text: one pen, anchor shifts the origin
+            None => {
+                let mut x = run.x as f32
+                    - match run.anchor {
+                        1 => total * 0.5,
+                        2 => total,
+                        _ => 0.0,
+                    };
+                for (ch, a) in run.text.chars().zip(adv.iter()) {
+                    blit_glyph(
+                        &mut img.px,
+                        width,
+                        fonts,
+                        &style,
+                        scale,
+                        ch,
+                        x,
+                        run.y as f32,
+                        run.alpha as f32,
+                    );
+                    x += *a;
+                }
+            }
+            // <textPath>: glyphs ride the polyline; `textLength` stretches the
+            // advances so the run fills the path (MDN's mandala: slashes
+            // spread around a circle). shortcut: the stretch is a uniform
+            // scale of every advance instead of extra spacing between glyphs,
+            // and glyphs stay upright (the spec's rotate="0" default).
+            Some(pts) if pts.len() >= 2 => {
+                let mut lens: Vec<f64> = Vec::with_capacity(pts.len());
+                let mut acc = 0.0f64;
+                for w in pts.windows(2) {
+                    acc += ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+                    lens.push(acc);
+                }
+                let plen = acc.max(1e-6);
+                let stretch = run
+                    .text_len
+                    .map(|t| (t / total.max(1e-6) as f64).max(1e-6))
+                    .unwrap_or(1.0);
+                if run.anchor != 0 && run.text_len.is_none() {
+                    // start marker along the path for middle/end anchoring
+                    let mut s = match run.anchor {
+                        1 => (plen - total as f64) * 0.5,
+                        _ => plen - total as f64,
+                    }
+                    .max(0.0);
+                    for (ch, a) in run.text.chars().zip(adv.iter()) {
+                        if let Some((p, n)) = path_point(pts, &lens, s) {
+                            blit_glyph(
+                                &mut img.px,
+                                width,
+                                fonts,
+                                &style,
+                                scale,
+                                ch,
+                                (p.0 + n.0 * run.dy) as f32,
+                                (p.1 + n.1 * run.dy) as f32,
+                                run.alpha as f32,
+                            );
+                        }
+                        s += *a as f64;
+                    }
+                    continue;
+                }
+                let mut s = 0.0f64;
+                for (ch, a) in run.text.chars().zip(adv.iter()) {
+                    if let Some((p, n)) = path_point(pts, &lens, s) {
+                        blit_glyph(
+                            &mut img.px,
+                            width,
+                            fonts,
+                            &style,
+                            scale,
+                            ch,
+                            (p.0 + n.0 * run.dy) as f32,
+                            (p.1 + n.1 * run.dy) as f32,
+                            run.alpha as f32,
+                        );
+                    }
+                    s += *a as f64 * stretch;
+                }
+            }
+            Some(_) => {} // degenerate path: nothing to lay on
+        }
+    }
+}
+
+/// Point at arc length `s` on a polyline plus its unit normal `(-ty, tx)`
+/// (the "inward" side for a clockwise path, which is how `dy` on a textPath
+/// is applied).
+fn path_point(
+    pts: &[(f64, f64)],
+    lens: &[f64],
+    s: f64,
+) -> Option<((f64, f64), (f64, f64))> {
+    if pts.len() < 2 || lens.is_empty() {
+        return None;
+    }
+    let s = s.clamp(0.0, *lens.last()?);
+    let i = lens.partition_point(|&l| l < s).min(lens.len() - 1);
+    let (a, b) = (pts[i], pts[i + 1]);
+    let seg = lens[i] - if i == 0 { 0.0 } else { lens[i - 1] };
+    let t = if seg > 1e-9 { (s - if i == 0 { 0.0 } else { lens[i - 1] }) / seg } else { 0.0 };
+    let p = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+    Some((p, (-dy / len, dx / len)))
+}
+
+/// One glyph into an ARGB buffer (the SVG image's pixels), source-over.
+#[allow(clippy::too_many_arguments)]
+fn blit_glyph(
+    buf: &mut [u32],
+    width: usize,
+    fonts: &Fonts,
+    style: &Style,
+    scale: PxScale,
+    ch: char,
+    x: f32,
+    baseline: f32,
+    alpha: f32,
+) {
+    let font = fonts.pick_font_for(ch, style);
+    let id = font.glyph_id(ch);
+    let Some(m) = fonts.glyph_mask(&font, id, scale, x, baseline) else { return };
+    let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    if a == 0 {
+        return;
+    }
+    let gx0 = x.floor() as i32 + m.ox;
+    let gy0 = baseline.floor() as i32 + m.oy;
+    for gy in 0..m.h {
+        let dy = gy0 + gy as i32;
+        if dy < 0 {
+            continue;
+        }
+        let row = dy as usize * width;
+        if row >= buf.len() {
+            continue;
+        }
+        for gx in 0..m.w {
+            let cov = m.cov[gy * m.w + gx] as u32 * a / 255;
+            if cov == 0 {
+                continue;
+            }
+            let dx = gx0 + gx as i32;
+            if dx < 0 || dx as usize >= width {
+                continue;
+            }
+            let idx = row + dx as usize;
+            if idx < buf.len() {
+                blend_argb(&mut buf[idx], style.color, cov);
+            }
+        }
+    }
+}
+
+/// Source-over onto a PREMULTIPLIED-ALPHA-free ARGB pixel; unlike the page
+/// buffer (`blend`) the destination alpha must survive so the SVG image
+/// composites correctly.
+fn blend_argb(dst: &mut u32, src: u32, a: u32) {
+    let inv = 255 - a;
+    let (dr, dg, db, da) = ((*dst >> 16) & 0xff, (*dst >> 8) & 0xff, *dst & 0xff, *dst >> 24);
+    let r = ((src >> 16) & 0xff) * a / 255 + dr * inv / 255;
+    let g = ((src >> 8) & 0xff) * a / 255 + dg * inv / 255;
+    let b = (src & 0xff) * a / 255 + db * inv / 255;
+    let oa = (a + da * inv / 255).min(255);
+    *dst = oa << 24 | r << 16 | g << 8 | b;
+}
+
 fn decode_images(
     n: &mut layout::BoxNode,
     base: &str,
@@ -4256,6 +4461,7 @@ fn decode_images(
     parent_masked: bool,
     next: &mut usize,
     cache: &mut ImgCache,
+    fonts: &Fonts,
 ) -> usize {
     let fixed = fixed || n.bx.pos == css::Pos::Fixed;
     // same predicate as collect_paint's sticky recording (DFS order aligns
@@ -4302,7 +4508,7 @@ fn decode_images(
         };
         if px <= *budget {
             let slot = cache.get(&key).or_else(|| {
-                let v = decode_slot(&src, abs.as_deref(), dw, dh, tint, clip, (fx, fy, fw, fh))?;
+                let v = decode_slot(&src, abs.as_deref(), dw, dh, tint, clip, (fx, fy, fw, fh), fonts)?;
                 cache.put(key.clone(), v.clone());
                 Some(v)
             });
@@ -4321,7 +4527,7 @@ fn decode_images(
     let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
     let bg = n.bx.bg;
     for c in &mut n.children {
-        count += decode_images(c, base, laid, budget, fixed, bg, masked, next, cache);
+        count += decode_images(c, base, laid, budget, fixed, bg, masked, next, cache, fonts);
     }
     if let Some(i) = grp {
         if let Some(g) = laid.sticky.get_mut(i) {
@@ -5785,6 +5991,25 @@ mod tests {
         assert!(warm.iter().any(|&p| p != 0x00ff_ffff), "text drew no ink");
     }
 
+
+    #[test]
+    fn svg_text_paints_ink_over_the_vector_pass() {
+        let fonts = Fonts::load();
+        let svg = br##"<svg width="120" height="40" font-size="28"><text x="4" y="32" fill="#ff0000">AW</text></svg>"##;
+        let mut img = svg::render(svg, 120, 40).expect("vector pass");
+        assert!(img.px.iter().all(|&p| p == 0), "the vector pass has no text");
+        paint_svg_text(&mut img, &svg::text_runs(svg, 120, 40), &fonts);
+        let ink = img.px.iter().filter(|&&p| p != 0).count();
+        assert!(ink > 20, "glyphs blitted: {ink} px of ink");
+        // red fill survives the ARGB blend, alpha included
+        assert!(
+            img.px
+                .iter()
+                .any(|&p| p >> 24 > 0 && (p >> 16) & 0xff > 128 && (p >> 8) & 0xff < 0x80),
+            "red glyph pixels"
+        );
+    }
+
     #[test]
     fn pixels_to_image_keeps_rgb() {
         let img = pixels_to_image(&[0x0012_3456, 0x00ff_ffff], 2, 1);
@@ -7017,7 +7242,19 @@ mod tests {
             layout::layout_tree(&mut root, vw, &|s: &str, _: &Style| s.chars().count() as f32 * 8.0);
         let mut budget = IMG_PIXEL_BUDGET;
         let mut next = 0usize;
-        decode_images(&mut root, base, &mut laid, &mut budget, false, None, false, &mut next, cache);
+        let fonts = Fonts::load();
+        decode_images(
+            &mut root,
+            base,
+            &mut laid,
+            &mut budget,
+            false,
+            None,
+            false,
+            &mut next,
+            cache,
+            &fonts,
+        );
         let drawn = laid
             .images
             .first()
