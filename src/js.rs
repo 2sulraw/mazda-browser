@@ -177,6 +177,11 @@ pub enum ObjKind {
     /// live generator instance; `.next`/`.return` resume the mini-VM
     /// (`gen.rs`) until the next `yield`.
     Generator(Rc<RefCell<GenVm>>),
+    /// host-backed `element.style` (a CSSStyleDeclaration stand-in): holds
+    /// the arena node id; reads/writes forward through `JsEngine::style_get`
+    /// / `style_set` (installed by the embedder, so this module stays
+    /// DOM-free). Own props still hold the method natives and `__node`.
+    Style(u32),
 }
 
 /// per-instance regex state (see `ObjKind::Regex`)
@@ -421,6 +426,7 @@ impl Val {
                     }
                     ObjKind::Regex(ri) => format!("/{}/{}", ri.re.src, ri.re.flags),
                     ObjKind::Generator(_) => "[object Generator]".into(),
+                    ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
                 }
             }
             Val::Func(c) => format!("function {}() {{ [code] }}", c.def.name),
@@ -833,6 +839,12 @@ pub struct JsEngine {
     pub(crate) err_located: bool,
     /// the escaping error text already carries its `(line, col)`
     pub(crate) err_decorated: bool,
+    /// CSSOM bridge installed by the embedder (`script.rs`): a `style`
+    /// object (see [`ObjKind::Style`]) forwards member reads/writes here.
+    /// `None` = no DOM attached (pure-engine unit tests): reads are
+    /// `undefined`, writes are no-ops.
+    pub(crate) style_get: Option<fn(u32, &str) -> String>,
+    pub(crate) style_set: Option<fn(u32, &str, &str)>,
 }
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
@@ -892,6 +904,8 @@ impl JsEngine {
             throw_src: 0,
             err_located: false,
             err_decorated: false,
+            style_get: None,
+            style_set: None,
             rng_state: 0x9e37_79b9_7f4a_7c15 ^ std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -2031,6 +2045,32 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                     }
                 }
             }
+            // CSSStyleDeclaration stand-in: own props (method natives,
+            // `__node`) win; everything else reads the element's `style`
+            // attribute through the embedder hook. No prototype walk —
+            // `style.width` must not accidentally resolve to Object.prototype.
+            let style_node = o
+                .try_borrow()
+                .ok()
+                .and_then(|b| match &b.kind {
+                    ObjKind::Style(n) => Some(*n),
+                    _ => None,
+                });
+            if let Some(node) = style_node {
+                let own = o
+                    .borrow()
+                    .props
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .map(|(_, v)| v.clone());
+                if let Some(v) = own {
+                    return Ok(v);
+                }
+                return Ok(match e.style_get {
+                    Some(f) => Val::Str(Rc::from(f(node, key).as_str())),
+                    None => Val::Undefined,
+                });
+            }
             {
                 let b = o.borrow();
                 if let ObjKind::Error { name, msg } = &b.kind {
@@ -2150,6 +2190,22 @@ fn regex_member(_e: &JsEngine, o: &Rc<RefCell<Obj>>, key: &str) -> Result<Val, J
 pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Result<(), JsError> {
     match base {
         Val::Obj(o) => {
+            // CSSStyleDeclaration stand-in: every write is a declaration
+            // update on the element's `style` attribute (empty value removes
+            // the declaration; `cssText` replaces the whole text).
+            let style_node = o
+                .try_borrow()
+                .ok()
+                .and_then(|b| match &b.kind {
+                    ObjKind::Style(n) => Some(*n),
+                    _ => None,
+                });
+            if let Some(node) = style_node {
+                if let Some(f) = e.style_set {
+                    f(node, key, &v.to_string());
+                }
+                return Ok(());
+            }
             // regex instances: `lastIndex` writes to the per-instance Cell
             if let Ok(b) = o.try_borrow() {
                 if let ObjKind::Regex(ri) = &b.kind {

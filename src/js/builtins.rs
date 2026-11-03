@@ -411,7 +411,7 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                     out.push_str("{}");
                 }
                 // regex/generator instances: no own enumerable props -> {}
-                ObjKind::Regex(_) | ObjKind::Generator(_) => {
+                ObjKind::Regex(_) | ObjKind::Generator(_) | ObjKind::Style(_) => {
                     out.push_str("{}");
                 }
                 ObjKind::Plain => {
@@ -822,6 +822,7 @@ fn n_objproto(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<V
                 ObjKind::Promise(_) => "[object Promise]",
                 ObjKind::Regex(_) => "[object RegExp]",
                 ObjKind::Generator(_) => "[object Generator]",
+                ObjKind::Style(_) => "[object CSSStyleDeclaration]",
             },
             _ => "[object Object]",
         }))),

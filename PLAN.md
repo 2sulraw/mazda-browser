@@ -1364,6 +1364,52 @@ curve matters more than the baseline (near-flat as tabs grow).
   **(x) next** - BigInt literals, `new.target`, `for await`, top-level
   `await`, import assertions, live module bindings, computed class
   accessors, class static blocks.
+  **(y) live element surface (style / classList / currentScript)** - the
+  convenience API the svelte.dev inline scripts assume:
+  - `element.style` is a host-backed CSSStyleDeclaration stand-in
+    (`ObjKind::Style(u32)`): member reads/writes forward through two fn
+    pointers the embedder installs on the engine (`style_get` / `style_set`),
+    so `js.rs` stays DOM-free. `runtime.rs` owns the text handling:
+    `style_text`, `style_prop`, `style_set` over the `style` attribute, with
+    a quote/paren-aware declaration splitter and a general camelCase →
+    kebab-case name rule (no per-property or per-vendor tables). Property
+    writes (`el.style.width = "100px"`, `Object.assign(el.style, {...})`),
+    `setProperty`, `getPropertyValue`, `removeProperty`, and `cssText`
+    (read/replace) all reach the cascade; an empty value removes that
+    declaration and an empty attribute is dropped.
+  - `element.classList` (`add`/`remove`/`toggle`/`contains`) reads and
+    rewrites the live `class` attribute; `element.parentElement` is a lazy
+    accessor (wrapping a node never wraps its whole ancestor chain);
+    `document.currentScript` names the `<script>` whose turn is running and
+    is `null` outside script turns; `append` (element arguments) and
+    `remove` complete the create/append/measure/remove cycle; the layout
+    reads (`offsetWidth/Height`, `clientWidth/Height`) are 0 because this
+    pipeline runs scripts before layout.
+  Honest shortcuts: `style.length` and other numeric CSSOM reads come back
+  as strings; `classList.value/length/replace` are absent; layout reads are
+  0 rather than forcing a synchronous layout; `append` does not create text
+  nodes from string arguments; the engine-core adapter (Option B) still
+  exposes the wave-17 element surface (feature is compile-gated only).
+  Tests (649 default / 653 with `engine-b woff2`):
+  `style_object_forwards_writes_to_the_attribute`,
+  `object_assign_onto_style_reaches_the_attribute`,
+  `style_removal_and_css_text_replacement`,
+  `class_list_mutates_the_live_class_attribute`,
+  `current_script_and_parent_element_are_live`,
+  `element_remove_detaches_from_parent`,
+  `css_property_names_normalize`,
+  `declarations_survive_quotes_and_functions`.
+  Live: svelte.dev 78.7-82.9 MB / 291 runs - both wave-18 inline-script
+  errors are gone; the only remaining inline error is the documented
+  `import()` gap (HTML line 10 of the boot script). MDN
+  `/Web/CSS/list-style-type` 87.5 MB / 2773 runs with the same pre-existing
+  bundle `length` error; Wikipedia `JavaScript` 96.2-96.8 MB / 11404 runs
+  with the same `match` error - no RAM or layout regression (97.0 MB
+  baseline on the same URL).
+  **(z) next** - BigInt literals, `new.target`, `for await`, top-level
+  `await`, import assertions, live module bindings, computed class
+  accessors, class static blocks, dynamic `import()` (the svelte.dev boot
+  blocker), canvas 2d context.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
@@ -1504,6 +1550,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 17 (URL + Object.prototype) | svelte.dev | 79.3-83.6 MB (291 runs; `new URL('.', urlObject)` fixed; remaining inline errors are a missing canvas-2d context and one `parentElement` read) |
 | 2026-11-03 | wave 17 (URL + Object.prototype) | runtime-error locations | parse probe: a thrower in script A called from script B now reports line 2 of A (was: the caller's source, or no position) |
 | 2026-11-03 | wave 17 (URL + Object.prototype) | Wikipedia `/wiki/JavaScript` | 101.6 MB (11404 runs; identical; one inline script stops on `Cannot read property 'match' of undefined`) |
+| 2026-11-03 | wave 18 (style/classList/currentScript) | svelte.dev | 78.7-82.9 MB (291 runs; both inline-script errors fixed; only dynamic `import()` remains) |
+| 2026-11-03 | wave 18 (style/classList/currentScript) | MDN `/Web/CSS/list-style-type` | 87.5 MB (2773 runs; same pre-existing bundle `length` error; rendering unchanged) |
+| 2026-11-03 | wave 18 (style/classList/currentScript) | Wikipedia `/wiki/JavaScript` | 96.2-96.8 MB (11404 runs; 97.0 MB baseline on the old binary; same `match` error, no regression) |
 
 ### Phase 1c (Track A) findings
 

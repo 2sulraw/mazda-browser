@@ -18,10 +18,20 @@
 //! that one thread; arena node indices stay valid for the page's lifetime.
 //!
 //! shortcuts (honest, per native):
-//! - property writes (`el.textContent = x`, `el.value = x`) cannot be
-//!   intercepted — the interpreter has no accessor hooks. Readable props
-//!   are snapshotted at wrap time; setters are methods (`setTextContent`,
-//!   `setValue`, `setClassName`).
+//! - readable props (`el.textContent`, `el.className`) are snapshotted at
+//!   wrap time; writes go through methods (`setTextContent`, `setValue`,
+//!   `setClassName`). Two exceptions are live, host-backed surfaces:
+//!   `el.style` (a CSSStyleDeclaration stand-in: property writes, `cssText`,
+//!   `setProperty`/`getPropertyValue`/`removeProperty`, camelCase or
+//!   kebab-case keys — numeric CSSOM reads like `style.length` come back as
+//!   strings) and `el.classList` (add/remove/toggle/contains; `value`,
+//!   `length`, `replace` are absent).
+//! - `offsetWidth`/`offsetHeight`/`clientWidth`/`clientHeight` are 0: this
+//!   pipeline runs scripts before layout, so there is no box to measure.
+//! - `parentElement` is a lazy accessor (never wraps the ancestor chain
+//!   eagerly); `document.currentScript` names the `<script>` whose turn is
+//!   running and is null outside script turns; `el.append` is
+//!   `appendChild` for element arguments (text arguments are not created).
 //! - `innerHTML` is text-only: markup fragments are logged and stored as
 //!   literal text (no fragment parser).
 //! - `querySelector` matches one simple selector (tag / #id / .class),
@@ -152,6 +162,7 @@ fn ctx_queue_raf(cb: Val) {
 fn wrap_element(node: u32) -> Val {
     let o = js::Val::new_object();
     o.set("__node", js::Val::Num(node as f64));
+    let n = nids();
     let p = runtime::host(|h| h.snapshot(node));
     if let Some(p) = p {
         o.set("tagName", str_val(&p.tag));
@@ -170,11 +181,29 @@ fn wrap_element(node: u32) -> Val {
         }
         o.set("textContent", str_val(&p.text));
     }
-    let n = nids();
+    o.set("style", wrap_style(node));
+    o.set("classList", wrap_class_list(node));
+    // `parentElement` resolves lazily (an accessor), so wrapping a node
+    // never wraps its whole ancestor chain.
+    o.set(
+        "parentElement",
+        js::Val::Acc(Rc::new(js::AccEntry {
+            getter: Some(js::Val::Native(n.el_parent)),
+            setter: None,
+        })),
+    );
+    // layout reads: scripts run before layout in this pipeline, so these are
+    // 0 — documented shortcut (no synchronous layout to measure against).
+    o.set("offsetWidth", js::Val::Num(0.0));
+    o.set("offsetHeight", js::Val::Num(0.0));
+    o.set("clientWidth", js::Val::Num(0.0));
+    o.set("clientHeight", js::Val::Num(0.0));
     o.set("getElementById", js::Val::Native(n.el_get_element));
     o.set("querySelector", js::Val::Native(n.el_query));
     o.set("querySelectorAll", js::Val::Native(n.el_query_all));
     o.set("appendChild", js::Val::Native(n.el_append));
+    o.set("append", js::Val::Native(n.el_append)); // shortcut: element args only
+    o.set("remove", js::Val::Native(n.el_remove));
     o.set("setAttribute", js::Val::Native(n.el_set_attr));
     o.set("getAttribute", js::Val::Native(n.el_get_attr));
     o.set("removeAttribute", js::Val::Native(n.el_rm_attr));
@@ -185,6 +214,36 @@ fn wrap_element(node: u32) -> Val {
     o.set("setClassName", js::Val::Native(n.el_set_class));
     o.set("focus", js::Val::Native(n.el_focus));
     o.set("submit", js::Val::Native(n.el_submit));
+    o
+}
+
+/// `element.style` — host-backed CSSStyleDeclaration stand-in
+/// (`js::ObjKind::Style`): member reads/writes go to the element's `style`
+/// attribute, so `el.style.display = "none"` and `Object.assign(el.style,
+/// {...})` reach the cascade. Own props carry the methods + `__node`.
+fn wrap_style(node: u32) -> Val {
+    let o = js::Val::new_object();
+    o.set("__node", js::Val::Num(node as f64));
+    if let js::Val::Obj(rc) = &o {
+        rc.borrow_mut().kind = js::ObjKind::Style(node);
+    }
+    let n = nids();
+    o.set("setProperty", js::Val::Native(n.style_set_prop));
+    o.set("getPropertyValue", js::Val::Native(n.style_get_prop));
+    o.set("removeProperty", js::Val::Native(n.style_remove_prop));
+    o
+}
+
+/// `element.classList`: method natives over the live `class` attribute
+/// (the wrapper's `className` stays a snapshot, like every other prop).
+fn wrap_class_list(node: u32) -> Val {
+    let o = js::Val::new_object();
+    o.set("__node", js::Val::Num(node as f64));
+    let n = nids();
+    o.set("add", js::Val::Native(n.cls_add));
+    o.set("remove", js::Val::Native(n.cls_remove));
+    o.set("toggle", js::Val::Native(n.cls_toggle));
+    o.set("contains", js::Val::Native(n.cls_contains));
     o
 }
 
@@ -252,6 +311,15 @@ struct Nids {
     el_set_class: usize,
     el_focus: usize,
     el_submit: usize,
+    el_parent: usize,
+    el_remove: usize,
+    cls_add: usize,
+    cls_remove: usize,
+    cls_toggle: usize,
+    cls_contains: usize,
+    style_set_prop: usize,
+    style_get_prop: usize,
+    style_remove_prop: usize,
     loc_assign: usize,
     loc_reload: usize,
     win_add_listener: usize,
@@ -361,6 +429,18 @@ const E_SET_CLASS_NAME: u16 = 21;
 const E_FOCUS: u16 = 22;
 /// `Element.submit()` — the form.submit() native (shared body in DomHost)
 const E_SUBMIT: u16 = 23;
+/// lazy `parentElement` getter (installed as an accessor)
+const E_PARENT: u16 = 24;
+/// classList group
+const E_CLASS_ADD: u16 = 25;
+const E_CLASS_REMOVE: u16 = 26;
+const E_CLASS_TOGGLE: u16 = 27;
+const E_CLASS_CONTAINS: u16 = 28;
+/// style group (CSSStyleDeclaration stand-in)
+const E_STYLE_SET_PROPERTY: u16 = 34;
+const E_STYLE_GET_PROPERTY: u16 = 35;
+const E_STYLE_REMOVE_PROPERTY: u16 = 36;
+const E_REMOVE: u16 = 37;
 /// location group idxs
 const L_ASSIGN: u16 = 30;
 const L_RELOAD: u16 = 31;
@@ -549,6 +629,81 @@ fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
             // (collect → navigate; spec shape = no submit event here)
             runtime::host_mut(|h| h.submit_form(node));
             Ok(Val::Undefined)
+        }
+        E_PARENT => Ok(match runtime::host(|h| h.parent_element(node)) {
+            Some(p) => wrap_element(p),
+            None => Val::Null,
+        }),
+        E_REMOVE => {
+            runtime::host_mut(|h| h.remove_node(node));
+            Ok(Val::Undefined)
+        }
+        E_CLASS_ADD | E_CLASS_REMOVE | E_CLASS_TOGGLE | E_CLASS_CONTAINS => {
+            let mut tokens: Vec<String> = runtime::host(|h| h.attr(node, "class"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let names: Vec<String> = args
+                .iter()
+                .filter_map(|v| v.as_string().map(|s| s.to_string()))
+                .collect();
+            let has = |tokens: &[String], name: &str| tokens.iter().any(|t| t == name);
+            let mut changed = false;
+            match idx {
+                E_CLASS_CONTAINS => {
+                    let some = names.first().map_or(false, |n| has(&tokens, n));
+                    return Ok(Val::Bool(some));
+                }
+                E_CLASS_ADD => {
+                    for name in names {
+                        if !has(&tokens, &name) {
+                            tokens.push(name);
+                            changed = true;
+                        }
+                    }
+                }
+                E_CLASS_REMOVE => {
+                    let before = tokens.len();
+                    tokens.retain(|t| !names.contains(t));
+                    changed = tokens.len() != before;
+                }
+                _ => {
+                    // toggle(name[, force])
+                    if let Some(name) = names.first() {
+                        let force = args.get(1).map(|v| v.to_bool());
+                        let present = has(&tokens, name);
+                        let want = force.unwrap_or(!present);
+                        if want && !present {
+                            tokens.push(name.clone());
+                            changed = true;
+                        } else if !want && present {
+                            tokens.retain(|t| t != name);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if changed {
+                set_attr(node, "class", &tokens.join(" "));
+            }
+            Ok(Val::Undefined)
+        }
+        E_STYLE_SET_PROPERTY => {
+            let name = a0.as_string().unwrap_or_default();
+            let val = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            runtime::host_mut(|h| h.style_set(node, &name, &val));
+            Ok(Val::Undefined)
+        }
+        E_STYLE_GET_PROPERTY => {
+            let name = a0.as_string().unwrap_or_default();
+            Ok(runtime::host(|h| str_val(&h.style_prop(node, &name))))
+        }
+        E_STYLE_REMOVE_PROPERTY => {
+            let name = a0.as_string().unwrap_or_default();
+            let old = runtime::host(|h| h.style_prop(node, &name));
+            runtime::host_mut(|h| h.style_set(node, &name, ""));
+            Ok(str_val(&old))
         }
         _ => Err(JsError::throw("TypeError: bad element native")),
     }
@@ -744,6 +899,16 @@ fn set_attr(node: u32, name: &str, val: &str) {
     runtime::host_mut(|h| h.set_attribute(node, name, val));
 }
 
+/// Style-object read/write hooks (installed on the engine). `host_opt` keeps
+/// a direct engine test (no script turn installed) from panicking.
+fn style_get_hook(node: u32, key: &str) -> String {
+    runtime::host_opt(|h| h.style_prop(node, key)).unwrap_or_default()
+}
+
+fn style_set_hook(node: u32, key: &str, val: &str) {
+    runtime::host_mut_opt(|h| h.style_set(node, key, val));
+}
+
 fn remove_attr(node: u32, name: &str) {
     runtime::host_mut(|h| h.remove_attribute(node, name));
 }
@@ -828,6 +993,15 @@ impl PageScripts {
             el_set_class: engine.register_native("Element.setClassName", el_native, E_SET_CLASS_NAME),
             el_focus: engine.register_native("Element.focus", el_native, E_FOCUS),
             el_submit: engine.register_native("Element.submit", el_native, E_SUBMIT),
+            el_parent: engine.register_native("Element.parentElement", el_native, E_PARENT),
+            el_remove: engine.register_native("Element.remove", el_native, E_REMOVE),
+            cls_add: engine.register_native("Element.classList.add", el_native, E_CLASS_ADD),
+            cls_remove: engine.register_native("Element.classList.remove", el_native, E_CLASS_REMOVE),
+            cls_toggle: engine.register_native("Element.classList.toggle", el_native, E_CLASS_TOGGLE),
+            cls_contains: engine.register_native("Element.classList.contains", el_native, E_CLASS_CONTAINS),
+            style_set_prop: engine.register_native("CSSStyleDeclaration.setProperty", el_native, E_STYLE_SET_PROPERTY),
+            style_get_prop: engine.register_native("CSSStyleDeclaration.getPropertyValue", el_native, E_STYLE_GET_PROPERTY),
+            style_remove_prop: engine.register_native("CSSStyleDeclaration.removeProperty", el_native, E_STYLE_REMOVE_PROPERTY),
             loc_assign: engine.register_native("location.assign", loc_native, L_ASSIGN),
             loc_reload: engine.register_native("location.reload", loc_native, L_RELOAD),
             win_add_listener: engine.register_native("window.addEventListener", win_native, W_ADD_LISTENER),
@@ -842,6 +1016,10 @@ impl PageScripts {
             fetch_text: engine.register_native("response.text", fetch_text_native, 0),
         };
         NIDS.with(|c| c.set(Some(ids)));
+        // CSSOM bridge: the style object's member reads/writes go through
+        // the shared host (js.rs itself stays DOM-free)
+        engine.style_get = Some(style_get_hook);
+        engine.style_set = Some(style_set_hook);
 
         let doc = Val::new_object();
         doc.set("getElementById", Val::Native(ids.doc_get_element));
@@ -852,6 +1030,8 @@ impl PageScripts {
         doc.set("setCookie", Val::Native(ids.doc_cookie_set));
         // no incremental loader: by the time scripts run, parsing is finished
         doc.set("readyState", str_val("complete"));
+        // null outside a `<script>`; set/cleared around each script turn
+        doc.set("currentScript", Val::Null);
 
         // localStorage == sessionStorage (merged, in worker RAM — module docs)
         let storage_obj = Val::new_object();
@@ -977,10 +1157,13 @@ impl PageScripts {
                 let modules = &mut self.modules;
                 let (r, mut host, cx) =
                     with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                        let doc = e.get_global("document");
+                        doc.set("currentScript", wrap_element(s.node));
                         let r = match &inline {
                             Some(text) => modules.load_source(e, &url, text),
                             None => modules.load(e, &url),
                         };
+                        doc.set("currentScript", Val::Null);
                         if let Err(m) = e.drain_microtasks() {
                             eprintln!("[js] microtask error: {m}");
                         }
@@ -1036,7 +1219,10 @@ impl PageScripts {
             let storage = self.storage.clone();
             let (r, mut host, cx) =
                 with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                    let doc = e.get_global("document");
+                    doc.set("currentScript", wrap_element(s.node));
                     let r = e.exec(&src);
+                    doc.set("currentScript", Val::Null);
                     // queued microtasks (Promise.then) run before we look at
                     // timers — same turn semantics as the embedder contract
                     if let Err(m) = e.drain_microtasks() {
@@ -1378,6 +1564,8 @@ impl runtime::ScriptRuntime for PageScripts {
 
 /// A `<script>` element's source (shared with the engine-core adapter).
 pub(crate) struct ScriptSrc {
+    /// arena id of the `<script>` element (drives `document.currentScript`)
+    pub(crate) node: u32,
     /// inline source (text children) — empty when `src` is set
     pub(crate) text: String,
     pub(crate) src: Option<String>,
@@ -1416,6 +1604,7 @@ pub(crate) fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
                         );
                     if is_js {
                         out.push(ScriptSrc {
+                            node: n,
                             text: child_text(dom, n),
                             src: dom.attr(n, "src").map(|s| s.to_string()),
                             is_module,
@@ -1630,6 +1819,135 @@ mod tests {
         // attached under #host
         let host = query_all_dom(&dom, "#host")[0];
         assert!(dom.nodes[host as usize].children.contains(&made[0]));
+    }
+
+    #[test]
+    fn style_object_forwards_writes_to_the_attribute() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="s"></div><script>
+                var el = document.getElementById("s");
+                el.style.backgroundColor = "red";
+                el.style.width = "100px";
+                el.style.setProperty("height", "20px");
+                window.w = el.style.width;
+                window.bg = el.style.backgroundColor;
+                window.ct = el.style.cssText;
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert!(turn.dirty, "style writes must re-layout");
+        let s = query_all_dom(&dom, "#s")[0];
+        assert_eq!(
+            dom.attr(s, "style"),
+            Some("background-color: red; width: 100px; height: 20px")
+        );
+        assert_eq!(get_global_str(&mut ps, "w"), "100px");
+        assert_eq!(get_global_str(&mut ps, "bg"), "red");
+        assert_eq!(
+            get_global_str(&mut ps, "ct"),
+            "background-color: red; width: 100px; height: 20px"
+        );
+    }
+
+    #[test]
+    fn object_assign_onto_style_reaches_the_attribute() {
+        // exactly the shape svelte.dev's inline probe uses (create → assign
+        // → measure → classList → remove)
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="seed"></div><script>
+                var div = document.createElement("div");
+                Object.assign(div.style, {
+                    width: "100px", height: "100px", overflow: "scroll"
+                });
+                document.body.append(div);
+                window.ow = div.offsetWidth;
+                window.scroll = div.offsetWidth - div.clientWidth;
+                div.classList.add("probe");
+                div.remove();
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "ow"), "0");
+        assert_eq!(get_global_str(&mut ps, "scroll"), "0");
+        // the probe was appended and then removed again: body keeps only the
+        // seeded div (a removed node is detached, though its arena slot lives on)
+        let body = dom.body_root();
+        let element_children = dom.nodes[body as usize]
+            .children
+            .iter()
+            .filter(|&&c| matches!(dom.nodes[c as usize].kind, NodeKind::Element(..)))
+            .count();
+        // seeded div + the <script> element; the appended probe was removed
+        assert_eq!(element_children, 2);
+    }
+
+    #[test]
+    fn style_removal_and_css_text_replacement() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="s" style="color: blue; width: 5px"></div><script>
+                var el = document.getElementById("s");
+                window.old = el.style.removeProperty("width");
+                el.style.setProperty("height", "1px");
+                el.style.cssText = "margin: 0px";
+                window.empty = el.style.width;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "old"), "5px");
+        assert_eq!(get_global_str(&mut ps, "empty"), "");
+        let s = query_all_dom(&dom, "#s")[0];
+        assert_eq!(dom.attr(s, "style"), Some("margin: 0px"));
+    }
+
+    #[test]
+    fn class_list_mutates_the_live_class_attribute() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="d" class="a b"></div><script>
+                var d = document.getElementById("d");
+                window.has = d.classList.contains("c");
+                d.classList.add("c", "a");
+                d.classList.add("c");
+                d.classList.remove("b");
+                d.classList.toggle("a");
+                d.classList.toggle("z", true);
+                window.has2 = d.classList.contains("z");
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "has"), "false");
+        assert_eq!(get_global_str(&mut ps, "has2"), "true");
+        let d = query_all_dom(&dom, "#d")[0];
+        assert_eq!(dom.attr(d, "class"), Some("c z"));
+    }
+
+    #[test]
+    fn current_script_and_parent_element_are_live() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="wrap"><script>
+                    window.inner = document.currentScript.parentElement.id;
+                </script></div><script>
+                    window.outer = document.currentScript.parentElement.tagName;
+                </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "inner"), "wrap");
+        assert_eq!(get_global_str(&mut ps, "outer"), "BODY");
+        // outside a script the property reads null
+        let after = ps.engine.get_global("document").get("currentScript");
+        assert_eq!(after.to_string(), "null");
+    }
+
+    #[test]
+    fn element_remove_detaches_from_parent() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="host"><p id="gone">x</p></div><script>
+                document.getElementById("gone").remove();
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert!(turn.dirty);
+        let host = query_all_dom(&dom, "#host")[0];
+        assert!(dom.nodes[host as usize].children.is_empty());
     }
 
     #[test]

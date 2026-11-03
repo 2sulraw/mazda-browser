@@ -622,6 +622,103 @@ impl DomHost {
         }
     }
 
+    /// Raw text of an element's `style` attribute (empty when absent).
+    pub fn style_text(&self, node: u32) -> String {
+        self.attr(node, "style").unwrap_or_default()
+    }
+
+    /// CSSStyleDeclaration read for the `style` object: `cssText`, the
+    /// declaration `length`, or one declaration's value (empty when unset).
+    /// `key` is camelCase (`backgroundColor`) or already kebab-case.
+    pub fn style_prop(&self, node: u32, key: &str) -> String {
+        let text = self.style_text(node);
+        match key {
+            "cssText" => text,
+            "length" => style_decls(&text).len().to_string(),
+            _ => {
+                let want = css_prop_name(key);
+                style_decls(&text)
+                    .into_iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&want))
+                    .map(|(_, v)| v)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// CSSStyleDeclaration write: an empty value removes the declaration,
+    /// `cssText` replaces the whole attribute text.
+    pub fn style_set(&mut self, node: u32, key: &str, val: &str) {
+        if key == "cssText" {
+            if val.trim().is_empty() {
+                self.remove_attribute(node, "style");
+            } else {
+                self.set_attribute(node, "style", val);
+            }
+            return;
+        }
+        if key == "length" {
+            return; // read-only in CSSOM
+        }
+        let want = css_prop_name(key);
+        let mut decls = style_decls(&self.style_text(node));
+        let val = val.trim();
+        let pos = decls.iter().position(|(k, _)| k.eq_ignore_ascii_case(&want));
+        if val.is_empty() {
+            if let Some(i) = pos {
+                decls.remove(i);
+            }
+        } else if let Some(i) = pos {
+            decls[i].1 = val.to_string();
+        } else {
+            decls.push((want, val.to_string()));
+        }
+        if decls.is_empty() {
+            self.remove_attribute(node, "style");
+        } else {
+            let text = decls
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.set_attribute(node, "style", &text);
+        }
+    }
+
+    /// Parent element id (None at the document root): `parentElement` reads
+    /// this lazily so wrapping a node never wraps its whole ancestor chain.
+    pub fn parent_element(&self, node: u32) -> Option<u32> {
+        let p = self.dom_ref().nodes.get(node as usize)?.parent;
+        (p != 0 && p != node).then_some(p)
+    }
+
+    /// `element.remove()`: detach from the parent's child list.
+    pub fn remove_node(&mut self, node: u32) -> bool {
+        let dom = unsafe { &mut *self.dom };
+        let parent = match dom.nodes.get(node as usize) {
+            Some(n) => n.parent,
+            None => return false,
+        };
+        if parent == node || parent == 0 {
+            return false;
+        }
+        let removed = match dom.nodes.get_mut(parent as usize) {
+            Some(p) => match p.children.iter().position(|&c| c == node) {
+                Some(i) => {
+                    p.children.remove(i);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if removed {
+            dom.nodes[node as usize].parent = 0;
+            self.dirty = true;
+        }
+        removed
+    }
+
     /// Remove an attribute; true (and dirty) only when it existed.
     pub fn remove_attribute(&mut self, node: u32, name: &str) -> bool {
         let dom = unsafe { &mut *self.dom };
@@ -840,6 +937,70 @@ impl DomHost {
     }
 }
 
+/// `style` attribute text → ordered declarations. Values may contain `;`
+/// inside quotes or `url(...)`, so splitting tracks both.
+fn style_decls(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut parts: Vec<&str> = Vec::new();
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth = (depth - 1).max(0),
+                ';' if depth == 0 => {
+                    parts.push(&text[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    parts.push(&text[start..]);
+    for part in parts {
+        if let Some((k, v)) = part.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                out.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// CSSOM property name: `backgroundColor` → `background-color`; kebab input
+/// passes through. A leading capital takes the generic single-dash prefix.
+/// General rule only — no per-property or per-vendor table.
+fn css_prop_name(key: &str) -> String {
+    if key.contains('-') {
+        return key.to_ascii_lowercase();
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for (i, c) in key.char_indices() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    if key.starts_with(|c: char| c.is_ascii_uppercase()) {
+        out.insert(0, '-');
+    }
+    out
+}
+
 /// Wrapper-prop snapshot (see `DomHost::snapshot`): exactly the readable
 /// surface the built-in engine exposes on element wrappers.
 pub struct ElemProps {
@@ -920,6 +1081,17 @@ pub fn host_mut<R>(f: impl FnOnce(&mut DomHost) -> R) -> R {
     })
 }
 
+/// Optional read handle: `None` outside a turn (an embedder helper the
+/// engine can call without a DOM, e.g. the CSSOM style hooks in unit tests).
+pub fn host_opt<R>(f: impl FnOnce(&DomHost) -> R) -> Option<R> {
+    HOST.with(|h| h.borrow().as_ref().map(f))
+}
+
+/// Optional write handle: `None` outside a turn.
+pub fn host_mut_opt<R>(f: impl FnOnce(&mut DomHost) -> R) -> Option<R> {
+    HOST.with(|h| h.borrow_mut().as_mut().map(f))
+}
+
 // ---------------------------------------------------------------------------
 // Option B — engine-core adapter (compiled only with `--features engine-b`)
 // ---------------------------------------------------------------------------
@@ -931,6 +1103,12 @@ pub fn host_mut<R>(f: impl FnOnce(&mut DomHost) -> R) -> R {
 // own to reconcile (setTimeout lives on our side in both engines), and
 // `cancelAnimationFrame` does not exist yet in either engine (callback ids
 // are returned but unused — same shortcut in script.rs).
+//
+// Wave 18 (live `element.style` / `classList` / `parentElement` /
+// `document.currentScript`, zero-size layout reads) landed on Option A's
+// wrapper only: the engine-core adapter still exposes the wave-17 element
+// surface. This feature is compile-gated and not live-tested; the default
+// engine is A.
 #[cfg(feature = "engine-b")]
 pub mod engine_b {
     use super::*;
@@ -2107,5 +2285,37 @@ mod conf_tests {
         assert_eq!(cli_fonts_flag(&args("--fonts=x")), None);
         assert_eq!(cli_fonts_flag(&args("https://x.com")), None);
         assert_eq!(cli_fonts_flag(&args("--fonts")), None);
+    }
+}
+
+#[cfg(test)]
+mod style_text_tests {
+    use super::*;
+
+    /// CSSOM property-name normalization is general (no per-property table):
+    /// camelCase → kebab-case, kebab passes through, a leading capital takes
+    /// the generic single-dash prefix (same rule for any such name).
+    #[test]
+    fn css_property_names_normalize() {
+        assert_eq!(css_prop_name("backgroundColor"), "background-color");
+        assert_eq!(css_prop_name("width"), "width");
+        assert_eq!(css_prop_name("background-color"), "background-color");
+        assert_eq!(css_prop_name("XyzzyThing"), "-xyzzy-thing");
+        assert_eq!(css_prop_name("font"), "font");
+    }
+
+    /// Declaration splitting must not cut inside quotes or `url(...)`.
+    #[test]
+    fn declarations_survive_quotes_and_functions() {
+        let d = style_decls(
+            r#"background: url("a;b.png") no-repeat; content: 'x;y'; color: red"#,
+        );
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].0, "background");
+        assert_eq!(d[0].1, r#"url("a;b.png") no-repeat"#);
+        assert_eq!(d[1], ("content".to_string(), "'x;y'".to_string()));
+        assert_eq!(d[2], ("color".to_string(), "red".to_string()));
+        // empty / malformed segments are dropped
+        assert!(style_decls(" ; ; ").is_empty());
     }
 }
