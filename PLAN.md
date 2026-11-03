@@ -1673,6 +1673,37 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | svelte.dev | 91.9 MB (291 runs; pixel-unchanged) |
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | MDN homepage | 98.5 MB (615 runs; unchanged; same single bundle `length` error) |
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | Wikipedia `/wiki/Main_Page` | 105.7 MB (1434 runs; **zero `[js]` errors**; search toggle inside its box, no overlap with the personal links) |
+| 2026-11-03 | wave 24 (intrinsic margin contributions) | Wikipedia `/wiki/Main_Page` | 103.1 MB (1347 boxes, 1434 runs; same run count as wave 22 — geometry only; menu landmark 20px wide, logo box at 64, `-12px` flush-left button at 12..56, all matching the reference) |
+| 2026-11-03 | wave 24 (intrinsic margin contributions) | rust-lang.org | 89.2 MB (452 boxes, 483 runs; pixel-unchanged) |
+
+### Wave 24 findings
+
+- **A block/flex-column child contributes its MARGIN box to the parent's
+  max-content width, not just its border box.** Negative margins therefore
+  *shrink* the shrink-to-fit parent — Vector 2022's `.vector-main-menu-landmark`
+  is exactly that: a 20px flex item whose only child is the 44px menu button
+  with `margin: 0 -12px`, so it contributes 20, not 44. Ours reserved 44 and
+  pushed the Wikipedia logo 24px to the right. Auto margins contribute nothing.
+- **`content_min_w` (the min-content measure) now adds child margins too**, so
+  the same rule holds on the automatic-minimum path: a flex item's floor is its
+  min-content *margin* box. Both the max-content and min-content contributions
+  agree, which is what a flex base and the `min-width: auto` floor both need.
+- **Formatting whitespace between block-level children is not content.** Text
+  runs keep the source's newlines/tabs (`"\n\t\t\t\t\n"` measured 43.7px), so a
+  container whose children are all boxes was being widened by its own
+  indentation — that whitespace alone was the landmark's 43.7px. Whitespace is
+  now skipped in the max-content measure unless the container has real inline
+  content, where a single space still separates inline boxes.
+- **`calc(-12px)`** (a single negative argument) parses; the site's
+  `.vector-button-flush-left` uses it for the flush-left margin.
+- Verified against the reference at vw=1000 on `/wiki/Main_Page`: header start
+  24..204, landmark 24..44 (20 wide), dropdown 12..56 (44 wide, `margin: 0 -12px`),
+  logo box 64..204 — the wordmark moved 24px left, matching the reference.
+  Note the page area itself is inset 12px in the window, so on-screen pixels are
+  layout + 12 (this is what made the button *look* 12px off).
+- **Known gaps**: nothing left in this chain; the intrinsic rules still model
+  only horizontal margins (no `margin` collapsing, no vertical intrinsic
+  contribution), and inline-block baselines are approximated elsewhere.
 
 ### Wave 22 findings
 
