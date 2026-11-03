@@ -637,6 +637,7 @@ impl App {
         self.pinned = None;
         self.selection = None;
         self.select_anchor = None;
+        self.menu = None;
     }
 
     /// Queue a re-layout of the current page (resize / form typing / hover
@@ -1486,9 +1487,13 @@ impl eframe::App for App {
             )
         });
         if toggle_inspect || inspect_f12 {
+            self.menu = None;
             self.set_inspect(!self.inspect);
-        } else if escape && self.inspect {
-            self.set_inspect(false);
+        } else if escape {
+            // Esc closes the context menu before it leaves inspector mode
+            if self.menu.take().is_none() && self.inspect {
+                self.set_inspect(false);
+            }
         }
         if self.selection.is_some()
             && !self.address_focused
@@ -1512,6 +1517,24 @@ impl eframe::App for App {
         let mut new_tab = false;
         let mut go_back = false;
         let mut go: Option<String> = None; // address submit or link click
+
+        // A press outside the open context menu dismisses it. The rect comes
+        // from the last frame's paint (this frame's menu may not be laid out
+        // yet). `menu_dismissed` also suppresses the page press that did it,
+        // so closing the menu never starts a text selection.
+        let mut menu_dismissed = false;
+        if let Some(rect) = self.menu.as_ref().and_then(|m| m.rect) {
+            let pressed_outside = ui.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer
+                        .interact_pos()
+                        .map_or(true, |p| !rect.contains(p))
+            });
+            if pressed_outside {
+                self.menu = None;
+                menu_dismissed = true;
+            }
+        }
 
         // ---- tab strip (the custom titlebar) ----
         let titles: Vec<String> = self.tabs.iter().map(|t| short_title(&t.url)).collect();
@@ -1888,7 +1911,12 @@ impl eframe::App for App {
                     let sel_press = ui
                         .input(|i| i.pointer.primary_pressed().then(|| i.pointer.interact_pos()))
                         .flatten()
-                        .filter(|p| resp.rect.contains(*p) && !in_bar(*p));
+                        .filter(|p| {
+                            resp.rect.contains(*p)
+                                && !in_bar(*p)
+                                && self.menu.is_none()
+                                && !menu_dismissed
+                        });
                     if let Some(p) = sel_press {
                         let rx = p.x - resp.rect.min.x - PADDING as f32;
                         let my_doc = p.y - resp.rect.min.y - PADDING as f32;
@@ -2090,6 +2118,122 @@ impl eframe::App for App {
                         }
                         // the sweep moves every frame, not just on input
                         ui.ctx().request_repaint();
+                    }
+
+                    // ---- page context menu (last, so it paints over the
+                    // page and its overlays) ----
+                    if let Some(menu) = self.menu.clone() {
+                        let mut rows: Vec<MenuRow> = vec![
+                            MenuRow::Action(
+                                MenuAction::Back,
+                                "Back".into(),
+                                !self.back_stack.is_empty(),
+                            ),
+                            MenuRow::Action(MenuAction::Reload, "Reload".into(), true),
+                            MenuRow::Sep,
+                            MenuRow::Action(
+                                MenuAction::Copy,
+                                "Copy".into(),
+                                self.selected_text().is_some_and(|t| !t.is_empty()),
+                            ),
+                            MenuRow::Action(
+                                MenuAction::SelectAll,
+                                "Select all".into(),
+                                !self.page.laid.runs.is_empty(),
+                            ),
+                        ];
+                        if menu.link.is_some() {
+                            rows.push(MenuRow::Sep);
+                            rows.push(MenuRow::Action(
+                                MenuAction::OpenLink,
+                                "Open link".into(),
+                                true,
+                            ));
+                            rows.push(MenuRow::Action(
+                                MenuAction::OpenInNewTab,
+                                "Open link in new tab".into(),
+                                true,
+                            ));
+                            rows.push(MenuRow::Action(
+                                MenuAction::CopyLink,
+                                "Copy link address".into(),
+                                true,
+                            ));
+                        }
+                        if menu
+                            .node
+                            .is_some_and(|n| self.page.elements.contains_key(&n))
+                        {
+                            rows.push(MenuRow::Sep);
+                            rows.push(MenuRow::Action(
+                                MenuAction::Inspect,
+                                "Inspect element".into(),
+                                true,
+                            ));
+                        }
+                        let (action, rect) = paint_context_menu(ui, resp.rect, menu.pos, &rows);
+                        if let Some(m) = self.menu.as_mut() {
+                            m.rect = Some(rect);
+                        }
+                        match action {
+                            Some(MenuAction::Back) => {
+                                self.menu = None;
+                                go_back = true;
+                            }
+                            Some(MenuAction::Reload) => {
+                                self.menu = None;
+                                eprintln!("[menu] reload");
+                                let url = self.page.url.clone();
+                                self.dispatch(&url, pw, ph, self.scroll, false);
+                            }
+                            Some(MenuAction::Copy) => {
+                                self.menu = None;
+                                if let Some(text) = self.selected_text() {
+                                    if !text.is_empty() {
+                                        eprintln!("[menu] copy {} chars", text.chars().count());
+                                        ui.ctx().copy_text(text);
+                                    }
+                                }
+                            }
+                            Some(MenuAction::SelectAll) => {
+                                self.menu = None;
+                                self.select_all();
+                                eprintln!("[menu] select all");
+                            }
+                            Some(MenuAction::OpenLink) => {
+                                self.menu = None;
+                                if let Some(url) = menu.link.clone() {
+                                    eprintln!("[menu] open link {url}");
+                                    self.navigate(&url, pw, ph);
+                                }
+                            }
+                            Some(MenuAction::OpenInNewTab) => {
+                                self.menu = None;
+                                if let Some(url) = menu.link.clone() {
+                                    // the tab loads on its first activation,
+                                    // exactly like a restored session tab
+                                    eprintln!("[menu] open link in new tab: {url}");
+                                    self.tabs.push(Tab { url, scroll: 0.0 });
+                                }
+                            }
+                            Some(MenuAction::CopyLink) => {
+                                self.menu = None;
+                                if let Some(url) = &menu.link {
+                                    eprintln!("[menu] copy link address {url}");
+                                    ui.ctx().copy_text(url.clone());
+                                }
+                            }
+                            Some(MenuAction::Inspect) => {
+                                self.menu = None;
+                                self.set_inspect(true);
+                                if let Some(n) = menu.node {
+                                    if self.page.elements.contains_key(&n) {
+                                        self.pinned = Some(n);
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
                     }
                 }
 
@@ -6734,6 +6878,22 @@ mod tests {
         // unchanged legacy behavior still holds
         assert_eq!(address_target("example.com"), "https://example.com");
         assert!(address_target("rust lang").starts_with("https://duckduckgo.com/"));
+    }
+
+    /// Link targets resolve against the page URL; an absolute `http(s)` href
+    /// must survive a non-http base (a `data:` test page), which is what the
+    /// context menu's link rows rely on.
+    #[test]
+    fn link_targets_resolve_from_a_data_page() {
+        assert_eq!(
+            resolve("data:text/html,<p>x</p>", "https://www.rust-lang.org/tools/install")
+                .as_deref(),
+            Some("https://www.rust-lang.org/tools/install")
+        );
+        assert_eq!(
+            resolve("https://x.com/a/b", "../c").as_deref(),
+            Some("https://x.com/c")
+        );
     }
 
     /// Link clicks land on a DOM node even though layout runs carry only
