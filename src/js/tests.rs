@@ -978,6 +978,96 @@ fn base64_and_typed_array_stand_ins() {
 }
 
 #[test]
+fn of_is_a_plain_identifier() {
+    // `of` is contextual: only the for-head separator, never a keyword
+    assert_eq!(num("var of = 3; of + 1"), 4.0);
+    assert_eq!(num("function of(x) { return x * 2 } of(4)"), 8.0);
+    assert_eq!(num("({ of: 7 }).of"), 7.0);
+    assert_eq!(num("var o = { of: 5 }; o.of"), 5.0);
+    assert_eq!(num("var a = [1, 2]; var n = 0; for (var of of a) n += of; n"), 3.0);
+}
+
+#[test]
+fn object_and_array_are_callable() {
+    // `Object(x)` / `Array(n)` / `new Array(n)`: the constructors are plain
+    // objects here, so the hidden `__call` hook makes the call form work
+    assert!(boolean("typeof Object({ a: 1 }) === 'object'"));
+    assert_eq!(string("Object({ a: 1 }).a"), "1");
+    assert_eq!(string("Object(null).toString()"), "[object Object]");
+    assert_eq!(string("new Array(3).length"), "3");
+    assert_eq!(string("Array(3).length"), "3");
+    assert_eq!(string("Array(1, 2).join('-')"), "1-2");
+    assert_eq!(string("Array.of(1, 2).length"), "2");
+    assert_eq!(string("Array.from('abc').join('')"), "abc");
+    assert_eq!(string("Array.from([1, 2], function (v) { return v * 2 }).join(',')"), "2,4");
+    assert_eq!(string("Array.from({ length: 2, 0: 'a', 1: 'b' }).join('')"), "ab");
+}
+
+#[test]
+fn object_to_string_is_a_tag_not_a_dump() {
+    // `ToString` on a plain object is its tag, never a walk of its properties:
+    // walking is exponential on a cyclic graph like `window`, which used to
+    // blow up to gigabytes when gtag.js evaluated `window == null`.
+    assert_eq!(string("String({ a: 1 })"), "[object Object]");
+    assert_eq!(string("var w = {}; w.self = w; String(w)"), "[object Object]");
+    assert_eq!(string("String([1, [2, 3]])"), "1,2,3");
+    assert!(boolean("(globalThis == null) === false"));
+    assert!(boolean("String(JSON.parse('{\"a\":1}')) === '[object Object]'"));
+}
+
+#[test]
+fn primitive_and_function_prototypes_exist() {
+    // feature probes core-js-style bundles run before installing polyfills
+    assert!(boolean("'trimStart' in String.prototype && 'trim' in String.prototype"));
+    assert!(boolean("'toUpperCase' in String.prototype"));
+    assert!(boolean("'toString' in Number.prototype"));
+    assert!(boolean("'toString' in Boolean.prototype"));
+    assert!(boolean("typeof Symbol.prototype === 'object'"));
+    // borrowed methods work through the prototype object
+    assert_eq!(string("String.prototype.trimStart.call('  x  ')"), "x  ");
+    assert_eq!(string("String.prototype.trim.call('  x  ')"), "x");
+    assert_eq!(string("String.prototype.toUpperCase.call('ab')"), "AB");
+    assert_eq!(string("Number.prototype.toFixed.call(1.5, 1)"), "1.5");
+    assert_eq!(
+        string("Function.prototype.call.call(function (a) { return a; }, null, 4)"),
+        "4"
+    );
+    // functions inherit Object.prototype through Function.prototype
+    assert!(boolean("(function () {}).hasOwnProperty('prototype')"));
+    assert!(boolean("!(function () {}).bind(null).hasOwnProperty('prototype')"));
+    // shortcut: the Function constructor returns the global-getter idiom
+    assert!(boolean("Function('return this')() === globalThis"));
+    // Object.prototype surface core-js probes before installing polyfills
+    assert!(boolean("({ a: 1 }).propertyIsEnumerable('a')"));
+    assert!(boolean("![1].propertyIsEnumerable('length')"));
+    assert!(boolean("({}).valueOf() !== null"));
+    // Object.defineProperties applies every descriptor
+    assert_eq!(
+        string("var o = {}; Object.defineProperties(o, { a: { value: 1 }, b: { value: 2 } }); o.a + o.b"),
+        "3"
+    );
+    assert!(boolean("Object.prototype.isPrototypeOf({})"));
+    assert!(boolean("!Object.prototype.isPrototypeOf(Object.prototype)"));
+}
+
+#[test]
+fn in_operator_survives_nested_grammar_in_for_heads() {
+    assert!(boolean("'a' in { a: 1 }"));
+    assert!(boolean(
+        "var o = { a: 1 }; var q = false; if (o && 'a' in o) q = true; q"
+    ));
+    // function body inside a for-init: `in` suppression must not leak
+    assert!(boolean(
+        "var r = []; for (var f = function (o) { return 'a' in o; }; r.length < 1;) { r.push(f({ a: 1 })); break; } r[0]"
+    ));
+    // object/array literal inside a for-init
+    assert!(boolean("for (var o = { k: 'a' in { a: 1 } }; o.k;) { break; } o.k"));
+    assert!(boolean("for (var a = ['b' in { b: 1 }]; a[0];) { break; } a[0]"));
+    // `in` in the condition of a classic for
+    assert_eq!(num("var n = 0; for (var i = 0; 'a' in { a: 1 }; i++) { n++; break; } n"), 1.0);
+}
+
+#[test]
 fn array_sort_and_reverse() {
     assert_eq!(string("[3, 1, 2].sort().join(',')"), "1,2,3");
     assert_eq!(string("['b', 'a'].sort().join(',')"), "a,b");
@@ -2162,4 +2252,102 @@ fn url_accepts_a_url_instance_as_base() {
         "/a/c"
     );
     assert_eq!(string("new URL('https://example.com/x').toString()"), "https://example.com/x");
+}
+
+// -- wave 21: error family, function/promise prototypes, array/string nits --
+
+#[test]
+fn error_objects_have_names_prototypes_and_stack() {
+    assert_eq!(string("new Error('boom').name"), "Error");
+    assert_eq!(string("new TypeError('bad').name"), "TypeError");
+    assert_eq!(string("new Error('boom').message"), "boom");
+    assert_eq!(string("new Error('boom').toString()"), "Error: boom");
+    assert_eq!(string("new Error().toString()"), "Error");
+    assert!(boolean("new TypeError('x') instanceof Error"));
+    assert!(boolean("new RangeError('x') instanceof Error"));
+    assert!(boolean("new Error('x') instanceof Object"));
+    assert!(boolean("Object.getPrototypeOf(TypeError.prototype) === Error.prototype"));
+    // shortcut: no captured frames - `stack` is the head line only
+    assert!(boolean("typeof new Error('x').stack === 'string'"));
+    // borrowed by libraries: reads this.name / this.message, not the slot
+    assert_eq!(
+        string("Error.prototype.toString.call({ name: 'X', message: 'y' })"),
+        "X: y"
+    );
+    assert_eq!(string("Error.prototype.toString.call({})"), "Error");
+    // an error logged by the engine keeps its own message
+    assert!(err("throw new TypeError('bad')")
+        .to_string()
+        .contains("TypeError: bad"));
+}
+
+#[test]
+fn subclasses_of_error_stay_errors() {
+    assert!(boolean("class MyError extends Error {}; new MyError('m') instanceof Error"));
+    assert_eq!(
+        string("class MyError extends Error {}; new MyError('m').message"),
+        "m"
+    );
+    assert_eq!(
+        string("class MyError extends Error {}; new MyError('m').toString()"),
+        "Error: m"
+    );
+}
+
+#[test]
+fn promise_prototype_is_an_object_with_borrowable_methods() {
+    // core-js-style bundles do `pm = Promise.prototype` then define `then`:
+    // the object must exist and expose the methods
+    assert!(boolean("typeof Promise.prototype === 'object'"));
+    assert!(boolean("typeof Promise.prototype.then === 'function'"));
+    assert!(boolean("typeof Promise.prototype.catch === 'function'"));
+    assert!(boolean("typeof Promise.prototype.finally === 'function'"));
+    assert!(boolean(
+        "Object.getPrototypeOf(Promise.resolve()) === Promise.prototype"
+    ));
+    // borrowed through the prototype object
+    assert_eq!(
+        mnum(
+            "let m = 0; let pm = Promise.prototype; \
+             pm.then.call(Promise.resolve(5), function (v) { m = v * 2 })"
+        ),
+        10.0
+    );
+}
+
+#[test]
+fn string_char_code_at() {
+    assert_eq!(num("'A'.charCodeAt(0)"), 65.0);
+    assert_eq!(num("'abc'.charCodeAt(2)"), 99.0);
+    // EUR sign U+20AC
+    assert_eq!(num("'\\u20ac'.charCodeAt(0)"), 8364.0);
+    assert!(num("'abc'.charCodeAt(9)").is_nan());
+}
+
+#[test]
+fn array_splice_removes_and_inserts() {
+    assert_eq!(
+        string("var a = [1, 2, 3, 4]; a.splice(1, 2).join(',') + '|' + a.join(',')"),
+        "2,3|1,4"
+    );
+    assert_eq!(
+        string("var a = [1, 2, 3]; a.splice(1, 0, 'x', 'y'); a.join(',')"),
+        "1,x,y,2,3"
+    );
+    assert_eq!(string("var a = [1, 2, 3]; a.splice(-1, 1); a.join(',')"), "1,2");
+    assert_eq!(num("var a = [1, 2, 3]; a.splice(1); a.length"), 1.0);
+}
+
+#[test]
+fn function_to_string_reports_a_function() {
+    assert_eq!(
+        string("(function foo() {}).toString()"),
+        "function foo() { [code] }"
+    );
+    assert_eq!(
+        string("(function () {}).toString()"),
+        "function () { [code] }"
+    );
+    // natives advertise themselves as native, as feature probes expect
+    assert!(boolean("String(Math.max).indexOf('native code') > 0"));
 }

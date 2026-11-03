@@ -318,9 +318,15 @@ pub struct BoxStyle {
     /// `[line-name]` boundaries from `grid-template-columns`
     /// (name → track index it precedes)
     pub col_lines: Vec<(String, usize)>,
-    /// this grid item's `grid-column: <name>` — resolved against the
-    /// container's `col_lines` (`name-start`…`name-end`) at layout
+    /// this grid item's `grid-column-start` (or the first half of the
+    /// `grid-column` shorthand) — resolved against the container's
+    /// `col_lines` (`name-start`…`name-end`) at layout
     pub grid_col: Option<String>,
+    /// `grid-column-end`: the item spans from `grid_col` (or the column
+    /// before this line when the start is auto) to here. MDN's homepage
+    /// header relies on it (`grid-column: content` + `grid-column-end:
+    /// extended-full-end`) to bleed past the content column.
+    pub grid_col_end: Option<String>,
     /// `grid-template-areas` rows of cell names; `None` = an empty `.` cell.
     /// Items name a cell with `grid-area` and are placed into its rect.
     pub areas: Vec<Vec<Option<String>>>,
@@ -566,6 +572,7 @@ impl Default for BoxStyle {
             rows: Vec::new(),
             col_lines: Vec::new(),
             grid_col: None,
+            grid_col_end: None,
             areas: Vec::new(),
             grid_area: None,
             width: None,
@@ -1155,6 +1162,8 @@ const KNOWN: &[&str] = &[
     "grid-template-areas",
     "grid-area",
     "grid-column",
+    "grid-column-start",
+    "grid-column-end",
     "width",
     "max-width",
     "min-width",
@@ -2404,12 +2413,40 @@ fn apply_decl(
                 bx.grid_area = Some(first.to_string());
             }
         }
-        // item placement into named lines: `grid-column: content` spans the
-        // [content-start]…[content-end] pair from the container's template
+        // item placement into named lines: `grid-column: content` starts at
+        // [content-start]; a second half (`content / extended-full-end`) or
+        // the `-end` longhand below makes the item span to that line
         "grid-column" => {
-            let first = d.1.split('/').next().unwrap_or("").trim();
-            if !first.is_empty() && first != "auto" && !first.parse::<u32>().is_ok() {
+            let mut parts = d.1.split('/');
+            let first = parts.next().unwrap_or("").trim();
+            if !first.is_empty() && first != "auto" && first.parse::<u32>().is_err() {
                 bx.grid_col = Some(first.to_string());
+            }
+            if let Some(end) = parts.next() {
+                let end = end.trim();
+                if !end.is_empty()
+                    && end != "auto"
+                    && !end.starts_with("span")
+                    && end.parse::<u32>().is_err()
+                {
+                    bx.grid_col_end = Some(end.to_string());
+                }
+            }
+        }
+        "grid-column-start" => {
+            let first = d.1.split('/').next().unwrap_or("").trim();
+            if !first.is_empty() && first != "auto" && first.parse::<u32>().is_err() {
+                bx.grid_col = Some(first.to_string());
+            }
+        }
+        "grid-column-end" => {
+            let first = d.1.split('/').next().unwrap_or("").trim();
+            if !first.is_empty()
+                && first != "auto"
+                && !first.starts_with("span")
+                && first.parse::<u32>().is_err()
+            {
+                bx.grid_col_end = Some(first.to_string());
             }
         }
         "width" => {
@@ -4125,6 +4162,21 @@ fn parse_color(v: &str) -> Option<u32> {
         .or_else(|| v.strip_prefix("rgb("))
         .and_then(|s| s.strip_suffix(')'));
     if let Some(inner) = inner {
+        if !inner.contains(',') {
+            // modern space-separated form: `rgb(35 39 47/1)` (Tailwind and
+            // most 2021+ design systems emit this)
+            let (parts, alpha) = space_color_args(inner);
+            if parts.len() < 3 {
+                return None;
+            }
+            let r = rgb_channel(parts[0])?;
+            let g = rgb_channel(parts[1])?;
+            let b = rgb_channel(parts[2])?;
+            if alpha.and_then(alpha_channel).map_or(false, |a| a <= 0.0) {
+                return None; // transparent
+            }
+            return Some(r << 16 | g << 8 | b);
+        }
         let mut parts = inner.split(',');
         let r = parts.next()?.trim().parse::<u32>().ok()?;
         let g = parts.next()?.trim().parse::<u32>().ok()?;
@@ -4157,6 +4209,37 @@ fn parse_color(v: &str) -> Option<u32> {
         "brown" => Some(0xa52a2a),
         "pink" => Some(0xffc0cb),
         _ => None, // transparent, currentColor, var(), url() …
+    }
+}
+
+/// Split a modern color argument list (`35 39% 47% / 0.5`) into its channel
+/// tokens plus the optional alpha token after the slash.
+fn space_color_args(inner: &str) -> (Vec<&str>, Option<&str>) {
+    match inner.split_once('/') {
+        Some((main, a)) => (main.split_whitespace().collect(), Some(a.trim())),
+        None => (inner.split_whitespace().collect(), None),
+    }
+}
+
+/// One rgb() channel: bare number or percentage.
+fn rgb_channel(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(p) = s.strip_suffix('%') {
+        let p: f32 = p.trim().parse().ok()?;
+        Some((p / 100.0 * 255.0).round().clamp(0.0, 255.0) as u32)
+    } else {
+        let n: f32 = s.parse().ok()?;
+        Some(n.round().clamp(0.0, 255.0) as u32)
+    }
+}
+
+/// alpha token: bare 0-1 or percentage.
+fn alpha_channel(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(p) = s.strip_suffix('%') {
+        Some(p.trim().parse::<f32>().ok()? / 100.0)
+    } else {
+        s.parse::<f32>().ok()
     }
 }
 
@@ -4202,14 +4285,19 @@ fn parse_hsl(v: &str) -> Option<(u32, u8)> {
         .strip_prefix("hsla(")
         .or_else(|| v.strip_prefix("hsl("))
         .and_then(|s| s.strip_suffix(')'))?;
-    let mut parts = inner.split(',').map(|p| p.trim());
-    let h = parts.next()?.trim_end_matches("deg").parse::<f32>().ok()?;
-    let s = parts.next()?.trim_end_matches('%').parse::<f32>().ok()? / 100.0;
-    let l = parts.next()?.trim_end_matches('%').parse::<f32>().ok()? / 100.0;
-    let a = if is_hsla {
-        parts.next().and_then(|p| p.parse::<f32>().ok()).unwrap_or(1.0)
+    let (parts, alpha): (Vec<&str>, Option<&str>) = if inner.contains(',') {
+        let mut it = inner.split(',').map(|p| p.trim());
+        (it.by_ref().collect(), None)
     } else {
-        1.0
+        space_color_args(inner)
+    };
+    let h = parts.first()?.trim_end_matches("deg").parse::<f32>().ok()?;
+    let s = parts.get(1)?.trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+    let l = parts.get(2)?.trim_end_matches('%').parse::<f32>().ok()? / 100.0;
+    let a = match alpha {
+        Some(t) => alpha_channel(t).unwrap_or(1.0),
+        None if is_hsla => parts.get(3).and_then(|p| p.parse::<f32>().ok()).unwrap_or(1.0),
+        None => 1.0,
     };
     if !(0.0..=1.0).contains(&s) || !(0.0..=1.0).contains(&l) {
         return None;
@@ -4266,6 +4354,17 @@ fn parse_color_alpha(v: &str) -> Option<(u32, u8)> {
         .or_else(|| v.strip_prefix("rgb("))
         .and_then(|s| s.strip_suffix(')'));
     if let Some(inner) = inner {
+        if !inner.contains(',') {
+            let (parts, alpha) = space_color_args(inner);
+            if parts.len() < 3 {
+                return None;
+            }
+            let r = rgb_channel(parts[0])?;
+            let g = rgb_channel(parts[1])?;
+            let b = rgb_channel(parts[2])?;
+            let a = (alpha.and_then(alpha_channel).unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+            return Some((r << 16 | g << 8 | b, a));
+        }
         let mut parts = inner.split(',');
         let r = parts.next()?.trim().parse::<u32>().ok()?;
         let g = parts.next()?.trim().parse::<u32>().ok()?;
@@ -6169,6 +6268,25 @@ mod tests {
     fn hsl_alpha_parses() {
         assert_eq!(parse_color_alpha("hsla(0, 0%, 10%, 1)"), Some((0x1a1a1a, 255)));
         assert_eq!(parse_color_alpha("hsla(210, 50%, 40%, 0.5)"), Some((0x336699, 128)));
+    }
+
+    #[test]
+    fn modern_space_separated_color_syntax() {
+        // CSS Color 4 form: channels separated by spaces, alpha after `/`.
+        // Tailwind-based sites emit this everywhere (`rgb(35 39 47/1)`).
+        assert_eq!(parse_color("rgb(35 39 47)"), Some(0x23272f));
+        assert_eq!(parse_color("rgb(35 39 47 / 1)"), Some(0x23272f));
+        assert_eq!(parse_color("rgb(100% 0% 0%)"), Some(0xff0000));
+        assert_eq!(parse_color_alpha("rgb(35 39 47 / 0.5)"), Some((0x23272f, 128)));
+        assert_eq!(parse_color_alpha("rgb(0 0 0 / 0)"), Some((0x000000, 0)));
+        // an unresolved custom property in the alpha slot must not discard
+        // the colour: tailwind emits `rgb(35 39 47 / var(--tw-text-opacity))`
+        assert_eq!(
+            parse_color("rgb(35 39 47 / var(--tw-text-opacity))"),
+            Some(0x23272f)
+        );
+        assert_eq!(parse_color("hsl(210 50% 40%)"), Some(0x336699));
+        assert_eq!(parse_color_alpha("hsl(210 50% 40% / 50%)"), Some((0x336699, 128)));
     }
 
     #[test]

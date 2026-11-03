@@ -297,7 +297,7 @@ fn n_dynamic_import(
         .module_url_for(e.cur_src)
         .or_else(|| e.import_base.clone())
         .unwrap_or_default();
-    let p = super::new_promise_obj();
+    let p = e.new_promise();
     match resolve_specifier(&base, &spec) {
         Some(url) => e.microtasks.push(super::Job::Import {
             url: Rc::from(url.as_str()),

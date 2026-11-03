@@ -39,7 +39,7 @@ that gets cheaper per tab instead of more expensive.
 | 🔤 | **Text** | Charset detection, gzip, CJK/Hangul fallback, `@font-face` (WOFF1, optional WOFF2), font stacks |
 | ⚙️ | **JavaScript** | From-scratch interpreter: classes, modules, promises, builtins, DOM APIs, events, `fetch`, timers — plus an optional full engine core |
 | 🌐 | **Networking** | HTTP(S), disk cache, persisted cookie jar, gzip |
-| 🪟 | **Shell** | Tabs, history, address bar, scrollbar, form controls, hover, F11, settings overlay, live RSS meter |
+| 🪟 | **Shell** | Tabs, history, address bar, scrollbar, form controls, hover, F11, settings overlay, element inspector, drag-select + copy, live RSS meter |
 | 🧠 | **Memory** | Worker-thread loading, DOM snapshots for tab restore, lazy fonts, hard decode budgets |
 
 ## Architecture
@@ -145,7 +145,7 @@ Mazda is **alpha** — it renders Wikipedia, MDN, Hacker News, rust-lang.org, an
 runs real page scripts, but it is not a daily driver.
 
 - **In scope:** HTML/CSS/layout, images, fonts, a JavaScript interpreter, forms, tabs
-- **Not yet:** GPU compositing, process sandbox, media playback, DRM, extensions, DevTools
+- **Not yet:** GPU compositing, process sandbox, media playback, DRM, extensions, full DevTools
 - **Not a near-term target:** Chrome-scale JS applications — that needs their API surface and a JIT
 
 > JavaScript was originally a non-goal. It is now in scope as a from-scratch interpreter, with

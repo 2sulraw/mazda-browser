@@ -100,18 +100,30 @@ pub(crate) fn install(e: &mut JsEngine) {
         ("hasOwn", O_HAS_OWN),
         ("getOwnPropertyDescriptor", O_GET_DESC),
         ("getOwnPropertyDescriptors", O_GET_DESCS),
+        ("defineProperties", O_DEFINE_PROPS),
     ] {
         let id = e.register_native(&format!("Object.{name}"), n_object, idx);
         obj_set_own(own(&object), name, Val::Native(id));
     }
     e.set_global("Object", object.clone());
 
+    // `Object(x)` — the constructor is an ordinary object here, so the call
+    // form goes through the hidden `__call` hook (see `JsEngine::call`)
+    let oc = e.register_native("Object", n_object, O_CALL);
+    obj_set_own(own(&object), "__call", Val::Native(oc));
+
     // Object.prototype + Array.prototype chain
     let obj_proto = Val::new_object();
     let ts = e.register_native("toString", n_objproto, 0);
     let ho = e.register_native("hasOwnProperty", n_objproto, 1);
+    let pie = e.register_native("propertyIsEnumerable", n_objproto, 2);
+    let vof = e.register_native("valueOf", n_objproto, 3);
+    let ipo = e.register_native("isPrototypeOf", n_objproto, 4);
     obj_set_own(own(&obj_proto), "toString", Val::Native(ts));
     obj_set_own(own(&obj_proto), "hasOwnProperty", Val::Native(ho));
+    obj_set_own(own(&obj_proto), "propertyIsEnumerable", Val::Native(pie));
+    obj_set_own(own(&obj_proto), "valueOf", Val::Native(vof));
+    obj_set_own(own(&obj_proto), "isPrototypeOf", Val::Native(ipo));
     // `Object.prototype` is reachable as a property, so libraries that borrow
     // methods (`Object.prototype.hasOwnProperty.call(o, k)`) work. Plain
     // objects also lazily inherit it on first member access (get_member), so
@@ -146,6 +158,7 @@ pub(crate) fn install(e: &mut JsEngine) {
         "every",
         "sort",
         "reverse",
+        "splice",
     ]
     .iter()
     .enumerate()
@@ -159,15 +172,49 @@ pub(crate) fn install(e: &mut JsEngine) {
     let is_array = e.register_native("Array.isArray", n_array, 100);
     let array_ctor = Val::new_object();
     obj_set_own(own(&array_ctor), "isArray", Val::Native(is_array));
+    let ac = e.register_native("Array", n_array_call, 0);
+    let a_of = e.register_native("Array.of", n_array_call, 1);
+    let a_from = e.register_native("Array.from", n_array_call, 2);
+    obj_set_own(own(&array_ctor), "__call", Val::Native(ac));
+    obj_set_own(own(&array_ctor), "of", Val::Native(a_of));
+    obj_set_own(own(&array_ctor), "from", Val::Native(a_from));
     obj_set_own(own(&array_ctor), "prototype", arr_proto);
     e.set_global("Array", array_ctor);
 
     // -- Error family ------------------------------------------------------
+    // A real `Error.prototype` (name/message/toString) so `class X extends
+    // Error` builds a working chain and `err.toString()` is inherited. Each
+    // subclass gets its own prototype object chained to it.
+    let err_to_str = e.register_native("Error.prototype.toString", n_error_to_string, 0);
+    let error_proto = Val::new_object();
+    obj_set_own(own(&error_proto), "name", Val::Str(Rc::from("Error")));
+    obj_set_own(own(&error_proto), "message", Val::Str(Rc::from("")));
+    obj_set_own(own(&error_proto), "toString", Val::Native(err_to_str));
+    if let (Val::Obj(o), Some(parent)) = (&error_proto, &e.object_proto) {
+        o.borrow_mut().proto = Some(parent.clone());
+    }
+    if let Val::Obj(o) = &error_proto {
+        e.error_proto = Some(o.clone());
+    }
     for (i, name) in ["Error", "TypeError", "RangeError", "SyntaxError"]
         .iter()
         .enumerate()
     {
         let id = e.register_native(name, n_error_ctor, i as u16);
+        if i == 0 {
+            // `Error.prototype` IS the shared base prototype, so an instance
+            // of any subclass satisfies `x instanceof Error`.
+            e.set_native_prop(id, "prototype", error_proto.clone());
+            e.set_global(name, Val::Native(id));
+            continue;
+        }
+        let proto = Val::new_object();
+        obj_set_own(own(&proto), "name", Val::Str(Rc::from(*name)));
+        obj_set_own(own(&proto), "message", Val::Str(Rc::from("")));
+        if let (Val::Obj(o), Val::Obj(parent)) = (&proto, &error_proto) {
+            o.borrow_mut().proto = Some(parent.clone());
+        }
+        e.set_native_prop(id, "prototype", proto);
         e.set_global(name, Val::Native(id));
     }
 
@@ -184,6 +231,58 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("String", Val::Native(str_id));
     e.set_global("Number", Val::Native(num_id));
     e.set_global("Boolean", Val::Native(bool_id));
+
+    // -- primitive prototypes ----------------------------------------------
+    // Bundles probe `"trimStart" in String.prototype` to decide whether to
+    // install a polyfill, and borrow the method (`String.prototype.slice
+    // .call(x)`). The primitive dispatch table in `get_member` stays the real
+    // implementation; these prototype objects expose the same natives as
+    // borrowed callables, so both patterns work.
+    let str_proto = Val::new_object();
+    for (i, (name, _m)) in STR_METHODS.iter().enumerate() {
+        let id = e.register_native(&format!("String.prototype.{name}"), n_str_proto, i as u16);
+        obj_set_own(own(&str_proto), name, Val::Native(id));
+    }
+    e.set_native_prop(str_id, "prototype", str_proto.clone());
+    let num_proto = Val::new_object();
+    for (i, (name, _m)) in NUM_METHODS.iter().enumerate() {
+        let id = e.register_native(&format!("Number.prototype.{name}"), n_num_proto, i as u16);
+        obj_set_own(own(&num_proto), name, Val::Native(id));
+    }
+    e.set_native_prop(num_id, "prototype", num_proto.clone());
+    let bool_proto = Val::new_object();
+    let bts = e.register_native("Boolean.prototype.toString", n_num_proto, 0);
+    obj_set_own(own(&bool_proto), "toString", Val::Native(bts));
+    e.set_native_prop(bool_id, "prototype", bool_proto.clone());
+    if let Val::Obj(o) = &str_proto {
+        o.borrow_mut().proto = match &obj_proto {
+            Val::Obj(p) => Some(p.clone()),
+            _ => None,
+        };
+    }
+
+    // -- Function.prototype -------------------------------------------------
+    // Function values already answer `call`/`apply`/`bind` directly; the
+    // prototype object exposes the same three as borrowed callables
+    // (`Function.prototype.call.call(f, thisArg, ...)`), which core-js uses.
+    let fn_proto = Val::new_object();
+    for (i, name) in ["call", "apply", "bind", "toString"].iter().enumerate() {
+        let id = e.register_native(&format!("Function.prototype.{name}"), n_fn_proto, i as u16);
+        obj_set_own(own(&fn_proto), name, Val::Native(id));
+    }
+    if let Val::Obj(o) = &fn_proto {
+        o.borrow_mut().proto = match &obj_proto {
+            Val::Obj(p) => Some(p.clone()),
+            _ => None,
+        };
+        e.function_proto = Some(o.clone());
+    }
+    let fn_body = e.register_native("Function(...) body", n_fn_body, 0);
+    let fn_ctor = e.register_native("Function", n_fn_ctor, 0);
+    e.set_native_prop(fn_ctor, "prototype", fn_proto);
+    e.fn_body_native = fn_body;
+    e.set_global("Function", Val::Native(fn_ctor));
+
     e.set_global("NaN", Val::Num(f64::NAN));
     e.set_global("Infinity", Val::Num(f64::INFINITY));
 
@@ -201,9 +300,15 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("encodeURIComponent", Val::Native(enc));
     e.set_global("decodeURIComponent", Val::Native(dec));
 
-    // -- timers (queue-only stub; embedder drains via drain_timers) --------
+    // -- timers (queue-only; embedder drains via drain_timers) --------------
     let st = e.register_native("setTimeout", n_set_timeout, 0);
     e.set_global("setTimeout", Val::Native(st));
+    let si = e.register_native("setInterval", n_set_timeout, 1);
+    e.set_global("setInterval", Val::Native(si));
+    let ct = e.register_native("clearTimeout", n_set_timeout, 2);
+    e.set_global("clearTimeout", Val::Native(ct));
+    let ci = e.register_native("clearInterval", n_set_timeout, 2);
+    e.set_global("clearInterval", Val::Native(ci));
 
     // -- Promise (constructor + statics) ------------------------------------
     // `new Promise(executor)` and all five static combinators below; the
@@ -224,9 +329,36 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&promise), "race", Val::Native(pray));
     obj_set_own(own(&promise), "allSettled", Val::Native(pass));
     e.promise_statics = Some(obj_of(&promise));
+    // `Promise.prototype` must exist: feature probes borrow its `then`
+    // (`var Vy = Promise.prototype.then`) and re-apply it to real promises.
+    let promise_proto = Val::new_object();
+    obj_set_own(own(&promise_proto), "then", Val::Method(Meth::PromiseThen));
+    obj_set_own(own(&promise_proto), "catch", Val::Method(Meth::PromiseCatch));
+    obj_set_own(own(&promise_proto), "finally", Val::Method(Meth::PromiseFinally));
+    if let (Val::Obj(o), Some(parent)) = (&promise_proto, &e.object_proto) {
+        o.borrow_mut().proto = Some(parent.clone());
+    }
+    e.set_native_prop(pc, "prototype", promise_proto.clone());
+    if let Val::Obj(o) = &promise_proto {
+        e.promise_proto = Some(o.clone());
+    }
 
     // -- RegExp (callable constructor; same behavior plain or `new`) --------
     let rc = e.register_native("RegExp", n_regexp, 0);
+    // `RegExp.prototype` is an ordinary object holding the methods. Polyfill
+    // bundles borrow them through `Function.prototype.call` (`b(ws.exec)`),
+    // so these must be real function values, not the receiver-dispatched
+    // shortcuts `re.exec` uses.
+    let re_proto = Val::new_object();
+    for (i, name) in ["exec", "test", "toString"].iter().enumerate() {
+        let id = e.register_native(
+            &format!("RegExp.prototype.{name}"),
+            n_regex_proto,
+            i as u16,
+        );
+        obj_set_own(own(&re_proto), name, Val::Native(id));
+    }
+    e.set_native_prop(rc, "prototype", re_proto);
     e.set_global("RegExp", Val::Native(rc));
 
     // -- URL / URLSearchParams --------------------------------------------
@@ -329,7 +461,37 @@ pub(crate) fn install(e: &mut JsEngine) {
     // computed property key work because the engine stringifies it as
     // `Symbol(desc)`; there is no real primitive symbol type.
     let sym = e.register_native("Symbol", n_symbol, 0);
-    for name in ["iterator", "asyncIterator", "toStringTag", "hasInstance"] {
+    // `Symbol.prototype` exists so feature probes (`"description" in
+    // Symbol.prototype`) and `defineProperty` on it do not throw.
+    let sym_proto = Val::new_object();
+    e.set_native_prop(sym, "prototype", sym_proto.clone());
+    if let Val::Obj(o) = &sym_proto {
+        let ts = e.register_native("Symbol.prototype.toString", n_symbol_proto, 0);
+        let vo = e.register_native("Symbol.prototype.valueOf", n_symbol_proto, 1);
+        obj_set_own(o, "toString", Val::Native(ts));
+        obj_set_own(o, "valueOf", Val::Native(vo));
+        // the real accessor; a data property keeps `"description" in
+        // Symbol.prototype` true (feature probes only)
+        obj_set_own(o, "description", Val::Undefined);
+    }
+    for name in [
+        "iterator",
+        "asyncIterator",
+        "toStringTag",
+        "hasInstance",
+        "species",
+        "isConcatSpreadable",
+        "match",
+        "matchAll",
+        "replace",
+        "search",
+        "split",
+        "toPrimitive",
+        "unscopables",
+        "asyncDispose",
+        "dispose",
+        "metadata",
+    ] {
         let s = new_symbol(name);
         e.set_native_prop(sym, name, s);
     }
@@ -453,7 +615,7 @@ pub(crate) fn array_proto(e: &JsEngine) -> Option<Rc<RefCell<Obj>>> {
 
 fn n_console(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     // match engine logging style: script console output goes to stderr
-    let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+    let parts: Vec<String> = args.iter().map(|v| v.inspect()).collect();
     eprintln!("{}", parts.join(" "));
     Ok(Val::Undefined)
 }
@@ -830,9 +992,113 @@ const O_IS_SEALED: u16 = 14;
 const O_HAS_OWN: u16 = 15;
 const O_GET_DESC: u16 = 16;
 const O_GET_DESCS: u16 = 17;
+const O_DEFINE_PROPS: u16 = 18;
+const O_CALL: u16 = 19;
+
+/// Apply one `Object.defineProperty` descriptor to `target`.
+fn define_prop(
+    e: &mut JsEngine,
+    target: &Val,
+    key: &str,
+    d: Option<&Val>,
+) -> Result<(), JsError> {
+    let value = match d {
+        Some(Val::Obj(ob)) => {
+            let b = ob.borrow();
+            b.props
+                .iter()
+                .find(|(k, _)| k.as_ref() == "value")
+                .map(|(_, v)| v.clone())
+        }
+        _ => None,
+    };
+    // accessors read through get_member (callable `get`/`set`)
+    let get = match d {
+        Some(d) => get_member(e, d, "get")?,
+        None => Val::Undefined,
+    };
+    let set = match d {
+        Some(d) => get_member(e, d, "set")?,
+        None => Val::Undefined,
+    };
+    let acc = if is_callable(&get) || is_callable(&set) {
+        Some(Val::Acc(Rc::new(AccEntry {
+            getter: if is_callable(&get) { Some(get) } else { None },
+            setter: if is_callable(&set) { Some(set) } else { None },
+        })))
+    } else {
+        None
+    };
+    // A descriptor without `value` and without `get`/`set` modifies flags
+    // only: the current value has to survive. `Object.defineProperty(fn,
+    // "prototype", { writable: false })` used to wipe the prototype to
+    // `undefined` — exactly what a published polyfill bundle does, which
+    // then broke its own `t.prototype` reads. Only an explicit `value`
+    // (including `value: undefined`) replaces the property.
+    let v = match (acc, value) {
+        (Some(a), _) => a,
+        (None, Some(v)) => v,
+        (None, None) => {
+            let existing = match target {
+                Val::Obj(o) => o
+                    .borrow()
+                    .props
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .map(|(_, x)| x.clone()),
+                Val::Func(f) => f
+                    .props
+                    .borrow()
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .map(|(_, x)| x.clone())
+                    .filter(|x| !matches!(x, Val::Undefined)),
+                _ => None,
+            };
+            match existing {
+                Some(x) => x,
+                // every non-arrow function owns a `prototype` object, even
+                // before anyone read it (it is materialized lazily)
+                None => match target {
+                    Val::Func(f) if key == "prototype" => {
+                        Val::Obj(super::interp::ensure_prototype(f))
+                    }
+                    _ => Val::Undefined,
+                },
+            }
+        }
+    };
+    match target {
+        Val::Obj(o) => obj_set_own(o, key, v),
+        Val::Func(f) => {
+            let mut props = f.props.borrow_mut();
+            props.retain(|(k, _)| k.as_ref() != key);
+            props.push((Rc::from(key), v));
+        }
+        // built-in constructors keep their own props in the native side
+        // table; polyfills legitimately patch them (`Object.defineProperty(
+        // Symbol, "dispose", …)`)
+        Val::Native(id) => e.set_native_prop(*id, key, v),
+        _ => {
+            return Err(JsError::throw(
+                "TypeError: Object.defineProperty called on non-object",
+            ))
+        }
+    }
+    Ok(())
+}
 
 fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
+        // `Object(x)` — objects pass through unchanged, nullish builds a
+        // fresh object. shortcut: a primitive comes back unwrapped (no boxed
+        // String/Number wrappers in this engine).
+        O_CALL => Ok(match args.first() {
+            None | Some(Val::Null) | Some(Val::Undefined) => {
+                proto_instance(e.object_proto.clone())
+            }
+            Some(v) => v.clone(),
+        }),
         O_KEYS | O_VALUES | O_ENTRIES => {
             // shortcut: arrays yield index strings (matches real engines)
             let o = args.first().cloned().unwrap_or(Val::Undefined);
@@ -879,51 +1145,21 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
         O_DEFINE_PROP => {
             // Object.defineProperty(target, key, { value?, get?, set? })
             // shortcut: writable/enumerable/configurable flags are accepted
-            // and ignored — accessors and values install normally
+            // and ignored - accessors and values install normally
             let target = args.first().cloned().unwrap_or(Val::Undefined);
             let key = args.get(1).map(|v| v.to_string()).unwrap_or_default();
-            let (vals, gets, sets) = match args.get(2) {
-                Some(d) => {
-                    let value = match d {
-                        Val::Obj(ob) => {
-                            let b = ob.borrow();
-                            b.props
-                                .iter()
-                                .find(|(k, _)| k.as_ref() == "value")
-                                .map(|(_, v)| v.clone())
-                        }
-                        _ => None,
-                    };
-                    // accessors read through get_member (callable `get`/`set`)
-                    let get = get_member(e, d, "get")?;
-                    let set = get_member(e, d, "set")?;
-                    (value, get, set)
-                }
-                _ => (None, Val::Undefined, Val::Undefined),
+            define_prop(e, &target, &key, args.get(2))?;
+            Ok(target)
+        }
+        O_DEFINE_PROPS => {
+            // Object.defineProperties(target, { key: descriptor, ... })
+            let target = args.first().cloned().unwrap_or(Val::Undefined);
+            let descs: Vec<(Rc<str>, Val)> = match args.get(1) {
+                Some(Val::Obj(d)) => d.borrow().props.clone(),
+                _ => Vec::new(),
             };
-            match args.first() {
-                Some(t @ Val::Obj(_)) => {
-                    let obj_rc = obj_of(t);
-                    let g = if is_callable(&gets) { Some(gets) } else { None };
-                    let s = if is_callable(&sets) { Some(sets) } else { None };
-                    if g.is_some() || s.is_some() {
-                        obj_set_own(
-                            &obj_rc,
-                            &key,
-                            Val::Acc(Rc::new(AccEntry {
-                                getter: g,
-                                setter: s,
-                            })),
-                        );
-                    } else {
-                        obj_set_own(&obj_rc, &key, vals.unwrap_or(Val::Undefined));
-                    }
-                }
-                _ => {
-                    return Err(JsError::throw(
-                        "TypeError: Object.defineProperty called on non-object",
-                    ))
-                }
+            for (k, d) in descs {
+                define_prop(e, &target, &k, Some(&d))?;
             }
             Ok(target)
         }
@@ -1028,6 +1264,13 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
             let k = arg_str(args, 1);
             Ok(match &o {
                 Val::Obj(b) => own_desc(b, &k).unwrap_or(Val::Undefined),
+                Val::Func(f) => fn_desc(f, &k).unwrap_or(Val::Undefined),
+                // built-in constructors keep their properties in the native
+                // side table (`Symbol.asyncDispose`, `String.prototype`, …)
+                Val::Native(id) => match e.native_prop(*id, &k) {
+                    Some(v) => desc_from_value(v),
+                    None => Val::Undefined,
+                },
                 _ => Val::Undefined,
             })
         }
@@ -1085,8 +1328,11 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
 
 const OP_TOSTRING: u16 = 0;
 const OP_HASOWN: u16 = 1;
+const OP_IS_ENUM: u16 = 2;
+const OP_VALUEOF: u16 = 3;
+const OP_IS_PROTO: u16 = 4;
 
-fn n_objproto(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         OP_TOSTRING => Ok(Val::Str(Rc::from(match this {
             Val::Obj(o) => match &o.borrow().kind {
@@ -1099,6 +1345,11 @@ fn n_objproto(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<V
                 ObjKind::Generator(_) => "[object Generator]",
                 ObjKind::Style(_) => "[object CSSStyleDeclaration]",
             },
+            // callables report their tag too (`classof`-style feature tests
+            // in published bundles rely on it)
+            Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_) => {
+                "[object Function]"
+            }
             _ => "[object Object]",
         }))),
         OP_HASOWN => {
@@ -1109,8 +1360,64 @@ fn n_objproto(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<V
                     b.props.iter().any(|(k, _)| k.as_ref() == key.as_str())
                         || matches!(&b.kind, ObjKind::Array(items) if key.parse::<usize>().map_or(false, |i| i < items.len()))
                 }
+                // function own props: `name`/`length` always, `prototype`
+                // only on real functions (arrows and bound wrappers lack it)
+                Val::Func(c) => match key.as_str() {
+                    "name" | "length" => true,
+                    "prototype" => {
+                        !c.is_arrow && !matches!(c.def.body, FnBody::Bound { .. })
+                    }
+                    _ => c.props.borrow().iter().any(|(k, _)| k.as_ref() == key.as_str()),
+                },
                 _ => false,
             }))
+        }
+        // every own prop this engine stores is enumerable (arrays included)
+        OP_IS_ENUM => {
+            let key = args.first().map_or("".to_string(), |v| v.to_string());
+            Ok(Val::Bool(match this {
+                Val::Obj(o) => {
+                    let b = o.borrow();
+                    b.props.iter().any(|(k, _)| k.as_ref() == key.as_str())
+                        || matches!(&b.kind, ObjKind::Array(items) if key.parse::<usize>().map_or(false, |i| i < items.len()))
+                }
+                Val::Func(c) => c.props.borrow().iter().any(|(k, _)| k.as_ref() == key.as_str()),
+                _ => false,
+            }))
+        }
+        OP_VALUEOF => Ok(this.clone()),
+        OP_IS_PROTO => {
+            let want = match this {
+                Val::Obj(o) => o.clone(),
+                _ => return Ok(Val::Bool(false)),
+            };
+            let start = match args.first() {
+                Some(Val::Obj(o)) => o.clone(),
+                _ => return Ok(Val::Bool(false)),
+            };
+            // an object is never its own prototype
+            if Rc::ptr_eq(&start, &want) {
+                return Ok(Val::Bool(false));
+            }
+            let mut cur = start.borrow().proto.clone();
+            for _ in 0..PROTO_WALK_CAP {
+                let c = match cur {
+                    None => break,
+                    Some(c) => c,
+                };
+                if Rc::ptr_eq(&c, &want) {
+                    return Ok(Val::Bool(true));
+                }
+                cur = c.borrow().proto.clone();
+            }
+            // plain objects attach Object.prototype lazily; a chain that ends
+            // without one still stands for `Object.prototype`
+            if let Some(op) = &e.object_proto {
+                if Rc::ptr_eq(op, &want) {
+                    return Ok(Val::Bool(true));
+                }
+            }
+            Ok(Val::Bool(false))
         }
         _ => Ok(Val::Undefined),
     }
@@ -1135,6 +1442,7 @@ const A_SOME: u16 = 13;
 const A_EVERY: u16 = 14;
 const A_SORT: u16 = 15;
 const A_REVERSE: u16 = 16;
+const A_SPLICE: u16 = 17;
 const A_ISARRAY: u16 = 100;
 
 /// Own-property check that also understands array indices/length.
@@ -1151,25 +1459,9 @@ fn obj_has_own(o: &Rc<RefCell<Obj>>, key: &str) -> bool {
     b.props.iter().any(|(k, _)| k.as_ref() == key)
 }
 
-/// `Object.getOwnPropertyDescriptor` shape: data properties always report
-/// writable/enumerable/configurable (the engine tracks none of those).
-fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
-    let b = o.borrow();
-    let v = if let ObjKind::Array(items) = &b.kind {
-        if key == "length" {
-            Some(Val::Num(items.len() as f64))
-        } else {
-            key.parse::<usize>().ok().and_then(|i| items.get(i).cloned())
-        }
-    } else {
-        None
-    }
-    .or_else(|| {
-        b.props
-            .iter()
-            .find(|(k, _)| k.as_ref() == key)
-            .map(|(_, v)| v.clone())
-    })?;
+/// Descriptor object for a data property (the engine tracks no writability /
+/// enumerability, so those always report `true`) or an accessor pair.
+fn desc_from_value(v: Val) -> Val {
     let d = Val::new_object();
     match v {
         Val::Acc(a) => {
@@ -1191,7 +1483,47 @@ fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
     }
     obj_set_own(own(&d), "enumerable", Val::Bool(true));
     obj_set_own(own(&d), "configurable", Val::Bool(true));
-    Some(d)
+    d
+}
+
+/// `Object.getOwnPropertyDescriptor` shape: data properties always report
+/// writable/enumerable/configurable (the engine tracks none of those).
+fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
+    let b = o.borrow();
+    let v = if let ObjKind::Array(items) = &b.kind {
+        if key == "length" {
+            Some(Val::Num(items.len() as f64))
+        } else {
+            key.parse::<usize>().ok().and_then(|i| items.get(i).cloned())
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        b.props
+            .iter()
+            .find(|(k, _)| k.as_ref() == key)
+            .map(|(_, v)| v.clone())
+    })?;
+    Some(desc_from_value(v))
+}
+
+/// Own descriptor on a closure (function) — its props plus the implicit
+/// `prototype` every non-arrow function owns.
+fn fn_desc(f: &Rc<Closure>, key: &str) -> Option<Val> {
+    let found = f
+        .props
+        .borrow()
+        .iter()
+        .find(|(k, _)| k.as_ref() == key)
+        .map(|(_, v)| v.clone());
+    match found {
+        Some(v) => Some(desc_from_value(v)),
+        None if key == "prototype" => {
+            Some(desc_from_value(Val::Obj(super::interp::ensure_prototype(f))))
+        }
+        None => None,
+    }
 }
 
 fn need_array(this: &Val) -> Result<Rc<RefCell<Obj>>, JsError> {    match this {
@@ -1206,6 +1538,57 @@ fn need_array(this: &Val) -> Result<Rc<RefCell<Obj>>, JsError> {    match this {
     }
 }
 
+/// `Array(n)`, `new Array(...)`, `Array.of(...)`, `Array.from(items, mapFn?)`.
+/// shortcut: arrays are dense, so a huge `Array(n)` length is clamped to
+/// `MAX_ARRAY_FILL` holes instead of building a sparse array.
+fn n_array_call(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    const MAX_ARRAY_FILL: usize = 100_000;
+    match idx {
+        // Array(n) / Array(a, b, ...): one number means a length
+        0 => {
+            if args.len() == 1 {
+                if let Val::Num(n) = args[0] {
+                    let len = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+                    return Ok(Val::new_array(vec![Val::Undefined; len.min(MAX_ARRAY_FILL)]));
+                }
+            }
+            Ok(Val::new_array(args.to_vec()))
+        }
+        // Array.of(a, b, ...): the arguments ARE the elements
+        1 => Ok(Val::new_array(args.to_vec())),
+        // Array.from(iterable, mapFn?, thisArg?): array-likes and strings
+        // go through the same spread source as `for..of`
+        _ => {
+            let mut items = match args.first() {
+                None => Vec::new(),
+                Some(v) => match super::interp::for_of_items(v) {
+                    Ok(items) => items,
+                    // not iterable: accept an array-like (`length` + index
+                    // keys), which `for..of` rightly rejects
+                    Err(_) => {
+                        let n = get_member(e, v, "length")?.to_number();
+                        let mut out = Vec::new();
+                        if n.is_finite() && n > 0.0 {
+                            for i in 0..(n as usize).min(MAX_ARRAY_FILL) {
+                                out.push(get_member(e, v, &i.to_string())?);
+                            }
+                        }
+                        out
+                    }
+                },
+            };
+            if let Some(f) = args.get(1).filter(|f| is_callable(f)).cloned() {
+                let mut mapped = Vec::with_capacity(items.len());
+                for (i, v) in items.into_iter().enumerate() {
+                    mapped.push(e.call(f.clone(), Val::Undefined, vec![v, Val::Num(i as f64)])?);
+                }
+                items = mapped;
+            }
+            Ok(Val::new_array(items))
+        }
+    }
+}
+
 fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     if idx == A_ISARRAY {
         // static: inspects the ARGUMENT, not `this`
@@ -1216,6 +1599,44 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
     }
     let o = need_array(this)?;
     Ok(match idx {
+        A_SPLICE => {
+            let len = match &o.borrow().kind {
+                ObjKind::Array(items) => items.len(),
+                _ => 0,
+            };
+            let n = len as f64;
+            let start = args.first().map_or(0.0, |v| v.to_number());
+            let start = if start.is_nan() {
+                0
+            } else if start < 0.0 {
+                (n + start).max(0.0) as usize
+            } else {
+                (start as usize).min(len)
+            };
+            let del = if args.len() < 2 {
+                len - start
+            } else {
+                let d = args[1].to_number();
+                if d.is_nan() || d < 0.0 {
+                    0
+                } else {
+                    (d as usize).min(len - start)
+                }
+            };
+            let inserted: Vec<Val> = args.iter().skip(2).cloned().collect();
+            let (removed, newlen) = {
+                let mut b = o.borrow_mut();
+                match &mut b.kind {
+                    ObjKind::Array(items) => {
+                        let removed: Vec<Val> = items.splice(start..start + del, inserted).collect();
+                        (removed, items.len())
+                    }
+                    _ => (Vec::new(), 0),
+                }
+            };
+            let _ = newlen;
+            Val::new_array(removed)
+        }
         A_PUSH => {
             // borrow, extend, drop — never hold a borrow across a JS call
             let len = {
@@ -1474,19 +1895,72 @@ const E_TYPE: u16 = 1;
 const E_RANGE: u16 = 2;
 const E_SYNTAX: u16 = 3;
 
-fn n_error_ctor(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_error_ctor(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let name: Rc<str> = Rc::from(match idx {
         E_TYPE => "TypeError",
         E_RANGE => "RangeError",
         E_SYNTAX => "SyntaxError",
         _ => "Error",
     });
-    let msg = Rc::from(args.first().map_or("".to_string(), |v| v.to_string()).as_str());
+    let msg: Rc<str> = Rc::from(args.first().map_or("".to_string(), |v| v.to_string()).as_str());
+    // the instance chains to its own class prototype (Error.prototype
+    // itself when idx == 0), so `instanceof` holds for the right class
+    let proto = e
+        .native_id(&name)
+        .and_then(|id| e.native_prop(id, "prototype"))
+        .and_then(|v| match v {
+            Val::Obj(o) => Some(o),
+            _ => None,
+        })
+        .or_else(|| e.error_proto.clone());
+    // `class MyError extends Error`: `super(msg)` runs on the object `new`
+    // already made for the subclass, so turn that object into an error in
+    // place instead of returning a detached one the caller would drop.
+    // shortcut: `is_ctor_call` is the same this != global heuristic the other
+    // native constructors use (Error.call(obj) would mutate obj too).
+    if is_ctor_call(e, this) {
+        if let Val::Obj(o) = this {
+            let mut b = o.borrow_mut();
+            if !matches!(b.kind, ObjKind::Error { .. }) {
+                b.kind = ObjKind::Error {
+                    name: name.clone(),
+                    msg: msg.clone(),
+                };
+                if b.proto.is_none() {
+                    b.proto = proto.clone();
+                }
+                return Ok(this.clone());
+            }
+        }
+    }
     Ok(Val::Obj(Rc::new(RefCell::new(Obj {
         kind: ObjKind::Error { name, msg },
         props: Vec::new(),
-        proto: None,
+        proto,
     }))))
+}
+
+/// `Error.prototype.toString`: `Name: message`, or just the name when the
+/// message is empty. The two fields are read through the prototype chain (not
+/// from the internal slot) so borrowing it for an error-like object works:
+/// libraries do `Error.prototype.toString.call(err)`.
+fn n_error_to_string(e: &mut JsEngine, _idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    let name = match get_member(e, this, "name")? {
+        Val::Undefined => "Error".to_string(),
+        v => v.to_string(),
+    };
+    let msg = match get_member(e, this, "message")? {
+        Val::Undefined => String::new(),
+        v => v.to_string(),
+    };
+    Ok(Val::Str(Rc::from(
+        if msg.is_empty() {
+            name
+        } else {
+            format!("{name}: {msg}")
+        }
+        .as_str(),
+    )))
 }
 
 // -- Date -------------------------------------------------------------------
@@ -1532,6 +2006,67 @@ fn n_date(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, J
 }
 
 // -- conversions ------------------------------------------------------------
+
+/// Names exposed on `String.prototype` (mirrors the primitive dispatch table
+/// in `get_member`; `substring` maps to `slice`, an honest shortcut).
+const STR_METHODS: &[(&str, Meth)] = &[
+    ("toUpperCase", Meth::StrToUpper),
+    ("toLowerCase", Meth::StrToLower),
+    ("trim", Meth::StrTrim),
+    ("trimStart", Meth::StrTrimStart),
+    ("trimLeft", Meth::StrTrimStart),
+    ("trimEnd", Meth::StrTrimEnd),
+    ("trimRight", Meth::StrTrimEnd),
+    ("slice", Meth::StrSlice),
+    ("substring", Meth::StrSlice),
+    ("indexOf", Meth::StrIndexOf),
+    ("includes", Meth::StrIncludes),
+    ("split", Meth::StrSplit),
+    ("replace", Meth::StrReplace),
+    ("match", Meth::StrMatch),
+    ("search", Meth::StrSearch),
+    ("matchAll", Meth::StrMatchAll),
+    ("startsWith", Meth::StrStartsWith),
+    ("endsWith", Meth::StrEndsWith),
+    ("repeat", Meth::StrRepeat),
+    ("padStart", Meth::StrPadStart),
+    ("padEnd", Meth::StrPadEnd),
+    ("charAt", Meth::StrCharAt),
+    ("charCodeAt", Meth::StrCharCodeAt),
+    ("toString", Meth::StrToString),
+    ("valueOf", Meth::StrToString),
+];
+
+const NUM_METHODS: &[(&str, Meth)] = &[
+    ("toString", Meth::NumToString),
+    ("valueOf", Meth::NumToString),
+    ("toFixed", Meth::NumToFixed),
+];
+
+fn n_str_proto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    super::interp::call_method(e, STR_METHODS[idx as usize].1, this, args)
+}
+
+fn n_num_proto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    super::interp::call_method(e, NUM_METHODS[idx as usize].1, this, args)
+}
+
+const FN_METHODS: &[Meth] = &[Meth::FnCall, Meth::FnApply, Meth::FnBind, Meth::FnToString];
+
+fn n_fn_proto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    super::interp::call_method(e, FN_METHODS[idx as usize], this, args)
+}
+
+/// shortcut: the `Function` constructor does not compile source. The callable
+/// it returns ignores its body and yields the global object — enough for the
+/// widespread `Function("return this")()` global probe.
+fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    Ok(Val::Native(e.fn_body_native))
+}
+
+fn n_fn_body(e: &mut JsEngine, _idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    Ok(Val::Obj(e.global_obj.clone()))
+}
 
 fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let v = args.first().cloned().unwrap_or(Val::Undefined);
@@ -1687,7 +2222,17 @@ fn n_uri(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, 
 
 // -- timers -----------------------------------------------------------------
 
-fn n_set_timeout(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_set_timeout(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    // idx 0 = setTimeout, 1 = setInterval, 2 = clearTimeout/clearInterval.
+    // String callbacks ("alert()") are not compiled: they are a legacy form no
+    // real page uses any more, and they would need a compile step per tick.
+    if idx == 2 {
+        let id = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+        if id.is_finite() {
+            e.cancelled_timers.push(id);
+        }
+        return Ok(Val::Undefined);
+    }
     let cb = args.first().cloned().unwrap_or(Val::Undefined);
     if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
         return Err(JsError::throw("TypeError: setTimeout callback is not a function"));
@@ -1703,7 +2248,11 @@ fn n_set_timeout(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Resu
     let id = e.next_timer_id;
     e.next_timer_id += 1.0;
     e.timers.push(TimerTask {
+        id,
         delay_ms: ms,
+        // a 0ms interval would spin the worker forever at one callback per
+        // turn; browsers clamp too (nested-timeout clamp), so do the same
+        repeat_ms: if idx == 1 { Some(ms.max(4.0)) } else { None },
         callback: cb,
         args: args.iter().skip(2).cloned().collect(),
     });
@@ -1751,12 +2300,12 @@ fn n_promise(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Va
             if let Some(p) = promise_of(&v) {
                 return Ok(Val::Obj(p)); // `Promise.resolve(p)` is identity for promises
             }
-            let p = new_promise_obj();
+            let p = e.new_promise();
             resolve_promise(e, &p, v);
             Ok(Val::Obj(p))
         }
         PS_REJECT => {
-            let p = new_promise_obj();
+            let p = e.new_promise();
             settle_promise(
                 e,
                 &p,
@@ -1766,7 +2315,7 @@ fn n_promise(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Va
         }
         PS_ALL | PS_ANY | PS_RACE | PS_ALL_SETTLED => {
             let items = interp::for_of_items(&args.first().cloned().unwrap_or(Val::Undefined))?;
-            let result = new_promise_obj();
+            let result = e.new_promise();
             let n = items.len();
             let mode = match idx {
                 PS_ALL => ComboMode::All,
@@ -1960,6 +2509,18 @@ fn deposit_combo(
 
 // -- RegExp ---------------------------------------------------------------
 
+/// `RegExp.prototype.exec` / `.test` / `.toString` as real function values:
+/// they forward to the same receiver-dispatched implementations `re.exec`
+/// uses, so borrowing them (`RegExp.prototype.exec.call(re, s)`) works.
+fn n_regex_proto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let m = match idx {
+        0 => Meth::RegexExec,
+        1 => Meth::RegexTest,
+        _ => Meth::RegexToString,
+    };
+    super::interp::call_method(e, m, this, args)
+}
+
 fn n_regexp(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     // `new RegExp(pat, flags)` / `RegExp(pat)` — same behavior both ways.
     // A regex argument without explicit flags inherits its source+flags
@@ -1991,11 +2552,24 @@ fn n_regexp(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Va
             args.get(1).cloned().unwrap_or(Val::Undefined),
         ),
     };
-    let flags_s = match flags {
+    let flags_s: Rc<str> = match flags {
         Val::Undefined => Rc::from(""),
         v => Rc::from(v.to_string().as_str()),
     };
-    let re = e.regex_from_literal(src, flags_s)?;
+    let re = match e.regex_from_literal(src.clone(), flags_s.clone()) {
+        Ok(re) => re,
+        // `new RegExp(bad)` throws a normal, catchable SyntaxError; only a
+        // regex *literal* is a parse-time error. Published bundles probe
+        // engine support with `try { new RegExp("(?<a>b)") } catch {}`, so
+        // this must not abort the whole script.
+        Err(JsError::Syntax { msg, .. }) => {
+            return Err(JsError::throw(&format!(
+                "SyntaxError: Invalid regular expression: /{}/{}/: {}",
+                src, flags_s, msg
+            )))
+        }
+        Err(other) => return Err(other),
+    };
     Ok(Val::Obj(Rc::new(RefCell::new(Obj {
         kind: ObjKind::Regex(ReInst {
             re,
@@ -2361,6 +2935,27 @@ fn new_symbol(desc: &str) -> Val {
     let o = Val::new_object();
     obj_set_own(own(&o), "__symbol", Val::Str(Rc::from(desc)));
     o
+}
+
+fn n_symbol_proto(_e: &mut JsEngine, idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    let desc = match this {
+        Val::Obj(o) => o
+            .borrow()
+            .props
+            .iter()
+            .find(|(k, _)| &**k == "__symbol")
+            .map(|(_, v)| v.to_string()),
+        _ => None,
+    };
+    let Some(desc) = desc else {
+        return Err(JsError::throw(
+            "TypeError: Symbol.prototype method called on non-symbol",
+        ));
+    };
+    Ok(match idx {
+        0 => Val::Str(Rc::from(format!("Symbol({desc})").as_str())),
+        _ => this.clone(),
+    })
 }
 
 fn n_symbol(e: &mut JsEngine, _idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {

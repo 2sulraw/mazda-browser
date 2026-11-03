@@ -4128,13 +4128,20 @@ fn item_min_content(
             .fold(0.0f32, f32::max),
         Item::Grp(i) => {
             let c = &parent.children[*i];
+            let margins = resolve_len(c.bx.margin[3], avail) + resolve_len(c.bx.margin[1], avail);
+            // CSS Grid's automatic minimum size is 0 for an item whose
+            // overflow is not visible: a clipped decorative panel must not
+            // claim its whole intrinsic width and starve the text column.
+            if c.bx.clip {
+                return margins;
+            }
             // a declared px width is the border-box contribution; content
             // wider than it overflows (same model as the max-content side)
             let w = match c.bx.width {
                 Some(Len::Px(p)) => p,
                 _ => min_content_w(c, avail, measure),
             };
-            w + resolve_len(c.bx.margin[3], avail) + resolve_len(c.bx.margin[1], avail)
+            w + margins
         }
     }
 }
@@ -4513,11 +4520,31 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f3
     let gaps = gap * (n as f32 - 1.0).max(0.0);
     let mut w: Vec<f32> = sizes.iter().map(|s| s.min).collect();
     let mut free = (avail - w.iter().sum::<f32>() - gaps).max(0.0);
-    for i in 0..n {
-        if sizes[i].flex <= 0.0 && w[i] < sizes[i].max && free > 0.0 {
-            let grow = (sizes[i].max - w[i]).min(free);
+    // "Maximize tracks": share the free space EQUALLY among the content-sized
+    // tracks, freezing each one as it reaches its growth limit. Giving the
+    // first track everything (the old greedy loop) sized a two-column header
+    // as one huge column plus a zero-width one.
+    let mut active: Vec<usize> = (0..n)
+        .filter(|&i| sizes[i].flex <= 0.0 && w[i] < sizes[i].max)
+        .collect();
+    for _ in 0..n {
+        if active.is_empty() || free <= 0.0 {
+            break;
+        }
+        let share = free / active.len() as f32;
+        let mut next = Vec::new();
+        for &i in &active {
+            let grow = (sizes[i].max - w[i]).min(share);
             w[i] += grow;
             free -= grow;
+            if w[i] < sizes[i].max {
+                next.push(i);
+            }
+        }
+        let saturated = next.len() < active.len();
+        active = next;
+        if !saturated {
+            break; // everybody took an equal share and nobody hit a limit
         }
     }
     let flex_sum: f32 = sizes.iter().map(|s| s.flex).sum();
@@ -4568,6 +4595,21 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f3
             excess -= cut;
             if excess <= 0.0 {
                 break;
+            }
+        }
+    }
+    // `justify-content: normal` behaves as `stretch` for grid, and stretch
+    // only grows `auto` tracks. Without this a two-column
+    // `grid-template-areas` header hugs its content instead of filling the
+    // row (the copy column ends up one word wide).
+    let used: f32 = w.iter().sum::<f32>() + gaps;
+    let autos = cols.iter().filter(|t| matches!(t, Track::Auto)).count();
+    let slack = avail - used;
+    if autos > 0 && slack > 0.5 {
+        let add = slack / autos as f32;
+        for (i, t) in cols.iter().enumerate() {
+            if matches!(t, Track::Auto) {
+                w[i] += add;
             }
         }
     }
@@ -5443,17 +5485,25 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     // resolve each item's (row, c0, c1) — needs only the column COUNT, so it
     // runs BEFORE track widths are resolved (content tracks are sized from
     // the items placed in them)
-    let resolve_col = |name: &str| -> Option<(usize, usize)> {
-        let line = |suffix: &str| {
+    // `grid-column: content / extended-full-end`: look each half up as an
+    // exact line name or via its -start/-end suffix. A lone end with an auto
+    // start occupies the single track before that line.
+    let resolve_col = |start: Option<&str>, end: Option<&str>| -> Option<(usize, usize)> {
+        let line = |name: &str, suffix: &str| {
             n.bx
                 .col_lines
                 .iter()
                 .find(|(l, _)| l == name || l == &format!("{name}{suffix}"))
                 .map(|(_, i)| *i)
         };
-        let s = line("-start")?;
-        let e = line("-end").filter(|&e| e > s).unwrap_or(s + 1);
-        Some((s, e.min(nc)))
+        let s = start.and_then(|nm| line(nm, "-start"));
+        let e = end.and_then(|nm| line(nm, "-end"));
+        match (s, e) {
+            (Some(s), Some(e)) if e > s => Some((s, e.min(nc))),
+            (Some(s), _) => Some((s, (s + 1).min(nc))),
+            (None, Some(e)) => Some((e.saturating_sub(1).min(nc - 1), e.min(nc))),
+            (None, None) => None,
+        }
     };
     // `grid-area: <name>` → the bounding rect of that name in
     // `grid-template-areas`, as (row0, row1, col0, col1) with exclusive ends
@@ -5485,7 +5535,7 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                 let b = &n.children[*i].bx;
                 (
                     b.grid_area.as_deref().and_then(|nm| area_rect(nm)),
-                    b.grid_col.as_deref().and_then(|nm| resolve_col(nm)),
+                    resolve_col(b.grid_col.as_deref(), b.grid_col_end.as_deref()),
                 )
             }
             Item::Text(..) => (None, None),
@@ -7093,15 +7143,29 @@ mod tests {
 
     #[test]
     fn grid_auto_tracks_size_to_content() {
+        // with no leftover space the tracks are exactly their content
+        let (tight, _) = grid_case(
+            vec![Track::Auto, Track::Auto],
+            &["aa", "bbbb"],
+            24.0,
+            0.0,
+        );
+        assert_eq!(tight.children[0].w, 8.0, "short content");
+        assert_eq!(tight.children[1].w, 16.0, "long content");
+        assert_eq!(tight.children[1].x, 8.0, "columns sit edge to edge");
+
+        // `justify-content: normal` = stretch, and only `auto` tracks stretch:
+        // the 376px of slack is shared, so `grid-template-areas: "copy ..."`
+        // fills the row instead of hugging one word per line
         let (n, _) = grid_case(
             vec![Track::Auto, Track::Auto],
             &["aa", "bbbb"],
             400.0,
             0.0,
         );
-        assert_eq!(n.children[0].w, 8.0, "short content");
-        assert_eq!(n.children[1].w, 16.0, "long content");
-        assert_eq!(n.children[1].x, 8.0, "columns sit edge to edge");
+        assert_eq!(n.children[0].w, 196.0, "8 + 376/2");
+        assert_eq!(n.children[1].w, 204.0, "16 + 376/2");
+        assert_eq!(n.children[1].x, 196.0);
     }
 
     #[test]
@@ -7159,10 +7223,114 @@ mod tests {
         );
         n.children = vec![padded, plain];
         layout_tree(&mut n, 300.0, &m4);
-        // "aa" 8 + padding 20 + border 2 + margins 10 = 40
-        assert_eq!(n.children[1].x, 40.0, "auto track is the margin box");
-        assert_eq!(n.children[0].w, 30.0, "border box inside its 5px margins");
+        // "aa" 8 + padding 20 + border 2 + margins 10 = 40; the 255px of
+        // slack is shared by the two auto tracks (+127.5 each)
+        assert_eq!(n.children[1].x, 168.0, "auto track is the margin box, stretched (pixel-snapped)");
+        assert_eq!(n.children[0].w, 158.0, "border box fills the track inside its 5px margins");
         assert_eq!(n.children[0].x, 5.0, "left margin offsets the item");
+    }
+
+    #[test]
+    fn grid_column_end_spans_from_the_named_start_line() {
+        // `grid-column: content` + `grid-column-end: extended-full-end`: the
+        // start half resolves through the -start suffix, the end half through
+        // the exact line name, so the item bleeds over the whole template.
+        let mut item = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grid_col: Some("content".into()),
+                grid_col_end: Some("extended-full-end".into()),
+                ..BoxStyle::default()
+            },
+        );
+        item.children = vec![leaf("x")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Px(50.0), Track::Px(100.0), Track::Px(50.0)],
+                col_lines: vec![
+                    ("content-start".into(), 0),
+                    ("content-end".into(), 1),
+                    ("extended-full-end".into(), 3),
+                ],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![item];
+        layout_tree(&mut n, 200.0, &m4);
+        assert_eq!(n.children[0].x, 0.0);
+        assert_eq!(n.children[0].w, 200.0, "spans content-start..extended-full-end");
+    }
+
+    #[test]
+    fn grid_tracks_grow_equally_instead_of_first_come() {
+        // two content-sized tracks, 400px available, growth limits 300/1000:
+        // each gets 200. The old greedy loop gave the first 300 and the
+        // second 100.
+        let boxed = |w: f32, t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(w)),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![
+                    Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::MaxContent),
+                    Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::MaxContent),
+                ],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![boxed(300.0, "a"), boxed(1000.0, "b")];
+        layout_tree(&mut n, 400.0, &m4);
+        assert_eq!(n.children[1].x, 200.0, "second track got an equal share");
+    }
+
+    #[test]
+    fn grid_clipped_item_has_a_zero_automatic_minimum() {
+        // a clipped decorative panel (overflow: hidden) contributes 0 as its
+        // automatic minimum, so the neighbouring text column keeps its
+        // max-content width instead of being starved by the panel's graphic
+        let mut panel = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                clip: true,
+                ..BoxStyle::default()
+            },
+        );
+        panel.children = vec![leaf(&"x".repeat(200))];
+        let mut text = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                ..BoxStyle::default()
+            },
+        );
+        text.children = vec![leaf("aa bb cc")];
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Auto, Track::Auto],
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![panel, text];
+        layout_tree(&mut n, 400.0, &m4);
+        assert_eq!(n.children[1].w, 32.0, "text column keeps its max-content");
+        assert!(n.children[0].w > n.children[1].w, "panel takes the rest");
     }
 
     #[test]

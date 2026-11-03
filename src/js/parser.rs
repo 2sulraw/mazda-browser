@@ -1307,6 +1307,11 @@ impl<'a> Parser<'a> {
     }
 
     fn block_body(&mut self) -> Result<Vec<Stmt>, JsError> {
+        // A function body is its own grammar: `in` is a normal operator again
+        // even when the function expression sits in a for-head initializer
+        // (`for (var f = function () { "x" in y; };;)`). Same for class bodies.
+        let prev_no_in = self.no_in;
+        self.no_in = false;
         let mut out = Vec::new();
         while !self.eat_punct(Punct::RBrace) {
             if *self.peek() == Tok::Eof {
@@ -1314,6 +1319,7 @@ impl<'a> Parser<'a> {
             }
             out.push(self.statement()?);
         }
+        self.no_in = prev_no_in;
         Ok(out)
     }
 
@@ -1549,7 +1555,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let obj = self.expr()?;
                         return Ok(ForHead::In { kind, target, obj });
                     }
-                    if self.eat_kw(Kw::Of) {
+                    if self.eat_word("of") {
                         let iter = self.assign_expr()?; // no comma in for-of head
                         return Ok(ForHead::Of { kind, target, iter });
                     }
@@ -1577,7 +1583,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 obj,
             });
         }
-        if self.eat_kw(Kw::Of) {
+        if self.eat_word("of") {
             // assignment-destructuring form: `for ([a, b] of pairs)`
             let target = self.expr_to_loop_target(&e, "invalid for-of target")?;
             let iter = self.assign_expr()?;
@@ -3184,6 +3190,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
             Tok::Punct(Punct::LBrack) => {
                 self.next();
+                // array elements are their own grammar: `for (var x = [a in b];;)`
+                let prev_no_in = self.no_in;
+                self.no_in = false;
                 let mut items = Vec::new();
                 while !self.eat_punct(Punct::RBrack) {
                     if !items.is_empty() {
@@ -3200,10 +3209,14 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         items.push(ArrayElem::Item(self.assign_expr()?));
                     }
                 }
+                self.no_in = prev_no_in;
                 ExprKind::Array(items)
             }
             Tok::Punct(Punct::LBrace) => {
                 self.next();
+                // property values reset `in` suppression (object-literal grammar)
+                let prev_no_in = self.no_in;
+                self.no_in = false;
                 let mut props: Vec<ObjElem> = Vec::new();
                 while !self.eat_punct(Punct::RBrace) {
                     if !props.is_empty() {
@@ -3387,6 +3400,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         ));
                     }
                 }
+                self.no_in = prev_no_in;
                 ExprKind::Object(props)
             }
             other => {

@@ -33,7 +33,7 @@ wuff = { version = "0.2.9", optional = true, default-features = false, features 
 # window + chrome shell: eframe with the glow (OpenGL software-ish) backend,
 # NOT wgpu — wgpu would add a large driver/GPU stack to the RAM budget.
 # x11+wayland keep it Linux-capable; window controls/resize come from winit.
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "clipboard"] }
 
 [features]
 engine-b = ["dep:boa_engine"]

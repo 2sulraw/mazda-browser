@@ -102,7 +102,34 @@ pub(crate) fn hoist(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) {
                     }
                     walk(e, env, std::slice::from_ref(body));
                 }
-                StmtKind::ForIn { body, .. } | StmtKind::ForOf { body, .. } => {
+                StmtKind::ForIn {
+                    kind,
+                    target,
+                    body,
+                    ..
+                }
+                | StmtKind::ForOf {
+                    kind,
+                    target,
+                    body,
+                    ..
+                } => {
+                    // `for (var x in o)`: the loop binding is a
+                    // function-scoped `var`. Without this the assignment
+                    // resolves to an outer binding of the same name (the
+                    // loop leaked into the enclosing closure).
+                    if *kind == Some(VarKind::Var) {
+                        match target {
+                            ForTarget::Name(n) => {
+                                env.declare_if_absent(n.clone(), Val::Undefined, false);
+                            }
+                            ForTarget::Pat(p) => {
+                                for n in pat_leaf_names(p) {
+                                    env.declare_if_absent(n, Val::Undefined, false);
+                                }
+                            }
+                        }
+                    }
                     walk(e, env, std::slice::from_ref(body))
                 }
                 StmtKind::Switch { cases, .. } => {
@@ -1936,6 +1963,16 @@ pub(crate) fn call_method(
                 None => Val::Str(Rc::from("")),
             })
         }
+        // `"".charCodeAt(i)`: UTF-16 code unit, NaN when out of range
+        StrCharCodeAt => {
+            let s = need_str(this)?;
+            let i = arg_num(args, 0);
+            let i = if i.is_nan() || i < 0.0 { usize::MAX } else { i as usize };
+            Ok(match s.encode_utf16().nth(i) {
+                Some(u) => Val::Num(u as f64),
+                None => Val::Num(f64::NAN),
+            })
+        }
         StrToString => Ok(need_str(this).map(Val::Str)?),
 
         // -- number methods ------------------------------------------------
@@ -2103,6 +2140,13 @@ pub(crate) fn call_method(
         },
 
         // -- function methods ----------------------------------------------
+        FnToString => Ok(Val::Str(Rc::from(
+            match this {
+                Val::Func(c) => format!("function {}() {{ [code] }}", c.def.name),
+                _ => "function () { [native code] }".to_string(),
+            }
+            .as_str(),
+        ))),
         FnCall | FnApply | FnBind => {
             let target = this.clone();
             if !matches!(
@@ -2352,7 +2396,7 @@ fn is_callable(v: &Val) -> bool {
 
 /// `.finally(cb)` — reaction that runs cb then propagates the outcome
 fn finally_then(e: &mut JsEngine, o: &Rc<RefCell<Obj>>, cb: Val) -> Result<Val, JsError> {
-    let ret = new_promise_obj();
+    let ret = e.new_promise();
     let re = Reaction {
         kind: ReactKind::Finally { cb },
         ret: Some(ret.clone()),

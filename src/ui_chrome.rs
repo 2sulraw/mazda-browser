@@ -46,8 +46,9 @@ const WIN_CLOSE_BG: Color32 = Color32::from_rgb(0xe8, 0x11, 0x23);
 const PILL_H: f32 = 28.0;
 const PILL_RADIUS: f32 = 10.0;
 const PILL_X0: f32 = 52.0;
-/// Right inset of the address pill — keeps room for the ⚙ settings button.
-const PILL_X1: f32 = 34.0 + 12.0;
+/// Right inset of the address pill — keeps room for the ⚙ settings button
+/// and the element-inspector toggle beside it.
+const PILL_X1: f32 = GEAR_RIGHT + 2.0 * GEAR_SIZE + INSPECT_GAP + 6.0;
 const PILL_PAD: f32 = 12.0;
 const PILL_BG: Color32 = BG_HOVER;
 const PILL_RING: Color32 = Color32::from_rgb(0x6a, 0x9c, 0xff);
@@ -58,6 +59,8 @@ const DISABLED_FG: Color32 = Color32::from_rgb(0x5f, 0x63, 0x68);
 /// ⚙ settings button (right end of the toolbar row).
 const GEAR_SIZE: f32 = 28.0;
 const GEAR_RIGHT: f32 = 12.0;
+/// Gap between the inspector toggle and the ⚙ button.
+const INSPECT_GAP: f32 = 4.0;
 
 const TEXT: f32 = 13.0;
 const NEW_TAB_SIZE: f32 = 24.0;
@@ -83,6 +86,8 @@ pub enum ToolbarEvent {
     Focused(bool),
     /// the ⚙ button was clicked — open the settings overlay
     Settings,
+    /// the element-inspector toggle was clicked
+    Inspect,
 }
 
 /// What the settings overlay wants `main.rs` to do.
@@ -296,7 +301,12 @@ pub(crate) fn ellipsized_chars(widths: &[f32], max_w: f32, ellipsis_w: f32) -> u
 // ---------------------------------------------------------------------------
 
 /// Paint the toolbar row (back button + address pill) and report actions.
-pub fn toolbar(ui: &mut Ui, text: &mut String, can_go_back: bool) -> Vec<ToolbarEvent> {
+pub fn toolbar(
+    ui: &mut Ui,
+    text: &mut String,
+    can_go_back: bool,
+    inspecting: bool,
+) -> Vec<ToolbarEvent> {
     let mut events = Vec::new();
     let row = ui.max_rect();
     let cy = row.center().y;
@@ -387,6 +397,36 @@ pub fn toolbar(ui: &mut Ui, text: &mut String, can_go_back: bool) -> Vec<Toolbar
     if presp.clicked() && !tresp.has_focus() {
         // clicked the pill padding → focus + select-all next frame
         tresp.request_focus();
+    }
+
+    // ---- element inspector toggle (left of ⚙) ----
+    let irect = Rect::from_center_size(
+        pos2(
+            row.right() - GEAR_RIGHT - 2.0 * GEAR_SIZE - INSPECT_GAP + GEAR_SIZE / 2.0,
+            cy,
+        ),
+        vec2(GEAR_SIZE, GEAR_SIZE),
+    );
+    let iresp = ui.interact(irect, ui.scope_id().with("chrome_inspect"), Sense::click());
+    if inspecting {
+        ui.painter().rect_filled(irect, 6.0, BG_ACTIVE);
+    } else if iresp.hovered() {
+        ui.painter().rect_filled(irect, 6.0, BG_HOVER);
+    }
+    paint_inspect_icon(
+        ui,
+        irect.center(),
+        if inspecting {
+            PILL_RING
+        } else if iresp.hovered() {
+            ICON_HOVER
+        } else {
+            ICON
+        },
+    );
+    if iresp.clicked() {
+        eprintln!("[chrome] inspect toggle");
+        events.push(ToolbarEvent::Inspect);
     }
 
     // ---- ⚙ settings (right end of the row) ----
@@ -655,6 +695,23 @@ fn paint_x(ui: &Ui, c: Pos2, r: f32, color: Color32) {
         .line_segment([pos2(c.x - r, c.y - r), pos2(c.x + r, c.y + r)], stroke);
     ui.painter()
         .line_segment([pos2(c.x + r, c.y - r), pos2(c.x - r, c.y + r)], stroke);
+}
+
+/// Element-inspector glyph: a target ring with four ticks.
+fn paint_inspect_icon(ui: &Ui, c: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    let p = ui.painter();
+    let r = 5.0;
+    p.circle_stroke(c, r, stroke);
+    for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+        p.line_segment(
+            [
+                pos2(c.x + dx * (r + 0.5), c.y + dy * (r + 0.5)),
+                pos2(c.x + dx * (r + 3.2), c.y + dy * (r + 3.2)),
+            ],
+            stroke,
+        );
+    }
 }
 
 /// Window-control glyphs: – □ ✕ as crisp vector strokes.

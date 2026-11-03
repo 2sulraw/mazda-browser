@@ -77,7 +77,6 @@ pub enum Kw {
     Do,
     For,
     In,
-    Of,
     Break,
     Continue,
     New,
@@ -224,7 +223,8 @@ fn kw_of(s: &str) -> Option<Kw> {
         "do" => Kw::Do,
         "for" => Kw::For,
         "in" => Kw::In,
-        "of" => Kw::Of,
+        // `of` is contextual: a plain identifier everywhere except the head of
+        // a `for (... of ...)`. Bundles use it as a variable (`var of = ...`).
         "break" => Kw::Break,
         "continue" => Kw::Continue,
         "new" => Kw::New,

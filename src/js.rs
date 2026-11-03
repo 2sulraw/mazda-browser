@@ -118,6 +118,7 @@ pub enum Meth {
     StrPadStart,
     StrPadEnd,
     StrCharAt,
+    StrCharCodeAt,
     StrToString,
     // regex-aware string additions
     StrMatch,
@@ -145,6 +146,7 @@ pub enum Meth {
     FnCall,
     FnApply,
     FnBind,
+    FnToString,
 }
 
 #[derive(Debug)]
@@ -380,14 +382,64 @@ impl Val {
             }
             Val::Num(n) => *n,
             Val::Str(s) => str_to_number(s),
-            Val::Obj(_) => str_to_number(&self.to_string_d(0)),
+            Val::Obj(_) => str_to_number(&self.to_string()),
             _ => f64::NAN,
         }
     }
 
-    /// JS `ToString`. shortcut: exponential formatting for very large/small
-    /// numbers differs from JS's (`1e+21`); every-day values match.
+    /// JS `ToString`. Primitives stringify directly; an object or function
+    /// coerces to its `Object.prototype.toString` tag, and an array joins its
+    /// elements (what `Array.prototype.toString` does). Property *values* are
+    /// never walked, so coercing a huge or cyclic value (the global object, a
+    /// DOM node, `window`) stays O(1) - walking made `window == null` allocate
+    /// gigabytes (exponential fan-out over the object graph).
+    /// shortcut: no user `toString`/`valueOf` override is consulted; the
+    /// exponential number formatting for very large/small values differs from
+    /// JS's (`1e+21`), while every-day values match.
     pub fn to_string(&self) -> String {
+        self.coerce(0)
+    }
+
+    fn coerce(&self, depth: u32) -> String {
+        if depth > 32 {
+            // cycle guard (e.g. a self-referencing array)
+            return "[Object]".into();
+        }
+        match self {
+            Val::Obj(o) => {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => items
+                        .iter()
+                        .map(|v| match v {
+                            Val::Undefined | Val::Null => String::new(),
+                            v => v.coerce(depth + 1),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    ObjKind::Error { name, msg } => format!("{}: {}", name, msg),
+                    ObjKind::Date(ms) => format!("Date({}ms)", ms),
+                    ObjKind::Regex(ri) => format!("/{}/{}", ri.re.src, ri.re.flags),
+                    ObjKind::Promise(_) => "[object Promise]".into(),
+                    ObjKind::Generator(_) => "[object Generator]".into(),
+                    ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::Plain => {
+                        // symbols are unique objects with a hidden
+                        // `__symbol` description (see builtins)
+                        match b.props.iter().find(|(k, _)| &**k == "__symbol") {
+                            Some((_, Val::Str(desc))) => format!("Symbol({})", desc),
+                            _ => "[object Object]".into(),
+                        }
+                    }
+                }
+            }
+            _ => self.to_string_d(0),
+        }
+    }
+
+    /// Inspector rendering for `console.log`: objects are dumped with their
+    /// properties (bounded depth), unlike the spec-shaped [`Val::to_string`].
+    pub fn inspect(&self) -> String {
         self.to_string_d(0)
     }
 
@@ -729,11 +781,16 @@ pub(crate) struct NativeEntry {
     pub host: Option<HostFn>,
 }
 
-/// A pending `setTimeout` job. The interpreter never runs timers itself â€”
-/// it only queues them; the embedder decides threading and drains the queue
-/// via `drain_timers`, invoking callbacks through `call_function`.
+/// A pending `setTimeout`/`setInterval` job. The interpreter never runs
+/// timers itself — it only queues them; the embedder decides threading and
+/// drains the queue via `drain_timers`, invoking callbacks through
+/// `call_function`.
 pub struct TimerTask {
+    /// the id `setTimeout`/`setInterval` returned to the script
+    pub id: f64,
     pub delay_ms: f64,
+    /// `Some(period)` repeats forever (`setInterval`); `None` fires once
+    pub repeat_ms: Option<f64>,
     pub callback: Val,
     pub args: Vec<Val>,
 }
@@ -795,6 +852,9 @@ pub struct JsEngine {
     pub(crate) natives_by_name: HashMap<Rc<str>, usize>,
     pub(crate) call_depth: usize,
     pub(crate) timers: Vec<TimerTask>,
+    /// ids passed to `clearTimeout`/`clearInterval` since the last drain;
+    /// the embedder removes already-queued jobs with these ids
+    pub(crate) cancelled_timers: Vec<f64>,
     pub(crate) microtasks: Vec<Job>,
     /// per-page ES module registry, owned by the engine so the dynamic
     /// `import()` job can run the loader from inside the microtask pump.
@@ -808,6 +868,8 @@ pub struct JsEngine {
     /// Promise.resolve/reject/... statics installed by builtins; reachable
     /// through member lookup on the constructor native
     pub(crate) promise_statics: Option<Rc<RefCell<Obj>>>,
+    /// shared `Promise.prototype`
+    pub(crate) promise_proto: Option<Rc<RefCell<Obj>>>,
     /// own data properties of native constructor values. Natives are ids, not
     /// objects, so `.prototype` and friends live in this side table (builtins
     /// fills it in; `get_member`/`instanceof` consult it).
@@ -827,6 +889,13 @@ pub struct JsEngine {
     pub(crate) uint8_to_b64: usize,
     pub(crate) buffer_to_string: usize,
     pub(crate) arraybuffer_proto: Option<Rc<RefCell<Obj>>>,
+    /// `Function.prototype` — the fallback prototype for function values
+    pub(crate) function_proto: Option<Rc<RefCell<Obj>>>,
+    /// `Error.prototype` — parent of every error instance, so `extends
+    /// Error` and borrowed `Error.prototype.toString` both work
+    pub(crate) error_proto: Option<Rc<RefCell<Obj>>>,
+    /// native returned by `Function(...)` (its body is not compiled)
+    pub(crate) fn_body_native: usize,
     /// compiled-once regex literal cache, keyed by (pattern, flags). Regex
     /// literals are program text, so this cache is bounded by the number of
     /// distinct (pattern, flags) literals the page can create; still capped
@@ -929,10 +998,12 @@ impl JsEngine {
             natives_by_name: HashMap::new(),
             call_depth: 0,
             timers: Vec::new(),
+            cancelled_timers: Vec::new(),
             microtasks: Vec::new(),
             module_loader: None,
             promise_slots: Vec::new(),
             promise_statics: None,
+            promise_proto: None,
             native_props: HashMap::new(),
             url_proto: None,
             params_proto: None,
@@ -945,6 +1016,9 @@ impl JsEngine {
             uint8_to_b64: 0,
             buffer_to_string: 0,
             arraybuffer_proto: None,
+            function_proto: None,
+        error_proto: None,
+            fn_body_native: 0,
             regex_cache: HashMap::new(),
             next_timer_id: 1.0,
             steps: 0,
@@ -984,7 +1058,7 @@ impl JsEngine {
             return Ok(re.clone());
         }
         let re = regex::compile(&pattern, &flags).map_err(|re| JsError::Syntax {
-            msg: format!("Invalid regular expression: {}", re.msg),
+            msg: format!("/{}/{}: {}", pattern, flags, re.msg),
             line: 1,
             col: 1,
         })?;
@@ -1212,6 +1286,11 @@ impl JsEngine {
         std::mem::take(&mut self.timers)
     }
 
+    /// Ids cancelled with `clearTimeout`/`clearInterval` since the last call.
+    pub fn drain_cancelled_timers(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.cancelled_timers)
+    }
+
     /// Run queued microtask jobs (Promise reactions) until the queue is
     /// empty, capped at `MAX_MICROTASKS` runs so a runaway `.then` loop
     /// fails with an honest RangeError instead of looping forever.
@@ -1394,7 +1473,7 @@ impl JsEngine {
                     // completion; each `await` inside pumps the microtask
                     // queue (await_promise) and the result settles the
                     // promise this call returns.
-                    let p = new_promise_obj();
+                    let p = self.new_promise();
                     match interp::run_function_body(self, &c, &env) {
                         Ok(v) => resolve_promise(self, &p, v),
                         Err(JsError::Throw(v)) => settle_promise(self, &p, Err(v)),
@@ -1431,10 +1510,30 @@ impl JsEngine {
                 }
             }
             Val::Method(m) => interp::call_method(self, m, &this, &args),
-            other => Err(JsError::Throw(Val::Str(Rc::from(format!(
-                "TypeError: {} is not a function",
-                other.type_of()
-            ))))),
+            // shortcut: exotic callable objects. `Object`/`Array` are plain
+            // objects with their statics hung off them, so calling one as a
+            // function (`Object(x)`, `Array(3)`, `new Array(3)`) needs a
+            // hidden `__call` native to take over. Nothing else is callable.
+            Val::Obj(o) => {
+                let hook = o
+                    .borrow()
+                    .props
+                    .iter()
+                    .find(|(k, _)| &**k == "__call")
+                    .map(|(_, v)| v.clone());
+                match hook {
+                    Some(f) => self.call(f, this, args),
+                    None => Err(JsError::Throw(Val::Str(Rc::from(
+                        "TypeError: object is not a function".to_string(),
+                    )))),
+                }
+            }
+            other => {
+                Err(JsError::Throw(Val::Str(Rc::from(format!(
+                    "TypeError: {} is not a function",
+                    other.type_of()
+                )))))
+            }
         }
     }
 
@@ -1491,6 +1590,18 @@ pub(crate) fn new_promise_obj() -> Rc<RefCell<Obj>> {
         props: Vec::new(),
         proto: None,
     }))
+}
+
+impl JsEngine {
+    /// A fresh promise chained to `Promise.prototype`, so `getPrototypeOf`
+    /// and `instanceof Promise` see the prototype bundles install onto.
+    pub(crate) fn new_promise(&mut self) -> Rc<RefCell<Obj>> {
+        let p = new_promise_obj();
+        if let Some(proto) = self.promise_proto.clone() {
+            p.borrow_mut().proto = Some(proto);
+        }
+        p
+    }
 }
 
 /// the inner promise object if `v` is one
@@ -1574,7 +1685,7 @@ pub(crate) fn promise_then(
     on_ok: Val,
     on_err: Val,
 ) -> Result<Val, JsError> {
-    let ret = new_promise_obj();
+    let ret = e.new_promise();
     let re = Reaction {
         kind: ReactKind::Js { on_ok, on_err },
         ret: Some(ret.clone()),
@@ -1593,7 +1704,7 @@ pub(crate) fn promise_then(
 /// `new Promise(executor)`: register resolve/reject natives over a fresh
 /// slot, run the executor, reject on a synchronous throw.
 pub(crate) fn new_promise_with_executor(e: &mut JsEngine, executor: Val) -> Result<Val, JsError> {
-    let p = new_promise_obj();
+    let p = e.new_promise();
     let slot = e.promise_slots.len() as u16;
     e.promise_slots.push(Some(p.clone()));
     let rid = e.register_native("Promise.resolve#slot", n_p_resolve, slot);
@@ -1971,6 +2082,10 @@ pub fn obj_has(o: &Rc<RefCell<Obj>>, key: &str) -> bool {
 
 /// Full member read including the prototype chain and built-in methods.
 pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsError> {
+    get_member_impl(e, base, key)
+}
+
+fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsError> {
     match base {
         // accessor values never reach script land as plain member values
         // (get_member unwraps them); unreachable in practice
@@ -2014,6 +2129,7 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                 "padStart" => Some(StrPadStart),
                 "padEnd" => Some(StrPadEnd),
                 "charAt" => Some(StrCharAt),
+                "charCodeAt" => Some(StrCharCodeAt),
                 "toString" | "valueOf" => Some(StrToString),
                 _ => None,
             };
@@ -2096,6 +2212,14 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                             _ => None,
                         };
                     }
+                    // functions inherit from Function.prototype (which chains
+                    // to Object.prototype), so `fn.hasOwnProperty(...)` and
+                    // borrowed `Function.prototype.*` methods resolve
+                    if let Some(fp) = e.function_proto.clone() {
+                        if let Some(v) = chain_get(e, base, fp, key)? {
+                            return Ok(v);
+                        }
+                    }
                     Ok(Val::Undefined)
                 }
             }
@@ -2138,11 +2262,27 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                             return Ok(v);
                         }
                     }
+                    // built-in constructors are functions: anything not on
+                    // the native side table is inherited from
+                    // Function.prototype (`Function.toString`, …)
+                    if let Some(fp) = e.function_proto.clone() {
+                        if let Some(v) = chain_get(e, base, fp, key)? {
+                            return Ok(v);
+                        }
+                    }
                     Ok(Val::Undefined)
                 }
             }
         }
-        Val::Method(_) => Ok(Val::Undefined),
+        // A method value is callable, so `Function.prototype.call.call(f, t)`
+        // — the `uncurryThis` idiom every polyfill bundle is built on — must
+        // find `.call`/`.apply`/`.bind` on it too.
+        Val::Method(_) => Ok(match key {
+            "call" => Val::Method(Meth::FnCall),
+            "apply" => Val::Method(Meth::FnApply),
+            "bind" => Val::Method(Meth::FnBind),
+            _ => Val::Undefined,
+        }),
         Val::Obj(o) => {
             // lazy prototype attach: engine-created arrays (literals,
             // builtins, embedder-made) pick up Array.prototype on first
@@ -2196,6 +2336,11 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                     match key {
                         "name" => return Ok(Val::Str(name.clone())),
                         "message" => return Ok(Val::Str(msg.clone())),
+                        // shortcut: no captured frames — the "stack" is just
+                        // the head line a log/overlay would print
+                        "stack" => {
+                            return Ok(Val::Str(Rc::from(format!("{name}: {msg}").as_str())))
+                        }
                         _ => {}
                     }
                 }
@@ -2237,47 +2382,58 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
             }
             // prototype walk with accessor interception: an own OR inherited
             // `Val::Acc` property invokes its getter (receiver = `base`)
-            let mut cur = Some(o.clone());
-            for _ in 0..PROTO_WALK_CAP {
-                let c = match cur {
-                    None => break,
-                    Some(c) => c,
-                };
-                let (found, next) = {
-                    let b = c.borrow();
-                    if let ObjKind::Array(items) = &b.kind {
-                        if key == "length" {
-                            return Ok(Val::Num(items.len() as f64));
-                        }
-                        if let Ok(i) = key.parse::<usize>() {
-                            if i < items.len() {
-                                return Ok(items[i].clone());
-                            }
-                        }
-                    }
-                    (
-                        b.props
-                            .iter()
-                            .find(|(k, _)| k.as_ref() == key)
-                            .map(|(_, v)| v.clone()),
-                        b.proto.clone(),
-                    )
-                };
-                cur = next;
-                if let Some(v) = found {
-                    if let Val::Acc(acc) = &v {
-                        let g = acc.getter.clone().unwrap_or(Val::Undefined);
-                        if is_callable(&g) {
-                            return e.call(g, base.clone(), Vec::new());
-                        }
-                        return Ok(Val::Undefined); // getter-less accessor
-                    }
-                    return Ok(v);
-                }
-            }
-            Ok(Val::Undefined)
+            Ok(chain_get(e, base, o.clone(), key)?.unwrap_or(Val::Undefined))
         }
     }
+}
+
+/// Walk `start`'s prototype chain for `key`, invoking accessor getters with
+/// `base` as receiver. `None` means the key is absent everywhere.
+fn chain_get(
+    e: &mut JsEngine,
+    base: &Val,
+    start: Rc<RefCell<Obj>>,
+    key: &str,
+) -> Result<Option<Val>, JsError> {
+    let mut cur = Some(start);
+    for _ in 0..PROTO_WALK_CAP {
+        let c = match cur {
+            None => break,
+            Some(c) => c,
+        };
+        let (found, next) = {
+            let b = c.borrow();
+            if let ObjKind::Array(items) = &b.kind {
+                if key == "length" {
+                    return Ok(Some(Val::Num(items.len() as f64)));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    if i < items.len() {
+                        return Ok(Some(items[i].clone()));
+                    }
+                }
+            }
+            (
+                b.props
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .map(|(_, v)| v.clone()),
+                b.proto.clone(),
+            )
+        };
+        cur = next;
+        if let Some(v) = found {
+            if let Val::Acc(acc) = &v {
+                let g = acc.getter.clone().unwrap_or(Val::Undefined);
+                if is_callable(&g) {
+                    return Ok(Some(e.call(g, base.clone(), Vec::new())?));
+                }
+                return Ok(Some(Val::Undefined)); // getter-less accessor
+            }
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 /// member m.resolve on a `ObjKind::Regex` value (see `get_member`)
@@ -2428,7 +2584,7 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
 /// objects "[object Object]").
 fn to_primitive(v: &Val) -> Val {
     match v {
-        Val::Obj(_) | Val::Func(_) => Val::Str(Rc::from(v.to_string_d(0))),
+        Val::Obj(_) | Val::Func(_) => Val::Str(Rc::from(v.to_string())),
         _ => v.clone(),
     }
 }

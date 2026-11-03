@@ -116,6 +116,163 @@ struct Page {
     laid: Layout,
     /// page background from body/html background-color (fallback: BG const)
     bg: u32,
+    /// inspector metadata by DOM node (built worker-side — the UI thread
+    /// has no DOM). Only elements that are hit-test targets get an entry.
+    elements: HashMap<u32, ElementInfo>,
+}
+
+/// What the element inspector shows about one element. The DOM lives on the
+/// worker thread, so its identity travels with the page: tag/id/classes, an
+/// ancestor path, the border box, a few attributes and a direct-text sample.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ElementInfo {
+    tag: String,
+    id: String,
+    classes: Vec<String>,
+    /// `html > body > div#app > p.lead`, root first
+    path: String,
+    /// border box in document coordinates (viewport ones when `fixed`)
+    rect: (f32, f32, f32, f32),
+    fixed: bool,
+    /// a short attribute sample (`href`, `src`, …) — id/class already shown
+    attrs: Vec<(String, String)>,
+    /// collapsed direct text content of the element (empty for containers)
+    text: String,
+}
+
+impl ElementInfo {
+    /// Compact `tag#id.class` form used by the highlight chip.
+    fn selector(&self) -> String {
+        let mut s = self.tag.clone();
+        if !self.id.is_empty() {
+            s.push('#');
+            s.push_str(&self.id);
+        }
+        for c in &self.classes {
+            s.push('.');
+            s.push_str(c);
+        }
+        s
+    }
+}
+
+/// The inspector is limited to this many characters per metadata string so a
+/// pathological page can't balloon the worker→UI payload.
+const ELEMENT_TEXT_MAX: usize = 100;
+const ELEMENT_ATTR_MAX: usize = 5;
+const ELEMENT_VALUE_MAX: usize = 80;
+const ELEMENT_PATH_DEPTH: usize = 6;
+
+/// DOM-derived metadata for the inspector, one entry per hit-test node.
+/// `targets` is in tree order, so an element's own box (pushed before its
+/// text runs) supplies its rect.
+fn collect_elements(
+    dom: &html::Dom,
+    targets: &[layout::HoverTarget],
+) -> HashMap<u32, ElementInfo> {
+    let mut out: HashMap<u32, ElementInfo> = HashMap::new();
+    for t in targets {
+        if out.contains_key(&t.node) || dom.tag(t.node) == "#text" {
+            continue;
+        }
+        out.insert(t.node, element_info(dom, t.node, t.rect, t.fixed));
+    }
+    out
+}
+
+fn element_info(
+    dom: &html::Dom,
+    node: u32,
+    rect: (f32, f32, f32, f32),
+    fixed: bool,
+) -> ElementInfo {
+    let id = dom.attr(node, "id").unwrap_or("").trim().to_string();
+    let classes: Vec<String> = dom
+        .attr(node, "class")
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let mut attrs = Vec::new();
+    if let html::NodeKind::Element(_, list) = &dom.nodes[node as usize].kind {
+        for (k, v) in list.iter() {
+            if attrs.len() >= ELEMENT_ATTR_MAX {
+                break;
+            }
+            if k.eq_ignore_ascii_case("id") || k.eq_ignore_ascii_case("class") {
+                continue;
+            }
+            attrs.push((k.clone(), truncate_chars(v, ELEMENT_VALUE_MAX)));
+        }
+    }
+    // direct text children only: cheap even on huge container elements
+    let mut text = String::new();
+    for &c in &dom.nodes[node as usize].children {
+        if let html::NodeKind::Text(t) = &dom.nodes[c as usize].kind {
+            for w in t.split_whitespace() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(w);
+                if text.chars().count() >= ELEMENT_TEXT_MAX {
+                    break;
+                }
+            }
+        }
+        if text.chars().count() >= ELEMENT_TEXT_MAX {
+            break;
+        }
+    }
+    ElementInfo {
+        tag: dom.tag(node).to_string(),
+        id,
+        classes,
+        path: element_path(dom, node),
+        rect,
+        fixed,
+        attrs,
+        text: truncate_chars(&text, ELEMENT_TEXT_MAX),
+    }
+}
+
+/// `html > body > div#app > p.lead`, capped at [`ELEMENT_PATH_DEPTH`]
+/// segments (the head is elided, the element itself always kept).
+fn element_path(dom: &html::Dom, node: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = node;
+    while cur != 0 && parts.len() < ELEMENT_PATH_DEPTH {
+        let tag = dom.tag(cur);
+        if tag == "#document" || tag == "#text" {
+            break;
+        }
+        let mut seg = tag.to_string();
+        if let Some(id) = dom.attr(cur, "id").map(str::trim).filter(|s| !s.is_empty()) {
+            seg.push('#');
+            seg.push_str(id);
+        }
+        if let Some(cls) = dom.attr(cur, "class") {
+            for c in cls.split_whitespace().take(3) {
+                seg.push('.');
+                seg.push_str(c);
+            }
+        }
+        parts.push(seg);
+        cur = dom.nodes[cur as usize].parent;
+    }
+    if cur != 0 {
+        parts.push("\u{2026}".into()); // "…" — the path continues upward
+    }
+    parts.reverse();
+    parts.join(" > ")
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// One browser tab. Pages are NOT kept in RAM (that would blow the budget) —
@@ -152,6 +309,22 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+/// One point in the laid-out text stream: a text run index (into
+/// `Layout::runs`) plus a byte offset into that run's string.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct TextPos {
+    run: usize,
+    ch: usize,
+}
+
+/// A drag-highlighted text range, anchor first in stream order (normalized
+/// when built, so `anchor.run/ch <= head.run/ch`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Selection {
+    anchor: TextPos,
+    head: TextPos,
 }
 
 struct App {
@@ -224,6 +397,16 @@ struct App {
     /// children under a still pointer, the next hit test lands on a sibling,
     /// which shifts it too, and the page re-lays out forever.
     last_ptr: Option<egui::Pos2>,
+    /// element inspector mode: the pointer highlights the element under it,
+    /// a click pins one, Esc (or the toolbar toggle) leaves
+    inspect: bool,
+    /// pinned element node id from the inspector (survives relayouts,
+    /// cleared on navigation); the details panel follows it
+    pinned: Option<u32>,
+    /// text selection highlighted in the page (set by drag)
+    selection: Option<Selection>,
+    /// drag origin while the primary button is down; None = not selecting
+    select_anchor: Option<TextPos>,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -345,6 +528,7 @@ impl App {
                 hover_targets: Vec::new(),
             },
             bg: BG,
+            elements: HashMap::new(),
         };
         let pixels = vec![page.bg; pw * ph];
         // one long-lived worker thread; unbounded channels so neither side
@@ -391,6 +575,10 @@ impl App {
             hover_wait: false,
             bar_grab: None,
             last_ptr: None,
+            inspect: false,
+            pinned: None,
+            selection: None,
+            select_anchor: None,
         };
         // Startup on a previously visited URL counts as a restore: the DOM
         // snapshot skips the fetch exactly like a tab switch (scripts still
@@ -423,6 +611,10 @@ impl App {
         self.forms = layout::FormState::default();
         // …and the hover cell (the new page's worker side starts at None)
         self.hovered = None;
+        // …and anything the inspector/selection pointed into the old page
+        self.pinned = None;
+        self.selection = None;
+        self.select_anchor = None;
     }
 
     /// Queue a re-layout of the current page (resize / form typing / hover
@@ -674,6 +866,127 @@ impl App {
         self.address = url.to_string();
     }
 
+    /// Toggle the element inspector. Leaving the mode drops the pinned
+    /// element; a text selection stays visible.
+    fn set_inspect(&mut self, on: bool) {
+        if self.inspect == on {
+            return;
+        }
+        self.inspect = on;
+        self.pinned = None;
+        self.select_anchor = None;
+        eprintln!("[inspect] {}", if on { "on" } else { "off" });
+    }
+
+    /// Nearest character boundary to `x` inside one laid-out run. Advances
+    /// come from the same font picker the renderer measures with; the sum is
+    /// rescaled to the run's laid width so kerning can't drift the estimate.
+    fn char_at_x(&self, run: &layout::PositionedRun, x: f32) -> usize {
+        if run.text.is_empty() {
+            return 0;
+        }
+        let advances: Vec<f32> = run
+            .text
+            .chars()
+            .map(|c| {
+                let mut buf = [0u8; 4];
+                self.fonts.measure(c.encode_utf8(&mut buf), &run.style)
+            })
+            .collect();
+        let total: f32 = advances.iter().sum();
+        let rel = (x - run.x).max(0.0);
+        let target = if run.width > 0.0 && total > 0.0 {
+            rel * total / run.width
+        } else {
+            rel
+        };
+        let mut acc = 0.0f32;
+        let mut best = 0usize;
+        let mut best_d = target;
+        let mut idx = 0usize;
+        for (c, adv) in run.text.chars().zip(&advances) {
+            acc += *adv;
+            idx += c.len_utf8();
+            let d = (acc - target).abs();
+            if d < best_d {
+                best_d = d;
+                best = idx;
+            }
+        }
+        best
+    }
+
+    /// Text position under a content point (`x`, `y` are page-buffer units
+    /// before the scroll offset). Prefers a run the point is inside;
+    /// otherwise the closest run (vertically) so a drag past the last line
+    /// still extends the selection instead of stopping.
+    fn text_pos_at(&self, x: f32, y: f32, scroll: f32) -> Option<TextPos> {
+        let mut exact: Option<usize> = None;
+        let mut nearest: Option<(f32, usize)> = None;
+        for (i, r) in self.page.laid.runs.iter().enumerate() {
+            if r.text.is_empty() {
+                continue;
+            }
+            let vy = if r.fixed { y } else { y + scroll };
+            let (top, bot) = (r.y, r.y + r.style.line_height());
+            if vy >= top && vy <= bot && x >= r.x - 1.0 && x <= r.x + r.width + 1.0 {
+                exact = Some(i); // later runs paint on top
+                continue;
+            }
+            let dy = if vy < top {
+                top - vy
+            } else if vy > bot {
+                vy - bot
+            } else {
+                0.0
+            };
+            let score = dy * 1000.0 + (x - (r.x + r.width * 0.5)).abs() * 0.01;
+            if nearest.map_or(true, |(s, _)| score < s) {
+                nearest = Some((score, i));
+            }
+        }
+        let i = exact.or(nearest.map(|(_, i)| i))?;
+        let r = &self.page.laid.runs[i];
+        Some(TextPos {
+            run: i,
+            ch: self.char_at_x(r, x),
+        })
+    }
+
+    /// Plain text of the current selection (newline between visual lines,
+    /// space across a word gap), used by Ctrl+C.
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let mut out = String::new();
+        // (right edge, y) of the previous included run — layout splits at
+        // spaces, so a horizontal gap between two runs IS a space
+        let mut prev_end: Option<(f32, f32)> = None;
+        for i in sel.anchor.run..=sel.head.run {
+            let r = self.page.laid.runs.get(i)?;
+            let from = if i == sel.anchor.run { sel.anchor.ch } else { 0 };
+            let to = if i == sel.head.run {
+                sel.head.ch
+            } else {
+                r.text.len()
+            };
+            let from = from.min(r.text.len());
+            let to = to.min(r.text.len()).max(from);
+            if let Some((x_end, py)) = prev_end {
+                if (py - r.y).abs() > 0.5 {
+                    out.push('\n');
+                } else if r.x > x_end + 0.5
+                    && !out.is_empty()
+                    && !out.ends_with(char::is_whitespace)
+                {
+                    out.push(' ');
+                }
+            }
+            out.push_str(&r.text[from..to]);
+            prev_end = Some((r.x + r.width, r.y));
+        }
+        Some(out)
+    }
+
     /// A form control was clicked. Text fields take focus (no worker job
     /// needed until a key arrives); the field that loses focus fires its
     /// `change` listeners one round trip before the new focus settles.
@@ -819,6 +1132,136 @@ fn hover_should_relayout(
     pointer_active && new_hovered != hovered && !busy && !scrolling
 }
 
+/// Translucent wash + outline over one element's border box, with a small
+/// `tag#id.class` chip. `info.rect` is in document coordinates (viewport
+/// coordinates for `position: fixed`), so the scroll offset is applied here.
+fn paint_inspect_box(
+    painter: &egui::Painter,
+    page: egui::Rect,
+    scroll: f32,
+    info: &ElementInfo,
+    pinned: bool,
+) {
+    let (x, y, w, h) = info.rect;
+    let sy = if info.fixed { y } else { y - scroll };
+    let rect = egui::Rect::from_min_size(
+        page.min + egui::vec2(PADDING as f32 + x, PADDING as f32 + sy),
+        egui::vec2(w.max(2.0), h.max(2.0)),
+    );
+    let visible = rect.intersect(page);
+    if !visible.is_positive() {
+        return;
+    }
+    painter.rect_filled(
+        visible,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0x5b, 0x9d, 0xff, 44),
+    );
+    painter.rect_stroke(
+        visible,
+        0.0,
+        egui::Stroke::new(
+            if pinned { 2.0 } else { 1.0 },
+            egui::Color32::from_rgba_unmultiplied(0x5b, 0x9d, 0xff, 230),
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    // chip above the box; pushed inside when the box starts at the top edge
+    let font = egui::FontId::monospace(11.0);
+    let galley = painter.layout_no_wrap(info.selector(), font, egui::Color32::WHITE);
+    let pad = egui::vec2(5.0, 2.0);
+    let mut at = egui::pos2(rect.left(), rect.top() - galley.size().y - 2.0 * pad.y - 2.0);
+    if at.y < page.top() {
+        at.y = rect.top() + 2.0;
+    }
+    at.x = at.x.clamp(page.left(), (page.right() - galley.size().x - 2.0 * pad.x).max(page.left()));
+    let chip = egui::Rect::from_min_size(at, galley.size() + 2.0 * pad);
+    painter.rect_filled(chip, 3.0, egui::Color32::from_rgb(0x1f, 0x6f, 0xd1));
+    painter.galley(at + pad, galley, egui::Color32::WHITE);
+}
+
+/// Floating details card for the inspected element (bottom-left of the page,
+/// clear of the scrollbar and the RSS meter).
+fn paint_inspect_panel(
+    ui: &egui::Ui,
+    page: egui::Rect,
+    info: &ElementInfo,
+    pinned: bool,
+) {
+    let bg: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x1b, 0x1c, 0x1f, 235);
+    let border: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3d, 0x44);
+    let dim: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x90, 0x96);
+    let pad = 10.0;
+    let w = 340.0_f32.min((page.width() - 24.0).max(200.0));
+    let (x, y, bw, bh) = info.rect;
+
+    let mut lines: Vec<(String, egui::Color32, f32)> = vec![
+        (info.selector(), egui::Color32::from_rgb(0x8f, 0xbb, 0xff), 13.0),
+        (
+            info.path.clone(),
+            dim,
+            10.5,
+        ),
+        (
+            format!("{bw:.0} \u{00d7} {bh:.0}  \u{00b7}  at {x:.0}, {y:.0}"),
+            egui::Color32::from_rgb(0xc9, 0xcd, 0xd2),
+            11.5,
+        ),
+    ];
+    for (k, v) in info.attrs.iter().take(4) {
+        lines.push((
+            format!("{k}=\"{v}\""),
+            egui::Color32::from_rgb(0xb6, 0xbd, 0xc6),
+            11.0,
+        ));
+    }
+    if !info.text.is_empty() {
+        lines.push((
+            format!("\u{201c}{}\u{201d}", info.text),
+            egui::Color32::from_rgb(0x9a, 0xa0, 0xa6),
+            11.0,
+        ));
+    }
+    lines.push((
+        if pinned {
+            "click an element to pin \u{00b7} Esc exits"
+        } else {
+            "click to pin \u{00b7} Esc exits"
+        }
+        .into(),
+        dim,
+        10.0,
+    ));
+
+    let painter = ui.painter().with_clip_rect(page);
+    let font_of = |size: f32| egui::FontId::proportional(size);
+    let galleys: Vec<_> = lines
+        .iter()
+        .map(|(text, color, size)| {
+            painter.layout(text.clone(), font_of(*size), *color, w - 2.0 * pad)
+        })
+        .collect();
+    let h = galleys.iter().map(|g| g.size().y + 3.0).sum::<f32>() + 2.0 * pad - 3.0;
+    let panel = egui::Rect::from_min_size(
+        egui::pos2(page.left() + 10.0, (page.bottom() - 10.0 - h).max(page.top())),
+        egui::vec2(w, h),
+    );
+    painter.rect_filled(panel, 7.0, bg);
+    painter.rect_stroke(
+        panel,
+        7.0,
+        egui::Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    let mut at = panel.min + egui::vec2(pad, pad);
+    for (galley, (_, color, _)) in galleys.into_iter().zip(&lines) {
+        let size = galley.size();
+        painter.galley(at, galley, *color);
+        at.y += size.y + 3.0;
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // deferred cookie-jar write (worker mutations inside the same second
@@ -847,6 +1290,34 @@ impl eframe::App for App {
             self.fullscreen = !self.fullscreen;
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+
+        // ---- inspector shortcuts: Ctrl+Shift+C (or F12) toggles the mode,
+        // Esc leaves it, Ctrl+C copies a drag selection ----
+        let (toggle_inspect, inspect_f12, escape) = ui.input(|i| {
+            (
+                i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::F12),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if toggle_inspect || inspect_f12 {
+            self.set_inspect(!self.inspect);
+        } else if escape && self.inspect {
+            self.set_inspect(false);
+        }
+        if self.selection.is_some()
+            && !self.address_focused
+            && ui.input(|i| {
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C)
+            })
+        {
+            if let Some(text) = self.selected_text() {
+                if !text.is_empty() {
+                    eprintln!("[select] copied {} chars", text.chars().count());
+                    ui.ctx().copy_text(text);
+                }
+            }
         }
 
         // Actions are collected during the panel closures and applied after
@@ -881,7 +1352,7 @@ impl eframe::App for App {
             .show_separator_line(false)
             .show(ui, |ui| {
                 let can_back = !self.back_stack.is_empty();
-                for ev in ui_chrome::toolbar(ui, &mut self.address, can_back) {
+                for ev in ui_chrome::toolbar(ui, &mut self.address, can_back, self.inspect) {
                     match ev {
                         ui_chrome::ToolbarEvent::Back => go_back = true,
                         ui_chrome::ToolbarEvent::Submit(q) => {
@@ -897,6 +1368,9 @@ impl eframe::App for App {
                         }
                         ui_chrome::ToolbarEvent::Settings => {
                             self.settings_open = true;
+                        }
+                        ui_chrome::ToolbarEvent::Inspect => {
+                            self.set_inspect(!self.inspect);
                         }
                     }
                 }
@@ -938,7 +1412,7 @@ impl eframe::App for App {
                 // bar owns the keyboard while it's focused). Enter submits
                 // (shell logs + fires change with the final value), Escape
                 // blurs (change fired).
-                if self.forms.focused.is_some() && !self.address_focused {
+                if self.forms.focused.is_some() && !self.address_focused && !self.inspect {
                     let field = self.forms.focused.unwrap();
                     let mut actions: Vec<KeyAction> = Vec::new();
                     ui.input(|i| {
@@ -1118,9 +1592,22 @@ impl eframe::App for App {
                         }
                     }
                     // link hit-test — identical math to the old minifb shell
-                    // (a press inside the scrollbar strip belongs to the bar)
+                    // (a press inside the scrollbar strip belongs to the bar).
+                    // In inspector mode a click pins the element under the
+                    // pointer and never navigates.
                     if resp.clicked() && !resp.interact_pointer_pos().map_or(false, in_bar) {
-                        if let Some(p) = resp.interact_pointer_pos() {
+                        if self.inspect {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let rx = p.x - resp.rect.min.x - PADDING as f32;
+                                let my_doc = p.y - resp.rect.min.y - PADDING as f32;
+                                self.pinned = self
+                                    .page
+                                    .laid
+                                    .hit_hover(rx, my_doc, self.scroll)
+                                    .map(|(n, _)| n);
+                                eprintln!("[inspect] pin {:?}", self.pinned);
+                            }
+                        } else if let Some(p) = resp.interact_pointer_pos() {
                             let rx = p.x - resp.rect.min.x - PADDING as f32;
                             let my_doc = p.y - resp.rect.min.y - PADDING as f32;
                             // form controls win over links underneath them
@@ -1182,6 +1669,56 @@ impl eframe::App for App {
                         }
                     }
 
+                    // ---- drag to highlight text ----
+                    // A press on page text starts (or clears) the selection;
+                    // moving with the button held extends it toward the
+                    // pointer; release keeps it. Form controls own their
+                    // press, and inspector mode selects elements instead.
+                    let sel_press = ui
+                        .input(|i| i.pointer.primary_pressed().then(|| i.pointer.interact_pos()))
+                        .flatten()
+                        .filter(|p| resp.rect.contains(*p) && !in_bar(*p));
+                    if let Some(p) = sel_press {
+                        let rx = p.x - resp.rect.min.x - PADDING as f32;
+                        let my_doc = p.y - resp.rect.min.y - PADDING as f32;
+                        self.select_anchor = if self.inspect
+                            || self.page.laid.hit_test_form(rx, my_doc, self.scroll).is_some()
+                        {
+                            None
+                        } else {
+                            self.text_pos_at(rx, my_doc, self.scroll)
+                        };
+                        self.selection = self
+                            .select_anchor
+                            .map(|a| Selection { anchor: a, head: a });
+                    }
+                    if let Some(anchor) = self.select_anchor {
+                        if ui.input(|i| i.pointer.primary_down()) {
+                            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                                let rx = p.x - resp.rect.min.x - PADDING as f32;
+                                // clamp so dragging past the viewport edges
+                                // still lands on the first/last line
+                                let my_doc = (p.y - resp.rect.min.y - PADDING as f32)
+                                    .clamp(0.0, page_h(ph));
+                                if let Some(head) = self.text_pos_at(rx, my_doc, self.scroll) {
+                                    let ordered = if (anchor.run, anchor.ch) <= (head.run, head.ch)
+                                    {
+                                        Selection { anchor, head }
+                                    } else {
+                                        Selection { anchor: head, head: anchor }
+                                    };
+                                    self.selection = Some(ordered);
+                                }
+                            }
+                        } else {
+                            self.select_anchor = None;
+                            // a plain click leaves no highlight behind
+                            if self.selection.map_or(false, |s| s.anchor == s.head) {
+                                self.selection = None;
+                            }
+                        }
+                    }
+
                     // hover: read the pointer (input is read-only here —
                     // never synthesized), hit-test with the SAME math as the
                     // link hit-test above, and rebuild when the effective
@@ -1212,13 +1749,17 @@ impl eframe::App for App {
                         // cursor follows the hit; no hit (page background)
                         // = Default. Only written inside the page image —
                         // over the chrome egui's own per-frame output wins
-                        let icon = hit
-                            .and_then(|(_, c)| c)
-                            .map(cursor_icon_of)
-                            .unwrap_or(egui::CursorIcon::Default);
+                        let icon = if self.inspect {
+                            egui::CursorIcon::Crosshair
+                        } else {
+                            hit.and_then(|(_, c)| c)
+                                .map(cursor_icon_of)
+                                .unwrap_or(egui::CursorIcon::Default)
+                        };
                         ui.ctx().set_cursor_icon(icon);
                     }
-                    let new_hovered = if self.bar_grab.is_some() {
+                    let new_hovered = if self.inspect || self.bar_grab.is_some() {
+                        // the inspector highlights without restyling the page
                         None
                     } else {
                         hit.map(|(n, _)| n)
@@ -1228,6 +1769,74 @@ impl eframe::App for App {
                         self.dispatch_relayout(pw, ph);
                         self.hover_wait = true;
                         ui.ctx().request_repaint();
+                    }
+
+                    // ---- text selection highlight (drag) ----
+                    if let Some(sel) = self.selection {
+                        let painter = ui.painter().with_clip_rect(resp.rect);
+                        let fill =
+                            egui::Color32::from_rgba_unmultiplied(0x4a, 0x8f, 0xf0, 90);
+                        for i in sel.anchor.run..=sel.head.run {
+                            let Some(r) = self.page.laid.runs.get(i) else {
+                                continue;
+                            };
+                            let from = if i == sel.anchor.run {
+                                sel.anchor.ch
+                            } else {
+                                0
+                            }
+                            .min(r.text.len());
+                            let to = if i == sel.head.run {
+                                sel.head.ch
+                            } else {
+                                r.text.len()
+                            }
+                            .min(r.text.len())
+                            .max(from);
+                            if from >= to {
+                                continue;
+                            }
+                            let x0 = r.x + self.fonts.measure(&r.text[..from], &r.style);
+                            let x1 = r.x + self.fonts.measure(&r.text[..to], &r.style);
+                            let sy = if r.fixed { r.y } else { r.y - self.scroll };
+                            let rect = egui::Rect::from_min_size(
+                                resp.rect.min
+                                    + egui::vec2(PADDING as f32 + x0, PADDING as f32 + sy),
+                                egui::vec2((x1 - x0).max(1.0), r.style.line_height()),
+                            );
+                            if rect.intersects(resp.rect) {
+                                painter.rect_filled(rect, 1.0, fill);
+                            }
+                        }
+                    }
+
+                    // ---- element inspector overlay ----
+                    if self.inspect {
+                        let hover_node = hit.map(|(n, _)| n);
+                        let painter = ui.painter().with_clip_rect(resp.rect);
+                        // the pinned box stays visible while the pointer is
+                        // elsewhere; the hovered box paints over it
+                        if let Some(n) = self.pinned.filter(|n| Some(*n) != hover_node) {
+                            if let Some(info) = self.page.elements.get(&n) {
+                                paint_inspect_box(&painter, resp.rect, self.scroll, info, true);
+                            }
+                        }
+                        if let Some(info) = hover_node.and_then(|n| self.page.elements.get(&n)) {
+                            paint_inspect_box(
+                                &painter,
+                                resp.rect,
+                                self.scroll,
+                                info,
+                                self.pinned == hover_node,
+                            );
+                        }
+                        if let Some(info) = self
+                            .pinned
+                            .or(hover_node)
+                            .and_then(|n| self.page.elements.get(&n))
+                        {
+                            paint_inspect_panel(ui, resp.rect, info, self.pinned.is_some());
+                        }
                     }
                 }
 
@@ -1591,6 +2200,8 @@ struct PageWire {
     form_names: HashMap<u32, String>,
     /// hover hit-test targets (rect + node + cursor + fixed), tree order
     hover_targets: Vec<layout::HoverTarget>,
+    /// inspector metadata by node (worker-built; see [`ElementInfo`])
+    elements: HashMap<u32, ElementInfo>,
 }
 
 /// One laid-out text run without `Rc` (link href as a plain `String`).
@@ -1681,6 +2292,7 @@ fn page_to_wire(
         form_values: p.laid.form_values,
         form_names,
         hover_targets: p.laid.hover_targets,
+        elements: p.elements,
     }
 }
 
@@ -1725,6 +2337,7 @@ fn wire_to_page(w: PageWire) -> Page {
             form_values: w.form_values,
             hover_targets: w.hover_targets,
         },
+        elements: w.elements,
     }
 }
 
@@ -3045,11 +3658,12 @@ fn layout_page(
                 break;
             }
             eprintln!(
-                "[run {i}] y={:.0} x={:.0} w={:.0} ul={} text={:?}",
+                "[run {i}] y={:.0} x={:.0} w={:.0} ul={} c={:06x} text={:?}",
                 r.y,
                 r.x,
                 r.width,
                 r.style.underline as u8,
+                r.style.color,
                 r.text
             );
         }
@@ -3075,10 +3689,13 @@ fn layout_page(
         }
     }
     let form_names = collect_form_names(dom);
+    // inspector identity for every hit-test node (the UI thread has no DOM)
+    let elements = collect_elements(dom, &laid.hover_targets);
     let page = Page {
         url: url.to_string(),
         laid,
         bg,
+        elements,
     };
     (page, form_names)
 }
@@ -5199,6 +5816,19 @@ mod tests {
             url: "https://example.com/".into(),
             laid,
             bg: 0xabcdef,
+            elements: HashMap::from([(
+                7,
+                ElementInfo {
+                    tag: "a".into(),
+                    id: "x".into(),
+                    classes: vec!["y".into()],
+                    path: "body > a#x.y".into(),
+                    rect: (1.0, 2.0, 30.0, 14.0),
+                    fixed: false,
+                    attrs: vec![("href".into(), "/".into())],
+                    text: "hello".into(),
+                },
+            )]),
         };
         page_to_wire(
             page,
@@ -5245,6 +5875,51 @@ mod tests {
             page.laid.hover_targets[0].cursor,
             Some(css::Cursor::Pointer)
         );
+        // inspector metadata rides the wire too (the UI thread has no DOM)
+        let info = page.elements.get(&7).expect("element metadata travels");
+        assert_eq!(info.selector(), "a#x.y");
+        assert_eq!(info.attrs[0], ("href".to_string(), "/".to_string()));
+    }
+
+    /// The inspector's element identity: selector, ancestor path, box and a
+    /// direct-text sample, collected once per hit-test node.
+    #[test]
+    fn inspector_metadata_describes_hit_test_nodes() {
+        let dom = html::parse(
+            "<html><body><div id='app' class='wrap main'><p class='lead'>Hello world</p></div></body></html>",
+        );
+        let mut p = 0u32;
+        let mut text = 0u32;
+        for i in 0..dom.nodes.len() as u32 {
+            match dom.tag(i) {
+                "p" => p = i,
+                "#text" if text == 0 => text = i,
+                _ => {}
+            }
+        }
+        assert!(p != 0 && text != 0);
+        let targets = vec![
+            layout::HoverTarget {
+                rect: (10.0, 20.0, 30.0, 14.0),
+                node: p,
+                cursor: None,
+                fixed: false,
+            },
+            // a text leaf is not an inspectable element
+            layout::HoverTarget {
+                rect: (10.0, 20.0, 30.0, 14.0),
+                node: text,
+                cursor: None,
+                fixed: false,
+            },
+        ];
+        let els = collect_elements(&dom, &targets);
+        assert_eq!(els.len(), 1, "one entry per element, text leaves skipped");
+        let info = els.get(&p).unwrap();
+        assert_eq!(info.selector(), "p.lead");
+        assert_eq!(info.rect, (10.0, 20.0, 30.0, 14.0));
+        assert!(info.path.ends_with("div#app.wrap.main > p.lead"));
+        assert_eq!(info.text, "Hello world");
     }
 
     /// Form interaction state must survive the worker→UI hop: focus, typed

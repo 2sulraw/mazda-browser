@@ -384,6 +384,11 @@ struct Nids {
     loc_assign: usize,
     loc_reload: usize,
     win_add_listener: usize,
+    match_media: usize,
+    media_noop: usize,
+    history_push: usize,
+    history_replace: usize,
+    history_go: usize,
     ev_prevent_default: usize,
     raf: usize,
     storage_get: usize,
@@ -508,6 +513,11 @@ const L_ASSIGN: u16 = 30;
 const L_RELOAD: u16 = 31;
 /// window group idxs
 const W_ADD_LISTENER: u16 = 32;
+const W_MATCH_MEDIA: u16 = 34;
+/// history group idxs
+const H_PUSH: u16 = 0;
+const H_REPLACE: u16 = 1;
+const H_GO: u16 = 2;
 /// event object group idxs
 const V_PREVENT_DEFAULT: u16 = 33;
 /// storage group idxs
@@ -812,11 +822,50 @@ fn win_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             ctx_add_listener(WIN_NODE, kind.to_string(), cb);
             Ok(Val::Undefined)
         }
+        // shortcut: no media engine - every query reports "no match", and the
+        // list is a fixed object whose listener methods do nothing
+        W_MATCH_MEDIA => {
+            let media = args
+                .first()
+                .map(|v| v.to_string())
+                .unwrap_or_else(String::new);
+            let list = Val::new_object();
+            list.set("media", Val::Str(Rc::from(media.as_str())));
+            list.set("matches", Val::Bool(false));
+            let noop = NIDS.with(|c| c.get().map(|n| n.media_noop).unwrap_or(0));
+            for name in [
+                "addEventListener",
+                "removeEventListener",
+                "addListener",
+                "removeListener",
+            ] {
+                list.set(name, Val::Native(noop));
+            }
+            Ok(list)
+        }
+        35 => Ok(Val::Undefined),
         _ => Err(JsError::throw("TypeError: bad window native")),
     }
 }
 
-/// The event object's preventDefault — flags the click so the UI thread
+/// shortcut: the session-history *stack* is not modelled. `pushState` /
+/// `replaceState` store the custom state and the new URL string (so routers
+/// that read them back agree), but back/forward/go do nothing and no
+/// `popstate` event is ever dispatched.
+fn hist_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == H_GO {
+        return Ok(Val::Undefined);
+    }
+    let hist = e.get_global("history");
+    hist.set("state", args.first().cloned().unwrap_or(Val::Null));
+    if let Some(url) = args.get(2).and_then(|v| v.as_string()) {
+        let loc = e.get_global("location");
+        loc.set("href", Val::Str(Rc::from(url)));
+    }
+    Ok(Val::Undefined)
+}
+
+/// The event object's preventDefault - flags the click so the UI thread
 /// cancels a not-yet-started link navigation (see module docs).
 fn ev_native(_e: &mut JsEngine, idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
     match idx {
@@ -910,6 +959,17 @@ fn n_match_media(_e: &mut JsEngine, args: &[Val]) -> Result<Val, JsError> {
     let o = Val::new_object();
     o.set("matches", Val::Bool(dark));
     o.set("media", str_val(&q));
+    // shortcut: no media engine, so the list never changes and its change
+    // listeners are recorded nowhere — themes just read `.matches` once
+    let noop = nids().media_noop;
+    for name in [
+        "addEventListener",
+        "removeEventListener",
+        "addListener",
+        "removeListener",
+    ] {
+        o.set(name, Val::Native(noop));
+    }
     Ok(o)
 }
 
@@ -1014,12 +1074,24 @@ pub(crate) fn subtree_query_dom(dom: &Dom, root: u32, sel: &str) -> Vec<u32> {
 
 /// Per-page script state kept by the loader worker between jobs: the
 /// engine (with listeners' closures alive inside it), the listener table
+/// A queued timer: absolute deadline, the id `setTimeout`/`setInterval`
+/// returned (so `clearTimeout` can still cancel it after it was harvested
+/// out of the engine), the callback plus its args, and the repeat period for
+/// `setInterval`.
+struct Timer {
+    due: Instant,
+    id: f64,
+    cb: Val,
+    args: Vec<Val>,
+    repeat_ms: Option<f64>,
+}
+
 /// and the pending timer queue. One per loaded page; dropped on navigate.
 pub struct PageScripts {
     engine: JsEngine,
     listeners: HashMap<(u32, String), Vec<Val>>,
     /// absolute deadline → (callback, args) — drives worker recv_timeout
-    timers: Vec<(Instant, Val, Vec<Val>)>,
+    timers: Vec<Timer>,
     /// (`requestAnimationFrame` deadline, callback) — due frames fire in
     /// one coalesced pass per epoch (see module docs)
     raf: Vec<(Instant, Val)>,
@@ -1076,6 +1148,11 @@ impl PageScripts {
             loc_assign: engine.register_native("location.assign", loc_native, L_ASSIGN),
             loc_reload: engine.register_native("location.reload", loc_native, L_RELOAD),
             win_add_listener: engine.register_native("window.addEventListener", win_native, W_ADD_LISTENER),
+            match_media: engine.register_native("window.matchMedia", win_native, W_MATCH_MEDIA),
+            media_noop: engine.register_native("MediaQueryList.addEventListener", win_native, 35),
+            history_push: engine.register_native("history.pushState", hist_native, H_PUSH),
+            history_replace: engine.register_native("history.replaceState", hist_native, H_REPLACE),
+            history_go: engine.register_native("history.back", hist_native, H_GO),
             ev_prevent_default: engine.register_native("event.preventDefault", ev_native, V_PREVENT_DEFAULT),
             raf: engine.register_native("requestAnimationFrame", raf_native, 0),
             storage_get: engine.register_native("localStorage.getItem", storage_native, S_GET),
@@ -1123,10 +1200,38 @@ impl PageScripts {
         // navigator: fixed honest UA string (no engine names), nothing dynamic
         let nav = Val::new_object();
         nav.set("userAgent", str_val("Mazda/1.0"));
+        // a host platform string, not a browser claim; sites use it to pick
+        // keyboard-shortcut glyphs
+        nav.set(
+            "platform",
+            str_val(if cfg!(target_os = "windows") {
+                "Win32"
+            } else if cfg!(target_os = "macos") {
+                "MacIntel"
+            } else {
+                "Linux x86_64"
+            }),
+        );
+        nav.set("language", str_val("en-US"));
         engine.set_global("navigator", nav.clone());
+
+        // history: the surface routers probe plus pushState-based SPA
+        // navigation. Shortcut: one entry, no session-history stack and no
+        // popstate event; pushState/replaceState only record the URL.
+        let hist = Val::new_object();
+        hist.set("scrollRestoration", str_val("auto"));
+        hist.set("state", Val::Null);
+        hist.set("length", Val::Num(1.0));
+        hist.set("pushState", Val::Native(ids.history_push));
+        hist.set("replaceState", Val::Native(ids.history_replace));
+        hist.set("back", Val::Native(ids.history_go));
+        hist.set("forward", Val::Native(ids.history_go));
+        hist.set("go", Val::Native(ids.history_go));
+        engine.set_global("history", hist);
         // window aliases the global object — methods installed on the global
         // object are reachable as window.x / globalThis.x both ways
         engine.set_global("addEventListener", Val::Native(ids.win_add_listener));
+        engine.set_global("matchMedia", Val::Native(ids.match_media));
         engine.set_global("requestAnimationFrame", Val::Native(ids.raf));
         // document-level listeners share the global (window) bucket: both
         // are page-wide targets with no own arena node, and the global stop
@@ -1278,7 +1383,8 @@ impl PageScripts {
                     }
                 }
                 if let Err(err) = r {
-                    eprintln!("[js] script error: {err}");
+                    let name = s.src.as_deref().unwrap_or("inline module");
+                    eprintln!("[js] script error in {name}: {err}");
                 }
                 self.harvest_timers();
                 continue;
@@ -1341,7 +1447,8 @@ impl PageScripts {
                 }
             }
             if let Err(err) = r {
-                eprintln!("[js] script error: {err}");
+                let name = s.src.as_deref().unwrap_or("inline script");
+                eprintln!("[js] script error in {name}: {err}");
             }
             // queue whatever the script scheduled: timers (engine table)
             // and rAF callbacks (ctx side channel → merge_ctx above) so
@@ -1466,13 +1573,28 @@ impl PageScripts {
     /// and logs — the newest always live on.
     fn harvest_timers(&mut self) {
         let now = Instant::now();
+        // cancellations first: a `clearTimeout` may name a job that is still
+        // queued here, or one the engine has not handed over yet
+        let cancelled = self.engine.drain_cancelled_timers();
+        if !cancelled.is_empty() {
+            self.timers.retain(|t| !cancelled.contains(&t.id));
+        }
         for t in self.engine.drain_timers() {
+            if cancelled.contains(&t.id) {
+                continue;
+            }
             let d = if t.delay_ms.is_finite() && t.delay_ms > 0.0 {
                 t.delay_ms as u64
             } else {
                 0
             };
-            self.timers.push((now + Duration::from_millis(d), t.callback, t.args));
+            self.timers.push(Timer {
+                due: now + Duration::from_millis(d),
+                id: t.id,
+                cb: t.callback,
+                args: t.args,
+                repeat_ms: t.repeat_ms,
+            });
         }
         if self.timers.len() > MAX_PENDING_TIMERS {
             let drop = self.timers.len() - MAX_PENDING_TIMERS;
@@ -1509,9 +1631,18 @@ impl PageScripts {
             let due = self
                 .timers
                 .iter()
-                .position(|(t, _, _)| *t <= now)
+                .position(|t| t.due <= now)
                 .map(|i| self.timers.swap_remove(i));
-            let Some((_, cb, args)) = due else { break };
+            let Some(Timer {
+                id,
+                cb,
+                args,
+                repeat_ms,
+                ..
+            }) = due
+            else {
+                break;
+            };
             let listeners = std::mem::take(&mut self.listeners);
             let storage = self.storage.clone();
             let (r, mut host, cx) =
@@ -1538,6 +1669,18 @@ impl PageScripts {
             }
             if let Err(err) = r {
                 eprintln!("[js] timer error: {err}");
+            }
+            // `setInterval`: re-arm. A `clearInterval` for this id (fired
+            // from the callback itself, for instance) is applied by the
+            // `harvest_timers` pass once this turn unwinds.
+            if let Some(period) = repeat_ms {
+                self.timers.push(Timer {
+                    due: Instant::now() + Duration::from_millis(period.max(1.0) as u64),
+                    id,
+                    cb,
+                    args,
+                    repeat_ms,
+                });
             }
         }
         // timers queued by timers
@@ -1611,7 +1754,7 @@ impl PageScripts {
 
     /// Next timer deadline (`None` = no pending timers).
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        self.timers.iter().map(|(t, _, _)| *t).min()
+        self.timers.iter().map(|t| t.due).min()
     }
 
     /// Next frame-epoch deadline (`None` = no queued rAF callbacks).
@@ -2305,6 +2448,52 @@ mod tests {
             "same-delay timers fire in enqueue order; the chain fires next turn"
         );
         assert!(ps.next_timer_deadline().is_none(), "chain exhausted");
+    }
+
+    /// A `setInterval` keeps firing on every due pass until `clearInterval`
+    /// removes it; the id `setInterval` returned is the same id
+    /// `clearInterval` takes.
+    #[test]
+    fn interval_repeats_until_cleared() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.hits = "";
+                window.id = setInterval(function () {
+                    window.hits = window.hits + "x";
+                    if (window.hits.length === 3) { clearInterval(window.id); }
+                }, 0);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        for _ in 0..10 {
+            // a 0ms interval is clamped (>=1ms per arm, like browsers), so
+            // each pass needs its deadline to actually pass
+            std::thread::sleep(Duration::from_millis(3));
+            let _ = ps.run_due_timers(&mut dom);
+        }
+        assert_eq!(get_global_str(&mut ps, "hits"), "xxx");
+        // the interval cleared itself; nothing is left to wake the worker
+        let _ = ps.run_due_timers(&mut dom);
+        assert!(
+            ps.next_timer_deadline().is_none(),
+            "a cleared interval leaves no pending timer"
+        );
+    }
+
+    /// `clearTimeout` on a queued callback removes it before it fires.
+    #[test]
+    fn clear_timeout_cancels_a_queued_callback() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.hits = 0;
+                var id = setTimeout(function () { window.hits = 1; }, 0);
+                clearTimeout(id);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        let _ = ps.run_due_timers(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "hits"), "0");
+        assert!(ps.next_timer_deadline().is_none());
     }
 
     /// A timer callback can navigate (location.assign from setTimeout
