@@ -1743,6 +1743,17 @@ curve matters more than the baseline (near-flat as tabs grow).
   `1<<24` element cap still applies. Guards:
   `bigint_pow_does_not_spin_on_huge_exponents`,
   `typed_array_length_ctor_zero_fills_without_a_value_vector`.
+- **Known gap, visible on the reference capture**: MDN's "Latest news" date now
+  paints (`<time>` only appeared once this wave's DOM/date path worked), and it
+  lands on top of the source link. The template and `grid-area` both parse —
+  a standalone repro with MDN's rule set places the card correctly — so this is
+  a grid *track sizing* bug, not a missing feature: a multi-column-spanning item
+  (the summary `<p>`) contributes its full max-content width to every column it
+  covers (`grid()`'s documented span shortcut), so the `max-content` column
+  inflates to the paragraph's one-line width and the `1fr` column collapses.
+  Fixing it is a track-distribution change (divide a spanning item's
+  contribution across its tracks, then fit to the container), outside these six
+  waves; recorded here so the capture difference is not mistaken for a JS bug.
 - **Wave numbering note**: waves 27 (SVG paint pass) and 28 (TLS/media) landed
   first; this JS wave is 29.
 
