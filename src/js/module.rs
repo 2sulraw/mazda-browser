@@ -18,9 +18,18 @@
 //! - module scripts run in document order together with classic scripts
 //!   (both are already deferred in this engine; there is no parser task to
 //!   interleave them with)
-//! - `import.meta`, dynamic `import()` and import assertions are not
-//!   implemented: `import()`/`import.meta` fail at runtime (so the rest of
-//!   the script still runs), import assertions do not parse
+//! - dynamic `import()` is a real Promise: the global native resolves the
+//!   specifier and queues a `Job::Import` microtask; the engine's microtask
+//!   pump loads and executes the module, then settles the promise — so
+//!   `.then` chains and `await import(...)` both work, with module jobs
+//!   interleaved in microtask order rather than the spec's separate
+//!   module-job queue
+//! - the specifier base is the URL of the module whose code is running
+//!   (`src_id → URL` table: a module-defined function called later, from
+//!   classic script code, still resolves against its own module), or the
+//!   page URL outside module code
+//! - `import.meta.url` is supported on the same lookup (no `resolve()`);
+//!   import assertions do not parse
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -77,11 +86,18 @@ impl ModuleLoader {
             return Ok(x.clone());
         }
         let src_id = e.register_source(src);
+        if src_id != 0 {
+            // remember which URL this source belongs to: `import()` and
+            // `import.meta.url` resolve against it even when a module-defined
+            // function is called later from classic script code
+            e.module_urls.insert(src_id, Rc::from(url));
+        }
         let program = parser::parse(src, src_id).map_err(|err| format!("{url}: {err}"))?;
-        // each module body is its own execution turn (same budget reset as
-        // `JsEngine::exec`), so a huge dependency graph is not starved by
-        // whichever module ran first
+        // each module body is its own execution turn (fresh step budget), but
+        // it may run re-entrantly from a microtask inside an outer call
+        // (`await import(...)`), so the caller's frame depth is restored after
         e.steps = 0;
+        let saved_depth = e.call_depth;
         e.call_depth = 0;
         e.cur_src = src_id;
         e.err_located = false;
@@ -90,6 +106,7 @@ impl ModuleLoader {
         self.active.push(url.to_string());
         let r = self.run_body(e, url, src, &program, &ns);
         self.active.pop();
+        e.call_depth = saved_depth;
         if r.is_err() {
             // a failed module must not stay cached as a half namespace
             self.cache.remove(url);
@@ -128,7 +145,7 @@ impl ModuleLoader {
                             env.declare(local.clone(), v, true);
                         }
                         ImportBinding::Namespace { local } => {
-                            env.declare(local.clone(), namespace(&dep), true);
+                            env.declare(local.clone(), namespace_value(&dep), true);
                         }
                     }
                 }
@@ -206,10 +223,22 @@ impl ModuleLoader {
             .ok_or_else(|| format!("cannot resolve module specifier {spec:?} from {base}"))?;
         self.load(e, &url)
     }
+
+    /// Test hook: register a module namespace without fetching/executing.
+    /// Dynamic-import tests seed the target so they never touch the network
+    /// (`load` treats a cached URL exactly like an already-evaluated one).
+    #[cfg(test)]
+    pub(crate) fn seed(&mut self, url: &str, pairs: &[(&str, Val)]) {
+        let ns: Exports = Rc::new(RefCell::new(HashMap::new()));
+        for (k, v) in pairs {
+            ns.borrow_mut().insert(Rc::from(*k), v.clone());
+        }
+        self.cache.insert(url.to_string(), ns);
+    }
 }
 
-/// The object handed to `import * as ns`.
-fn namespace(xs: &Exports) -> Val {
+/// The object handed to `import * as ns` (and to `import()`'s `.then`).
+pub(crate) fn namespace_value(xs: &Exports) -> Val {
     let o = Val::new_object();
     if let Val::Obj(obj) = &o {
         let entries: Vec<(Rc<str>, Val)> = xs
@@ -235,6 +264,54 @@ fn resolve_specifier(base: &str, spec: &str) -> Option<String> {
         .join(spec)
         .ok()
         .map(|u| u.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic `import()` — a global native queues a `Job::Import` microtask and
+// returns the pending Promise; the engine's microtask pump loads the module
+// and settles it (so `.then` chains and `await import(...)` both work)
+// ---------------------------------------------------------------------------
+
+/// Install the global `import` native (call once per page, after
+/// `JsEngine::new`). The page URL fallback comes from `JsEngine::import_base`.
+pub(crate) fn install_dynamic_import(e: &mut JsEngine) {
+    let id = e.register_native("import", n_dynamic_import, 0);
+    e.set_global("import", Val::Native(id));
+    e.import_native = Some(id);
+}
+
+/// `import(spec)`: ToString the argument, resolve it against the running
+/// module's URL (or the page URL), queue the load as a microtask and return
+/// a pending Promise. An unresolvable specifier still returns a Promise —
+/// already rejected, so `try`/`catch` around `import()` sees no throw (the
+/// spec rejects asynchronously; this engine cannot observe the difference
+/// beyond microtask order).
+fn n_dynamic_import(
+    e: &mut JsEngine,
+    _idx: u16,
+    _this: &Val,
+    args: &[Val],
+) -> Result<Val, JsError> {
+    let spec = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let base = e
+        .module_url_for(e.cur_src)
+        .or_else(|| e.import_base.clone())
+        .unwrap_or_default();
+    let p = super::new_promise_obj();
+    match resolve_specifier(&base, &spec) {
+        Some(url) => e.microtasks.push(super::Job::Import {
+            url: Rc::from(url.as_str()),
+            promise: p.clone(),
+        }),
+        None => {
+            let msg = format!(
+                "TypeError: cannot resolve module specifier {spec:?} (base {base:?})"
+            );
+            eprintln!("[js] dynamic import failed: {msg}");
+            super::settle_promise(e, &p, Err(Val::Str(Rc::from(msg.as_str()))));
+        }
+    }
+    Ok(Val::Obj(p))
 }
 
 #[cfg(test)]
@@ -406,5 +483,105 @@ mod tests {
             .is_err();
         assert!(before);
         assert!(!l.cache.contains_key("https://mazda.test/bad.js"));
+    }
+
+    #[test]
+    fn import_meta_url_names_the_defining_module() {
+        let mut e = JsEngine::new();
+        install_dynamic_import(&mut e);
+        e.import_base = Some(Rc::from("https://mazda.test/page/index.html"));
+        let mut l = ModuleLoader::new();
+        let xs = l
+            .load_source(
+                &mut e,
+                "https://mazda.test/dir/main.js",
+                "export function where() { return import.meta.url; }",
+            )
+            .expect("module runs");
+        // called later, outside the module body: the closure's source id
+        // still maps to its defining module
+        let f = get(&xs, "where");
+        let v = e.call_function(&f, Val::Undefined, &[]).expect("call");
+        assert_eq!(v.to_string(), "https://mazda.test/dir/main.js");
+    }
+
+    #[test]
+    fn dynamic_import_inside_module_function_uses_module_base() {
+        let mut e = JsEngine::new();
+        install_dynamic_import(&mut e);
+        e.import_base = Some(Rc::from("https://mazda.test/page/index.html"));
+        let mut l = ModuleLoader::new();
+        l.seed("https://mazda.test/dir/dep.js", &[("v", Val::Num(3.0))]);
+        let xs = l
+            .load_source(
+                &mut e,
+                "https://mazda.test/dir/main.js",
+                "export function load() {
+                     return import(\"./dep.js\").then(function (ns) {
+                         globalThis.late = ns.v;
+                     });
+                 }",
+            )
+            .expect("module runs");
+        e.module_loader = Some(l);
+        let f = get(&xs, "load");
+        e.call_function(&f, Val::Undefined, &[]).expect("call");
+        e.drain_microtasks().expect("microtasks");
+        assert_eq!(e.get_global("late").to_string(), "3");
+    }
+
+    #[test]
+    fn dynamic_import_resolves_from_page_base() {
+        let mut e = JsEngine::new();
+        install_dynamic_import(&mut e);
+        e.import_base = Some(Rc::from("https://mazda.test/page/"));
+        let mut l = ModuleLoader::new();
+        l.seed("https://mazda.test/page/dep.js", &[("v", Val::Num(4.0))]);
+        e.module_loader = Some(l);
+        // `exec` drains microtasks at the end of the turn: the import job
+        // loads the seeded module, settles, and `.then` runs
+        e.exec(
+            "import(\"./dep.js\").then(function (ns) { globalThis.got = ns.v; },
+                function (err) { globalThis.err = err; });",
+        )
+        .expect("script runs");
+        assert_eq!(e.get_global("got").to_string(), "4");
+        assert!(matches!(e.get_global("err"), Val::Undefined));
+    }
+
+    #[test]
+    fn dynamic_import_rejects_unresolvable_specifier() {
+        let mut e = JsEngine::new();
+        install_dynamic_import(&mut e);
+        // no page base and no module URL: a relative specifier cannot resolve
+        e.module_loader = Some(ModuleLoader::new());
+        e.exec(
+            "import(\"./nowhere.js\").then(function () { globalThis.ok = 1; },
+                function (err) { globalThis.err = err; });",
+        )
+        .expect("script runs");
+        assert!(matches!(e.get_global("ok"), Val::Undefined));
+        let err = e.get_global("err").to_string();
+        assert!(err.contains("cannot resolve module specifier"), "{err}");
+    }
+
+    #[test]
+    fn dynamic_import_specifier_is_module_relative() {
+        let mut e = JsEngine::new();
+        install_dynamic_import(&mut e);
+        e.import_base = Some(Rc::from("https://mazda.test/page/index.html"));
+        let mut l = ModuleLoader::new();
+        l.seed("https://mazda.test/dir/dep.js", &[("v", Val::Num(7.0))]);
+        e.module_loader = Some(l);
+        e.load_module_source(
+            "https://mazda.test/dir/main.js",
+            "globalThis.pp = import(\"./dep.js\").then(function (ns) {
+                 globalThis.got2 = ns.v;
+             });",
+        )
+        .expect("module runs");
+        e.drain_microtasks().expect("microtasks");
+        // resolved against the module URL (`/dir/`), not the page URL
+        assert_eq!(e.get_global("got2").to_string(), "7");
     }
 }

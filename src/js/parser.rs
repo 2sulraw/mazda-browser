@@ -1252,8 +1252,9 @@ impl<'a> Parser<'a> {
             // `import` / `export` (contextual words: neither is lexed as a
             // keyword so they stay usable as identifiers elsewhere).
             // `import(`/`import.` are NOT declarations: those fall through to
-            // the expression path so `import()` is a runtime failure instead
-            // of a parse error that would kill the whole script.
+            // the expression path. `import(...)` is the dynamic-import native
+            // the embedder installs (a real Promise); `import.meta` reads
+            // undefined. Parsing them here would kill the whole script instead.
             Tok::Ident(name)
                 if name.as_ref() == "import"
                     && !matches!(

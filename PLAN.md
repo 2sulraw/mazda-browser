@@ -1406,10 +1406,50 @@ curve matters more than the baseline (near-flat as tabs grow).
   bundle `length` error; Wikipedia `JavaScript` 96.2-96.8 MB / 11404 runs
   with the same `match` error - no RAM or layout regression (97.0 MB
   baseline on the same URL).
+  **(z) dynamic `import()` + `import.meta.url`** - the svelte.dev boot
+  blocker, and the module-URL plumbing it exposed:
+  - the global `import(spec)` native returns a real Promise and queues a
+    `Job::Import` microtask. The engine's microtask pump takes the module
+    registry out of the engine (re-entrantly), fetches/executes the module,
+    then settles the promise - so `.then`/`.catch` chains and
+    `await import(...)` both work, and a module body runs with the caller's
+    frame depth restored (`await` pumps the load, so the outer call stack
+    must survive it).
+  - the specifier base is the URL of the module whose code is running: a
+    `src_id -> URL` table lives on the engine, and a call frame reports its
+    closure's source (`cur_src`), so a module-defined function called later
+    from classic script code still resolves `./x.js` against its own module
+    rather than the page.
+  - `import.meta.url` builds `{url}` at read time from the same lookup (no
+    `resolve()`); import assertions still do not parse; an unresolvable
+    specifier rejects the promise (and logs once - there is no
+    `unhandledrejection` event).
+  Honest shortcuts: module jobs ride the microtask queue instead of the
+  spec's separate module-job queue (ordering observable only against
+  timers), a failed import is logged but never reported to the page as an
+  `unhandledrejection` event, and `import.meta` has only `url`.
+  Tests (656 default / 660 with `engine-b woff2`):
+  `dynamic_import_resolves_from_page_base`,
+  `dynamic_import_rejects_unresolvable_specifier`,
+  `dynamic_import_specifier_is_module_relative`,
+  `import_meta_url_names_the_defining_module`,
+  `dynamic_import_inside_module_function_uses_module_base`,
+  `dynamic_import_resolves_and_then_runs`,
+  `await_dynamic_import_resumes_inside_a_call`.
+  Live: svelte.dev 83.2 MB / 291 runs - no inline-script error remains; the
+  22802-byte boot script now loads `entry/start...js`. Calling its `init`
+  then stops in Vite's preload helper, which needs
+  `document.getElementsByTagName`, `document.head` and a `link` element
+  from `createElement` - the next DOM batch, not a module gap. MDN
+  `/Web/CSS/list-style-type` 87.3 MB / 2773 runs (same pre-existing bundle
+  error); Wikipedia `JavaScript` 96.9 MB / 11404 runs with the same
+  `match` error (99.4 MB on the first run, the known load-time noise) - no
+  RAM or layout regression.
   **(z) next** - BigInt literals, `new.target`, `for await`, top-level
   `await`, import assertions, live module bindings, computed class
-  accessors, class static blocks, dynamic `import()` (the svelte.dev boot
-  blocker), canvas 2d context.
+  accessors, class static blocks, canvas 2d context, and the Vite preload
+  DOM surface (`getElementsByTagName`, `head`, `createElement("link")`,
+  attribute property setters).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
@@ -1553,6 +1593,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 18 (style/classList/currentScript) | svelte.dev | 78.7-82.9 MB (291 runs; both inline-script errors fixed; only dynamic `import()` remains) |
 | 2026-11-03 | wave 18 (style/classList/currentScript) | MDN `/Web/CSS/list-style-type` | 87.5 MB (2773 runs; same pre-existing bundle `length` error; rendering unchanged) |
 | 2026-11-03 | wave 18 (style/classList/currentScript) | Wikipedia `/wiki/JavaScript` | 96.2-96.8 MB (11404 runs; 97.0 MB baseline on the old binary; same `match` error, no regression) |
+| 2026-11-03 | wave 19 (dynamic import) | svelte.dev | 83.2 MB (291 runs; the boot script's `import()` loads the entry module — no inline-script error left; `init` stops in Vite's preload helper, the next DOM gap) |
+| 2026-11-03 | wave 19 (dynamic import) | MDN `/Web/CSS/list-style-type` | 87.3 MB (2773 runs; same pre-existing bundle `length` error) |
+| 2026-11-03 | wave 19 (dynamic import) | Wikipedia `/wiki/JavaScript` | 96.9 MB (11404 runs; 99.4 MB on the first run, known load-time noise; same `match` error) |
+| 2026-11-03 | wave 19 (dynamic import) | local ESM probe (2 modules, nested + awaited imports) | 65.2 MB (1 run; `await import()` resumes inside an async arrow, module-relative specifiers resolve, the reaction's DOM write paints) |
 
 ### Phase 1c (Track A) findings
 

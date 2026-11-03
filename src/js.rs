@@ -42,7 +42,7 @@ mod builtins;
 mod gen;
 mod interp;
 mod lexer;
-mod module;
+pub(crate) mod module;
 mod parser;
 mod regex;
 pub(crate) mod url;
@@ -734,6 +734,10 @@ pub(crate) const MAX_MICROTASKS: u32 = 10_000; // drain-work cap (runaway `.then
 pub(crate) enum Job {
     /// a reaction firing with the promise's settlement outcome
     Reaction(Reaction, Result<Val, Val>),
+    /// a dynamic `import()` waiting for the loader: runs like any other
+    /// microtask, so `await import(...)` pumps it and `.then` chains follow
+    /// in order. The URL was resolved when `import()` was called.
+    Import { url: Rc<str>, promise: Rc<RefCell<Obj>> },
 }
 
 /// Shared bookkeeping for `Promise.all/any/race/allSettled`: a board where
@@ -778,6 +782,10 @@ pub struct JsEngine {
     pub(crate) call_depth: usize,
     pub(crate) timers: Vec<TimerTask>,
     pub(crate) microtasks: Vec<Job>,
+    /// per-page ES module registry, owned by the engine so the dynamic
+    /// `import()` job can run the loader from inside the microtask pump.
+    /// Taken out around a load (running a module body needs `&mut self`).
+    pub(crate) module_loader: Option<ModuleLoader>,
     /// deferred `new Promise` resolver slots: slot index -> the promise the
     /// registered `resolve`/`reject` natives settle. The slot is emptied on
     /// settle, so the engine holds no reference afterwards (script-level
@@ -845,6 +853,17 @@ pub struct JsEngine {
     /// `undefined`, writes are no-ops.
     pub(crate) style_get: Option<fn(u32, &str) -> String>,
     pub(crate) style_set: Option<fn(u32, &str, &str)>,
+    /// Page URL used as the fallback base for dynamic `import()` outside a
+    /// module body (module bodies use the module's own URL). Set by the
+    /// embedder; `None` in pure-engine tests.
+    pub(crate) import_base: Option<Rc<str>>,
+    /// native id of the global `import` function (member reads of `.meta`
+    /// build the import-meta object from the executing module's URL).
+    pub(crate) import_native: Option<usize>,
+    /// source id → absolute module URL. A closure calls back with
+    /// `cur_src = def.src`, so `import()` and `import.meta.url` inside any
+    /// function defined by a module resolve against that module's URL.
+    pub(crate) module_urls: HashMap<u32, Rc<str>>,
 }
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
@@ -885,6 +904,7 @@ impl JsEngine {
             call_depth: 0,
             timers: Vec::new(),
             microtasks: Vec::new(),
+            module_loader: None,
             promise_slots: Vec::new(),
             promise_statics: None,
             native_props: HashMap::new(),
@@ -906,6 +926,9 @@ impl JsEngine {
             err_decorated: false,
             style_get: None,
             style_set: None,
+            import_base: None,
+            import_native: None,
+            module_urls: HashMap::new(),
             rng_state: 0x9e37_79b9_7f4a_7c15 ^ std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -969,6 +992,33 @@ impl JsEngine {
         // with the embedder's own drain later)
         self.run_microtasks(MAX_MICROTASKS)?;
         Ok(last)
+    }
+
+    /// Run already-fetched module source on this engine's module registry
+    /// (static `<script type="module">`). The loader is taken out around the
+    /// call because a module body runs with `&mut self` (re-entrancy).
+    pub(crate) fn load_module_source(&mut self, url: &str, src: &str) -> Result<(), String> {
+        let mut loader = self.module_loader.take().unwrap_or_default();
+        let r = loader.load_source(self, url, src);
+        self.module_loader = Some(loader);
+        r.map(|_| ())
+    }
+
+    /// Dynamic `import(url)`: fetch/execute through the same registry and
+    /// return the namespace object. The loader is taken out for the same
+    /// reason as above.
+    pub(crate) fn load_module(&mut self, url: &str) -> Result<Val, String> {
+        let mut loader = self.module_loader.take().unwrap_or_default();
+        let r = loader.load(self, url);
+        self.module_loader = Some(loader);
+        r.map(|ns| module::namespace_value(&ns))
+    }
+
+    /// URL of the module whose code is executing (`None` for classic
+    /// scripts): drives both `import()`'s specifier base and
+    /// `import.meta.url`.
+    pub(crate) fn module_url_for(&self, src: u32) -> Option<Rc<str>> {
+        self.module_urls.get(&src).cloned()
     }
 
     /// Invoke a JS function value from the embedder (event handlers, timer
@@ -1579,9 +1629,29 @@ fn deliver(e: &mut JsEngine, ret: Option<Rc<RefCell<Obj>>>, out: Result<Val, Val
     }
 }
 
-/// run one queued reaction (see `Job::Reaction`)
+/// run one queued reaction (see `Job::Reaction`) or dynamic import
 fn exec_job(e: &mut JsEngine, job: Job) -> Result<(), JsError> {
-    let Job::Reaction(re, out) = job;
+    let (re, out) = match job {
+        Job::Reaction(re, out) => (re, out),
+        Job::Import { url, promise } => {
+            // a module job: fetch/execute (cached after the first time), then
+            // settle the promise `import()` handed back; `.then` follows in
+            // the same drain and `await import(...)` pumps it here
+            match e.load_module(&url) {
+                Ok(ns) => {
+                    eprintln!("[js] dynamic import {url}");
+                    settle_promise(e, &promise, Ok(ns));
+                }
+                Err(err) => {
+                    // unhandled unless the page attached a handler; log once
+                    // (this engine has no `unhandledrejection` event)
+                    eprintln!("[js] dynamic import failed: {err}");
+                    settle_promise(e, &promise, Err(Val::Str(Rc::from(err.as_str()))));
+                }
+            }
+            return Ok(());
+        }
+    };
     match re.kind {
         ReactKind::Js { on_ok, on_err } => {
             let handler = match &out {
@@ -1996,6 +2066,19 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
             }
         }
         Val::Native(id) => {
+            // `import.meta` (dynamic-import function): build the object at
+            // read time so `.url` names the module whose code is running —
+            // or the page URL for a classic script. Only `.url` exists
+            // (no `resolve()`); honest shortcut.
+            if Some(*id) == e.import_native && key == "meta" {
+                let url = e
+                    .module_url_for(e.cur_src)
+                    .or_else(|| e.import_base.clone())
+                    .unwrap_or_default();
+                let meta = Val::new_object();
+                meta.set("url", Val::Str(url));
+                return Ok(meta);
+            }
             match key {
                 "call" => Ok(Val::Method(Meth::FnCall)),
                 "apply" => Ok(Val::Method(Meth::FnApply)),

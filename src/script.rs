@@ -41,6 +41,10 @@
 //!   bubble chain on every event.
 //! - `fetch` is synchronous and returns a plain `{ok, status, text()}`
 //!   object, not a Promise — the interpreter has no async/await.
+//! - `import(spec)` is a real Promise (dynamic import): the embedder settles
+//!   the job after the current turn, so `.then` chains run a turn later than
+//!   a browser's eager module resolution. `import.meta` reads `undefined`;
+//!   import assertions do not parse.
 //! - `createElement` clones the TagId of a tag already in the parsed
 //!   fragment table (see `element_tid`); unknown tags log and return null.
 //! - `document.cookie` is an accessor in the real API, and property
@@ -960,8 +964,6 @@ pub struct PageScripts {
     /// with the natives through the shared host handle
     storage: runtime::Storage,
     base: String,
-    /// `<script type="module">` namespaces (one per absolute URL)
-    modules: js::ModuleLoader,
 }
 // The per-turn Turn result lives in runtime.rs (same contract for both
 // engines) — script.rs re-exports it via the import at the top.
@@ -1020,6 +1022,11 @@ impl PageScripts {
         // the shared host (js.rs itself stays DOM-free)
         engine.style_get = Some(style_get_hook);
         engine.style_set = Some(style_set_hook);
+        // dynamic import(): global native; the module registry itself lives
+        // on the engine (engine.module_loader), and the page URL is the
+        // fallback base for specifiers called outside a module body
+        js::module::install_dynamic_import(&mut engine);
+        engine.import_base = Some(Rc::from(base));
 
         let doc = Val::new_object();
         doc.set("getElementById", Val::Native(ids.doc_get_element));
@@ -1110,7 +1117,6 @@ impl PageScripts {
             raf: Vec::new(),
             storage,
             base: base.to_string(),
-            modules: js::ModuleLoader::new(),
         }
     }
 
@@ -1154,14 +1160,13 @@ impl PageScripts {
                 );
                 let listeners = std::mem::take(&mut self.listeners);
                 let storage = self.storage.clone();
-                let modules = &mut self.modules;
                 let (r, mut host, cx) =
                     with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
                         let doc = e.get_global("document");
                         doc.set("currentScript", wrap_element(s.node));
                         let r = match &inline {
-                            Some(text) => modules.load_source(e, &url, text),
-                            None => modules.load(e, &url),
+                            Some(text) => e.load_module_source(&url, text),
+                            None => e.load_module(&url).map(|_| ()),
                         };
                         doc.set("currentScript", Val::Null);
                         if let Err(m) = e.drain_microtasks() {
@@ -1651,6 +1656,48 @@ mod tests {
         assert!(turn.dirty, "setTextContent must mark the page dirty");
         let p = query_all_dom(&dom, "#t")[0];
         assert_eq!(child_text(&dom, p), "new");
+    }
+
+    #[test]
+    fn dynamic_import_resolves_and_then_runs() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                import("/dep.js").then(function (ns) {
+                    window.got = ns.v;
+                }, function (err) {
+                    window.err = err;
+                });
+                window.sync = "before";
+            </script></body></html>"#,
+        );
+        let mut l = js::ModuleLoader::new();
+        l.seed("https://example.com/dep.js", &[("v", Val::Num(4.0))]);
+        ps.engine.module_loader = Some(l);
+        let _ = ps.run_scripts(&mut dom);
+        // the script body already finished; .then ran in its microtask drain
+        assert_eq!(get_global_str(&mut ps, "sync"), "before");
+        assert_eq!(get_global_str(&mut ps, "got"), "4");
+        assert_eq!(get_global_str(&mut ps, "err"), "undefined");
+    }
+
+    #[test]
+    fn await_dynamic_import_resumes_inside_a_call() {
+        // the module body runs re-entrantly from `await`'s microtask pump
+        // inside `boot`'s frame; it must not clobber the caller's call depth
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                async function boot() {
+                    const ns = await import("/dep.js");
+                    window.awaited = ns.v;
+                }
+                boot();
+            </script></body></html>"#,
+        );
+        let mut l = js::ModuleLoader::new();
+        l.seed("https://example.com/dep.js", &[("v", Val::Num(9.0))]);
+        ps.engine.module_loader = Some(l);
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "awaited"), "9");
     }
 
     #[test]
