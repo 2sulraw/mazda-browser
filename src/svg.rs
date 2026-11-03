@@ -72,6 +72,279 @@ const SKIP: &[&str] = &[
     "image", "foreignObject", "use",
 ];
 
+// ---------- text ----------
+
+/// One run of SVG text, resolved to FINAL-IMAGE pixels (viewBox scale and
+/// supersampling already divided out) and handed to the shell, which owns the
+/// font metrics. The vector parser does not measure glyphs, so `<text>` is
+/// not painted here: `main.rs` positions and blits the glyphs.
+pub struct TextRun {
+    /// whitespace-collapsed, entity-decoded content (tspans flattened)
+    pub text: String,
+    /// baseline origin in image pixels (x, y)
+    pub x: f64,
+    pub y: f64,
+    /// font size in image pixels
+    pub size: f64,
+    /// 0x00RRGGBB
+    pub color: u32,
+    /// fill-opacity × opacity, 0..1
+    pub alpha: f64,
+    /// text-anchor: 0 start, 1 middle, 2 end
+    pub anchor: u8,
+    /// `<textPath href="#id">` polyline in image pixels (None = plain text)
+    pub path: Option<Vec<(f64, f64)>>,
+    /// `textLength` in image pixels: glyph advances are stretched to fill it
+    pub text_len: Option<f64>,
+    /// `dy` in image pixels — a perpendicular offset when on a path
+    pub dy: f64,
+}
+
+/// `<path id=…>` polylines, for `<textPath href="#id">`.
+fn harvest_paths(txt: &str) -> Vec<(String, Vec<(f64, f64)>)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(tag) = next_tag(txt, &mut i) {
+        if tag.closing || tag.name != "path" {
+            continue;
+        }
+        let (Some(id), Some(d)) = (get_attr(tag.attrs, "id"), get_attr(tag.attrs, "d")) else {
+            continue;
+        };
+        let subs = parse_path(d);
+        if let Some(sub) = subs.into_iter().max_by_key(|s| s.pts.len()) {
+            if sub.pts.len() >= 2 {
+                out.push((id.to_string(), sub.pts));
+            }
+        }
+    }
+    out
+}
+
+/// Text between tags: drop nested markup (tspan/textPath) and decode the
+/// five XML entities plus numeric references.
+fn text_of(inner: &str) -> String {
+    let mut raw = String::new();
+    let mut rest = inner;
+    while let Some(lt) = rest.find('<') {
+        raw.push_str(&rest[..lt]);
+        match rest[lt..].find('>') {
+            Some(gt) => rest = &rest[lt + gt + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    raw.push_str(rest);
+    // entities
+    let mut out = String::with_capacity(raw.len());
+    let mut it = raw.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        let rest = &raw[i..];
+        let Some(semi) = rest.find(';').filter(|&e| e <= 12) else {
+            out.push('&');
+            continue;
+        };
+        let ent = &rest[1..semi];
+        let rep = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some('\u{a0}'),
+            _ => {
+                let num = ent.strip_prefix('#').map(|n| {
+                    let (digits, radix) = match n.strip_prefix(['x', 'X']) {
+                        Some(h) => (h, 16),
+                        None => (n, 10),
+                    };
+                    u32::from_str_radix(digits, radix).ok().and_then(char::from_u32)
+                });
+                num.flatten()
+            }
+        };
+        match rep {
+            Some(r) => {
+                out.push(r);
+                // skip the reference's chars (they are ASCII, 1 byte each)
+                for _ in 0..semi {
+                    it.next();
+                }
+            }
+            None => out.push('&'),
+        }
+    }
+    out
+}
+
+/// `xml:space` default: runs of ASCII whitespace collapse to one space and
+/// the ends are trimmed; NBSP is a real glyph and must survive.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = false;
+    for c in s.chars() {
+        if c.is_whitespace() && c != '\u{a0}' {
+            space = true;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(c);
+    }
+    out
+}
+
+struct OpenText {
+    /// depth AFTER the `<text>` open tag — the matching close tag reports it
+    depth: usize,
+    m: M,
+    style: Style,
+    /// byte offset just past the `<text …>` tag
+    start: usize,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    text_len: Option<f64>,
+    path: Option<Vec<(f64, f64)>>,
+}
+
+/// All `<text>` runs in the document, in paint order, in image pixels.
+pub fn text_runs(bytes: &[u8], w: u32, h: u32) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    let Ok(txt) = std::str::from_utf8(bytes) else { return out };
+    let Some(base) = root_space(txt, w, h) else { return out };
+    let grads = harvest_gradients(txt);
+    let paths = harvest_paths(txt);
+    let k = SS as f64;
+
+    let mut mats = vec![base];
+    let mut styles = vec![Style::default()];
+    let mut depth = 0usize;
+    let mut skip_at: Option<usize> = None;
+    let mut open: Option<OpenText> = None;
+    let mut i = 0usize;
+
+    while let Some(tag) = next_tag(txt, &mut i) {
+        if tag.closing {
+            if let Some(o) = open.take_if(|o| o.depth == depth) {
+                let text = collapse_ws(&text_of(&txt[o.start..tag.start]));
+                if !text.is_empty() {
+                    let sc = (o.m.a.hypot(o.m.b) + o.m.c.hypot(o.m.d)) / 2.0; // super px per user unit
+                    let px = |v: f64| v * sc / k;
+                    let on_path = o.path.is_some();
+                    let (ox, oy) = if on_path {
+                        o.m.apply(o.x, o.y)
+                    } else {
+                        o.m.apply(o.x + o.dx, o.y + o.dy)
+                    };
+                    let path = o.path.as_ref().map(|pts| {
+                        pts.iter()
+                            .map(|&(px_, py_)| {
+                                let q = o.m.apply(px_, py_);
+                                (q.0 / k, q.1 / k)
+                            })
+                            .collect()
+                    });
+                    if let Some(col) = o.style.fill.resolve(&grads) {
+                        out.push(TextRun {
+                            text,
+                            x: ox / k,
+                            y: oy / k,
+                            size: px(o.style.fs),
+                            color: col & 0x00ff_ffff,
+                            alpha: o.style.fill_opacity.clamp(0.0, 1.0),
+                            anchor: o.style.anchor,
+                            path,
+                            text_len: o.text_len.map(px),
+                            dy: if on_path { px(o.dy) } else { 0.0 },
+                        });
+                    }
+                }
+                open = None;
+            }
+            if skip_at == Some(depth) {
+                skip_at = None;
+            }
+            depth = depth.saturating_sub(1);
+            mats.pop();
+            styles.pop();
+            continue;
+        }
+
+        let m = mats.last().copied().unwrap_or(base);
+        let m = match get_attr(tag.attrs, "transform") {
+            Some(t) => m * parse_transform(t),
+            None => m,
+        };
+        let st = styles.last().cloned().unwrap_or_default().with(tag.attrs);
+        if !tag.selfclose {
+            depth += 1;
+            mats.push(m);
+            styles.push(st.clone());
+        }
+        if skip_at.is_some() {
+            continue;
+        }
+        if let Some(o) = &mut open {
+            if tag.name == "textPath" {
+                // the textPath's own presentation attributes style the glyphs
+                // it carries (MDN sizes each ring separately)
+                for key in ["font-size", "fill"] {
+                    if let Some(v) = get_style(tag.attrs, key).or_else(|| get_attr(tag.attrs, key)) {
+                        o.style.apply(key, v);
+                    }
+                }
+            }
+            // a textPath inside the run: its href only says WHERE the text
+            // goes, the glyphs still come from the enclosing <text>
+            if tag.name == "textPath" && o.path.is_none() {
+                if let Some(href) = get_attr(tag.attrs, "href")
+                    .or_else(|| get_attr(tag.attrs, "xlink:href"))
+                {
+                    o.path = paths
+                        .iter()
+                        .find(|(id, _)| id == href.trim_start_matches('#'))
+                        .map(|(_, pts)| pts.clone());
+                }
+                if o.text_len.is_none() {
+                    o.text_len = get_attr(tag.attrs, "textLength").and_then(parse_px);
+                }
+            }
+            continue;
+        }
+        if tag.name == "text" {
+            if !tag.selfclose {
+                open = Some(OpenText {
+                    depth,
+                    m,
+                    style: st.effective(),
+                    start: i,
+                    x: attrf(tag.attrs, "x"),
+                    y: attrf(tag.attrs, "y"),
+                    dx: attrf(tag.attrs, "dx"),
+                    dy: attrf(tag.attrs, "dy"),
+                    text_len: get_attr(tag.attrs, "textLength").and_then(parse_px),
+                    path: None,
+                });
+            }
+            continue;
+        }
+        if SKIP.contains(&tag.name) && !tag.selfclose {
+            skip_at = Some(depth);
+        }
+    }
+    out
+}
+
 // ---------- element tree walk ----------
 //
 // Definitions (`clipPath`, `mask`, `filter`, `pattern`, `symbol`, any
@@ -1820,6 +2093,10 @@ struct Style {
     fill_opacity: f64,
     stroke_opacity: f64,
     evenodd: bool,
+    /// `font-size` in user units (SVG's initial value is 16)
+    fs: f64,
+    /// `text-anchor`: 0 start, 1 middle, 2 end
+    anchor: u8,
 }
 
 impl Default for Style {
@@ -1832,6 +2109,8 @@ impl Default for Style {
             fill_opacity: 1.0,
             stroke_opacity: 1.0,
             evenodd: false,
+            fs: 16.0,
+            anchor: 0,
         }
     }
 }
@@ -1840,7 +2119,17 @@ impl Style {
     /// Inherit + apply presentation attributes (inline style wins over them).
     fn with(&self, raw: &str) -> Style {
         let mut s = self.clone();
-        for key in ["fill", "stroke", "stroke-width", "fill-rule", "fill-opacity", "stroke-opacity", "opacity"] {
+        for key in [
+            "fill",
+            "stroke",
+            "stroke-width",
+            "fill-rule",
+            "fill-opacity",
+            "stroke-opacity",
+            "opacity",
+            "font-size",
+            "text-anchor",
+        ] {
             if let Some(v) = get_style(raw, key).or_else(|| get_attr(raw, key)) {
                 s.apply(key, v);
             }
@@ -1858,6 +2147,18 @@ impl Style {
             "fill-opacity" => self.fill_opacity = v.parse::<f64>().unwrap_or(self.fill_opacity).clamp(0.0, 1.0),
             "stroke-opacity" => self.stroke_opacity = v.parse::<f64>().unwrap_or(self.stroke_opacity).clamp(0.0, 1.0),
             "opacity" => self.opacity = v.parse::<f64>().unwrap_or(self.opacity).clamp(0.0, 1.0),
+            "font-size" => {
+                if let Some(n) = parse_px(v) {
+                    self.fs = n.max(0.0)
+                }
+            }
+            "text-anchor" => {
+                self.anchor = match v {
+                    "middle" => 1,
+                    "end" => 2,
+                    _ => 0,
+                }
+            }
             _ => {}
         }
     }
@@ -2552,4 +2853,49 @@ mod tests {
         assert_eq!(img.px[15 * 20 + 15], 0xff00_0000);
         assert_eq!(img.px[2 * 20 + 2], 0, "nested content is confined to its viewport");
     }
+
+#[test]
+    fn text_run_position_size_colour_and_anchor() {
+        let s = br##"<svg width="100" height="40" font-size="20"><text x="10" y="30" fill="#ff0000" text-anchor="middle">Hi &amp; bye</text></svg>"##;
+        let runs = text_runs(s, 100, 40);
+        assert_eq!(runs.len(), 1, "one run");
+        assert_eq!(runs[0].text, "Hi & bye");
+        assert!((runs[0].x - 10.0).abs() < 0.01, "x={}", runs[0].x);
+        assert!((runs[0].y - 30.0).abs() < 0.01, "y={}", runs[0].y);
+        assert!((runs[0].size - 20.0).abs() < 0.01, "size={}", runs[0].size);
+        assert_eq!(runs[0].color, 0x00ff_0000);
+        assert_eq!(runs[0].anchor, 1);
+        assert!(runs[0].path.is_none());
+        // no <text> ink in the vector pass — the shell paints it
+        let img = render(s, 100, 40).unwrap();
+        assert!(img.px.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn text_path_run_carries_polyline_text_length_and_dy() {
+        let s = br##"<svg width="20" height="20"><defs><path id="c" d="M2 10h16"/></defs><text dy="3" textLength="16"><textPath href="#c">abc</textPath></text></svg>"##;
+        let runs = text_runs(s, 20, 20);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "abc");
+        let p = runs[0].path.as_ref().expect("path");
+        assert_eq!(p.len(), 2);
+        assert!((p[0].0 - 2.0).abs() < 0.01 && (p[0].1 - 10.0).abs() < 0.01);
+        assert!((runs[0].text_len.unwrap() - 16.0).abs() < 0.01);
+        assert!((runs[0].dy - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_tspans_flatten_and_whitespace_collapses_nbsp_survives() {
+        let s = "<svg width=\"10\" height=\"10\"><text>  a<tspan>/</tspan>\n\n b&nbsp;c  </text></svg>".as_bytes();
+        let runs = text_runs(s, 10, 10);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "a/ b\u{a0}c");
+    }
+
+    #[test]
+    fn text_inside_defs_is_not_a_run() {
+        let s = br#"<svg width="10" height="10"><defs><text x="1" y="1">hidden</text></defs></svg>"#;
+        assert!(text_runs(s, 10, 10).is_empty());
+    }
+
 }

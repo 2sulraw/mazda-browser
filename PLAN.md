@@ -1886,6 +1886,44 @@ curve matters more than the baseline (near-flat as tabs grow).
   only horizontal margins (no `margin` collapsing, no vertical intrinsic
   contribution), and inline-block baselines are approximated elsewhere.
 
+| 2026-11-03 | wave 23 (SVG text) | MDN homepage | 101.1 MB (615 runs; layout unchanged; the mandala still paints nothing - its `fill`/`font-size` come from page CSS applied *inside* the inline `<svg>`, which the image pipeline does not cascade) |
+| 2026-11-03 | wave 23 (SVG text) | local page, inline `<svg>` (5 rings + anchors) | 76.9 MB (0 runs; 2 images drawn - five concentric slash rings plus start/middle/end `<text>` in three colours) |
+
+### Wave 23 findings
+
+- **The vector rasterizer cannot measure glyphs, so `<text>` is split across
+  two layers.** `svg.rs` walks the document and emits `TextRun` records in
+  *image* pixels (origin, size, colour, alpha, `text-anchor`, the `<textPath>`
+  polyline, `textLength`, `dy`); the shell lays the runs out with the only
+  font metrics in the process and blits them into the SVG's ARGB buffer.
+  Content flattening is the parser's job (tspans flattened, entities decoded
+  including `&nbsp;`, whitespace collapsed, NBSP kept).
+- **Text paints after the shapes**, not in document order (shortcut): a run's
+  glyphs are positioned before the SIMD-free blit and there is no z-slot for
+  them inside the vector pass.
+- **`textPath` needs the polyline in image space**, so `text_runs` re-derives
+  the root viewBox matrix and harvests `<path id>` polylines (`harvest_paths`).
+  Glyphs ride the path, stay upright (the spec's `rotate="0"` default), and an
+  explicit `dy` moves them along the normal `(-ty, tx)` - which is why the rings
+  sit *inside* their circles, as the reference does.
+- **`textLength` is applied as one uniform advance scale** for the whole run;
+  the reference distributes the extra as inter-glyph spacing. Identical total
+  length, slightly different rhythm on very short runs.
+- **`textPath`'s own `font-size`/`fill` style its glyphs** (MDN sizes each ring
+  separately: 24 / 20.8 / 19.2 / 17.6 / 16 px).
+- **Blending must not drop destination alpha.** The page buffer is opaque, but
+  the SVG image composites over the page, so `blend_argb` keeps `A` while the
+  page's `blend` still writes `00RRGGBB`.
+- **Cost:** an SVG is now walked twice (`render` + `text_runs`); both passes are
+  a tag scan over a few KB, so icons are unaffected - but it is a second parse,
+  recorded here so a later profiler does not "find" it as a surprise.
+- **Known gaps after wave 23**: `<tspan>`-level `dx`/`dy`/`style`/`fill` are
+  flattened (one style per run); no `rotate`/`letter-spacing`/`word-spacing`;
+  no `<text>` inside `<use>`; page CSS does not reach inside inline SVG, so
+  MDN's mandala stays blank until that cascade exists (the SVG itself is
+  verified by the inline-page row above); `dominant-baseline` and
+  `alignment-baseline` are ignored.
+
 ### Wave 22 findings
 
 - **`width: auto` must reset an earlier `width`.** The shorthand cascade kept
