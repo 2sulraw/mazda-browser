@@ -592,6 +592,10 @@ fn stmt_has_yield(s: &parser::Stmt) -> bool {
                 .iter()
                 .any(|d| d.init.as_ref().map_or(false, expr_has_yield)),
             parser::StmtKind::Block(b) | parser::StmtKind::List(b) => b.iter().any(w),
+            // module wrappers: `export` may hide a declaration with a yield,
+            // `import` never runs a statement
+            parser::StmtKind::Import { .. } => false,
+            parser::StmtKind::Export { inner, .. } => inner.as_deref().map_or(false, w),
             parser::StmtKind::If { test, then, other } => {
                 expr_has_yield(test)
                     || w(then)

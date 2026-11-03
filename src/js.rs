@@ -42,8 +42,11 @@ mod builtins;
 mod gen;
 mod interp;
 mod lexer;
+mod module;
 mod parser;
 mod regex;
+
+pub use module::ModuleLoader;
 
 #[cfg(test)]
 mod tests;

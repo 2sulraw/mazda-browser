@@ -1225,6 +1225,51 @@ curve matters more than the baseline (near-flat as tabs grow).
   (`computed_object_keys`, `object_literal_accessors`,
   `optional_chaining`; the `**` assertions moved into
   `arithmetic_and_precedence`).
+  **(u) ES modules** - `<script type="module">` is no longer ignored:
+  - the parser treats `import`/`export` as *contextual* words (neither
+    becomes a lexer keyword, so both stay usable as identifiers). Supported:
+    default / named / `* as` / bare `import "m"`; `export const|let|var`
+    (destructured names included), `export function`, `export async
+    function`, `export class`, `export { a as b }`, `export { a } from
+    "m"`, `export * from "m"`, and `export default <expr|function|class>`
+    (an anonymous default gets a synthesized internal name).
+  - a per-page `ModuleLoader` (`src/js/module.rs`) keys namespaces by
+    absolute URL, resolves dependencies depth-first in document order and
+    runs each body in its own child environment, so module bindings never
+    leak into the page. Relative specifiers resolve against the importing
+    module's URL; `export *` skips `default`; a failed module is dropped
+    from the cache instead of being reused half-filled.
+  - `nomodule` scripts are skipped when the document has a module build, so
+    dual-build pages no longer run both halves.
+  - `import()` / `import.meta` were deliberately kept as *runtime*
+    failures: a parse error would kill every statement before them in the
+    script (that is exactly what svelte.dev's bundle does).
+  Honest shortcuts: exported bindings are a snapshot taken when the
+  defining module finishes (no live bindings), a cyclic import sees an
+  empty namespace, bare package specifiers do not resolve, dynamic
+  `import()` / `import.meta` are unimplemented, and engine B logs + skips
+  module scripts.
+  Tests (614 default / 618 with `engine-b woff2`):
+  `exports_values_default_and_functions`,
+  `imports_default_named_and_namespace`, `module_scope_is_private`,
+  `reexports_named_and_star`, `export_list_of_locals`,
+  `export_default_anonymous_function`, `export_default_anonymous_class`,
+  `failed_module_is_not_cached`, `module_script_runs_and_mutates_dom`,
+  `module_imports_a_data_url_dependency`,
+  `nomodule_fallback_is_skipped_when_a_module_exists`,
+  `import_in_a_classic_script_errors_honestly`,
+  `import_export_need_a_module_script`,
+  `dynamic_import_fails_at_runtime_not_parse_time`,
+  `import_dot_meta_does_not_stop_parsing`.
+  Live: a `data:` page imports three data-URL modules (named, default,
+  namespace) - 5/5 `ok`; a local HTTP page with relative imports across
+  three files (named + default + `export *`) - 4/4 `ok`. MDN
+  `/Web/CSS/list-style-type` still lays out at 2773 runs (it now discovers
+  5 module bundles; each one fails on private class fields, the next syntax
+  batch). Wikipedia `JavaScript` unchanged at 11404 runs; svelte.dev
+  unchanged at 291 runs.
+  **(v) next** - private `#fields` (the last common bundle-syntax gap),
+  BigInt literals, `new.target`, computed class keys, `for await`.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
@@ -1352,6 +1397,11 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 14 (JS syntax batch 2) | svelte.dev | 115.9–126.6 MB (291 runs; client-rendered hero now paints — `catch {}` was the blocker, plus an `Object.assign(fn, …)` worker panic fixed) |
 | 2026-11-03 | wave 14 (JS syntax batch 2) | MDN `/Web/CSS/list-style-type` | 82.0 MB (2773 runs; unchanged — no regression) |
 | 2026-11-03 | wave 14 (JS syntax batch 2) | Wikipedia `/wiki/JavaScript` | 100.1 MB (11404 runs; identical) |
+| 2026-11-03 | wave 15 (ES modules) | `data:` 5-check module probe | 73.2 MB (5/5 `ok`: named import, default import, `import * as`, namespace `default`, `nomodule` half skipped) |
+| 2026-11-03 | wave 15 (ES modules) | local HTTP ESM page (3 modules, relative imports) | 64.7 MB (2 runs; named + default + `export *` resolve over real HTTP) |
+| 2026-11-03 | wave 15 (ES modules) | MDN `/Web/CSS/list-style-type` | 85.7 MB (2773 runs; layout unchanged; 5 module bundles now fetched but fail on private class fields) |
+| 2026-11-03 | wave 15 (ES modules) | Wikipedia `/wiki/JavaScript` | 98.4 MB (11404 runs; identical) |
+| 2026-11-03 | wave 15 (ES modules) | svelte.dev | 111.2 MB (291 runs; unchanged; dynamic `import()` is now a runtime error, so earlier statements still run) |
 
 ### Phase 1c (Track A) findings
 

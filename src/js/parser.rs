@@ -384,6 +384,44 @@ pub enum StmtKind {
         getter: Option<Rc<FnDef>>,
         setter: Option<Rc<FnDef>>,
     },
+    /// `import ... from "..."`. Only a module loader resolves these; the
+    /// interpreter rejects one so a classic script fails honestly instead of
+    /// silently skipping it.
+    Import {
+        source: Rc<str>,
+        bindings: Vec<ImportBinding>,
+    },
+    /// `export ...`. `names` are `(exported, local)` pairs; `inner` wraps the
+    /// declaration for `export <decl>` / `export default`. The interpreter
+    /// runs `inner` (the declaration still happens) and the module loader
+    /// records the values.
+    Export {
+        kind: ExportKind,
+        names: Vec<(Rc<str>, Rc<str>)>,
+        source: Option<Rc<str>>,
+        inner: Option<Box<Stmt>>,
+    },
+}
+
+/// one bound name of an `import` declaration
+#[derive(Clone, Debug)]
+pub enum ImportBinding {
+    /// `import x from "m"` / `import { a as x } from "m"`
+    Named { imported: Rc<str>, local: Rc<str> },
+    /// `import * as ns from "m"`
+    Namespace { local: Rc<str> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExportKind {
+    /// `export <decl>` - export every name the declaration binds
+    Decl,
+    /// `export default ...`
+    Default,
+    /// `export { a, b as c }` (optionally `from "m"`)
+    Named,
+    /// `export * from "m"`
+    All,
 }
 
 /// loop-variable binding target of for-in/for-of
@@ -682,6 +720,289 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// contextual keyword (`from`, `as`): an identifier token with this text
+    fn eat_word(&mut self, w: &str) -> bool {
+        let hit = matches!(self.peek(), Tok::Ident(n) if n.as_ref() == w);
+        if hit {
+            self.next();
+        }
+        hit
+    }
+
+    fn expect_string(&mut self) -> Result<Rc<str>, JsError> {
+        match self.peek().clone() {
+            Tok::Str(s) => {
+                self.next();
+                Ok(s)
+            }
+            _ => self.err(format!("expected a string literal, found `{:?}`", self.peek())),
+        }
+    }
+
+    /// `{ a, b as c }` -> `(source name, alias)`; imports read it as
+    /// (imported, local) and exports as (local, exported)
+    fn named_specifiers(&mut self) -> Result<Vec<(Rc<str>, Rc<str>)>, JsError> {
+        self.expect_punct(Punct::LBrace)?;
+        let mut out = Vec::new();
+        while *self.peek() != Tok::Punct(Punct::RBrace) {
+            let first = self.prop_name()?;
+            let second = if self.eat_word("as") {
+                Some(self.prop_name()?)
+            } else {
+                None
+            };
+            out.push(match second {
+                Some(local) => (first, local),
+                None => (first.clone(), first),
+            });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(out)
+    }
+
+    /// `import` already consumed.
+    fn import_rest(&mut self) -> Result<StmtKind, JsError> {
+        let mut bindings = Vec::new();
+        let source: Rc<str>;
+        if let Tok::Str(s) = self.peek().clone() {
+            // `import "m"` - run for side effects only
+            self.next();
+            source = s;
+        } else {
+            if *self.peek() == Tok::Op(Op::Mul) {
+                self.next();
+                bindings.push(ImportBinding::Namespace {
+                    local: self.import_ns_name()?,
+                });
+            } else if *self.peek() == Tok::Punct(Punct::LBrace) {
+                for (imported, local) in self.named_specifiers()? {
+                    bindings.push(ImportBinding::Named { imported, local });
+                }
+            } else {
+                let local = self.expect_ident()?;
+                bindings.push(ImportBinding::Named {
+                    imported: Rc::from("default"),
+                    local,
+                });
+                if self.eat_punct(Punct::Comma) {
+                    if *self.peek() == Tok::Op(Op::Mul) {
+                        self.next();
+                        bindings.push(ImportBinding::Namespace {
+                            local: self.import_ns_name()?,
+                        });
+                    } else {
+                        for (imported, local) in self.named_specifiers()? {
+                            bindings.push(ImportBinding::Named { imported, local });
+                        }
+                    }
+                }
+            }
+            if !self.eat_word("from") {
+                return self.err("expected `from` in import declaration");
+            }
+            source = self.expect_string()?;
+        }
+        self.finish_stmt()?;
+        Ok(StmtKind::Import { source, bindings })
+    }
+
+    fn import_ns_name(&mut self) -> Result<Rc<str>, JsError> {
+        if !self.eat_word("as") {
+            return self.err("expected `as` after `*` in import");
+        }
+        self.expect_ident()
+    }
+
+    /// `export` already consumed.
+    fn export_rest(&mut self) -> Result<StmtKind, JsError> {
+        if self.eat_kw(Kw::Default) {
+            let (inner, local) = self.export_default_rest()?;
+            return Ok(StmtKind::Export {
+                kind: ExportKind::Default,
+                names: vec![(Rc::from("default"), local)],
+                source: None,
+                inner: Some(Box::new(inner)),
+            });
+        }
+        if *self.peek() == Tok::Op(Op::Mul) {
+            self.next();
+            if !self.eat_word("from") {
+                return self.err("expected `from` after `export *`");
+            }
+            let source = self.expect_string()?;
+            self.finish_stmt()?;
+            return Ok(StmtKind::Export {
+                kind: ExportKind::All,
+                names: Vec::new(),
+                source: Some(source),
+                inner: None,
+            });
+        }
+        if *self.peek() == Tok::Punct(Punct::LBrace) {
+            let names: Vec<(Rc<str>, Rc<str>)> = self
+                .named_specifiers()?
+                .into_iter()
+                // specifier order is (local/source name, exported alias) but the
+                // Export node stores (exported, local)
+                .map(|(local, exported)| (exported, local))
+                .collect();
+            let source = if self.eat_word("from") {
+                Some(self.expect_string()?)
+            } else {
+                None
+            };
+            self.finish_stmt()?;
+            return Ok(StmtKind::Export {
+                kind: ExportKind::Named,
+                names,
+                source,
+                inner: None,
+            });
+        }
+        let (inner, names) = self.export_decl_rest()?;
+        Ok(StmtKind::Export {
+            kind: ExportKind::Decl,
+            names,
+            source: None,
+            inner: Some(Box::new(inner)),
+        })
+    }
+
+    /// `export default <expr | function | class>`; returns the statement and
+    /// the local name the value lives under.
+    fn export_default_rest(&mut self) -> Result<(Stmt, Rc<str>), JsError> {
+        let start = self.pos;
+        let is_async_fn =
+            *self.peek() == Tok::Kw(Kw::Async) && *self.peek_at(1) == Tok::Kw(Kw::Function);
+        if is_async_fn || *self.peek() == Tok::Kw(Kw::Function) {
+            if is_async_fn {
+                self.next(); // async
+            }
+            self.next(); // function
+            let is_gen = self.eat_op(Op::Mul);
+            let f = self.function_rest(false, is_async_fn, is_gen)?;
+            let (f, name) = if f.name.is_empty() {
+                let name: Rc<str> =
+                    Rc::from(format!("__default{}", next_class_id()).as_str());
+                (
+                    Rc::new(FnDef {
+                        name: name.clone(),
+                        ..(*f).clone()
+                    }),
+                    name,
+                )
+            } else {
+                (f.clone(), f.name.clone())
+            };
+            return Ok((
+                Stmt {
+                    kind: StmtKind::FuncDecl(f),
+                    span: self.span_from(start),
+                },
+                name,
+            ));
+        }
+        if *self.peek() == Tok::Kw(Kw::Class) {
+            self.next();
+            let name = match self.peek().clone() {
+                Tok::Ident(n) => {
+                    self.next();
+                    n
+                }
+                _ => Rc::from(format!("__default{}", next_class_id()).as_str()),
+            };
+            let stmts = self.class_rest_named(name.clone())?;
+            return Ok((
+                Stmt {
+                    kind: StmtKind::List(stmts),
+                    span: self.span_from(start),
+                },
+                name,
+            ));
+        }
+        let e = self.expr()?;
+        self.finish_stmt()?;
+        let name: Rc<str> = Rc::from(format!("__default{}", next_class_id()).as_str());
+        Ok((
+            Stmt {
+                kind: StmtKind::VarDecl(
+                    VarKind::Const,
+                    vec![Declarator {
+                        name: name.clone(),
+                        pat: None,
+                        init: Some(e),
+                    }],
+                ),
+                span: self.span_from(start),
+            },
+            name,
+        ))
+    }
+
+    /// `export const/let/var`, `export function ...`, `export class ...`
+    fn export_decl_rest(&mut self) -> Result<(Stmt, Vec<(Rc<str>, Rc<str>)>), JsError> {
+        let start = self.pos;
+        let decl_kind = match self.peek() {
+            Tok::Kw(Kw::Var) => Some(VarKind::Var),
+            Tok::Kw(Kw::Let) => Some(VarKind::Let),
+            Tok::Kw(Kw::Const) => Some(VarKind::Const),
+            _ => None,
+        };
+        if let Some(k) = decl_kind {
+            self.next();
+            let ds = self.declarators()?;
+            let mut leaves = Vec::new();
+            for d in &ds {
+                match &d.pat {
+                    Some(p) => pat_binding_names(p, &mut leaves),
+                    None => leaves.push(d.name.clone()),
+                }
+            }
+            let names = leaves.into_iter().map(|n| (n.clone(), n)).collect();
+            return Ok((
+                Stmt {
+                    kind: StmtKind::VarDecl(k, ds),
+                    span: self.span_from(start),
+                },
+                names,
+            ));
+        }
+        let is_async_fn =
+            *self.peek() == Tok::Kw(Kw::Async) && *self.peek_at(1) == Tok::Kw(Kw::Function);
+        if is_async_fn || *self.peek() == Tok::Kw(Kw::Function) {
+            if is_async_fn {
+                self.next(); // async
+            }
+            self.next(); // function
+            let is_gen = self.eat_op(Op::Mul);
+            let f = self.function_rest(true, is_async_fn, is_gen)?;
+            let name = f.name.clone();
+            return Ok((
+                Stmt {
+                    kind: StmtKind::FuncDecl(f),
+                    span: self.span_from(start),
+                },
+                vec![(name.clone(), name)],
+            ));
+        }
+        if *self.peek() == Tok::Kw(Kw::Class) {
+            self.next();
+            let name = self.expect_ident()?;
+            let stmts = self.class_rest_named(name.clone())?;
+            return Ok((
+                Stmt {
+                    kind: StmtKind::List(stmts),
+                    span: self.span_from(start),
+                },
+                vec![(name.clone(), name)],
+            ));
+        }
+        self.err("expected a declaration after `export`")
+    }
+
     // -- statements ---------------------------------------------------------
 
     fn statement(&mut self) -> Result<Stmt, JsError> {
@@ -895,6 +1216,31 @@ impl<'a> Parser<'a> {
                 let list = self.class_rest()?;
                 return Ok(Stmt {
                     kind: StmtKind::List(list),
+                    span: self.span_from(start),
+                });
+            }
+            // `import` / `export` (contextual words: neither is lexed as a
+            // keyword so they stay usable as identifiers elsewhere).
+            // `import(`/`import.` are NOT declarations: those fall through to
+            // the expression path so `import()` is a runtime failure instead
+            // of a parse error that would kill the whole script.
+            Tok::Ident(name)
+                if name.as_ref() == "import"
+                    && !matches!(
+                        *self.peek_at(1),
+                        Tok::Punct(Punct::LParen) | Tok::Punct(Punct::Dot)
+                    ) =>
+            {
+                self.next();
+                return Ok(Stmt {
+                    kind: self.import_rest()?,
+                    span: self.span_from(start),
+                });
+            }
+            Tok::Ident(name) if name.as_ref() == "export" => {
+                self.next();
+                return Ok(Stmt {
+                    kind: self.export_rest()?,
                     span: self.span_from(start),
                 });
             }
@@ -2970,6 +3316,33 @@ fn next_class_id() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+/// every identifier a declaration pattern binds (`export const {a, b: c} = o`)
+fn pat_binding_names(p: &Pat, out: &mut Vec<Rc<str>>) {
+    match p {
+        Pat::Name(BindTgt::Name(n)) => out.push(n.clone()),
+        Pat::Name(_) => {}
+        Pat::Arr(parts) => {
+            for part in parts {
+                match part {
+                    PatPart::Hole => {}
+                    PatPart::Bind(p, _) | PatPart::Rest(p) => pat_binding_names(p, out),
+                }
+            }
+        }
+        Pat::Obj(props) => {
+            for prop in props {
+                match prop {
+                    ObjPatPart::Prop { part, .. } => match part {
+                        PatPart::Hole => {}
+                        PatPart::Bind(p, _) | PatPart::Rest(p) => pat_binding_names(p, out),
+                    },
+                    ObjPatPart::Rest(p) => pat_binding_names(p, out),
+                }
+            }
+        }
+    }
+}
+
 fn tok_str(t: &Tok) -> String {
     match t {
         Tok::Num(n) => format!("{}", n),
@@ -3095,6 +3468,8 @@ fn stmt_uses(s: &Stmt, k: SusKind) -> bool {
                 || d.pat.as_ref().map_or(false, |p| pat_uses(p, k))
         }),
         Block(b) | List(b) => stmts_use(b, k),
+        Import { .. } => false,
+        Export { inner, .. } => inner.as_deref().map_or(false, |i| stmt_uses(i, k)),
         If { test, then, other } => {
             expr_uses(test, k)
                 || stmt_uses(then, k)
@@ -3215,6 +3590,11 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
             Ok(())
         }
         Block(b) | List(b) => check_yield_stmts(b),
+        Import { .. } => Ok(()),
+        Export { inner, .. } => match inner {
+            Some(i) => check_y_clean(i),
+            None => Ok(()),
+        },
         If { test, then, other } => {
             if expr_uses(test, SusKind::Yield) {
                 return Err("yield cannot appear in an if condition".into());
@@ -3317,6 +3697,8 @@ fn scan_stmt_arguments(s: &Stmt) -> bool {
                     .map_or(false, |p| pat_scan_args(p))
         }),
         Block(b) | List(b) => scan_uses_arguments_stmts(b),
+        Import { .. } => false,
+        Export { inner, .. } => inner.as_deref().map_or(false, scan_stmt_arguments),
         If { test, then, other } => {
             scan_expr_arguments(test)
                 || scan_stmt_arguments(then)

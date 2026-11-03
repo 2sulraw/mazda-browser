@@ -83,6 +83,10 @@ pub(crate) fn hoist(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) {
                     env.declare_if_absent(f.name.clone(), c, false);
                 }
                 StmtKind::Block(b) | StmtKind::List(b) => walk(e, env, b),
+                // `export <decl>` still declares its name
+                StmtKind::Export { inner: Some(st), .. } => {
+                    walk(e, env, std::slice::from_ref(st))
+                }
                 StmtKind::If { then, other, .. } => {
                     walk(e, env, std::slice::from_ref(then));
                     if let Some(o) = other {
@@ -291,6 +295,14 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             run_block(e, &benv, stmts)
         }
         StmtKind::List(stmts) => run_block(e, env, stmts),
+        // A module loader consumes these before evaluation; reaching one
+        // means a classic script (or engine B) declared an import/export.
+        StmtKind::Import { .. } => Err(JsError::throw(
+            "SyntaxError: `import` is only valid in a module script",
+        )),
+        StmtKind::Export { .. } => Err(JsError::throw(
+            "SyntaxError: `export` is only valid in a module script",
+        )),
         StmtKind::If { test, then, other } => {
             if eval_expr(e, env, test)?.to_bool() {
                 eval_stmt(e, env, then)

@@ -1699,6 +1699,15 @@ pub mod engine_b {
             let scripts = crate::script::collect_scripts(dom);
             let mut out = Turn::none();
             for s in &scripts {
+                // engine B is an external core: it has no module loader here,
+                // so say so instead of feeding it module syntax
+                if s.is_module {
+                    eprintln!(
+                        "[js] engine B: module scripts are not supported yet, skipping {}",
+                        s.src.as_deref().unwrap_or("inline module")
+                    );
+                    continue;
+                }
                 let src = match &s.src {
                     Some(u) => {
                         let abs = match crate::resolve(&self.base, u) {

@@ -1631,3 +1631,29 @@ fn budget_is_per_turn_not_leaking_into_later_turns() {
     e.step_budget = DEFAULT_STEP_BUDGET;
     assert_eq!(e.exec("let i = 0; while (i < 1000) { i++ } i").unwrap().to_number(), 1000.0);
 }
+
+#[test]
+fn import_export_need_a_module_script() {
+    // the parser understands both, the interpreter refuses them outside a
+    // module (a classic script gets an honest error, not silent success)
+    assert!(err("export const a = 1;").to_string().contains("module script"));
+    assert!(err("import x from \"./x.js\";").to_string().contains("module script"));
+}
+
+#[test]
+fn dynamic_import_fails_at_runtime_not_parse_time() {
+    // `import()` is not implemented. It must stay a *runtime* failure so the
+    // statements around it still run (a parse error would kill the script).
+    assert_eq!(
+        num("var a = 1; try { import('./x.js') } catch (e) { a = 2 } a"),
+        2.0
+    );
+    assert_eq!(num("var b = 1; try { import('./x.js') } catch (e) {} b + 1"), 2.0);
+}
+
+#[test]
+fn import_dot_meta_does_not_stop_parsing() {
+    // `import.meta` reaches the expression path too (alternative of a runtime
+    // TypeError, never a SyntaxError that aborts the whole script)
+    assert_eq!(num("var n = 0; try { import.meta.url } catch (e) { n = 3 } n"), 3.0);
+}

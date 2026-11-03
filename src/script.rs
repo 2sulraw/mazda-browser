@@ -795,6 +795,8 @@ pub struct PageScripts {
     /// with the natives through the shared host handle
     storage: runtime::Storage,
     base: String,
+    /// `<script type="module">` namespaces (one per absolute URL)
+    modules: js::ModuleLoader,
 }
 // The per-turn Turn result lives in runtime.rs (same contract for both
 // engines) — script.rs re-exports it via the import at the top.
@@ -916,6 +918,7 @@ impl PageScripts {
             raf: Vec::new(),
             storage,
             base: base.to_string(),
+            modules: js::ModuleLoader::new(),
         }
     }
 
@@ -924,10 +927,72 @@ impl PageScripts {
     /// script errors are logged `[js]` and skipped.
     pub fn run_scripts(&mut self, dom: &mut Dom) -> Turn {
         let scripts = collect_scripts(dom);
+        // a dual build (module entry + `nomodule` fallback) must run only the
+        // module half; with no module script at all the legacy half still runs
+        let has_modules = scripts.iter().any(|s| s.is_module);
         let mut dirty = false;
         let mut nav = None;
         let mut form_nav: Option<runtime::FormNav> = None;
-        for s in &scripts {
+        for (idx, s) in scripts.iter().enumerate() {
+            if s.is_nomodule && has_modules {
+                eprintln!("[js] skip nomodule script (page has a module build)");
+                continue;
+            }
+            // ---- module script: fetch + execute through the module loader
+            if s.is_module {
+                let (url, inline) = match &s.src {
+                    Some(u) => match crate::resolve(&self.base, u) {
+                        Some(a) => (a, None),
+                        None => {
+                            eprintln!("[js] module src unresolvable: {u:?}");
+                            continue;
+                        }
+                    },
+                    None => (
+                        format!("{}#mazda-module-{idx}", self.base),
+                        Some(s.text.clone()),
+                    ),
+                };
+                if inline.as_ref().map_or(false, |t| t.trim().is_empty()) {
+                    continue;
+                }
+                eprintln!(
+                    "[js] run module {}",
+                    s.src.as_deref().unwrap_or("inline module")
+                );
+                let listeners = std::mem::take(&mut self.listeners);
+                let storage = self.storage.clone();
+                let modules = &mut self.modules;
+                let (r, mut host, cx) =
+                    with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
+                        let r = match &inline {
+                            Some(text) => modules.load_source(e, &url, text),
+                            None => modules.load(e, &url),
+                        };
+                        if let Err(m) = e.drain_microtasks() {
+                            eprintln!("[js] microtask error: {m}");
+                        }
+                        r.map(|_| Val::Undefined)
+                    });
+                self.merge_ctx(&cx);
+                self.listeners = cx.listeners;
+                if host.dirty() {
+                    dirty = true;
+                }
+                if nav.is_none() {
+                    nav = host.take_nav();
+                }
+                if let Some(f) = host.take_form_nav() {
+                    if form_nav.is_none() {
+                        form_nav = Some(f);
+                    }
+                }
+                if let Err(err) = r {
+                    eprintln!("[js] script error: {err}");
+                }
+                self.harvest_timers();
+                continue;
+            }
             let src = match &s.src {
                 Some(u) => {
                     let abs = match crate::resolve(&self.base, u) {
@@ -1304,6 +1369,10 @@ pub(crate) struct ScriptSrc {
     /// inline source (text children) — empty when `src` is set
     pub(crate) text: String,
     pub(crate) src: Option<String>,
+    /// `<script type="module">`: run through the module loader
+    pub(crate) is_module: bool,
+    /// `<script nomodule>`: the legacy fallback of a dual build
+    pub(crate) is_nomodule: bool,
 }
 
 /// Every `<script>` element in document order.
@@ -1315,9 +1384,15 @@ pub(crate) fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
         match &dom.nodes[n as usize].kind {
             NodeKind::Element(_, _) => {
                 if dom.tag(n) == "script" {
+                    let ty = dom.attr(n, "type").unwrap_or("");
+                    let is_module = ty.trim().eq_ignore_ascii_case("module");
                     out.push(ScriptSrc {
                         text: child_text(dom, n),
                         src: dom.attr(n, "src").map(|s| s.to_string()),
+                        is_module,
+                        // a boolean attribute may arrive as `""`, "nomodule" or
+                        // an empty value; presence is all that matters
+                        is_nomodule: dom.attr(n, "nomodule").is_some(),
                     });
                 }
                 for &c in dom.nodes[n as usize].children.iter().rev() {
@@ -1357,6 +1432,57 @@ mod tests {
         assert!(turn.dirty, "setTextContent must mark the page dirty");
         let p = query_all_dom(&dom, "#t")[0];
         assert_eq!(child_text(&dom, p), "new");
+    }
+
+    #[test]
+    fn module_script_runs_and_mutates_dom() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="t">old</p>
+            <script type="module">export const x = 1;
+                document.getElementById("t").setTextContent("module");</script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert!(turn.dirty, "a module script mutates the page like a classic one");
+        let p = query_all_dom(&dom, "#t")[0];
+        assert_eq!(child_text(&dom, p), "module");
+    }
+
+    #[test]
+    fn module_imports_a_data_url_dependency() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="t">old</p>
+            <script type="module">
+              import { label } from "data:text/javascript,export%20const%20label%20%3D%20%22dep%22%3B";
+              document.getElementById("t").setTextContent(label);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        let p = query_all_dom(&dom, "#t")[0];
+        assert_eq!(child_text(&dom, p), "dep");
+    }
+
+    #[test]
+    fn nomodule_fallback_is_skipped_when_a_module_exists() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="t">old</p>
+            <script type="module">document.getElementById("t").setTextContent("esm");</script>
+            <script nomodule>document.getElementById("t").setTextContent("legacy");</script>
+            </body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        let p = query_all_dom(&dom, "#t")[0];
+        assert_eq!(child_text(&dom, p), "esm");
+    }
+
+    #[test]
+    fn import_in_a_classic_script_errors_honestly() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="t">old</p><script>import x from "./x.js";</script></body></html>"#,
+        );
+        // must not panic; the failing statement is logged and skipped
+        let _ = ps.run_scripts(&mut dom);
+        let p = query_all_dom(&dom, "#t")[0];
+        assert_eq!(child_text(&dom, p), "old");
     }
 
     #[test]
