@@ -1,4 +1,4 @@
-//! Minimal SVG rasterizer — enough for site logos and icons (Phase 1f).
+//! Minimal SVG rasterizer ΓÇö enough for site logos and icons (Phase 1f).
 //!
 //! Supports: `path` (M/L/H/V/C/S/Q/T/A/Z, abs+rel), rect (incl. rx/ry),
 //! circle, ellipse, polygon, polyline, line; `g`/svg `transform`
@@ -11,7 +11,7 @@
 
 use crate::image::ImageData;
 
-/// 2x2 supersampling — cheap antialiasing for thin logo strokes.
+/// 2x2 supersampling ΓÇö cheap antialiasing for thin logo strokes.
 const SS: usize = 2;
 
 /// Intrinsic size from the root `<svg>` width/height (fallback: viewBox,
@@ -30,159 +30,1555 @@ pub fn probe(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w.unwrap_or(300.0) as u32, h.unwrap_or(150.0) as u32)) // spec default
 }
 
-/// Rasterize at the requested size (vector → pixel-exact at any scale).
+/// Rasterize at the requested size (vector â†’ pixel-exact at any scale).
 pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<ImageData> {
     let txt = std::str::from_utf8(bytes).ok()?;
-    let (_, root_attrs) = root_tag(txt)?;
+    let base = root_space(txt, w, h)?;
+    let (root_attrs, cs, ce) = root_content(txt)?;
+    let grads = harvest_gradients(txt);
+    let defs = harvest_defs(txt);
+    let ctx = Ctx {
+        txt,
+        defs: &defs,
+        grads: &grads,
+        w: w as usize,
+        h: h as usize,
+        w2: w as usize * SS,
+        h2: h as usize * SS,
+    };
     let vb = get_attr(root_attrs, "viewBox")
         .and_then(nums4)
         .unwrap_or([0.0, 0.0, w as f64, h as f64]);
-    let (vw, vh) = (vb[2].max(1e-6), vb[3].max(1e-6));
-    let scale = (w as f64 / vw).min(h as f64 / vh); // xMidYMid meet
-    let k = SS as f64; // everything below works in supersampled space
-    let base = M {
-        a: scale * k,
-        b: 0.0,
-        c: 0.0,
-        d: scale * k,
-        e: ((w as f64 - vw * scale) / 2.0 - vb[0] * scale) * k,
-        f: ((h as f64 - vh * scale) / 2.0 - vb[1] * scale) * k,
+    let m = match get_attr(root_attrs, "transform") {
+        Some(t) => base * parse_transform(t),
+        None => base,
     };
-
-    let grads = harvest_gradients(txt);
-    let (w2, h2) = (w as usize * SS, h as usize * SS);
-    let mut img = vec![0u32; (w as usize) * (h as usize)];
-    let mut mask = vec![0u8; w2 * h2];
-
-    // per-open-tag stacks (matrix, style); balanced by the matching close
-    let mut mats = vec![base];
-    let mut styles = vec![Style::default()];
-    let mut depth = 0usize;
-    let mut skip_at: Option<usize> = None; // inside defs/clip/text/…: don't draw
-    let mut i = 0usize;
-
-    while let Some(tag) = next_tag(txt, &mut i) {
-        if tag.closing {
-            if skip_at == Some(depth) {
-                skip_at = None;
-            }
-            depth = depth.saturating_sub(1);
-            mats.pop();
-            styles.pop();
-            continue;
-        }
-        let m = mats.last().copied().unwrap_or(base);
-        let m = match get_attr(tag.attrs, "transform") {
-            Some(t) => m * parse_transform(t),
-            None => m,
-        };
-        let st = styles.last().cloned().unwrap_or_default().with(tag.attrs);
-        if !tag.selfclose {
-            depth += 1;
-            mats.push(m);
-            styles.push(st.clone());
-        }
-        if skip_at.is_some() {
-            continue; // already inside a skip container (stack still pushed)
-        }
-        if SKIP.contains(&tag.name) {
-            if !tag.selfclose {
-                skip_at = Some(depth);
-            }
-            continue;
-        }
-
-        // paint the shape (shapes have no drawn children either way)
-        let st = st.effective();
-        let mut fill_polys: Vec<Vec<(f64, f64)>> = Vec::new();
-        let mut stroke_subs: Option<Vec<Sub>> = None;
-        match tag.name {
-            "path" => {
-                let Some(d) = get_attr(tag.attrs, "d") else { continue };
-                let subs = parse_path(d);
-                stroke_subs = Some(subs.clone());
-                fill_polys = subs.iter().filter(|s| s.pts.len() >= 3).map(|s| s.pts.clone()).collect();
-            }
-            "rect" => {
-                let x = attrf(tag.attrs, "x");
-                let y = attrf(tag.attrs, "y");
-                let rw = attrf(tag.attrs, "width");
-                let rh = attrf(tag.attrs, "height");
-                if rw <= 0.0 || rh <= 0.0 {
-                    continue;
-                }
-                let rx = get_attr(tag.attrs, "rx").and_then(parse_px).unwrap_or(0.0).min(rw / 2.0);
-                let ry = get_attr(tag.attrs, "ry").and_then(parse_px).unwrap_or(rx).min(rh / 2.0);
-                fill_polys = vec![rect_poly(x, y, rw, rh, rx, ry)];
-                stroke_subs = Some(vec![Sub { pts: fill_polys[0].clone(), closed: true }]);
-            }
-            "circle" | "ellipse" => {
-                let cx = attrf(tag.attrs, "cx");
-                let cy = attrf(tag.attrs, "cy");
-                let rx = if tag.name == "circle" { attrf(tag.attrs, "r") } else { attrf(tag.attrs, "rx") };
-                let ry = if tag.name == "circle" { attrf(tag.attrs, "r") } else { attrf(tag.attrs, "ry") };
-                if rx <= 0.0 || ry <= 0.0 {
-                    continue;
-                }
-                fill_polys = vec![ellipse_poly(cx, cy, rx, ry)];
-                stroke_subs = Some(vec![Sub { pts: fill_polys[0].clone(), closed: true }]);
-            }
-            "polygon" | "polyline" => {
-                let nums = get_attr(tag.attrs, "points").map(nums).unwrap_or_default();
-                let pts: Vec<(f64, f64)> = nums.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-                if pts.len() < 2 {
-                    continue;
-                }
-                if tag.name == "polygon" && pts.len() >= 3 {
-                    fill_polys = vec![pts.clone()];
-                }
-                stroke_subs = Some(vec![Sub { pts, closed: tag.name == "polygon" }]);
-            }
-            "line" => {
-                let p = vec![
-                    (attrf(tag.attrs, "x1"), attrf(tag.attrs, "y1")),
-                    (attrf(tag.attrs, "x2"), attrf(tag.attrs, "y2")),
-                ];
-                stroke_subs = Some(vec![Sub { pts: p, closed: false }]);
-            }
-            _ => continue, // <g>/<svg>/<a>/unknown: container only
-        }
-
-        if let Some(col) = st.fill.resolve(&grads) {
-            let col = scale_alpha(col, (st.fill_opacity * 255.0).round() as u32);
-            let polys: Vec<Vec<(f64, f64)>> = fill_polys
-                .iter()
-                .map(|p| p.iter().map(|&(x, y)| m.apply(x, y)).collect())
-                .collect();
-            if !polys.is_empty() {
-                mask.fill(0);
-                fill_scan(&mut mask, w2, h2, &polys, st.evenodd);
-                comp(&mut img, &mask, w, h, col);
-            }
-        }
-        if let (Some(col), Some(subs)) = (st.stroke.resolve(&grads), stroke_subs) {
-            // matrix already maps to supersampled space → hypot gives super px
-            let sw = st.sw * (m.a.hypot(m.b) + m.c.hypot(m.d)) / 2.0;
-            if sw > 0.0 {
-                let polys = stroke_polys(&subs, m, sw);
-                if !polys.is_empty() {
-                    let col = scale_alpha(col, (st.stroke_opacity * 255.0).round() as u32);
-                    mask.fill(0);
-                    fill_scan(&mut mask, w2, h2, &polys, false);
-                    comp(&mut img, &mask, w, h, col);
-                }
-            }
-        }
-    }
-
+    let state = State {
+        m,
+        st: Style::default().with(root_attrs),
+        clips: Vec::new(),
+        masks: Vec::new(),
+        filters: Vec::new(),
+        vp: (vb[2], vb[3]),
+    };
+    let mut img = vec![0u32; ctx.w * ctx.h];
+    paint_range(&ctx, cs, ce, &state, &mut img, 0);
     Some(ImageData { w, h, px: img })
 }
 
 const SKIP: &[&str] = &[
     "defs", "clipPath", "mask", "filter", "pattern", "marker", "symbol", "text", "tspan",
     "style", "title", "desc", "metadata", "linearGradient", "radialGradient", "script",
-    "image", "use",
+    "image", "foreignObject", "use",
 ];
+
+// ---------- element tree walk ----------
+//
+// Definitions (`clipPath`, `mask`, `filter`, `pattern`, `symbol`, any
+// `id`-carrying element) are harvested once into byte ranges, then painted on
+// demand. The paint walk recurses per container instead of keeping parallel
+// matrix/style stacks: `use` and clip/mask content need to re-enter arbitrary
+// subtrees, which a streaming walk cannot express.
+
+struct Def<'a> {
+    tag: &'a str,
+    attrs: &'a str,
+    content_start: usize,
+    content_end: usize,
+}
+
+struct Defs<'a> {
+    items: Vec<(String, Def<'a>)>,
+}
+
+impl<'a> Defs<'a> {
+    fn get(&self, id: &str) -> Option<&Def<'a>> {
+        self.items.iter().find(|(k, _)| k == id).map(|(_, d)| d)
+    }
+}
+
+fn harvest_defs<'a>(txt: &'a str) -> Defs<'a> {
+    let mut items = Vec::new();
+    let mut i = 0usize;
+    while let Some(t) = next_tag(txt, &mut i) {
+        if t.closing {
+            continue;
+        }
+        let Some(id) = get_attr(t.attrs, "id") else { continue };
+        let (cs, ce) = if t.selfclose {
+            (i, i)
+        } else {
+            let (ce, _) = matching_close(txt, i, t.name);
+            (i, ce)
+        };
+        items.push((
+            id.to_string(),
+            Def { tag: t.name, attrs: t.attrs, content_start: cs, content_end: ce },
+        ));
+    }
+    Defs { items }
+}
+
+/// Content end + byte offset just past the matching close tag. `from` is the
+/// first byte after the open tag. A missing close runs to EOF.
+fn matching_close(txt: &str, from: usize, name: &str) -> (usize, usize) {
+    let mut i = from;
+    let mut depth = 0usize;
+    while let Some(t) = next_tag(txt, &mut i) {
+        if t.name != name {
+            continue;
+        }
+        if t.closing {
+            if depth == 0 {
+                return (t.start, i);
+            }
+            depth -= 1;
+        } else if !t.selfclose {
+            depth += 1;
+        }
+    }
+    (txt.len(), txt.len())
+}
+
+fn root_content(txt: &str) -> Option<(&str, usize, usize)> {
+    let mut i = 0usize;
+    let t = next_tag(txt, &mut i)?;
+    if t.closing || t.name != "svg" {
+        return None;
+    }
+    if t.selfclose {
+        return Some((t.attrs, i, i));
+    }
+    let (ce, _) = matching_close(txt, i, "svg");
+    Some((t.attrs, i, ce))
+}
+
+/// Root user space â†’ supersampled image pixels (`viewBox` fit, xMidYMid meet).
+fn root_space(txt: &str, w: u32, h: u32) -> Option<M> {
+    let (_, root_attrs) = root_tag(txt)?;
+    let vb = get_attr(root_attrs, "viewBox")
+        .and_then(nums4)
+        .unwrap_or([0.0, 0.0, w as f64, h as f64]);
+    let (vw, vh) = (vb[2].max(1e-6), vb[3].max(1e-6));
+    let scale = (w as f64 / vw).min(h as f64 / vh);
+    let k = SS as f64;
+    Some(M {
+        a: scale * k,
+        b: 0.0,
+        c: 0.0,
+        d: scale * k,
+        e: ((w as f64 - vw * scale) / 2.0 - vb[0] * scale) * k,
+        f: ((h as f64 - vh * scale) / 2.0 - vb[1] * scale) * k,
+    })
+}
+
+fn is_shape(name: &str) -> bool {
+    matches!(
+        name,
+        "path" | "rect" | "circle" | "ellipse" | "polygon" | "polyline" | "line"
+    )
+}
+
+#[derive(Clone)]
+enum ClipRef {
+    /// `clipPath` id, matrix of the user space it was declared in
+    Path(String, M),
+    /// viewport rectangle (nested `<svg>`, `<use><symbol>`), matrix + x/y/w/h
+    Rect(M, f64, f64, f64, f64),
+}
+
+#[derive(Clone)]
+struct State {
+    m: M,
+    st: Style,
+    clips: Vec<ClipRef>,
+    masks: Vec<(String, M)>,
+    filters: Vec<(String, M)>,
+    /// current viewport in user units (percentage width/height resolve here)
+    vp: (f64, f64),
+}
+
+struct Ctx<'a> {
+    txt: &'a str,
+    defs: &'a Defs<'a>,
+    grads: &'a [(String, u32)],
+    w: usize,
+    h: usize,
+    w2: usize,
+    h2: usize,
+}
+
+fn paint_range(ctx: &Ctx, start: usize, end: usize, state: &State, img: &mut [u32], depth: usize) {
+    if depth > 24 {
+        return;
+    }
+    let mut i = start;
+    while let Some(tag) = next_tag(ctx.txt, &mut i) {
+        if tag.start >= end {
+            break;
+        }
+        if tag.closing {
+            continue;
+        }
+        if is_shape(tag.name) || tag.selfclose {
+            paint_element(ctx, &tag, None, state, img, depth);
+        } else {
+            let (ce, after) = matching_close(ctx.txt, i, tag.name);
+            paint_element(ctx, &tag, Some((i, ce)), state, img, depth);
+            i = after;
+        }
+    }
+}
+
+fn paint_element(
+    ctx: &Ctx,
+    tag: &Tag,
+    content: Option<(usize, usize)>,
+    state: &State,
+    img: &mut [u32],
+    depth: usize,
+) {
+    let m = match get_attr(tag.attrs, "transform") {
+        Some(t) => state.m * parse_transform(t),
+        None => state.m,
+    };
+    let mut child = state.clone();
+    child.m = m;
+    child.st = state.st.with(tag.attrs);
+    if let Some(id) = ref_id(tag.attrs, "clip-path") {
+        child.clips.push(ClipRef::Path(id, m));
+    }
+    if let Some(id) = ref_id(tag.attrs, "mask") {
+        child.masks.push((id, m));
+    }
+    if let Some(id) = ref_id(tag.attrs, "filter") {
+        child.filters.push((id, m));
+    }
+
+    match tag.name {
+        "svg" => {
+            // nested viewport: x/y/width/height + optional viewBox, clipped
+            // to the viewport rectangle in the parent's user space
+            if let Some((cs, ce)) = content {
+                let (nm, vw, vh) = nested_viewport(m, tag.attrs, state.vp);
+                let x = attrf(tag.attrs, "x");
+                let y = attrf(tag.attrs, "y");
+                let w = len_attr(tag.attrs, "width", state.vp.0).unwrap_or(state.vp.0);
+                let h = len_attr(tag.attrs, "height", state.vp.1).unwrap_or(state.vp.1);
+                let mut s = child;
+                s.m = nm;
+                s.vp = (vw, vh);
+                s.clips.push(ClipRef::Rect(m, x, y, w, h));
+                paint_range(ctx, cs, ce, &s, img, depth + 1);
+            }
+        }
+        "use" => paint_use(ctx, tag, &child, img, depth),
+        n if is_shape(n) => paint_shape(ctx, n, tag.attrs, &child, img, depth),
+        n if SKIP.contains(&n) => {}
+        _ => {
+            if let Some((cs, ce)) = content {
+                paint_range(ctx, cs, ce, &child, img, depth + 1);
+            }
+        }
+    }
+}
+
+fn len_attr(attrs: &str, key: &str, base: f64) -> Option<f64> {
+    let v = get_attr(attrs, key)?.trim();
+    if let Some(p) = v.strip_suffix('%') {
+        return p.parse::<f64>().ok().map(|p| p / 100.0 * base);
+    }
+    parse_px(v)
+}
+
+fn translate(x: f64, y: f64) -> M {
+    M { e: x, f: y, ..M::id() }
+}
+
+/// Nested `<svg>` viewport â†’ (content matrix, viewBox width, viewBox height).
+fn nested_viewport(m: M, attrs: &str, parent_vp: (f64, f64)) -> (M, f64, f64) {
+    let x = attrf(attrs, "x");
+    let y = attrf(attrs, "y");
+    let w = len_attr(attrs, "width", parent_vp.0).unwrap_or(parent_vp.0).max(1e-6);
+    let h = len_attr(attrs, "height", parent_vp.1).unwrap_or(parent_vp.1).max(1e-6);
+    match get_attr(attrs, "viewBox").and_then(nums4) {
+        Some(vb) => {
+            let s = (w / vb[2]).min(h / vb[3]);
+            let tx = x + (w - vb[2] * s) / 2.0 - vb[0] * s;
+            let ty = y + (h - vb[3] * s) / 2.0 - vb[1] * s;
+            (m * M { a: s, b: 0.0, c: 0.0, d: s, e: tx, f: ty }, vb[2], vb[3])
+        }
+        None => (m * translate(x, y), w, h),
+    }
+}
+
+fn paint_use(ctx: &Ctx, tag: &Tag, state: &State, img: &mut [u32], depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    let Some(href) = get_attr(tag.attrs, "href").or_else(|| get_attr(tag.attrs, "xlink:href")) else {
+        return;
+    };
+    let Some(def) = ctx.defs.get(href.trim().trim_start_matches('#')) else { return };
+    let x = attrf(tag.attrs, "x");
+    let y = attrf(tag.attrs, "y");
+    let m = state.m * translate(x, y);
+
+    if def.tag == "symbol" || def.tag == "svg" {
+        // symbol/svg is a viewport: use width/height (+ symbol viewBox)
+        let w = len_attr(tag.attrs, "width", state.vp.0)
+            .or_else(|| len_attr(def.attrs, "width", state.vp.0))
+            .unwrap_or(state.vp.0)
+            .max(1e-6);
+        let h = len_attr(tag.attrs, "height", state.vp.1)
+            .or_else(|| len_attr(def.attrs, "height", state.vp.1))
+            .unwrap_or(state.vp.1)
+            .max(1e-6);
+        let mut s = state.clone();
+        s.st = state.st.with(def.attrs);
+        match get_attr(def.attrs, "viewBox").and_then(nums4) {
+            Some(vb) => {
+                let sc = (w / vb[2]).min(h / vb[3]);
+                let tx = (w - vb[2] * sc) / 2.0 - vb[0] * sc;
+                let ty = (h - vb[3] * sc) / 2.0 - vb[1] * sc;
+                s.m = m * M { a: sc, b: 0.0, c: 0.0, d: sc, e: tx, f: ty };
+                s.vp = (vb[2], vb[3]);
+            }
+            None => {
+                s.m = m;
+                s.vp = (w, h);
+            }
+        }
+        s.clips.push(ClipRef::Rect(state.m, x, y, w, h));
+        paint_range(ctx, def.content_start, def.content_end, &s, img, depth + 1);
+        return;
+    }
+
+    if is_shape(def.tag) {
+        let mut s = state.clone();
+        s.m = m * match get_attr(def.attrs, "transform") {
+            Some(t) => parse_transform(t),
+            None => M::id(),
+        };
+        s.st = state.st.with(def.attrs);
+        paint_shape(ctx, def.tag, def.attrs, &s, img, depth + 1);
+        return;
+    }
+
+    // group / unknown container: its content re-enters under the use's style
+    let mut s = state.clone();
+    s.m = m * match get_attr(def.attrs, "transform") {
+        Some(t) => parse_transform(t),
+        None => M::id(),
+    };
+    s.st = state.st.with(def.attrs);
+    paint_range(ctx, def.content_start, def.content_end, &s, img, depth + 1);
+}
+
+
+// ---------- shapes and paint effects ----------
+
+enum FillSrc {
+    Color(u32),
+    Pattern(String),
+}
+
+fn resolve_fill(p: &Paint, ctx: &Ctx) -> Option<FillSrc> {
+    match p {
+        Paint::None => None,
+        Paint::Color(c) => Some(FillSrc::Color(*c)),
+        Paint::Url(id) => {
+            // unknown gradient id â†’ per spec the element is not rendered
+            if let Some((_, c)) = ctx.grads.iter().find(|(k, _)| k == id) {
+                return Some(FillSrc::Color(*c));
+            }
+            match ctx.defs.get(id) {
+                Some(d) if d.tag == "pattern" => Some(FillSrc::Pattern(id.clone())),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `url(#id)` in a presentation attribute or inline style; `none` â†’ None.
+fn ref_id(raw: &str, key: &str) -> Option<String> {
+    let v = get_style(raw, key).or_else(|| get_attr(raw, key))?.trim();
+    if v.eq_ignore_ascii_case("none") || v.is_empty() {
+        return None;
+    }
+    let inner = v
+        .strip_prefix("url(")
+        .and_then(|r| r.split(')').next())
+        .unwrap_or(v)
+        .trim()
+        .trim_matches(['"', '\'']);
+    let id = inner.trim().trim_start_matches('#');
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn shape_geometry(name: &str, attrs: &str) -> (Vec<Vec<(f64, f64)>>, Option<Vec<Sub>>) {
+    let mut fill_polys: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut stroke_subs: Option<Vec<Sub>> = None;
+    match name {
+        "path" => {
+            let Some(d) = get_attr(attrs, "d") else {
+                return (fill_polys, stroke_subs);
+            };
+            let subs = parse_path(d);
+            stroke_subs = Some(subs.clone());
+            fill_polys = subs.iter().filter(|s| s.pts.len() >= 3).map(|s| s.pts.clone()).collect();
+        }
+        "rect" => {
+            let x = attrf(attrs, "x");
+            let y = attrf(attrs, "y");
+            let rw = attrf(attrs, "width");
+            let rh = attrf(attrs, "height");
+            if rw <= 0.0 || rh <= 0.0 {
+                return (fill_polys, stroke_subs);
+            }
+            let rx = get_attr(attrs, "rx").and_then(parse_px).unwrap_or(0.0).min(rw / 2.0);
+            let ry = get_attr(attrs, "ry").and_then(parse_px).unwrap_or(rx).min(rh / 2.0);
+            fill_polys = vec![rect_poly(x, y, rw, rh, rx, ry)];
+            stroke_subs = Some(vec![Sub { pts: fill_polys[0].clone(), closed: true }]);
+        }
+        "circle" | "ellipse" => {
+            let cx = attrf(attrs, "cx");
+            let cy = attrf(attrs, "cy");
+            let rx = if name == "circle" { attrf(attrs, "r") } else { attrf(attrs, "rx") };
+            let ry = if name == "circle" { attrf(attrs, "r") } else { attrf(attrs, "ry") };
+            if rx <= 0.0 || ry <= 0.0 {
+                return (fill_polys, stroke_subs);
+            }
+            fill_polys = vec![ellipse_poly(cx, cy, rx, ry)];
+            stroke_subs = Some(vec![Sub { pts: fill_polys[0].clone(), closed: true }]);
+        }
+        "polygon" | "polyline" => {
+            let nums = get_attr(attrs, "points").map(nums).unwrap_or_default();
+            let pts: Vec<(f64, f64)> = nums.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+            if pts.len() < 2 {
+                return (fill_polys, stroke_subs);
+            }
+            if name == "polygon" && pts.len() >= 3 {
+                fill_polys = vec![pts.clone()];
+            }
+            stroke_subs = Some(vec![Sub { pts, closed: name == "polygon" }]);
+        }
+        "line" => {
+            let p = vec![
+                (attrf(attrs, "x1"), attrf(attrs, "y1")),
+                (attrf(attrs, "x2"), attrf(attrs, "y2")),
+            ];
+            stroke_subs = Some(vec![Sub { pts: p, closed: false }]);
+        }
+        _ => {}
+    }
+    (fill_polys, stroke_subs)
+}
+
+fn polys_bbox(polys: &[Vec<(f64, f64)>]) -> (f64, f64, f64, f64) {
+    let mut b = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in polys {
+        for &(x, y) in p {
+            b.0 = b.0.min(x);
+            b.1 = b.1.min(y);
+            b.2 = b.2.max(x);
+            b.3 = b.3.max(y);
+        }
+    }
+    if b.0 > b.2 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        (b.0, b.1, b.2 - b.0, b.3 - b.1)
+    }
+}
+
+fn paint_shape(
+    ctx: &Ctx,
+    name: &str,
+    attrs: &str,
+    state: &State,
+    img: &mut [u32],
+    _depth: usize,
+) {
+    let (fill_polys, stroke_subs) = shape_geometry(name, attrs);
+    if fill_polys.is_empty() && stroke_subs.is_none() {
+        return;
+    }
+    let st = state.st.effective();
+    let m = state.m;
+    let bbox = polys_bbox(&fill_polys);
+    let cov = effect_coverage(ctx, &state.clips, &state.masks, bbox);
+
+    if !state.filters.is_empty() {
+        // draw the element into an isolated layer, run the filter chain, then
+        // composite (clip/mask apply to the filter result, per spec)
+        let mut layer = vec![0u32; ctx.w * ctx.h];
+        paint_geometry(ctx, &mut layer, &fill_polys, &stroke_subs, &st, m, bbox, None);
+        let out = filter_chain(ctx, &state.filters, layer, m);
+        composite_layer(ctx, img, &out, cov.as_deref());
+    } else {
+        paint_geometry(ctx, img, &fill_polys, &stroke_subs, &st, m, bbox, cov.as_deref());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_geometry(
+    ctx: &Ctx,
+    dst: &mut [u32],
+    fill_polys: &[Vec<(f64, f64)>],
+    stroke_subs: &Option<Vec<Sub>>,
+    st: &Style,
+    m: M,
+    bbox: (f64, f64, f64, f64),
+    cov: Option<&[u8]>,
+) {
+    let mut mask = vec![0u8; ctx.w2 * ctx.h2];
+
+    if let Some(fill) = resolve_fill(&st.fill, ctx) {
+        let polys: Vec<Vec<(f64, f64)>> = fill_polys
+            .iter()
+            .map(|p| p.iter().map(|&(x, y)| m.apply(x, y)).collect())
+            .collect();
+        if !polys.is_empty() {
+            mask.fill(0);
+            fill_scan(&mut mask, ctx.w2, ctx.h2, &polys, st.evenodd);
+            if let Some(c) = cov {
+                mul_mask(&mut mask, c);
+            }
+            match fill {
+                FillSrc::Color(col) => {
+                    let col = scale_alpha(col, (st.fill_opacity * 255.0).round() as u32);
+                    comp(dst, &mask, ctx.w as u32, ctx.h as u32, col);
+                }
+                FillSrc::Pattern(id) => {
+                    blend_pattern(ctx, dst, &mask, &id, m, bbox, st.fill_opacity);
+                }
+            }
+        }
+    }
+
+    if let (Some(col), Some(subs)) = (st.stroke.resolve(ctx.grads), stroke_subs) {
+        // matrix already maps to supersampled space â†’ hypot gives super px
+        let sw = st.sw * (m.a.hypot(m.b) + m.c.hypot(m.d)) / 2.0;
+        if sw > 0.0 {
+            let polys = stroke_polys(subs, m, sw);
+            if !polys.is_empty() {
+                mask.fill(0);
+                fill_scan(&mut mask, ctx.w2, ctx.h2, &polys, false);
+                if let Some(c) = cov {
+                    mul_mask(&mut mask, c);
+                }
+                let col = scale_alpha(col, (st.stroke_opacity * 255.0).round() as u32);
+                comp(dst, &mask, ctx.w as u32, ctx.h as u32, col);
+            }
+        }
+    }
+}
+
+fn mul_mask(mask: &mut [u8], cov: &[u8]) {
+    for (m, c) in mask.iter_mut().zip(cov) {
+        *m = (*m as u32 * *c as u32 / 255) as u8;
+    }
+}
+
+fn and_into(acc: &mut Option<Vec<u8>>, buf: Vec<u8>) {
+    match acc {
+        Some(a) => {
+            for (x, y) in a.iter_mut().zip(&buf) {
+                *x = (*x as u32 * *y as u32 / 255) as u8;
+            }
+        }
+        None => *acc = Some(buf),
+    }
+}
+
+fn bbox_matrix(b: (f64, f64, f64, f64)) -> M {
+    if b.2 <= 0.0 || b.3 <= 0.0 {
+        M::id()
+    } else {
+        M { a: b.2, b: 0.0, c: 0.0, d: b.3, e: b.0, f: b.1 }
+    }
+}
+
+fn effect_coverage(
+    ctx: &Ctx,
+    clips: &[ClipRef],
+    masks: &[(String, M)],
+    bbox: (f64, f64, f64, f64),
+) -> Option<Vec<u8>> {
+    if clips.is_empty() && masks.is_empty() {
+        return None;
+    }
+    let mut out: Option<Vec<u8>> = None;
+    for c in clips {
+        let buf = match c {
+            ClipRef::Path(id, m) => clip_coverage(ctx, id, *m, bbox),
+            ClipRef::Rect(m, x, y, w, h) => rect_coverage(ctx, *m, *x, *y, *w, *h),
+        };
+        // an invalid reference is treated as `none` (no clipping)
+        if let Some(b) = buf {
+            and_into(&mut out, b);
+        }
+    }
+    for (id, m) in masks {
+        if let Some(b) = mask_coverage(ctx, id, *m, bbox) {
+            and_into(&mut out, b);
+        }
+    }
+    out
+}
+
+fn rect_coverage(ctx: &Ctx, m: M, x: f64, y: f64, w: f64, h: f64) -> Option<Vec<u8>> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let poly = rect_poly(x, y, w, h, 0.0, 0.0);
+    let pts: Vec<(f64, f64)> = poly.iter().map(|&(px, py)| m.apply(px, py)).collect();
+    let mut buf = vec![0u8; ctx.w2 * ctx.h2];
+    fill_scan(&mut buf, ctx.w2, ctx.h2, &[pts], false);
+    Some(buf)
+}
+
+fn clip_coverage(
+    ctx: &Ctx,
+    id: &str,
+    m: M,
+    bbox: (f64, f64, f64, f64),
+) -> Option<Vec<u8>> {
+    let def = ctx.defs.get(id)?;
+    if def.tag != "clipPath" {
+        return None;
+    }
+    let mut cm = m;
+    if let Some(t) = get_attr(def.attrs, "transform") {
+        cm = cm * parse_transform(t);
+    }
+    if get_attr(def.attrs, "clipPathUnits")
+        .map(|u| u.eq_ignore_ascii_case("objectBoundingBox"))
+        .unwrap_or(false)
+    {
+        cm = cm * bbox_matrix(bbox);
+    }
+    let mut polys = Vec::new();
+    collect_clip_polys(ctx, def.content_start, def.content_end, cm, &mut polys, 0);
+    if polys.is_empty() {
+        return None;
+    }
+    let mut buf = vec![0u8; ctx.w2 * ctx.h2];
+    fill_scan(&mut buf, ctx.w2, ctx.h2, &polys, false);
+    Some(buf)
+}
+
+fn collect_clip_polys(
+    ctx: &Ctx,
+    start: usize,
+    end: usize,
+    m: M,
+    out: &mut Vec<Vec<(f64, f64)>>,
+    depth: usize,
+) {
+    if depth > 12 {
+        return;
+    }
+    let mut i = start;
+    while let Some(t) = next_tag(ctx.txt, &mut i) {
+        if t.start >= end {
+            break;
+        }
+        if t.closing {
+            continue;
+        }
+        let tm = match get_attr(t.attrs, "transform") {
+            Some(v) => m * parse_transform(v),
+            None => m,
+        };
+        if is_shape(t.name) {
+            let (polys, _) = shape_geometry(t.name, t.attrs);
+            for p in polys {
+                out.push(p.iter().map(|&(x, y)| tm.apply(x, y)).collect());
+            }
+        } else if t.name == "use" {
+            if let Some(href) = get_attr(t.attrs, "href").or_else(|| get_attr(t.attrs, "xlink:href")) {
+                if let Some(d) = ctx.defs.get(href.trim().trim_start_matches('#')) {
+                    if is_shape(d.tag) {
+                        let dm = tm
+                            * translate(attrf(t.attrs, "x"), attrf(t.attrs, "y"))
+                            * match get_attr(d.attrs, "transform") {
+                                Some(v) => parse_transform(v),
+                                None => M::id(),
+                            };
+                        let (polys, _) = shape_geometry(d.tag, d.attrs);
+                        for p in polys {
+                            out.push(p.iter().map(|&(x, y)| dm.apply(x, y)).collect());
+                        }
+                    }
+                }
+            }
+        } else if !t.selfclose && !SKIP.contains(&t.name) {
+            let (ce, after) = matching_close(ctx.txt, i, t.name);
+            collect_clip_polys(ctx, i, ce, tm, out, depth + 1);
+            i = after;
+        }
+    }
+}
+
+fn mask_coverage(
+    ctx: &Ctx,
+    id: &str,
+    m: M,
+    bbox: (f64, f64, f64, f64),
+) -> Option<Vec<u8>> {
+    let def = ctx.defs.get(id)?;
+    if def.tag != "mask" {
+        return None;
+    }
+    let mut mm = m;
+    if let Some(t) = get_attr(def.attrs, "transform") {
+        mm = mm * parse_transform(t);
+    }
+    if get_attr(def.attrs, "maskContentUnits")
+        .map(|u| u.eq_ignore_ascii_case("objectBoundingBox"))
+        .unwrap_or(false)
+    {
+        mm = mm * bbox_matrix(bbox);
+    }
+    let mut cov = vec![0u8; ctx.w2 * ctx.h2];
+    // mask content inherits the mask element's own paint properties
+    let inherit = Style::default().with(def.attrs);
+    paint_mask_shapes(ctx, def.content_start, def.content_end, mm, &mut cov, 0, &inherit);
+    // The mask region (default -10%..120% of the bounding box) clips the
+    // content, so a stray shape cannot paint outside the referencing element.
+    if let Some((rx, ry, rw, rh)) = mask_region(def.attrs, bbox) {
+        if let Some(rc) = rect_coverage(ctx, m, rx, ry, rw, rh) {
+            mul_mask(&mut cov, &rc);
+        }
+    }
+    Some(cov)
+}
+
+fn mask_region(attrs: &str, bbox: (f64, f64, f64, f64)) -> Option<(f64, f64, f64, f64)> {
+    let (bx, by, bw, bh) = bbox;
+    let obb = !get_attr(attrs, "maskUnits")
+        .map(|u| u.eq_ignore_ascii_case("userSpaceOnUse"))
+        .unwrap_or(false);
+    if bw <= 0.0 || bh <= 0.0 {
+        return None;
+    }
+    let frac = |k: &str, def: f64, base: f64| -> f64 {
+        match get_attr(attrs, k) {
+            Some(v) => {
+                let v = v.trim();
+                if let Some(p) = v.strip_suffix('%') {
+                    p.parse::<f64>().unwrap_or(def * 100.0) / 100.0 * base
+                } else {
+                    parse_px(v).unwrap_or(def * base)
+                }
+            }
+            None => def * base,
+        }
+    };
+    let origin = if obb { (bx, by) } else { (0.0, 0.0) };
+    Some((
+        origin.0 + frac("x", -0.1, bw),
+        origin.1 + frac("y", -0.1, bh),
+        frac("width", 1.2, bw),
+        frac("height", 1.2, bh),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_mask_shapes(
+    ctx: &Ctx,
+    start: usize,
+    end: usize,
+    m: M,
+    cov: &mut [u8],
+    depth: usize,
+    inherit: &Style,
+) {
+    if depth > 12 {
+        return;
+    }
+    let mut i = start;
+    let mut tmp = vec![0u8; ctx.w2 * ctx.h2];
+    while let Some(t) = next_tag(ctx.txt, &mut i) {
+        if t.start >= end {
+            break;
+        }
+        if t.closing {
+            continue;
+        }
+        let tm = match get_attr(t.attrs, "transform") {
+            Some(v) => m * parse_transform(v),
+            None => m,
+        };
+        if is_shape(t.name) {
+            let st = inherit.with(t.attrs).effective();
+            let (polys, _) = shape_geometry(t.name, t.attrs);
+            if polys.is_empty() {
+                continue;
+            }
+            // luminance (default mask-type) Ã— fill alpha Ã— opacities
+            let Some(col) = st.fill.resolve(ctx.grads) else { continue };
+            let r = ((col >> 16) & 255) as f64;
+            let g = ((col >> 8) & 255) as f64;
+            let b = (col & 255) as f64;
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let a = ((col >> 24) & 255) as f64 / 255.0;
+            let w = (lum * a * st.fill_opacity * 255.0).clamp(0.0, 255.0);
+            if w <= 0.0 {
+                continue;
+            }
+            let polys: Vec<Vec<(f64, f64)>> = polys
+                .iter()
+                .map(|p| p.iter().map(|&(x, y)| tm.apply(x, y)).collect())
+                .collect();
+            tmp.fill(0);
+            fill_scan(&mut tmp, ctx.w2, ctx.h2, &polys, st.evenodd);
+            for (c, t) in cov.iter_mut().zip(&tmp) {
+                let add = *t as u32 * w as u32 / 255;
+                *c = (*c as u32 + add - (*c as u32 * add / 255)).min(255) as u8;
+            }
+        } else if !t.selfclose && !SKIP.contains(&t.name) {
+            let (ce, after) = matching_close(ctx.txt, i, t.name);
+            let next = inherit.with(t.attrs);
+            paint_mask_shapes(ctx, i, ce, tm, cov, depth + 1, &next);
+            i = after;
+        }
+    }
+}
+
+// ---------- patterns ----------
+
+fn blend_pattern(
+    ctx: &Ctx,
+    dst: &mut [u32],
+    mask: &[u8],
+    id: &str,
+    m: M,
+    bbox: (f64, f64, f64, f64),
+    opacity: f64,
+) {
+    let Some(def) = ctx.defs.get(id) else { return };
+    if def.tag != "pattern" {
+        return;
+    }
+    let obb = !get_attr(def.attrs, "patternUnits")
+        .map(|u| u.eq_ignore_ascii_case("userSpaceOnUse"))
+        .unwrap_or(false);
+    let (px, py, pw, ph) = pattern_rect(def.attrs, bbox, obb);
+    if pw <= 0.0 || ph <= 0.0 {
+        return;
+    }
+    let sc = m_scale(m) / SS as f64;
+    let tw = (pw * sc).abs().max(1.0);
+    let th = (ph * sc).abs().max(1.0);
+    let (ox, oy) = m.apply(px, py);
+
+    // Paint the pattern content once, in absolute device coordinates. Sampling
+    // below folds every pixel back into the first tile, so the content only
+    // has to exist there (the normal case: pattern kids live inside the tile).
+    let mut pat = vec![0u32; ctx.w * ctx.h];
+    let mut pstate = State {
+        m,
+        st: Style::default().with(def.attrs),
+        clips: Vec::new(),
+        masks: Vec::new(),
+        filters: Vec::new(),
+        vp: (pw, ph),
+    };
+    if let Some(t) = get_attr(def.attrs, "patternTransform") {
+        // patternTransform maps the tile's local space around its origin
+        pstate.m = m * translate(px, py) * parse_transform(t) * translate(-px, -py);
+    }
+    paint_range(ctx, def.content_start, def.content_end, &pstate, &mut pat, 0);
+
+    let w = ctx.w;
+    let h = ctx.h;
+    for y in 0..h {
+        for x in 0..w {
+            let m4 = mask[(2 * y) * ctx.w2 + 2 * x] as u32
+                + mask[(2 * y) * ctx.w2 + 2 * x + 1] as u32
+                + mask[(2 * y + 1) * ctx.w2 + 2 * x] as u32
+                + mask[(2 * y + 1) * ctx.w2 + 2 * x + 1] as u32;
+            if m4 == 0 {
+                continue;
+            }
+            let sx = (ox + (x as f64 - ox).rem_euclid(tw)).clamp(0.0, (w - 1) as f64) as usize;
+            let sy = (oy + (y as f64 - oy).rem_euclid(th)).clamp(0.0, (h - 1) as f64) as usize;
+            let src = pat[sy * w + sx];
+            if src >> 24 == 0 {
+                continue;
+            }
+            let a = ((src >> 24) * m4 / 1020) as f64 / 255.0 * opacity;
+            blend_px(&mut dst[y * w + x], src, a);
+        }
+    }
+}
+
+fn pattern_rect(
+    attrs: &str,
+    bbox: (f64, f64, f64, f64),
+    obb: bool,
+) -> (f64, f64, f64, f64) {
+    let (bx, by, bw, bh) = bbox;
+    let val = |k: &str, def: f64, base: f64| -> f64 {
+        match get_attr(attrs, k) {
+            Some(v) => {
+                let v = v.trim();
+                if let Some(p) = v.strip_suffix('%') {
+                    p.parse::<f64>().unwrap_or(def * 100.0) / 100.0 * base
+                } else {
+                    parse_px(v).unwrap_or(def * base)
+                }
+            }
+            None => def * base,
+        }
+    };
+    if obb {
+        if bw <= 0.0 || bh <= 0.0 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        (
+            bx + val("x", 0.0, bw),
+            by + val("y", 0.0, bh),
+            val("width", 0.0, bw),
+            val("height", 0.0, bh),
+        )
+    } else {
+        (val("x", 0.0, bw), val("y", 0.0, bh), val("width", 0.0, bw), val("height", 0.0, bh))
+    }
+}
+
+// ---------- filters ----------
+
+fn m_scale(m: M) -> f64 {
+    (m.a.hypot(m.b) + m.c.hypot(m.d)) / 2.0
+}
+
+fn blend_px(dst: &mut u32, src: u32, a: f64) {
+    let a = a.clamp(0.0, 1.0);
+    if a <= 0.0 {
+        return;
+    }
+    let d = *dst;
+    let (sr, sg, sb) = (((src >> 16) & 255) as f64, ((src >> 8) & 255) as f64, (src & 255) as f64);
+    let (dr, dg, db, da) = (
+        ((d >> 16) & 255) as f64,
+        ((d >> 8) & 255) as f64,
+        (d & 255) as f64,
+        (d >> 24) as f64,
+    );
+    let sa = a;
+    let inv = 1.0 - sa;
+    let r = (sr * sa + dr * inv) as u32;
+    let g = (sg * sa + dg * inv) as u32;
+    let b = (sb * sa + db * inv) as u32;
+    let oa = (sa * 255.0 + da * inv) as u32;
+    *dst = (oa.min(255) << 24) | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
+}
+
+fn composite_layer(ctx: &Ctx, img: &mut [u32], layer: &[u32], cov: Option<&[u8]>) {
+    let w = ctx.w;
+    for y in 0..ctx.h {
+        for x in 0..w {
+            let mut a = (layer[y * w + x] >> 24) as u32;
+            if a == 0 {
+                continue;
+            }
+            if let Some(c) = cov {
+                let c4 = (c[(2 * y) * ctx.w2 + 2 * x] as u32
+                    + c[(2 * y) * ctx.w2 + 2 * x + 1] as u32
+                    + c[(2 * y + 1) * ctx.w2 + 2 * x] as u32
+                    + c[(2 * y + 1) * ctx.w2 + 2 * x + 1] as u32)
+                    / 4;
+                a = a * c4 / 255;
+            }
+            if a == 0 {
+                continue;
+            }
+            let src = layer[y * w + x];
+            blend_px(&mut img[y * w + x], src, a as f64 / 255.0);
+        }
+    }
+}
+
+// ---------- filters ----------
+
+enum Prim {
+    Blur { input: Option<String>, sx: f64, sy: f64, result: Option<String> },
+    Offset { input: Option<String>, dx: f64, dy: f64, result: Option<String> },
+    Flood { color: u32, opacity: f64, result: Option<String> },
+    ColorMatrix { input: Option<String>, m: [f64; 20], result: Option<String> },
+    Merge { inputs: Vec<String>, result: Option<String> },
+    Blend { input: Option<String>, in2: Option<String>, mode: String, result: Option<String> },
+    Composite { input: Option<String>, in2: Option<String>, op: String, k: [f64; 4], result: Option<String> },
+    DropShadow {
+        input: Option<String>,
+        dx: f64,
+        dy: f64,
+        sx: f64,
+        sy: f64,
+        color: u32,
+        opacity: f64,
+        result: Option<String>,
+    },
+}
+
+fn parse_filter(ctx: &Ctx, def: &Def) -> Vec<Prim> {
+    let mut out = Vec::new();
+    let mut i = def.content_start;
+    while let Some(t) = next_tag(ctx.txt, &mut i) {
+        if t.start >= def.content_end {
+            break;
+        }
+        if t.closing {
+            continue;
+        }
+        let input = get_attr(t.attrs, "in").map(|s| s.to_string());
+        let result = get_attr(t.attrs, "result").map(|s| s.to_string());
+        match t.name {
+            "feGaussianBlur" => {
+                let n = get_attr(t.attrs, "stdDeviation").map(nums).unwrap_or_default();
+                let sx = n.first().copied().unwrap_or(0.0).abs();
+                let sy = n.get(1).copied().unwrap_or(sx).abs();
+                out.push(Prim::Blur { input, sx, sy, result });
+            }
+            "feOffset" => out.push(Prim::Offset {
+                input,
+                dx: attrf(t.attrs, "dx"),
+                dy: attrf(t.attrs, "dy"),
+                result,
+            }),
+            "feFlood" => {
+                let color = get_style(t.attrs, "flood-color")
+                    .or_else(|| get_attr(t.attrs, "flood-color"))
+                    .and_then(parse_color)
+                    .unwrap_or(0xff00_0000);
+                let opacity = get_style(t.attrs, "flood-opacity")
+                    .or_else(|| get_attr(t.attrs, "flood-opacity"))
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                out.push(Prim::Flood { color, opacity, result });
+            }
+            "feColorMatrix" => {
+                let ty = get_attr(t.attrs, "type").unwrap_or("matrix");
+                let mtx = match ty {
+                    "saturate" => {
+                        let s = attrf(t.attrs, "values");
+                        saturate_matrix(s)
+                    }
+                    "hueRotate" => hue_matrix(attrf(t.attrs, "values")),
+                    "luminanceToAlpha" => {
+                        let mut m = [0.0; 20];
+                        m[15] = 0.2126;
+                        m[16] = 0.7152;
+                        m[17] = 0.0722;
+                        m
+                    }
+                    _ => {
+                        let v = get_attr(t.attrs, "values").map(nums).unwrap_or_default();
+                        let mut m = [0.0; 20];
+                        for (k, x) in v.iter().take(20).enumerate() {
+                            m[k] = *x;
+                        }
+                        m
+                    }
+                };
+                out.push(Prim::ColorMatrix { input, m: mtx, result });
+            }
+            "feMerge" => {
+                let mut inputs = Vec::new();
+                let (ce, after) = matching_close(ctx.txt, i, "feMerge");
+                let mut j = i;
+                while let Some(n) = next_tag(ctx.txt, &mut j) {
+                    if n.start >= ce {
+                        break;
+                    }
+                    if n.closing || n.name != "feMergeNode" {
+                        continue;
+                    }
+                    inputs.push(get_attr(n.attrs, "in").unwrap_or("SourceGraphic").to_string());
+                }
+                i = after;
+                out.push(Prim::Merge { inputs, result });
+            }
+            "feBlend" => out.push(Prim::Blend {
+                input,
+                in2: get_attr(t.attrs, "in2").map(|s| s.to_string()),
+                mode: get_attr(t.attrs, "mode").unwrap_or("normal").to_ascii_lowercase(),
+                result,
+            }),
+            "feComposite" => {
+                let k = [
+                    attrf(t.attrs, "k1"),
+                    attrf(t.attrs, "k2"),
+                    attrf(t.attrs, "k3"),
+                    attrf(t.attrs, "k4"),
+                ];
+                out.push(Prim::Composite {
+                    input,
+                    in2: get_attr(t.attrs, "in2").map(|s| s.to_string()),
+                    op: get_attr(t.attrs, "operator").unwrap_or("over").to_ascii_lowercase(),
+                    k,
+                    result,
+                });
+            }
+            "feDropShadow" => {
+                let n = get_attr(t.attrs, "stdDeviation").map(nums).unwrap_or_default();
+                let sx = n.first().copied().unwrap_or(0.0).abs();
+                let sy = n.get(1).copied().unwrap_or(sx).abs();
+                let color = get_style(t.attrs, "flood-color")
+                    .or_else(|| get_attr(t.attrs, "flood-color"))
+                    .and_then(parse_color)
+                    .unwrap_or(0xff00_0000);
+                let opacity = get_style(t.attrs, "flood-opacity")
+                    .or_else(|| get_attr(t.attrs, "flood-opacity"))
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                out.push(Prim::DropShadow {
+                    input,
+                    dx: attrf(t.attrs, "dx"),
+                    dy: attrf(t.attrs, "dy"),
+                    sx,
+                    sy,
+                    color,
+                    opacity,
+                    result,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn saturate_matrix(s: f64) -> [f64; 20] {
+    let s = s.clamp(0.0, 10.0);
+    [
+        0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s, 0.0, 0.0,
+        0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s, 0.0, 0.0,
+        0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]
+}
+
+fn hue_matrix(deg: f64) -> [f64; 20] {
+    let a = deg.to_radians();
+    let (s, c) = a.sin_cos();
+    [
+        0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928, 0.0, 0.0,
+        0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283, 0.0, 0.0,
+        0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]
+}
+
+fn filter_chain(ctx: &Ctx, refs: &[(String, M)], layer: Vec<u32>, m: M) -> Vec<u32> {
+    let mut cur = layer;
+    for (id, _) in refs {
+        if let Some(def) = ctx.defs.get(id) {
+            if def.tag == "filter" {
+                cur = apply_filter(ctx, def, cur, m);
+            }
+        }
+    }
+    cur
+}
+
+fn apply_filter(ctx: &Ctx, def: &Def, source: Vec<u32>, m: M) -> Vec<u32> {
+    let prims = parse_filter(ctx, def);
+    if prims.is_empty() {
+        return source;
+    }
+    let scale = m_scale(m) / SS as f64;
+    let region = expand_bbox(alpha_bbox(&source, ctx.w, ctx.h), ctx.w, ctx.h, 0.1);
+    let mut results: Vec<(String, Vec<u32>)> = vec![
+        ("SourceGraphic".to_string(), source.clone()),
+        ("SourceAlpha".to_string(), alpha_layer(&source)),
+    ];
+    let mut prev = source;
+    for p in &prims {
+        let res = eval_prim(ctx, p, &results, &prev, &region, scale);
+        let name = match p {
+            Prim::Blur { result, .. }
+            | Prim::Offset { result, .. }
+            | Prim::Flood { result, .. }
+            | Prim::ColorMatrix { result, .. }
+            | Prim::Merge { result, .. }
+            | Prim::Blend { result, .. }
+            | Prim::Composite { result, .. }
+            | Prim::DropShadow { result, .. } => result.clone(),
+        };
+        if let Some(n) = name {
+            results.push((n, res.clone()));
+        }
+        prev = res;
+    }
+    prev
+}
+
+fn eval_prim(
+    ctx: &Ctx,
+    p: &Prim,
+    results: &[(String, Vec<u32>)],
+    prev: &[u32],
+    region: &Option<(usize, usize, usize, usize)>,
+    scale: f64,
+) -> Vec<u32> {
+    let pick = |name: &Option<String>| -> Vec<u32> {
+        match name {
+            Some(n) => results
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| prev.to_vec()),
+            None => prev.to_vec(),
+        }
+    };
+    match p {
+        Prim::Blur { input, sx, sy, .. } => {
+            gaussian_blur(&pick(input), ctx.w, ctx.h, sx * scale, sy * scale)
+        }
+        Prim::Offset { input, dx, dy, .. } => {
+            offset(&pick(input), ctx.w, ctx.h, (dx * scale).round() as isize, (dy * scale).round() as isize)
+        }
+        Prim::Flood { color, opacity, .. } => flood(*color, *opacity, *region, ctx.w, ctx.h),
+        Prim::ColorMatrix { input, m, .. } => color_matrix(&pick(input), m),
+        Prim::Merge { inputs, .. } => {
+            let mut out = vec![0u32; ctx.w * ctx.h];
+            for name in inputs {
+                let src = results
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(prev);
+                for (d, s) in out.iter_mut().zip(src) {
+                    let a = (*s >> 24) as f64 / 255.0;
+                    blend_px(d, *s, a);
+                }
+            }
+            out
+        }
+        Prim::Blend { input, in2, mode, .. } => {
+            let a = pick(input);
+            let b = pick(in2);
+            blend_layers(&a, &b, mode)
+        }
+        Prim::Composite { input, in2, op, k, .. } => {
+            let a = pick(input);
+            let b = pick(in2);
+            composite_layers(&a, &b, op, k)
+        }
+        Prim::DropShadow { input, dx, dy, sx, sy, color, opacity, .. } => {
+            let src = pick(input);
+            let alpha = alpha_layer(&src);
+            let shifted = offset(&alpha, ctx.w, ctx.h, (dx * scale).round() as isize, (dy * scale).round() as isize);
+            let blurred = gaussian_blur(&shifted, ctx.w, ctx.h, sx * scale, sy * scale);
+            let mut shadow = blurred;
+            let (cr, cg, cb) = ((color >> 16) & 255, (color >> 8) & 255, color & 255);
+            for px in shadow.iter_mut() {
+                let a = ((*px >> 24) as f64 * opacity) as u32;
+                *px = a.min(255) << 24 | cr << 16 | cg << 8 | cb;
+            }
+            let mut out = shadow;
+            for (d, s) in out.iter_mut().zip(&src) {
+                let a = (*s >> 24) as f64 / 255.0;
+                blend_px(d, *s, a);
+            }
+            out
+        }
+    }
+}
+
+fn alpha_layer(src: &[u32]) -> Vec<u32> {
+    src.iter().map(|p| (p & 0xff00_0000) | 0x00ff_ffff).collect()
+}
+
+fn alpha_bbox(src: &[u32], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            if src[y * w + x] >> 24 != 0 {
+                any = true;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    any.then_some((x0, y0, x1, y1))
+}
+
+fn expand_bbox(
+    b: Option<(usize, usize, usize, usize)>,
+    w: usize,
+    h: usize,
+    frac: f64,
+) -> Option<(usize, usize, usize, usize)> {
+    let (x0, y0, x1, y1) = b?;
+    let padx = ((x1 - x0) as f64 * frac).ceil() as usize;
+    let pady = ((y1 - y0) as f64 * frac).ceil() as usize;
+    Some((
+        x0.saturating_sub(padx),
+        y0.saturating_sub(pady),
+        (x1 + padx).min(w),
+        (y1 + pady).min(h),
+    ))
+}
+
+fn flood(
+    color: u32,
+    opacity: f64,
+    region: Option<(usize, usize, usize, usize)>,
+    w: usize,
+    h: usize,
+) -> Vec<u32> {
+    let mut out = vec![0u32; w * h];
+    let Some((x0, y0, x1, y1)) = region else { return out };
+    let a = (((color >> 24) & 255) as f64 * opacity) as u32;
+    let c = a.min(255) << 24 | color & 0x00ff_ffff;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            out[y * w + x] = c;
+        }
+    }
+    out
+}
+
+fn offset(src: &[u32], w: usize, h: usize, dx: isize, dy: isize) -> Vec<u32> {
+    let mut out = vec![0u32; w * h];
+    if dx == 0 && dy == 0 {
+        return src.to_vec();
+    }
+    for y in 0..h {
+        let sy = y as isize - dy;
+        if sy < 0 || sy >= h as isize {
+            continue;
+        }
+        for x in 0..w {
+            let sx = x as isize - dx;
+            if sx < 0 || sx >= w as isize {
+                continue;
+            }
+            out[y * w + x] = src[sy as usize * w + sx as usize];
+        }
+    }
+    out
+}
+
+fn box_radius(s: f64) -> usize {
+    if s <= 0.0 {
+        0
+    } else {
+        (s * 3.0 * (2.0 * std::f64::consts::PI).sqrt() / 4.0 + 0.5).floor() as usize
+    }
+}
+
+fn box_h(buf: &mut [f32], w: usize, h: usize, r: usize) {
+    if r == 0 || w == 0 {
+        return;
+    }
+    let ri = r as isize;
+    let norm = 1.0 / (2 * r + 1) as f32;
+    let mut row = vec![0f32; w];
+    for y in 0..h {
+        let base = y * w;
+        let mut sum = 0.0f32;
+        for k in -ri..=ri {
+            sum += buf[base + (k.clamp(0, w as isize - 1) as usize)];
+        }
+        for x in 0..w {
+            row[x] = sum * norm;
+            let add = (x as isize + ri + 1).clamp(0, w as isize - 1) as usize;
+            let sub = (x as isize - ri).clamp(0, w as isize - 1) as usize;
+            sum += buf[base + add] - buf[base + sub];
+        }
+        buf[base..base + w].copy_from_slice(&row);
+    }
+}
+
+fn box_v(buf: &mut [f32], w: usize, h: usize, r: usize) {
+    if r == 0 || h == 0 {
+        return;
+    }
+    let ri = r as isize;
+    let norm = 1.0 / (2 * r + 1) as f32;
+    let mut col = vec![0f32; h];
+    for x in 0..w {
+        let mut sum = 0.0f32;
+        for k in -ri..=ri {
+            sum += buf[(k.clamp(0, h as isize - 1) as usize) * w + x];
+        }
+        for y in 0..h {
+            col[y] = sum * norm;
+            let add = (y as isize + ri + 1).clamp(0, h as isize - 1) as usize;
+            let sub = (y as isize - ri).clamp(0, h as isize - 1) as usize;
+            sum += buf[add * w + x] - buf[sub * w + x];
+        }
+        for y in 0..h {
+            buf[y * w + x] = col[y];
+        }
+    }
+}
+
+fn gaussian_blur(src: &[u32], w: usize, h: usize, sx: f64, sy: f64) -> Vec<u32> {
+    if sx <= 0.0 && sy <= 0.0 {
+        return src.to_vec();
+    }
+    let n = w * h;
+    let mut r = vec![0f32; n];
+    let mut g = vec![0f32; n];
+    let mut b = vec![0f32; n];
+    let mut a = vec![0f32; n];
+    for i in 0..n {
+        let p = src[i];
+        let al = ((p >> 24) & 255) as f32;
+        let k = al / 255.0;
+        r[i] = ((p >> 16) & 255) as f32 * k;
+        g[i] = ((p >> 8) & 255) as f32 * k;
+        b[i] = (p & 255) as f32 * k;
+        a[i] = al;
+    }
+    let dx = box_radius(sx);
+    let dy = box_radius(sy);
+    for _ in 0..3 {
+        if dx > 0 {
+            box_h(&mut r, w, h, dx);
+            box_h(&mut g, w, h, dx);
+            box_h(&mut b, w, h, dx);
+            box_h(&mut a, w, h, dx);
+        }
+        if dy > 0 {
+            box_v(&mut r, w, h, dy);
+            box_v(&mut g, w, h, dy);
+            box_v(&mut b, w, h, dy);
+            box_v(&mut a, w, h, dy);
+        }
+    }
+    let mut out = vec![0u32; n];
+    for i in 0..n {
+        let al = a[i].clamp(0.0, 255.0);
+        if al < 0.5 {
+            continue;
+        }
+        let k = 255.0 / al;
+        let rr = (r[i] * k).clamp(0.0, 255.0) as u32;
+        let gg = (g[i] * k).clamp(0.0, 255.0) as u32;
+        let bb = (b[i] * k).clamp(0.0, 255.0) as u32;
+        out[i] = (al as u32) << 24 | rr << 16 | gg << 8 | bb;
+    }
+    out
+}
+
+fn color_matrix(src: &[u32], m: &[f64; 20]) -> Vec<u32> {
+    src.iter()
+        .map(|p| {
+            let r = ((p >> 16) & 255) as f64 / 255.0;
+            let g = ((p >> 8) & 255) as f64 / 255.0;
+            let b = (p & 255) as f64 / 255.0;
+            let a = ((p >> 24) & 255) as f64 / 255.0;
+            let ch = |row: usize| {
+                (m[row * 5] * r
+                    + m[row * 5 + 1] * g
+                    + m[row * 5 + 2] * b
+                    + m[row * 5 + 3] * a
+                    + m[row * 5 + 4])
+                    .clamp(0.0, 1.0)
+            };
+            let (nr, ng, nb, na) = (ch(0), ch(1), ch(2), ch(3));
+            ((na * 255.0) as u32) << 24
+                | ((nr * 255.0) as u32) << 16
+                | ((ng * 255.0) as u32) << 8
+                | (nb * 255.0) as u32
+        })
+        .collect()
+}
+
+fn blend_layers(a: &[u32], b: &[u32], mode: &str) -> Vec<u32> {
+    a.iter()
+        .zip(b)
+        .map(|(&sa, &sb)| {
+            let (sar, sag, sab, saa) = (
+                ((sa >> 16) & 255) as f64,
+                ((sa >> 8) & 255) as f64,
+                (sa & 255) as f64,
+                (sa >> 24) as f64 / 255.0,
+            );
+            let (sbr, sbg, sbb, sba) = (
+                ((sb >> 16) & 255) as f64,
+                ((sb >> 8) & 255) as f64,
+                (sb & 255) as f64,
+                (sb >> 24) as f64 / 255.0,
+            );
+            let op = |x: f64, y: f64| match mode {
+                "multiply" => x * y / 255.0,
+                "screen" => 255.0 - (255.0 - x) * (255.0 - y) / 255.0,
+                "darken" => x.min(y),
+                "lighten" => x.max(y),
+                _ => x,
+            };
+            let cr = op(sar, sbr);
+            let cg = op(sag, sbg);
+            let cb = op(sab, sbb);
+            // source-over where the blended color is the "source" channel
+            let inv = 1.0 - saa;
+            let r = cr * saa + sbr * inv;
+            let g = cg * saa + sbg * inv;
+            let b = cb * saa + sbb * inv;
+            let al = saa + sba * inv;
+            ((al * 255.0) as u32) << 24
+                | (r.clamp(0.0, 255.0) as u32) << 16
+                | (g.clamp(0.0, 255.0) as u32) << 8
+                | b.clamp(0.0, 255.0) as u32
+        })
+        .collect()
+}
+
+fn composite_layers(a: &[u32], b: &[u32], op: &str, k: &[f64; 4]) -> Vec<u32> {
+    a.iter()
+        .zip(b)
+        .map(|(&sa, &sb)| {
+            let (sr, sg, sbb, saa) = (
+                ((sa >> 16) & 255) as f64,
+                ((sa >> 8) & 255) as f64,
+                (sa & 255) as f64,
+                (sa >> 24) as f64 / 255.0,
+            );
+            let (dr, dg, db, da) = (
+                ((sb >> 16) & 255) as f64,
+                ((sb >> 8) & 255) as f64,
+                (sb & 255) as f64,
+                (sb >> 24) as f64 / 255.0,
+            );
+            let (r, g, b, al) = match op {
+                "in" => (sr, sg, sbb, saa * da),
+                "out" => (sr, sg, sbb, saa * (1.0 - da)),
+                "atop" => (sr * da + dr * (1.0 - saa), sg * da + dg * (1.0 - saa), sbb * da + db * (1.0 - saa), da),
+                "xor" => (sr * (1.0 - da) + dr * (1.0 - saa), sg * (1.0 - da) + dg * (1.0 - saa), sbb * (1.0 - da) + db * (1.0 - saa), saa * (1.0 - da) + da * (1.0 - saa)),
+                "arithmetic" => {
+                    let f = |x: f64, y: f64| (k[0] * x * y + k[1] * x + k[2] * y + k[3]).clamp(0.0, 255.0);
+                    (f(sr, dr), f(sg, dg), f(sbb, db), saa + da - saa * da)
+                }
+                _ => {
+                    // over
+                    let inv = 1.0 - saa;
+                    (sr * saa + dr * inv, sg * saa + dg * inv, sbb * saa + db * inv, saa + da * inv)
+                }
+            };
+            ((al.clamp(0.0, 1.0) * 255.0) as u32) << 24
+                | (r.clamp(0.0, 255.0) as u32) << 16
+                | (g.clamp(0.0, 255.0) as u32) << 8
+                | b.clamp(0.0, 255.0) as u32
+        })
+        .collect()
+}
+
+
 
 // ---------- xml scanning (shortcut: not namespace-aware) ----------
 
@@ -191,6 +1587,9 @@ struct Tag<'a> {
     attrs: &'a str,
     selfclose: bool,
     closing: bool,
+    /// byte offset of this tag's `<` in the source (text content between
+    /// tags is sliced with it)
+    start: usize,
 }
 
 /// Root `<svg ...>`: returns (tag name, raw attrs string).
@@ -228,7 +1627,7 @@ fn next_tag<'a>(txt: &'a str, i: &mut usize) -> Option<Tag<'a>> {
         if name.is_empty() {
             continue;
         }
-        return Some(Tag { name, attrs: attrs.trim(), selfclose, closing });
+        return Some(Tag { name, attrs: attrs.trim(), selfclose, closing, start: lt });
     }
 }
 
@@ -275,7 +1674,7 @@ fn attrf(raw: &str, key: &str) -> f64 {
     get_attr(raw, key).and_then(parse_px).unwrap_or(0.0)
 }
 
-/// "12" / "12px" / "12.5" → number; %, em, url(…), missing → None.
+/// "12" / "12px" / "12.5" ΓåÆ number; %, em, url(ΓÇª), missing ΓåÆ None.
 fn parse_px(s: &str) -> Option<f64> {
     let s = s.trim();
     let n: String = s
@@ -404,7 +1803,7 @@ impl Paint {
         match self {
             Paint::None => None,
             Paint::Color(c) => Some(*c),
-            // unknown gradient id → per spec the element is not rendered
+            // unknown gradient id ΓåÆ per spec the element is not rendered
             Paint::Url(id) => grads.iter().find(|(k, _)| k == id).map(|(_, c)| *c),
         }
     }
@@ -482,8 +1881,8 @@ impl Style {
         Paint::Color(parse_color(v).unwrap_or(0xff00_0000))
     }
 
-    /// Fold element opacity into the two opacities (group opacity ≈ inherited
-    /// — shortcut: overlapping children inside an opacity group blend twice).
+    /// Fold element opacity into the two opacities (group opacity Γëê inherited
+    /// ΓÇö shortcut: overlapping children inside an opacity group blend twice).
     fn effective(&self) -> Style {
         let mut s = self.clone();
         s.fill_opacity *= s.opacity;
@@ -564,7 +1963,7 @@ struct Sub {
     closed: bool,
 }
 
-/// Full path-data parser → flattened subpaths (curves become polylines).
+/// Full path-data parser ΓåÆ flattened subpaths (curves become polylines).
 fn parse_path(d: &str) -> Vec<Sub> {
     let b = d.as_bytes();
     let mut i = 0usize;
@@ -762,7 +2161,7 @@ fn flatten_quad(out: &mut Vec<(f64, f64)>, p0: (f64, f64), p1: (f64, f64), p2: (
     flatten_cubic(out, p0, c1, c2, p2);
 }
 
-/// Arc → cubic segments (endpoint-to-center per SVG spec F.6).
+/// Arc ΓåÆ cubic segments (endpoint-to-center per SVG spec F.6).
 fn flatten_arc(out: &mut Vec<(f64, f64)>, p0: (f64, f64), rx: f64, ry: f64, laf: bool, sf: bool, p1: (f64, f64)) {
     if rx <= 0.0 || ry <= 0.0 || (p0.0 == p1.0 && p0.1 == p1.1) {
         out.push(p1); // degenerate: line to end (spec: identical ends draw nothing)
@@ -960,9 +2359,9 @@ fn scale_alpha(col: u32, k: u32) -> u32 {
     a << 24 | col & 0x00ff_ffff
 }
 
-// ---------- gradients (flat midpoint — shortcut) ----------
+// ---------- gradients (flat midpoint ΓÇö shortcut) ----------
 
-/// `id → average of first/last stop color` for linear/radial gradients.
+/// `id ΓåÆ average of first/last stop color` for linear/radial gradients.
 fn harvest_gradients(txt: &str) -> Vec<(String, u32)> {
     let mut out: Vec<(String, u32)> = Vec::new();
     let mut i = 0usize;
@@ -1034,7 +2433,7 @@ mod tests {
 
     #[test]
     fn evenodd_hole_and_none_fill() {
-        // two stacked squares, even-odd → middle is a hole
+        // two stacked squares, even-odd ΓåÆ middle is a hole
         let s = br#"<svg width="10" height="10" fill-rule="evenodd"><path d="M0 0h10v10H0z M2 2h6v6H2z" fill="black"/></svg>"#;
         let img = render(s, 10, 10).unwrap();
         assert_eq!(img.px[5 * 10 + 5], 0); // hole
@@ -1086,5 +2485,71 @@ mod tests {
         assert_eq!(img.px[0], 0xff00_ff00);
         let s2 = br#"<svg width="6" height="6" fill="none"><rect width="6" height="6"/></svg>"#;
         assert!(render(s2, 6, 6).unwrap().px.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn clip_path_limits_the_painted_area() {
+        let s = br##"<svg width="10" height="10"><defs><clipPath id="c"><rect width="5" height="5"/></clipPath></defs><rect width="10" height="10" fill="black" clip-path="url(#c)"/></svg>"##;
+        let img = render(s, 10, 10).unwrap();
+        assert_eq!(img.px[2 * 10 + 2], 0xff00_0000);
+        assert_eq!(img.px[8 * 10 + 8], 0, "outside the clip stays transparent");
+    }
+
+    #[test]
+    fn mask_white_region_limits_the_painted_area() {
+        let s = br##"<svg width="10" height="10"><defs><mask id="m"><rect width="5" height="10" fill="white"/></mask></defs><rect width="10" height="10" fill="black" mask="url(#m)"/></svg>"##;
+        let img = render(s, 10, 10).unwrap();
+        assert_eq!(img.px[2 * 10 + 2], 0xff00_0000);
+        assert_eq!(img.px[2 * 10 + 8], 0, "mask hole stays transparent");
+    }
+
+    #[test]
+    fn mask_inherits_fill_from_the_mask_element() {
+        let s = br##"<svg width="10" height="10"><defs><mask id="m" fill="white"><rect width="5" height="10"/></mask></defs><rect width="10" height="10" fill="black" mask="url(#m)"/></svg>"##;
+        let img = render(s, 10, 10).unwrap();
+        assert_eq!(img.px[2 * 10 + 2], 0xff00_0000);
+        assert_eq!(img.px[2 * 10 + 8], 0);
+    }
+
+    #[test]
+    fn pattern_tiles_the_fill() {
+        let s = br##"<svg width="4" height="4"><defs><pattern id="p" width="2" height="2" patternUnits="userSpaceOnUse"><rect width="1" height="1" fill="red"/></pattern></defs><rect width="4" height="4" fill="url(#p)"/></svg>"##;
+        let img = render(s, 4, 4).unwrap();
+        assert_eq!(img.px[0], 0xffff_0000);
+        assert_eq!(img.px[1], 0, "gap inside the tile stays transparent");
+        assert_eq!(img.px[2], 0xffff_0000, "pattern repeats horizontally");
+        assert_eq!(img.px[2 * 4 + 2], 0xffff_0000, "pattern repeats vertically");
+    }
+
+    #[test]
+    fn use_offsets_a_referenced_shape() {
+        let s = br##"<svg width="10" height="10"><defs><rect id="r" width="3" height="3" fill="blue"/></defs><use href="#r" x="5"/></svg>"##;
+        let img = render(s, 10, 10).unwrap();
+        assert_eq!(img.px[1 * 10 + 6], 0xff00_00ff);
+        assert_eq!(img.px[1 * 10 + 1], 0, "the definition itself is not drawn");
+    }
+
+    #[test]
+    fn use_symbol_scales_its_viewbox() {
+        let s = br##"<svg width="10" height="10"><defs><symbol id="s" viewBox="0 0 10 10"><rect width="10" height="10" fill="green"/></symbol></defs><use href="#s" width="5" height="5"/></svg>"##;
+        let img = render(s, 10, 10).unwrap();
+        assert_eq!(img.px[2 * 10 + 2], 0xff00_ff00);
+        assert_eq!(img.px[7 * 10 + 7], 0, "symbol paints only its viewport");
+    }
+
+    #[test]
+    fn fe_gaussian_blur_spreads_ink_outside_the_shape() {
+        let s = br##"<svg width="10" height="10"><defs><filter id="f"><feGaussianBlur stdDeviation="1"/></filter></defs><rect x="4" y="4" width="2" height="2" fill="black" filter="url(#f)"/></svg>"##;
+        let img = render(s, 10, 10).unwrap();
+        assert_ne!(img.px[5 * 10 + 5] >> 24, 0, "center keeps alpha");
+        assert_ne!(img.px[5 * 10 + 3], 0, "blur reaches outside the source rect");
+    }
+
+    #[test]
+    fn nested_svg_gets_its_own_viewport() {
+        let s = br##"<svg width="20" height="20"><svg x="10" y="10" width="10" height="10"><rect width="10" height="10" fill="black"/></svg></svg>"##;
+        let img = render(s, 20, 20).unwrap();
+        assert_eq!(img.px[15 * 20 + 15], 0xff00_0000);
+        assert_eq!(img.px[2 * 20 + 2], 0, "nested content is confined to its viewport");
     }
 }

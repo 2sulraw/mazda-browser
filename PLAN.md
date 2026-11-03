@@ -93,9 +93,15 @@ curve matters more than the baseline (near-flat as tabs grow).
   presentation attrs + inline style inheritance, named/hex/rgb()/rgba()
   colors, 2×2 supersampling, gradients collapsed to flat midpoint of stop
   colors; 81 tests; nextjs.org 8/9 images (SVG logos visible, was 1/9)**.
-  Known gaps: no text/glyphs, no clip/mask/filter/pattern, no `use`/
-  `image`, no CSS <style> blocks, gradients flat (not interpolated),
-  no stroke-dash/miter/linecap variants
+  Wave 27 adds the rest of the paint model: nested `<svg>` viewports,
+  `clipPath` (+ objectBoundingBox units), `mask` (luminance × alpha),
+  `pattern` (units/transform/objectBoundingBox), `use` (shapes, groups,
+  `symbol`/`svg` with viewBox), and filters (`feGaussianBlur`, `feOffset`,
+  `feFlood`, `feColorMatrix`, `feMerge`, `feBlend`, `feComposite`,
+  `feDropShadow`) — see the wave 27 findings.
+  Known gaps: no text/glyphs, no `image`, no CSS <style> blocks, gradients
+  flat (not interpolated), no `marker`, no stroke-dash/miter/linecap
+  variants, `mask-type: alpha` unread, pattern content painted once per tile
 - [x] **Phase 1g** — borders: ~~missing~~ **DONE (`border`/`border-width`/
   `border-color` shorthands + per-side `border-top/right/bottom/left`,
   style words ignored = everything solid, unspecified color = currentcolor
@@ -1673,6 +1679,66 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | svelte.dev | 91.9 MB (291 runs; pixel-unchanged) |
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | MDN homepage | 98.5 MB (615 runs; unchanged; same single bundle `length` error) |
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | Wikipedia `/wiki/Main_Page` | 105.7 MB (1434 runs; **zero `[js]` errors**; search toggle inside its box, no overlap with the personal links) |
+| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests — clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport — plus the new tokenizer test and the whole suite: default **707**, `engine-b + woff2` **711**) |
+
+### Wave 27 findings
+
+- **The SVG paint pass is now a recursive element walk, not a streaming
+  matrix/style stack.** `use`, `clipPath` content, `mask` content, `pattern`
+  content and filter inputs all have to re-enter arbitrary subtrees; parallel
+  stacks cannot express that. `next_tag` now records each tag's `<` offset
+  (`Tag.start`) and every container is painted by `paint_range(start, end)`.
+- **Definitions are harvested once by `id`** (`harvest_defs`) into byte ranges
+  (tag name, attrs, content start/end), so any element — not only `defs`
+  children — can be referenced. Missing close tags run to EOF; recursion is
+  depth-capped (24 levels of containers, 16 for `use`) so a cyclic sprite
+  cannot hang a page.
+- **Nested `<svg>` gets its own viewport**: `x`/`y`/`width`/`height` +
+  `viewBox` (xMidYMid meet) compose into the parent's matrix, percentages
+  resolve against the parent viewport, and the viewport rectangle is pushed as
+  a clip. `<use>` of a `symbol`/`svg` applies the same transform and
+  width/height defaults.
+- **`clip-path`** builds coverage from the referenced `clipPath`'s shapes
+  (nested groups and `<use>` included), honours `clipPathUnits =
+  objectBoundingBox` and the element's own transform. Coverage is ANDed for
+  nested clips.
+- **`mask`** coverage is luminance × fill alpha × `fill-opacity`, the default
+  mask type; the `<mask>` element's own `fill` inherits into its shapes (so
+  `<mask fill="white">` works without repeating the fill on every child),
+  `maskContentUnits` is honoured, and the default `-10%..120%` mask region
+  clips stray content.
+- **`pattern`** honours `patternUnits`, `patternTransform` and
+  `objectBoundingBox` units. Content is painted once in absolute device
+  coordinates and the result is tiled by modular sampling of the first tile.
+- **Filters** run on an isolated ARGB layer per element, then clip/mask apply
+  to the filter result (per spec). Implemented primitives: `feGaussianBlur`
+  (3-pass box approximation, per-axis radius), `feOffset`, `feFlood`,
+  `feColorMatrix` (`matrix`, `saturate`, `hueRotate`, `luminanceToAlpha`),
+  `feMerge`, `feBlend`, `feComposite` (`over`/`in`/`out`/`atop`/`xor`/
+  `arithmetic`) and `feDropShadow`. Named `result` chains and
+  `SourceGraphic`/`SourceAlpha` inputs work.
+- **`use`** clones shapes, groups and viewport roots (`symbol`/`svg`) with
+  `x`/`y` offsets; a definition is never painted in place, only where it is
+  referenced. `foreignObject` is skipped rather than painted as SVG.
+- **Nested-`<svg>` tokenizer truncation fixed.** `<svg>` is RAW_TEXT, so the
+  tokenizer stopped at the first `</svg>`; an inline sprite
+  (`<svg><symbol>…</symbol></svg><svg>…`) lost everything after the inner
+  close. `html::raw_text_end` now depth-counts `<svg>` (other raw-text
+  elements cannot nest and keep the old first-close behaviour). Regression:
+  `nested_svg_raw_text_keeps_inner_markup` asserts both the inner close and
+  the markup after it survive in the payload, and that the document continues
+  after the outer `</svg>`.
+- **Shortcuts taken**: gradients still collapse to the mid-stop colour
+  (pre-existing); pattern content is painted once and folded into the first
+  tile (content that intentionally overflows its tile is clipped); the filter
+  region is a flat 10% bbox pad rather than `filterUnits`/`x`/`y`/`width`/
+  `height`; `mask-type: alpha` is not read (luminance is assumed); no
+  `feImage`, `feTurbulence`, `feMorphology`, `feComponentTransfer` or
+  `feTile`; `clip-rule` is always nonzero; `marker` and `text` remain skipped.
+- **Verification note**: the full suite ran in a clean worktree at `HEAD`
+  with only `src/svg.rs` + `src/html.rs` overlaid — concurrent sessions had
+  `src/js/*` mid-edit in the shared tree, so those changes were deliberately
+  not pulled in. Default **707** tests, `engine-b + woff2` **711**, all pass.
 
 ### Wave 22 findings
 

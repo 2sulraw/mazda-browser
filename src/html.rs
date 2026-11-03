@@ -383,11 +383,7 @@ pub fn tokenize(s: &str) -> Vec<Token> {
             if RAW_TEXT.contains(&name.as_str()) && !self_closing {
                 // swallow raw text content up to the matching close tag, but
                 // keep it as a text child — <style> content is our CSS source
-                let lower = s[i..].to_ascii_lowercase();
-                let end = match lower.find(&format!("</{name}")) {
-                    Some(c) => i + c,
-                    None => s.len(),
-                };
+                let end = raw_text_end(s, i, &name);
                 if end > i {
                     out.push(Token::Text(s[i..end].to_string()));
                 }
@@ -411,6 +407,46 @@ pub fn tokenize(s: &str) -> Vec<Token> {
         out.push(Token::Text(s[text_start..].to_string()));
     }
     out
+}
+
+/// End offset of a RAW_TEXT element's content. `<svg>` nests (SVG-in-SVG is
+/// legal and common: icon sprites, `<symbol>` wrappers), so its close tag is
+/// matched with a depth counter instead of the first `</svg>`. Every other
+/// raw-text element (`script`, `style`, `textarea`, `title`) cannot nest.
+fn raw_text_end(s: &str, from: usize, name: &str) -> usize {
+    if name != "svg" {
+        let lower = s[from..].to_ascii_lowercase();
+        return match lower.find(&format!("</{name}")) {
+            Some(c) => from + c,
+            None => s.len(),
+        };
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 1usize;
+    let mut i = from;
+    while i < bytes.len() {
+        let Some(rel) = s[i..].find('<') else { return s.len() };
+        let lt = i + rel;
+        let Some(gt_rel) = s[lt..].find('>') else { return s.len() };
+        let gt = lt + gt_rel;
+        let tag = s[lt + 1..gt].trim_start();
+        let closing = tag.starts_with('/');
+        let tag = tag.trim_start_matches('/').trim_start();
+        let name_end = tag.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(tag.len());
+        let tname = &tag[..name_end];
+        if tname.eq_ignore_ascii_case("svg") {
+            if closing {
+                depth -= 1;
+                if depth == 0 {
+                    return lt;
+                }
+            } else if !tag.trim_end().ends_with('/') {
+                depth += 1;
+            }
+        }
+        i = gt + 1;
+    }
+    s.len()
 }
 
 pub fn decode_entities(s: &str) -> String {
@@ -784,6 +820,27 @@ mod tests {
         let p = dom.nodes.iter().position(|n| dom.tag(n.parent as usize as u32) == "p" && matches!(n.kind, NodeKind::Element(..)));
         assert!(p.is_some(), "expected a <p> child");
         assert_eq!(text_of(&dom), "Hello |bold");
+    }
+
+    #[test]
+    fn nested_svg_raw_text_keeps_inner_markup() {
+        // A `<svg>` inside `<svg>` is legal; its close tag must not end the
+        // outer element's RAW_TEXT payload at the first `</svg>`.
+        let html = r#"<body><svg viewBox="0 0 24 24"><svg width="12" height="12"><rect width="12" height="12"/></svg><circle cx="6" cy="6" r="3"/></svg><p>after</p></body>"#;
+        let toks = tokenize(html);
+        let payload = toks
+            .iter()
+            .find_map(|t| match t {
+                Token::Text(s) if s.contains("<rect") => Some(s),
+                _ => None,
+            })
+            .expect("svg raw-text payload");
+        assert!(payload.contains("</svg>"), "inner close kept: {payload:?}");
+        assert!(payload.contains("<circle"), "markup after nested svg kept: {payload:?}");
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::StartTag { name, .. } if name == "p")),
+            "document continues after the outer </svg>"
+        );
     }
 
     #[test]
