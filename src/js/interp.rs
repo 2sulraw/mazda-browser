@@ -776,11 +776,36 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
 pub(crate) fn for_of_items(v: &Val) -> Result<Vec<Val>, JsError> {
     match v {
         Val::Obj(o) => {
-            let b = o.borrow();
-            match &b.kind {
-                ObjKind::Array(items) => Ok(items.clone()),
+            // arrays iterate their elements
+            let direct = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => Some(items.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(items) = direct {
+                return Ok(items);
+            }
+            // Set/Map builtins carry their payload in a hidden own prop
+            // (`__set` values / `__map` [key, value] pairs); iterating either
+            // yields that array (Map yields pairs, like its real iterator).
+            let hidden = {
+                let b = o.borrow();
+                b.props
+                    .iter()
+                    .find(|(k, _)| &**k == "__set" || &**k == "__map")
+                    .map(|(_, v)| v.clone())
+            };
+            match hidden {
+                Some(Val::Obj(a)) => match &a.borrow().kind {
+                    ObjKind::Array(items) => Ok(items.clone()),
+                    _ => Err(JsError::throw(
+                        "TypeError: for...of cannot iterate this object",
+                    )),
+                },
                 _ => Err(JsError::throw(
-                    "TypeError: for...of supports arrays and strings only (iterator protocol: later wave)",
+                    "TypeError: for...of supports arrays, strings, Sets and Maps only (iterator protocol: later wave)",
                 )),
             }
         }
@@ -1441,6 +1466,31 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
             let key = l.to_string();
             match r {
                 Val::Obj(o) => Val::Bool(obj_has(o, &key)),
+                // functions are objects: `"name" in f`, `"prototype" in f`
+                Val::Func(c) => {
+                    // `name`/`length` are synthesized by get_member (no own
+                    // slot); `prototype` exists for non-arrow functions
+                    let mut found = key == "name"
+                        || key == "length"
+                        || (key == "prototype" && !c.is_arrow)
+                        || c.props.borrow().iter().any(|(k, _)| k.as_ref() == key);
+                    let mut cur = c.proto.borrow().clone();
+                    if !found {
+                        for _ in 0..100 {
+                            match cur {
+                                Some(Val::Obj(o)) => {
+                                    if obj_has(&o, &key) {
+                                        found = true;
+                                        break;
+                                    }
+                                    cur = o.borrow().proto.clone().map(Val::Obj);
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    Val::Bool(found)
+                }
                 Val::Str(s) => {
                     // `"0" in "abc"` -> true (index/length/method names)
                     let idx = key.parse::<usize>().ok().and_then(|i| s.chars().nth(i));

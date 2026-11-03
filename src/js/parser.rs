@@ -1085,7 +1085,10 @@ impl<'a> Parser<'a> {
                 if *self.peek_at(1) == Tok::Kw(Kw::Function) {
                     self.next(); // async
                     self.next(); // function
-                    let f = self.function_rest(true, true, false)?;
+                    // `async function*` parses as a generator: the resumable
+                    // walker runs the body blocking (see gen.rs docs)
+                    let is_gen = self.eat_op(Op::Mul);
+                    let f = self.function_rest(true, true, is_gen)?;
                     StmtKind::FuncDecl(f)
                 } else {
                     // async arrow / plain expression starting with `async`
@@ -1129,6 +1132,11 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::For) => {
                 self.next();
+                // `for await (...)` parses as plain `for-of` (shortcut: values
+                // are not awaited; iterable = array/string/Set/Map)
+                if *self.peek() == Tok::Kw(Kw::Await) {
+                    self.next();
+                }
                 self.expect_punct(Punct::LParen)?;
                 let f = self.for_rest()?;
                 self.expect_punct(Punct::RParen)?;
@@ -1681,9 +1689,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     /// initializer (`let x = yield v`). Anywhere else (conditions, calls,
     /// operators, return-expr, try blocks) is an honest SyntaxError — the
     /// resumable walker suspends exactly at those two positions.
-    fn validate_yields(&mut self, stmts: &[Stmt], is_async: bool) -> Result<(), JsError> {
+    ///
+    /// Async generators skip the parse-time check: their bodies often mix
+    /// `yield` into logical expressions (stream splitters). The body parses,
+    /// and the walker reports an honest error at CALL time if it reaches an
+    /// unsupported yield position — module evaluation still succeeds.
+    fn validate_yields(
+        &mut self,
+        stmts: &[Stmt],
+        is_async: bool,
+    ) -> Result<(), JsError> {
         if is_async {
-            return self.err("generator + async combination is not supported");
+            return Ok(());
         }
         check_yield_stmts(stmts).map_err(|m| {
             let t = self.cur();
@@ -3129,10 +3146,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 if *self.peek_at(1) == Tok::Kw(Kw::Function) {
                     self.next();
                     self.next();
-                    let f = self.function_rest(false, true, false)?;
+                    let is_gen = self.eat_op(Op::Mul);
+                    let f = self.function_rest(false, true, is_gen)?;
                     ExprKind::Func(f)
-                } else if *self.peek_at(1) == Tok::Op(Op::Mul) {
-                    return self.err("async generator functions are not supported");
                 } else {
                     // `async => ...` (async arrow whose single param is named
                     // `async`) falls through to the ident/arrow paths; a bare
@@ -3199,6 +3215,65 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     if *self.peek() == Tok::Spread {
                         self.next();
                         props.push(ObjElem::Spread(self.assign_expr()?));
+                        continue;
+                    }
+                    // `async m(){}` / `async *m(){}` / `*m(){}` method
+                    // shorthand (mirrors the class-method modifiers). A
+                    // property literally named `async` has `:`, `(`, `,` or
+                    // `}` next, so it is not consumed as a modifier.
+                    let mut is_async = false;
+                    let mut is_gen = false;
+                    if matches!(self.peek(), Tok::Kw(Kw::Async))
+                        || matches!(self.peek(), Tok::Ident(s) if s.as_ref() == "async")
+                    {
+                        let is_async_method =
+                            !self.toks[(self.pos + 1).min(self.toks.len() - 1)].nl
+                                && matches!(
+                                    self.peek_at(1),
+                                    Tok::Ident(_)
+                                        | Tok::Kw(_)
+                                        | Tok::Str(_)
+                                        | Tok::Num(_)
+                                        | Tok::Op(Op::Mul)
+                                );
+                        if is_async_method {
+                            self.next(); // `async`
+                            is_async = true;
+                        }
+                    }
+                    if *self.peek() == Tok::Op(Op::Mul) {
+                        self.next(); // `*`
+                        is_gen = true;
+                    }
+                    if is_async || is_gen {
+                        let key_tok = self.pos;
+                        let key = self.prop_name()?;
+                        let params = self.param_list()?;
+                        self.expect_punct(Punct::LBrace)?;
+                        let body = self.block_body()?;
+                        if is_gen {
+                            // sync generators keep the strict yield-position
+                            // check; async ones defer to call time
+                            self.validate_yields(&body, is_async)?;
+                        }
+                        let uses_arguments = scan_uses_arguments_stmts(&body);
+                        let f = Rc::new(FnDef {
+                            src: self.src_id,
+                            name: key,
+                            params,
+                            body: FnBody::Block(body),
+                            uses_arguments,
+                            is_async,
+                            is_generator: is_gen,
+                            has_yield: is_gen,
+                        });
+                        props.push(ObjElem::Prop(
+                            self.toks[key_tok].clone().tok_string(),
+                            Expr {
+                                kind: ExprKind::Func(f),
+                                span: self.span_from(start),
+                            },
+                        ));
                         continue;
                     }
                     // computed key: `[expr]: v` / `[expr](){}`

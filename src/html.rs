@@ -83,6 +83,12 @@ impl Dom {
         idx
     }
 
+    /// Intern (or look up) a tag name. Script `createElement` grows the
+    /// table on demand — any name is legal, like the real API.
+    pub fn tag_id(&mut self, name: &str) -> TagId {
+        self.intern(name)
+    }
+
     pub fn tag(&self, idx: u32) -> &str {
         match &self.nodes[idx as usize].kind {
             NodeKind::Element(t, _) => &self.tags[t.0 as usize],

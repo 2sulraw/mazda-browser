@@ -832,6 +832,214 @@ fn object_builtins() {
 }
 
 #[test]
+fn async_generator_functions_parse_and_suspend_like_generators() {
+    // shortcut: an async generator's `.next()` yields plain values (no
+    // promise wrapping) and `await` runs blocking inside the walker.
+    assert_eq!(
+        string(
+            "async function* g(){ yield 1; yield 2; } var it = g(); \
+             it.next().value + ',' + it.next().value"
+        ),
+        "1,2"
+    );
+    assert_eq!(
+        string(
+            "var g = async function*(){ yield 'a'; }; var it = g(); it.next().value"
+        ),
+        "a"
+    );
+}
+
+#[test]
+fn in_operator_accepts_function_objects() {
+    assert!(boolean("'name' in function f() {}"));
+    assert!(boolean("'prototype' in function f() {}"));
+    assert!(!boolean("'nope' in function f() {}"));
+}
+
+#[test]
+fn async_generator_parsing_and_for_await() {
+    // `for await` parses as for-of (values are not awaited)
+    assert_eq!(
+        string("var out = ''; async function f(){ for await (var x of [1, 2]) out += x; } f(); out"),
+        "12"
+    );
+    // a yield inside a logical expression parses (module evaluation
+    // succeeds); the walker errors honestly only when the body runs
+    err("async function* g(a){ (a && (yield 1)); } g(true).next()");
+}
+
+#[test]
+fn set_builtin_dedupes_and_iterates() {
+    assert_eq!(num("var s = new Set([1, 2, 2, 3]); s.size"), 3.0);
+    assert!(boolean("var s = new Set([1]); s.has(1) && !s.has(2)"));
+    assert_eq!(
+        string("var s = new Set([1, 2]); s.add(3); s.delete(1); s.values().join(',')"),
+        "2,3"
+    );
+    assert_eq!(
+        string("var s = new Set(['a', 'b']); var out = ''; for (var x of s) out += x; out"),
+        "ab"
+    );
+    assert_eq!(string("var s = new Set([1, 2]); [...s].join('+')"), "1+2");
+    assert!(boolean("new Set() instanceof Set"));
+}
+
+#[test]
+fn map_builtin_holds_key_value_pairs() {
+    assert_eq!(
+        string("var m = new Map([['a', 1], ['b', 2]]); m.get('a') + ',' + m.size"),
+        "1,2"
+    );
+    assert_eq!(
+        string("var m = new Map(); m.set('x', 1).set('y', 2); m.get('y')"),
+        "2"
+    );
+    assert_eq!(
+        string("var m = new Map(); m.set('x', 1); m.set('x', 9); m.get('x')"),
+        "9"
+    );
+    assert_eq!(
+        string("var m = new Map([['a', 1]]); var out = ''; m.forEach(function (v, k) { out += k + v; }); out"),
+        "a1"
+    );
+    assert_eq!(
+        string("var m = new Map([['a', 1], ['b', 2]]); m.entries().map(function (e) { return e[0] + e[1]; }).join(',')"),
+        "a1,b2"
+    );
+    assert!(boolean("new Map() instanceof Map"));
+    assert_eq!(
+        string("var m = new Map([['a', 1]]); var out = ''; for (var e of m) out += e[0] + e[1]; out"),
+        "a1"
+    );
+}
+
+#[test]
+fn async_and_generator_object_method_shorthand() {
+    assert_eq!(
+        string("var o = { async m() { return 7; } }; typeof o.m()"),
+        "object"
+    );
+    assert_eq!(
+        string("var o = { async m() { return 7; } }; var p = o.m(); typeof p.then"),
+        "function"
+    );
+    assert_eq!(
+        string("var o = { *g() { yield 1; yield 2; } }; var it = o.g(); it.next().value"),
+        "1"
+    );
+    assert_eq!(
+        string("var o = { async *g() { yield 'z'; } }; var it = o.g(); it.next().value"),
+        "z"
+    );
+    // a plain property named `async` still parses
+    assert_eq!(string("var o = { async: 3 }; o.async"), "3");
+    assert_eq!(string("var o = { async() { return 4; } }; o.async()"), "4");
+}
+
+#[test]
+fn arraybuffer_byte_length_accessor() {
+    assert_eq!(num("new ArrayBuffer(8).byteLength"), 8.0);
+    assert_eq!(
+        string("typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get"),
+        "function"
+    );
+    assert!(boolean("typeof SharedArrayBuffer.prototype.byteLength !== 'undefined'"));
+}
+
+#[test]
+fn object_integrity_and_descriptor_helpers() {
+    assert!(boolean("Object.is(NaN, NaN) && !Object.is(0, -0) && Object.is(1, 1)"));
+    assert!(boolean("var o = Object.freeze({ a: 1 }); o.a === 1"));
+    assert!(boolean("Object.hasOwn({ a: 1 }, 'a') && !Object.hasOwn({}, 'a')"));
+    assert_eq!(
+        string("Object.getOwnPropertyDescriptor({ a: 5 }, 'a').value"),
+        "5"
+    );
+    assert!(boolean("Object.getOwnPropertyDescriptor({}, 'x') === undefined"));
+    assert_eq!(
+        string("Object.getOwnPropertyDescriptors({ a: 1 }).a.value"),
+        "1"
+    );
+}
+
+#[test]
+fn base64_and_typed_array_stand_ins() {
+    assert_eq!(string("btoa('hi')"), "aGk=");
+    assert_eq!(string("atob('aGk=')"), "hi");
+    assert_eq!(string("new Uint8Array([104, 105]).toBase64()"), "aGk=");
+    assert_eq!(
+        string("Uint8Array.fromBase64('aGk=').join(',')"),
+        "104,105"
+    );
+    assert_eq!(num("new Uint8Array(3).length"), 3.0);
+    assert_eq!(string("Buffer.from('hi').toString('base64')"), "aGk=");
+    assert_eq!(num("Uint8Array.fromBase64('aGk=').buffer.byteLength"), 2.0);
+}
+
+#[test]
+fn array_sort_and_reverse() {
+    assert_eq!(string("[3, 1, 2].sort().join(',')"), "1,2,3");
+    assert_eq!(string("['b', 'a'].sort().join(',')"), "a,b");
+    assert_eq!(string("[3, 1, 2].sort(function (a, b) { return b - a; }).join(',')"), "3,2,1");
+    assert_eq!(string("[1, 2, 3].reverse().join(',')"), "3,2,1");
+    assert_eq!(num("var a = [2, 1]; a.sort(); a[0]"), 1.0);
+}
+
+#[test]
+fn text_encoder_decoder_round_trip() {
+    assert_eq!(
+        string("var e = new TextEncoder(); e.encode('hi').join(',')"),
+        "104,105"
+    );
+    assert_eq!(
+        string("var d = new TextDecoder(); d.decode([104, 105])"),
+        "hi"
+    );
+    assert_eq!(string("new TextDecoder().encoding"), "utf-8");
+}
+
+#[test]
+fn weak_collections_store_by_identity() {
+    assert_eq!(
+        string("var k = {}; var m = new WeakMap(); m.set(k, 5); m.get(k)"),
+        "5"
+    );
+    assert!(boolean("var k = {}; var m = new WeakMap([[k, 1]]); m.has(k)"));
+    assert!(boolean("var k = {}; var m = new WeakMap(); m.set(k, 1); m.delete(k) && !m.has(k)"));
+    assert!(boolean("var k = {}; var s = new WeakSet([k]); s.has(k)"));
+    assert!(boolean("new WeakMap([[{}, 1]]) instanceof WeakMap"));
+}
+
+#[test]
+fn symbol_builtin_is_unique_and_usable_as_a_key() {
+    assert_eq!(string("typeof Symbol('x')"), "symbol");
+    assert!(boolean("Symbol('x') === Symbol('x') === false"));
+    assert_eq!(string("var s = Symbol('a'); var o = {}; o[s] = 1; o[s]"), "1");
+    assert_eq!(string("String(Symbol('a'))"), "Symbol(a)");
+    assert_eq!(string("typeof Symbol.iterator"), "symbol");
+    err("new Symbol('x')");
+}
+
+#[test]
+fn object_from_entries_builds_objects() {
+    assert_eq!(
+        string("JSON.stringify(Object.fromEntries([['a', 1], ['b', 2]]))"),
+        "{\"a\":1,\"b\":2}"
+    );
+    assert_eq!(num("Object.fromEntries([[1, 2]])[1]"), 2.0);
+    assert_eq!(
+        string("Object.fromEntries(Object.entries({ x: 'y' })).x"),
+        "y"
+    );
+}
+
+#[test]
+fn object_from_entries_rejects_non_pairs() {
+    err("Object.fromEntries([[1]])");
+}
+
+#[test]
 fn conversions_and_number_globals() {
     assert_eq!(string("String(42)"), "42");
     assert_eq!(string("String(true)"), "true");

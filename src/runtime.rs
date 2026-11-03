@@ -540,6 +540,16 @@ impl DomHost {
         crate::script::subtree_query_dom(self.dom_ref(), root, sel)
     }
 
+    /// `getElementsByTagName`: every element with this tag in document order
+    /// (`"*"` = all elements).
+    pub fn by_tag(&self, name: &str) -> Vec<u32> {
+        let dom = self.dom_ref();
+        all_elements_dom(dom)
+            .into_iter()
+            .filter(|&i| name == "*" || dom.tag(i).eq_ignore_ascii_case(name))
+            .collect()
+    }
+
     /// First `<html>` element (documentElement wrapper source). Only the
     /// engine-core adapter needs it (A reads this at page setup).
     #[cfg(feature = "engine-b")]
@@ -758,20 +768,20 @@ impl DomHost {
         self.dirty = true;
     }
 
-    /// `createElement(tag)`: clones the TagId from any existing same-tag
-    /// element (the tag interner is private to html.rs); unknown tags
-    /// return None (the caller logs `[js]` honestly). The arena push is
-    /// split from wrapper construction so both engines wrap after —
+    /// `createElement(tag)`: interns the tag name on demand (any name is
+    /// legal, like the real API) and appends an orphan element node (parent =
+    /// document root, not in its child list until `appendChild`). The arena
+    /// push is split from wrapper construction so both engines wrap after -
     /// unwrapped orphan nodes can never leak into script-visible state.
     pub fn create_element(&mut self, tag: &str) -> Option<u32> {
+        if tag.is_empty() {
+            return None;
+        }
         let dom = unsafe { &mut *self.dom };
-        let tid = all_elements_dom(dom)
-            .into_iter()
-            .find(|&i| dom.tag(i) == tag)
-            .and_then(|i| match &dom.nodes[i as usize].kind {
-                NodeKind::Element(t, _) => Some(*t),
-                _ => None,
-            })?;
+        if dom.nodes.is_empty() {
+            return None;
+        }
+        let tid = dom.tag_id(tag);
         let id = dom.nodes.len() as u32;
         dom.nodes.push(html::Node {
             parent: 0,

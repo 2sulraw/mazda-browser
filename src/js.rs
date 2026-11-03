@@ -310,7 +310,15 @@ impl Val {
             Val::Bool(_) => "boolean",
             Val::Num(_) => "number",
             Val::Str(_) => "string",
-            Val::Obj(_) => "object",
+            Val::Obj(o) => {
+                // symbol stand-ins: unique objects with a hidden `__symbol`
+                // description (see builtins::install)
+                if o.borrow().props.iter().any(|(k, _)| &**k == "__symbol") {
+                    "symbol"
+                } else {
+                    "object"
+                }
+            }
             Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_) => "function",
         }
     }
@@ -413,7 +421,13 @@ impl Val {
                         Some(Err(_)) => "Promise { <rejected> }".into(),
                     },
                     ObjKind::Plain => {
-                        if b.props.is_empty() {
+                        // symbols are unique objects with a hidden
+                        // `__symbol` description (see builtins)
+                        if let Some((_, Val::Str(desc))) =
+                            b.props.iter().find(|(k, _)| &**k == "__symbol")
+                        {
+                            format!("Symbol({})", desc)
+                        } else if b.props.is_empty() {
                             "[object Object]".into()
                         } else {
                             let parts: Vec<String> = b
@@ -801,6 +815,18 @@ pub struct JsEngine {
     /// shared `URL.prototype` / `URLSearchParams.prototype`
     pub(crate) url_proto: Option<Rc<RefCell<Obj>>>,
     pub(crate) params_proto: Option<Rc<RefCell<Obj>>>,
+    /// shared `Set.prototype` / `Map.prototype`
+    pub(crate) set_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) map_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) weakmap_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) weakset_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) text_encoder_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) text_decoder_proto: Option<Rc<RefCell<Obj>>>,
+    /// reused native ids for the Uint8Array/Buffer stand-ins (avoids
+    /// registering a new native per created instance)
+    pub(crate) uint8_to_b64: usize,
+    pub(crate) buffer_to_string: usize,
+    pub(crate) arraybuffer_proto: Option<Rc<RefCell<Obj>>>,
     /// compiled-once regex literal cache, keyed by (pattern, flags). Regex
     /// literals are program text, so this cache is bounded by the number of
     /// distinct (pattern, flags) literals the page can create; still capped
@@ -910,6 +936,15 @@ impl JsEngine {
             native_props: HashMap::new(),
             url_proto: None,
             params_proto: None,
+            set_proto: None,
+            map_proto: None,
+            weakmap_proto: None,
+            weakset_proto: None,
+            text_encoder_proto: None,
+            text_decoder_proto: None,
+            uint8_to_b64: 0,
+            buffer_to_string: 0,
+            arraybuffer_proto: None,
             regex_cache: HashMap::new(),
             next_timer_id: 1.0,
             steps: 0,

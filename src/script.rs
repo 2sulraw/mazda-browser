@@ -45,8 +45,16 @@
 //!   the job after the current turn, so `.then` chains run a turn later than
 //!   a browser's eager module resolution. `import.meta` reads `undefined`;
 //!   import assertions do not parse.
-//! - `createElement` clones the TagId of a tag already in the parsed
-//!   fragment table (see `element_tid`); unknown tags log and return null.
+//! - `createElement` interns any tag name (the table grows on demand, so
+//!   custom elements and `link`/`meta` work); created nodes are inert until
+//!   appended (no fetch, no stylesheet application for a created `<link>`).
+//!   `getElementsByTagName(name)` returns a document-order snapshot array
+//!   (`"*"` = every element), not a live collection.
+//! - reflected attribute props (`id`, `className`, `href`, `src`, `rel`,
+//!   `as`, `crossOrigin`, `nonce`, `name`, `title`, `alt`, `target`, `media`,
+//!   `integrity`, `referrerPolicy`) are live accessors on every element
+//!   wrapper: reads return the attribute (or ""), writes call
+//!   `setAttribute`; they are installed over the snapshot props.
 //! - `document.cookie` is an accessor in the real API, and property
 //!   accessors cannot be intercepted — so the page-facing surface is
 //!   `document.getCookie()` / `document.setCookie(str)`. The cookies
@@ -74,7 +82,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::html::{Dom, NodeKind};
+use crate::html::{Dom, Node, NodeKind};
 use crate::js::{self, JsEngine, JsError, Val};
 use crate::runtime::{self, Turn, FRAME_EPOCH, MAX_PENDING_FRAMES, MAX_PENDING_TIMERS, WIN_NODE};
 
@@ -159,6 +167,28 @@ fn ctx_queue_raf(cb: Val) {
 // Element wrappers
 // ---------------------------------------------------------------------------
 
+/// Reflected attribute props: `(JS property, attribute name)`. Each entry is
+/// installed as one accessor pair on every element wrapper; reads go to the
+/// live attribute, writes re-link through `setAttribute` (so `link.rel = ...`
+/// reaches the cascade like the real DOM reflected attributes).
+const REFLECTED: &[(&str, &str)] = &[
+    ("id", "id"),
+    ("className", "class"),
+    ("href", "href"),
+    ("src", "src"),
+    ("rel", "rel"),
+    ("as", "as"),
+    ("crossOrigin", "crossorigin"),
+    ("nonce", "nonce"),
+    ("name", "name"),
+    ("title", "title"),
+    ("alt", "alt"),
+    ("target", "target"),
+    ("media", "media"),
+    ("integrity", "integrity"),
+    ("referrerPolicy", "referrerpolicy"),
+];
+
 /// Snapshot `node` into a JS object: `__node` (id) + readable props read
 /// live at wrap time through the shared host (`runtime::DomHost::snapshot`
 /// — the exact prop set both engines expose), then attach the method
@@ -170,8 +200,6 @@ fn wrap_element(node: u32) -> Val {
     let p = runtime::host(|h| h.snapshot(node));
     if let Some(p) = p {
         o.set("tagName", str_val(&p.tag));
-        o.set("id", str_val(p.id.as_deref().unwrap_or("")));
-        o.set("className", str_val(p.class.as_deref().unwrap_or("")));
         // value-like props snapshot: input/textarea current value
         if let Some(v) = p.value {
             o.set("value", str_val(&v));
@@ -180,10 +208,20 @@ fn wrap_element(node: u32) -> Val {
             o.set("type", str_val(&t));
             o.set("checked", js::Val::Bool(p.checked));
         }
-        if let Some(href) = p.href {
-            o.set("href", str_val(&href));
-        }
         o.set("textContent", str_val(&p.text));
+    }
+    // Reflected attribute props go on LAST: `id`/`className`/`href` are in
+    // the table, so these accessors replace the snapshot writes above (live
+    // reads and attribute-backed writes, one behaviour for both).
+    for (i, (prop, _)) in REFLECTED.iter().enumerate() {
+        let n = js::Val::Native(n.reflect[i]);
+        o.set(
+            prop,
+            js::Val::Acc(Rc::new(js::AccEntry {
+                getter: Some(n.clone()),
+                setter: Some(n),
+            })),
+        );
     }
     o.set("style", wrap_style(node));
     o.set("classList", wrap_class_list(node));
@@ -288,6 +326,22 @@ fn this_node(this: &Val) -> Result<u32, JsError> {
     }
 }
 
+/// Reflected attribute property (one native per `REFLECTED` entry): a getter
+/// call arrives with no arguments, a setter with one. Both halves of the
+/// accessor pair point at this same native; `this` is the element wrapper.
+fn el_prop_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let node = this_node(this)?;
+    let Some((_, attr)) = REFLECTED.get(idx as usize) else {
+        return Ok(Val::Undefined);
+    };
+    if args.is_empty() {
+        let v = runtime::host(|h| h.attr(node, attr)).unwrap_or_default();
+        return Ok(str_val(&v));
+    }
+    let val = args[0].to_string();
+    runtime::host_mut(|h| h.set_attribute(node, attr, &val));
+    Ok(Val::Undefined)
+}
 // ---------------------------------------------------------------------------
 // Native ids: `register_native` returns a per-engine table index, so ids are
 // captured at install time (one shared dispatch fn per group, u16 = method).
@@ -301,6 +355,9 @@ struct Nids {
     doc_create: usize,
     doc_cookie_get: usize,
     doc_cookie_set: usize,
+    doc_get_by_tag: usize,
+    /// one native per `REFLECTED` entry (accessor pair halves)
+    reflect: [usize; REFLECTED.len()],
     el_get_element: usize,
     el_query: usize,
     el_query_all: usize,
@@ -417,6 +474,7 @@ const D_QUERY_ALL: u16 = 2;
 const D_CREATE_ELEMENT: u16 = 3;
 const D_COOKIE_GET: u16 = 4;
 const D_COOKIE_SET: u16 = 5;
+const D_GET_ELEMENTS_BY_TAG: u16 = 6;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -509,6 +567,12 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             let Some(tag) = sel else { return Ok(Val::Null) };
             create_element(&tag)
         }
+        D_GET_ELEMENTS_BY_TAG => {
+            let name = sel.unwrap_or_default();
+            Ok(runtime::host(|h| {
+                js::Val::new_array(h.by_tag(&name).into_iter().map(wrap_element).collect())
+            }))
+        }
         // `document.cookie` is an accessor in the real API; the interpreter
         // has no accessor hooks, so the page-facing pair is get/setCookie
         // (documented in the module header).
@@ -523,18 +587,17 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
     }
 }
 
-/// `createElement`: the tag interner is private to html.rs, so clone the
-/// TagId from any existing element with the same tag (parsed documents
-/// almost always contain it); unknown tags log + null. The arena push is
-/// split from wrapper construction (on the shared host) so an unwrapped
-/// orphan node can never leak into script-visible state.
+/// `createElement`: interns the tag name on the shared host (the table grows
+/// on demand, so any tag is legal) and wraps the orphan node. The arena push
+/// is split from wrapper construction so an unwrapped orphan node can never
+/// leak into script-visible state.
 fn create_element(tag: &str) -> Result<Val, JsError> {
     let tag = tag.to_ascii_lowercase();
     let made = runtime::host_mut(|h| h.create_element(&tag));
     match made {
         Some(id) => Ok(wrap_element(id)),
         None => {
-            eprintln!("[js] createElement: unknown tag {tag:?} (not in document)");
+            eprintln!("[js] createElement: empty tag name");
             Ok(Val::Null)
         }
     }
@@ -974,6 +1037,10 @@ impl PageScripts {
     /// snapshotting wrapper props (no mutation).
     pub fn new(dom: &mut Dom, base: &str) -> PageScripts {
         let mut engine = JsEngine::new();
+        // one native per reflected-prop accessor (getter + setter share it)
+        let reflect = std::array::from_fn(|i| {
+            engine.register_native(REFLECTED[i].0, el_prop_native, i as u16)
+        });
         let ids = Nids {
             doc_get_element: engine.register_native("document.getElementById", doc_native, D_GET_ELEMENT_BY_ID),
             doc_query: engine.register_native("document.querySelector", doc_native, D_QUERY),
@@ -981,6 +1048,8 @@ impl PageScripts {
             doc_create: engine.register_native("document.createElement", doc_native, D_CREATE_ELEMENT),
             doc_cookie_get: engine.register_native("document.getCookie", doc_native, D_COOKIE_GET),
             doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
+            doc_get_by_tag: engine.register_native("document.getElementsByTagName", doc_native, D_GET_ELEMENTS_BY_TAG),
+            reflect,
             el_get_element: engine.register_native("Element.getElementById", el_native, E_GET_ELEMENT_BY_ID),
             el_query: engine.register_native("Element.querySelector", el_native, E_QUERY),
             el_query_all: engine.register_native("Element.querySelectorAll", el_native, E_QUERY_ALL),
@@ -1033,6 +1102,7 @@ impl PageScripts {
         doc.set("querySelector", Val::Native(ids.doc_query));
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
         doc.set("createElement", Val::Native(ids.doc_create));
+        doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
         doc.set("getCookie", Val::Native(ids.doc_cookie_get));
         doc.set("setCookie", Val::Native(ids.doc_cookie_set));
         // no incremental loader: by the time scripts run, parsing is finished
@@ -1094,19 +1164,39 @@ impl PageScripts {
         engine.set_global("location", loc);
         engine.set_global("fetch", Val::Native(ids.fetch));
 
-        // body/documentElement wrappers snapshot DOM props; needs one
+        // body/documentElement/head wrappers snapshot DOM props; needs one
         // no-op turn to install the thread-local ctx
         let body = dom.body_root();
         let html_el = (1..dom.nodes.len() as u32)
             .find(|&i| dom.tag(i) == "html")
             .unwrap_or(0);
+        // The forgiving parser only materialises what the markup spells out,
+        // while real HTML parsers always synthesize <head>. Pages that omit
+        // it (probe pages, fragments) still need a `document.head` to append
+        // links/metas to, so add one when it is missing (<head> is in the
+        // non-rendered UA set, so this never paints).
+        let head = match (1..dom.nodes.len() as u32).find(|&i| dom.tag(i) == "head") {
+            Some(h) => h,
+            None => {
+                let id = dom.nodes.len() as u32;
+                let tid = dom.tag_id("head");
+                dom.nodes.push(Node {
+                    parent: html_el,
+                    children: Vec::new(),
+                    kind: NodeKind::Element(tid, Box::from([])),
+                });
+                dom.nodes[html_el as usize].children.insert(0, id);
+                id
+            }
+        };
         let storage: runtime::Storage = Default::default();
         let (wrappers, _host, _cx) =
             with_ctx(&mut engine, dom, base, HashMap::new(), storage.clone(), |_e| {
-                (wrap_element(body), wrap_element(html_el))
+                (wrap_element(body), wrap_element(html_el), wrap_element(head))
             });
         doc.set("body", wrappers.0);
         doc.set("documentElement", wrappers.1);
+        doc.set("head", wrappers.2);
         engine.set_global("document", doc);
         let _ = html_el;
 
@@ -2077,14 +2167,100 @@ mod tests {
     }
 
     #[test]
-    fn unknown_create_element_returns_null() {
+    fn get_elements_by_tag_name_returns_document_order_snapshots() {
         let (mut dom, mut ps) = page(
-            r#"<html><body><p>x</p><script>
-                window.u = document.createElement("frobnicate");
+            r#"<html><head><link rel="a"></head><body><link rel="b"><p>x</p><script>
+                var links = document.getElementsByTagName("link");
+                window.n = links.length;
+                window.first = links[0].rel;
+                window.second = links[1].rel;
+                window.any = document.getElementsByTagName("*").length;
             </script></body></html>"#,
         );
         let _ = ps.run_scripts(&mut dom);
-        assert_eq!(get_global_str(&mut ps, "u"), "null");
+        assert_eq!(get_global_str(&mut ps, "n"), "2");
+        assert_eq!(get_global_str(&mut ps, "first"), "a");
+        assert_eq!(get_global_str(&mut ps, "second"), "b");
+        // "*" = every element (html, head, link, body, link, p, script)
+        assert_eq!(get_global_str(&mut ps, "any"), "7");
+    }
+
+    /// The shape a module-preload helper uses: scan existing links, create a
+    /// new <link>, reflect props onto attributes, append it to document.head.
+    #[test]
+    fn document_head_accepts_a_created_link_with_reflected_props() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="out">x</p><script>
+                var before = document.getElementsByTagName("link").length;
+                var link = document.createElement("link");
+                link.rel = "modulepreload";
+                link.as = "script";
+                link.crossOrigin = "";
+                link.href = "/app/dep.js";
+                link.nonce = "abc";
+                document.head.appendChild(link);
+                window.before = before;
+                window.after = document.getElementsByTagName("link").length;
+                window.href = link.href;
+                window.rel = link.rel;
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert!(turn.dirty, "attribute writes must re-layout");
+        assert_eq!(get_global_str(&mut ps, "before"), "0");
+        assert_eq!(get_global_str(&mut ps, "after"), "1");
+        assert_eq!(get_global_str(&mut ps, "href"), "/app/dep.js");
+        assert_eq!(get_global_str(&mut ps, "rel"), "modulepreload");
+        let links = query_all_dom(&dom, "link");
+        assert_eq!(links.len(), 1);
+        let link = links[0];
+        assert_eq!(dom.attr(link, "rel"), Some("modulepreload"));
+        assert_eq!(dom.attr(link, "as"), Some("script"));
+        assert_eq!(dom.attr(link, "crossorigin"), Some(""));
+        assert_eq!(dom.attr(link, "href"), Some("/app/dep.js"));
+        assert_eq!(dom.attr(link, "nonce"), Some("abc"));
+        // the missing <head> was synthesized under <html> and parents the link
+        let head = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "head")
+            .expect("head synthesized");
+        assert_eq!(dom.nodes[link as usize].parent, head);
+    }
+
+    /// Reflected props keep the pre-existing `className`/`id` behaviour but
+    /// now live against the arena (writes were previously wrapper-only).
+    #[test]
+    fn reflected_class_name_and_id_write_attributes() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="r"></div><script>
+                var el = document.getElementById("r");
+                el.className = "alpha beta";
+                el.id = "renamed";
+                el.title = "tip";
+                window.read = el.className + "/" + el.id + "/" + el.title;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        let el = query_all_dom(&dom, "div")[0];
+        assert_eq!(dom.attr(el, "class"), Some("alpha beta"));
+        assert_eq!(dom.attr(el, "id"), Some("renamed"));
+        assert_eq!(dom.attr(el, "title"), Some("tip"));
+        assert_eq!(get_global_str(&mut ps, "read"), "alpha beta/renamed/tip");
+    }
+
+    #[test]
+    fn create_element_accepts_tags_absent_from_the_document() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p>x</p><script>
+                window.u = document.createElement("frobnicate");
+                window.tag = window.u.tagName;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "tag"), "FROBNICATE");
+        let made = query_all_dom(&dom, "frobnicate");
+        assert_eq!(made.len(), 1);
+        // orphan until appended
+        assert_eq!(dom.nodes[0].children.contains(&made[0]), false);
     }
 
     // ---- js-event-loop wave: scheduler, event objects, natives ----

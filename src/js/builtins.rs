@@ -89,6 +89,21 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&object), "create", Val::Native(cr));
     let opn = e.register_native("Object.getOwnPropertyNames", n_object, O_PROP_NAMES);
     obj_set_own(own(&object), "getOwnPropertyNames", Val::Native(opn));
+    let fe = e.register_native("Object.fromEntries", n_object, O_FROM_ENTRIES);
+    obj_set_own(own(&object), "fromEntries", Val::Native(fe));
+    for (name, idx) in [
+        ("freeze", O_FREEZE),
+        ("seal", O_SEAL),
+        ("is", O_IS),
+        ("isFrozen", O_IS_FROZEN),
+        ("isSealed", O_IS_SEALED),
+        ("hasOwn", O_HAS_OWN),
+        ("getOwnPropertyDescriptor", O_GET_DESC),
+        ("getOwnPropertyDescriptors", O_GET_DESCS),
+    ] {
+        let id = e.register_native(&format!("Object.{name}"), n_object, idx);
+        obj_set_own(own(&object), name, Val::Native(id));
+    }
     e.set_global("Object", object.clone());
 
     // Object.prototype + Array.prototype chain
@@ -129,6 +144,8 @@ pub(crate) fn install(e: &mut JsEngine) {
         "reduce",
         "some",
         "every",
+        "sort",
+        "reverse",
     ]
     .iter()
     .enumerate()
@@ -250,6 +267,163 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_native_prop(upc, "prototype", params_proto.clone());
     e.set_global("URLSearchParams", Val::Native(upc));
     e.params_proto = Some(own(&params_proto).clone());
+
+    // -- Set / Map ---------------------------------------------------------
+    // Prototype-based constructors like URL above: the payload rides in a
+    // hidden own property (`__set` / `__map`), methods live on the shared
+    // prototype, and `instanceof` matches `.prototype` through the chain.
+    // shortcut: no iterator protocol — `values()`/`keys()`/`entries()` return
+    // plain arrays, and the hidden payload prop is visible to `Object.keys`
+    // and JSON.stringify (a real Set serializes to `{}`).
+    let set_proto = Val::new_object();
+    for (i, name) in [
+        "add", "has", "delete", "clear", "forEach", "values", "keys", "entries",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = e.register_native(&format!("Set.prototype.{name}"), n_set, i as u16);
+        obj_set_own(own(&set_proto), name, Val::Native(id));
+    }
+    let set_size = e.register_native("get Set.prototype.size", n_set, SET_SIZE);
+    obj_set_own(
+        own(&set_proto),
+        "size",
+        Val::Acc(Rc::new(AccEntry {
+            getter: Some(Val::Native(set_size)),
+            setter: None,
+        })),
+    );
+    let sc = e.register_native("Set", n_set_ctor, 0);
+    e.set_native_prop(sc, "prototype", set_proto.clone());
+    e.set_global("Set", Val::Native(sc));
+    e.set_proto = Some(own(&set_proto).clone());
+
+    let map_proto = Val::new_object();
+    for (i, name) in [
+        "get", "set", "has", "delete", "clear", "forEach", "keys", "values", "entries",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = e.register_native(&format!("Map.prototype.{name}"), n_map, i as u16);
+        obj_set_own(own(&map_proto), name, Val::Native(id));
+    }
+    let map_size = e.register_native("get Map.prototype.size", n_map, MAP_SIZE);
+    obj_set_own(
+        own(&map_proto),
+        "size",
+        Val::Acc(Rc::new(AccEntry {
+            getter: Some(Val::Native(map_size)),
+            setter: None,
+        })),
+    );
+    let mc = e.register_native("Map", n_map_ctor, 0);
+    e.set_native_prop(mc, "prototype", map_proto.clone());
+    e.set_global("Map", Val::Native(mc));
+    e.map_proto = Some(own(&map_proto).clone());
+
+    // -- Symbol ------------------------------------------------------------
+    // shortcut: a symbol is a unique plain object carrying a hidden
+    // `__symbol` description. Identity comparisons (`===`) and use as a
+    // computed property key work because the engine stringifies it as
+    // `Symbol(desc)`; there is no real primitive symbol type.
+    let sym = e.register_native("Symbol", n_symbol, 0);
+    for name in ["iterator", "asyncIterator", "toStringTag", "hasInstance"] {
+        let s = new_symbol(name);
+        e.set_native_prop(sym, name, s);
+    }
+    e.set_global("Symbol", Val::Native(sym));
+
+    // -- WeakMap / WeakSet --------------------------------------------------
+    // shortcut: same hidden `__map`/`__set` payload as Map/Set (identity
+    // comparison, no weak semantics, keys need not be objects).
+    let wm_proto = Val::new_object();
+    for (i, name) in ["get", "set", "has", "delete"].iter().enumerate() {
+        let id = e.register_native(&format!("WeakMap.prototype.{name}"), n_map, i as u16);
+        obj_set_own(own(&wm_proto), name, Val::Native(id));
+    }
+    let wmc = e.register_native("WeakMap", n_weakmap_ctor, 0);
+    e.set_native_prop(wmc, "prototype", wm_proto.clone());
+    e.set_global("WeakMap", Val::Native(wmc));
+    e.weakmap_proto = Some(own(&wm_proto).clone());
+
+    let ws_proto = Val::new_object();
+    for (i, name) in ["add", "has", "delete"].iter().enumerate() {
+        let id = e.register_native(&format!("WeakSet.prototype.{name}"), n_set, i as u16);
+        obj_set_own(own(&ws_proto), name, Val::Native(id));
+    }
+    let wsc = e.register_native("WeakSet", n_weakset_ctor, 0);
+    e.set_native_prop(wsc, "prototype", ws_proto.clone());
+    e.set_global("WeakSet", Val::Native(wsc));
+    e.weakset_proto = Some(own(&ws_proto).clone());
+
+    // -- TextEncoder / TextDecoder -----------------------------------------
+    // shortcut: UTF-8 only (the default), no `stream`/`ignoreBOM` options.
+    // `encode` returns a plain array of byte values (no TypedArray type).
+    let te_proto = Val::new_object();
+    let te_enc = e.register_native("TextEncoder.prototype.encode", n_text, 0);
+    obj_set_own(own(&te_proto), "encode", Val::Native(te_enc));
+    let tec = e.register_native("TextEncoder", n_text_ctor, 0);
+    e.set_native_prop(tec, "prototype", te_proto.clone());
+    e.set_global("TextEncoder", Val::Native(tec));
+    e.text_encoder_proto = Some(own(&te_proto).clone());
+
+    let td_proto = Val::new_object();
+    let td_dec = e.register_native("TextDecoder.prototype.decode", n_text, 1);
+    obj_set_own(own(&td_proto), "decode", Val::Native(td_dec));
+    obj_set_own(own(&td_proto), "encoding", Val::Str(Rc::from("utf-8")));
+    let tdc = e.register_native("TextDecoder", n_text_ctor, 1);
+    e.set_native_prop(tdc, "prototype", td_proto.clone());
+    e.set_global("TextDecoder", Val::Native(tdc));
+    e.text_decoder_proto = Some(own(&td_proto).clone());
+
+    // -- base64 + Uint8Array/Buffer stand-ins -------------------------------
+    // shortcut: a "typed array" is a plain JS array of byte values with
+    // `toBase64`/`buffer`/`byteLength` own props; there is no ArrayBuffer
+    // type and no element-size coercion beyond `& 0xff`.
+    let u8_to_b64 = e.register_native("Uint8Array.prototype.toBase64", n_u8, 0);
+    let u8_from_b64 = e.register_native("Uint8Array.fromBase64", n_u8, 1);
+    e.uint8_to_b64 = u8_to_b64;
+    let u8_proto = Val::new_object();
+    let u8c = e.register_native("Uint8Array", n_u8_ctor, 0);
+    e.set_native_prop(u8c, "prototype", u8_proto);
+    e.set_native_prop(u8c, "fromBase64", Val::Native(u8_from_b64));
+    e.set_global("Uint8Array", Val::Native(u8c));
+
+    let buf_to_string = e.register_native("Buffer.prototype.toString", n_buffer, 0);
+    e.buffer_to_string = buf_to_string;
+    let buf_from = e.register_native("Buffer.from", n_buffer, 1);
+    let buf = Val::new_object();
+    obj_set_own(own(&buf), "from", Val::Native(buf_from));
+    e.set_global("Buffer", buf);
+
+    let atob_id = e.register_native("atob", n_b64_global, 0);
+    let btoa_id = e.register_native("btoa", n_b64_global, 1);
+    e.set_global("atob", Val::Native(atob_id));
+    e.set_global("btoa", Val::Native(btoa_id));
+
+    // -- ArrayBuffer / SharedArrayBuffer ------------------------------------
+    // shortcut: a byteLength-bearing shell; no real backing store. The
+    // accessor exists so `Object.getOwnPropertyDescriptor(...).get` works.
+    let ab_len = e.register_native("get ArrayBuffer.prototype.byteLength", n_ab, 0);
+    let ab_proto = Val::new_object();
+    obj_set_own(
+        own(&ab_proto),
+        "byteLength",
+        Val::Acc(Rc::new(AccEntry {
+            getter: Some(Val::Native(ab_len)),
+            setter: None,
+        })),
+    );
+    let ab_ctor = e.register_native("ArrayBuffer", n_ab, 1);
+    e.set_native_prop(ab_ctor, "prototype", ab_proto.clone());
+    let ab_view = e.register_native("ArrayBuffer.isView", n_ab, 2);
+    e.set_native_prop(ab_ctor, "isView", Val::Native(ab_view));
+    e.set_global("ArrayBuffer", Val::Native(ab_ctor));
+    e.set_global("SharedArrayBuffer", Val::Native(ab_ctor));
+    e.arraybuffer_proto = Some(own(&ab_proto).clone());
+
 
     // -- global aliases ----------------------------------------------------
     let g = Val::Obj(e.global_obj.clone());
@@ -647,6 +821,15 @@ const O_SET_PROTO: u16 = 5;
 const O_GET_PROTO: u16 = 6;
 const O_CREATE: u16 = 7;
 const O_PROP_NAMES: u16 = 8;
+const O_FROM_ENTRIES: u16 = 9;
+const O_FREEZE: u16 = 10;
+const O_SEAL: u16 = 11;
+const O_IS: u16 = 12;
+const O_IS_FROZEN: u16 = 13;
+const O_IS_SEALED: u16 = 14;
+const O_HAS_OWN: u16 = 15;
+const O_GET_DESC: u16 = 16;
+const O_GET_DESCS: u16 = 17;
 
 fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
@@ -774,6 +957,98 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 _ => Val::Null,
             })
         }
+        O_FROM_ENTRIES => {
+            // Object.fromEntries(iterable of [key, value] pairs). The engine
+            // has no generic iterators, so arrays of 2-item arrays are the
+            // accepted shape (what `new Map(...)`-free code and Vite's
+            // `Object.entries(...).map(...)` produce).
+            let src = args.first().cloned().unwrap_or(Val::Undefined);
+            let pairs: Vec<Val> = match &src {
+                Val::Obj(o) => match &o.borrow().kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let out = Val::new_object();
+            for pair in pairs {
+                let pair = match &pair {
+                    Val::Obj(o) => match &o.borrow().kind {
+                        ObjKind::Array(items) if items.len() >= 2 => {
+                            (items[0].to_string(), items[1].clone())
+                        }
+                        _ => {
+                            return Err(JsError::throw(
+                                "TypeError: Object.fromEntries entry is not a [key, value] pair",
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(JsError::throw(
+                            "TypeError: Object.fromEntries entry is not a [key, value] pair",
+                        ))
+                    }
+                };
+                set_member(e, &out, &pair.0, pair.1)?;
+            }
+            Ok(out)
+        }
+        O_FREEZE | O_SEAL => {
+            // shortcut: no integrity levels — freeze/seal are identity
+            Ok(args.first().cloned().unwrap_or(Val::Undefined))
+        }
+        O_IS => {
+            // SameValue: NaN equals NaN, +0 differs from -0
+            let (a, b) = (
+                args.first().cloned().unwrap_or(Val::Undefined),
+                args.get(1).cloned().unwrap_or(Val::Undefined),
+            );
+            let same = match (&a, &b) {
+                (Val::Num(x), Val::Num(y)) => {
+                    (x.is_nan() && y.is_nan()) || (x == y && x.is_sign_negative() == y.is_sign_negative())
+                }
+                _ => strict_eq(&a, &b),
+            };
+            Ok(Val::Bool(same))
+        }
+        O_IS_FROZEN | O_IS_SEALED => Ok(Val::Bool(!matches!(
+            args.first(),
+            Some(Val::Obj(_))
+        ))),
+        O_HAS_OWN => {
+            let o = args.first().cloned().unwrap_or(Val::Undefined);
+            let k = arg_str(args, 1);
+            Ok(Val::Bool(match &o {
+                Val::Obj(b) => obj_has_own(b, &k),
+                _ => false,
+            }))
+        }
+        O_GET_DESC => {
+            let o = args.first().cloned().unwrap_or(Val::Undefined);
+            let k = arg_str(args, 1);
+            Ok(match &o {
+                Val::Obj(b) => own_desc(b, &k).unwrap_or(Val::Undefined),
+                _ => Val::Undefined,
+            })
+        }
+        O_GET_DESCS => {
+            let o = args.first().cloned().unwrap_or(Val::Undefined);
+            let out = Val::new_object();
+            if let Val::Obj(b) = &o {
+                let keys: Vec<Rc<str>> = match &b.borrow().kind {
+                    ObjKind::Array(items) => (0..items.len())
+                        .map(|i| Rc::from(i.to_string().as_str()))
+                        .collect(),
+                    _ => b.borrow().props.iter().map(|(k, _)| k.clone()).collect(),
+                };
+                for k in keys {
+                    if let Some(d) = own_desc(b, &k) {
+                        set_member(e, &out, &k, d)?;
+                    }
+                }
+            }
+            Ok(out)
+        }
         O_CREATE => {
             // shortcut: a `null` prototype is stored as "not attached yet", so
             // the new object still picks up Object.prototype on first access
@@ -858,10 +1133,68 @@ const A_FOREACH: u16 = 11;
 const A_REDUCE: u16 = 12;
 const A_SOME: u16 = 13;
 const A_EVERY: u16 = 14;
+const A_SORT: u16 = 15;
+const A_REVERSE: u16 = 16;
 const A_ISARRAY: u16 = 100;
 
-fn need_array(this: &Val) -> Result<Rc<RefCell<Obj>>, JsError> {
-    match this {
+/// Own-property check that also understands array indices/length.
+fn obj_has_own(o: &Rc<RefCell<Obj>>, key: &str) -> bool {
+    let b = o.borrow();
+    if let ObjKind::Array(items) = &b.kind {
+        if key == "length" {
+            return true;
+        }
+        if let Ok(i) = key.parse::<usize>() {
+            return i < items.len();
+        }
+    }
+    b.props.iter().any(|(k, _)| k.as_ref() == key)
+}
+
+/// `Object.getOwnPropertyDescriptor` shape: data properties always report
+/// writable/enumerable/configurable (the engine tracks none of those).
+fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
+    let b = o.borrow();
+    let v = if let ObjKind::Array(items) = &b.kind {
+        if key == "length" {
+            Some(Val::Num(items.len() as f64))
+        } else {
+            key.parse::<usize>().ok().and_then(|i| items.get(i).cloned())
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        b.props
+            .iter()
+            .find(|(k, _)| k.as_ref() == key)
+            .map(|(_, v)| v.clone())
+    })?;
+    let d = Val::new_object();
+    match v {
+        Val::Acc(a) => {
+            obj_set_own(
+                own(&d),
+                "get",
+                a.getter.clone().unwrap_or(Val::Undefined),
+            );
+            obj_set_own(
+                own(&d),
+                "set",
+                a.setter.clone().unwrap_or(Val::Undefined),
+            );
+        }
+        other => {
+            obj_set_own(own(&d), "value", other);
+            obj_set_own(own(&d), "writable", Val::Bool(true));
+        }
+    }
+    obj_set_own(own(&d), "enumerable", Val::Bool(true));
+    obj_set_own(own(&d), "configurable", Val::Bool(true));
+    Some(d)
+}
+
+fn need_array(this: &Val) -> Result<Rc<RefCell<Obj>>, JsError> {    match this {
         Val::Obj(o) => {
             if matches!(o.borrow().kind, ObjKind::Array(_)) {
                 Ok(o.clone())
@@ -1058,6 +1391,50 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                 A_EVERY => Val::Bool(true),
                 _ => Val::Undefined,
             }
+        }
+        A_SORT => {
+            // default: lexicographic by string; with a comparator, a stable
+            // insertion sort (bounded by typical script array sizes)
+            let mut items = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                }
+            };
+            match args.first() {
+                Some(cmp) if !matches!(cmp, Val::Undefined) => {
+                    let cmp = cmp.clone();
+                    let mut out: Vec<Val> = Vec::with_capacity(items.len());
+                    for it in items.drain(..) {
+                        let mut pos = out.len();
+                        for i in 0..out.len() {
+                            let r = e.call(
+                                cmp.clone(),
+                                Val::Undefined,
+                                vec![it.clone(), out[i].clone()],
+                            )?;
+                            if r.to_number() < 0.0 {
+                                pos = i;
+                                break;
+                            }
+                        }
+                        out.insert(pos, it);
+                    }
+                    items = out;
+                }
+                _ => items.sort_by(|a, b| a.to_string().cmp(&b.to_string())),
+            }
+            if let ObjKind::Array(slot) = &mut o.borrow_mut().kind {
+                *slot = items;
+            }
+            Val::Obj(o.clone())
+        }
+        A_REVERSE => {
+            if let ObjKind::Array(slot) = &mut o.borrow_mut().kind {
+                slot.reverse();
+            }
+            Val::Obj(o.clone())
         }
         A_REDUCE => {
             let f = args.first().cloned().unwrap_or(Val::Undefined);
@@ -1915,5 +2292,456 @@ fn n_params(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val,
                 .collect(),
         )),
         _ => Ok(Val::Undefined),
+    }
+}
+
+// -- Set / Map methods ------------------------------------------------------
+// Payload helpers: the hidden `__set` array / `__map` array-of-pairs lives as
+// an own prop on the instance (see the install block above).
+
+const SET_SIZE: u16 = 8;
+const MAP_SIZE: u16 = 9;
+
+fn set_items(this: &Val) -> Result<Vec<Val>, JsError> {
+    if let Val::Obj(o) = this {
+        if let Val::Obj(a) = obj_get_own(o, "__set") {
+            if let ObjKind::Array(items) = &a.borrow().kind {
+                return Ok(items.clone());
+            }
+        }
+    }
+    Err(JsError::throw("TypeError: Set method called on incompatible receiver"))
+}
+
+fn set_store(this: &Val, items: Vec<Val>) {
+    if let Val::Obj(o) = this {
+        obj_set_own(o, "__set", Val::new_array(items));
+    }
+}
+
+fn map_pairs(this: &Val) -> Result<Vec<(Val, Val)>, JsError> {
+    if let Val::Obj(o) = this {
+        if let Val::Obj(a) = obj_get_own(o, "__map") {
+            if let ObjKind::Array(entries) = &a.borrow().kind {
+                return entries
+                    .iter()
+                    .map(|e| match e {
+                        Val::Obj(p) => match &p.borrow().kind {
+                            ObjKind::Array(kv) if kv.len() >= 2 => Ok((kv[0].clone(), kv[1].clone())),
+                            _ => Err(JsError::throw("TypeError: corrupt Map entry")),
+                        },
+                        _ => Err(JsError::throw("TypeError: corrupt Map entry")),
+                    })
+                    .collect();
+            }
+        }
+    }
+    Err(JsError::throw("TypeError: Map method called on incompatible receiver"))
+}
+
+fn map_store(this: &Val, pairs: Vec<(Val, Val)>) {
+    if let Val::Obj(o) = this {
+        obj_set_own(
+            o,
+            "__map",
+            Val::new_array(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| Val::new_array(vec![k, v]))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+// -- Symbol ----------------------------------------------------------------
+
+/// A unique symbol stand-in: plain object + hidden `__symbol` description.
+fn new_symbol(desc: &str) -> Val {
+    let o = Val::new_object();
+    obj_set_own(own(&o), "__symbol", Val::Str(Rc::from(desc)));
+    o
+}
+
+fn n_symbol(e: &mut JsEngine, _idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if is_ctor_call(e, this) {
+        return Err(JsError::throw("TypeError: Symbol is not a constructor"));
+    }
+    Ok(new_symbol(&arg_str(args, 0)))
+}
+
+// -- base64 ----------------------------------------------------------------
+
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue, // padding, whitespace, garbage
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// Byte view of a typed-array stand-in (plain array or string).
+fn u8_bytes(v: &Val) -> Vec<u8> {
+    match v {
+        Val::Obj(o) => match &o.borrow().kind {
+            ObjKind::Array(items) => items
+                .iter()
+                .map(|x| (x.to_number() as i64 & 0xff) as u8)
+                .collect(),
+            _ => Vec::new(),
+        },
+        Val::Str(s) => s.as_bytes().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn u8_value(e: &JsEngine, bytes: Vec<u8>) -> Val {
+    let len = bytes.len();
+    let arr = Val::new_array(bytes.into_iter().map(|b| Val::Num(b as f64)).collect());
+    if let Val::Obj(o) = &arr {
+        obj_set_own(o, "toBase64", Val::Native(e.uint8_to_b64));
+        obj_set_own(o, "byteLength", Val::Num(len as f64));
+        let buf = Val::new_object();
+        obj_set_own(own(&buf), "byteLength", Val::Num(len as f64));
+        obj_set_own(o, "buffer", buf);
+    }
+    arr
+}
+
+fn n_u8_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let bytes = match args.first() {
+        Some(Val::Num(n)) => vec![0u8; (*n as i64).clamp(0, 1 << 24) as usize],
+        Some(v) => u8_bytes(v),
+        None => Vec::new(),
+    };
+    Ok(u8_value(e, bytes))
+}
+
+fn n_u8(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        0 => Ok(Val::Str(Rc::from(b64_encode(&u8_bytes(this)).as_str()))),
+        _ => Ok(u8_value(e, b64_decode(&arg_str(args, 0)))),
+    }
+}
+
+fn n_buffer(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == 1 {
+        // Buffer.from(str)
+        let s = arg_str(args, 0);
+        let o = Val::new_object();
+        obj_set_own(own(&o), "__buf", Val::Str(Rc::from(s.as_str())));
+        obj_set_own(own(&o), "toString", Val::Native(e.buffer_to_string));
+        return Ok(o);
+    }
+    let s = match this {
+        Val::Obj(o) => match o.borrow().props.iter().find(|(k, _)| &**k == "__buf") {
+            Some((_, Val::Str(s))) => s.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    let out = if arg_str(args, 0) == "base64" {
+        b64_encode(s.as_bytes())
+    } else {
+        s
+    };
+    Ok(Val::Str(Rc::from(out.as_str())))
+}
+
+fn n_b64_global(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let s = arg_str(args, 0);
+    if idx == 0 {
+        Ok(Val::Str(Rc::from(
+            String::from_utf8_lossy(&b64_decode(&s)).as_ref(),
+        )))
+    } else {
+        Ok(Val::Str(Rc::from(b64_encode(s.as_bytes()).as_str())))
+    }
+}
+
+fn n_ab(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        0 => {
+            let n = match this {
+                Val::Obj(o) => o
+                    .borrow()
+                    .props
+                    .iter()
+                    .find(|(k, _)| &**k == "__ab")
+                    .map(|(_, v)| v.to_number())
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            };
+            Ok(Val::Num(n))
+        }
+        2 => Ok(Val::Bool(false)),
+        _ => {
+            let len = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+            let o = proto_instance(e.arraybuffer_proto.clone());
+            obj_set_own(own(&o), "__ab", Val::Num(len));
+            Ok(o)
+        }
+    }
+}
+
+fn n_text_ctor(e: &mut JsEngine, idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    Ok(proto_instance(if idx == 0 {
+        e.text_encoder_proto.clone()
+    } else {
+        e.text_decoder_proto.clone()
+    }))
+}
+
+fn n_text(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        0 => {
+            // encode(str) -> array of UTF-8 byte values
+            let s = arg_str(args, 0);
+            Ok(Val::new_array(
+                s.as_bytes().iter().map(|b| Val::Num(*b as f64)).collect(),
+            ))
+        }
+        _ => {
+            // decode(bytes) -> string; accepts an array of byte values
+            let v = args.first().cloned().unwrap_or(Val::Undefined);
+            let bytes: Vec<u8> = match &v {
+                Val::Obj(o) => match &o.borrow().kind {
+                    ObjKind::Array(items) => items
+                        .iter()
+                        .map(|x| x.to_number().clamp(0.0, 255.0) as u8)
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                Val::Str(s) => return Ok(Val::Str(s.clone())),
+                _ => Vec::new(),
+            };
+            Ok(Val::Str(Rc::from(String::from_utf8_lossy(&bytes).as_ref())))
+        }
+    }
+}
+
+fn n_weakmap_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let obj = proto_instance(e.weakmap_proto.clone());
+    let pairs = map_entries_from(args.first())?;
+    map_store(&obj, pairs);
+    Ok(obj)
+}
+
+fn n_weakset_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let obj = proto_instance(e.weakset_proto.clone());
+    let mut items: Vec<Val> = Vec::new();
+    if let Some(init) = args.first() {
+        for v in super::interp::for_of_items(init)? {
+            if !items.iter().any(|x| strict_eq(x, &v)) {
+                items.push(v);
+            }
+        }
+    }
+    obj_set_own(own(&obj), "__set", Val::new_array(items));
+    Ok(obj)
+}
+
+fn n_set_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let obj = proto_instance(e.set_proto.clone());
+    let mut items: Vec<Val> = Vec::new();
+    if let Some(init) = args.first() {
+        for v in super::interp::for_of_items(init)? {
+            if !items.iter().any(|x| strict_eq(x, &v)) {
+                items.push(v);
+            }
+        }
+    }
+    obj_set_own(own(&obj), "__set", Val::new_array(items));
+    Ok(obj)
+}
+
+fn n_set(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let mut items = set_items(this)?;
+    match idx {
+        SET_SIZE => Ok(Val::Num(items.len() as f64)),
+        0 => {
+            // add(v)
+            let v = args.first().cloned().unwrap_or(Val::Undefined);
+            if !items.iter().any(|x| strict_eq(x, &v)) {
+                items.push(v);
+                set_store(this, items);
+            }
+            Ok(this.clone())
+        }
+        1 => Ok(Val::Bool(
+            items
+                .iter()
+                .any(|x| strict_eq(x, &args.first().cloned().unwrap_or(Val::Undefined))),
+        )),
+        2 => {
+            // delete(v)
+            let v = args.first().cloned().unwrap_or(Val::Undefined);
+            let before = items.len();
+            items.retain(|x| !strict_eq(x, &v));
+            let removed = items.len() != before;
+            if removed {
+                set_store(this, items);
+            }
+            Ok(Val::Bool(removed))
+        }
+        3 => {
+            set_store(this, Vec::new());
+            Ok(Val::Undefined)
+        }
+        4 => {
+            // forEach(cb[, thisArg]) — cb(value, value, set)
+            let cb = args.first().cloned().unwrap_or(Val::Undefined);
+            let this_arg = args.get(1).cloned().unwrap_or(Val::Undefined);
+            for v in items {
+                e.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    vec![v.clone(), v, this.clone()],
+                )?;
+            }
+            Ok(Val::Undefined)
+        }
+        5 | 6 => Ok(Val::new_array(items)),
+        7 => Ok(Val::new_array(
+            items
+                .into_iter()
+                .map(|v| Val::new_array(vec![v.clone(), v]))
+                .collect(),
+        )),
+        _ => Err(JsError::throw("TypeError: bad Set native")),
+    }
+}
+
+fn n_map_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let obj = proto_instance(e.map_proto.clone());
+    let pairs = map_entries_from(args.first())?;
+    map_store(&obj, pairs);
+    Ok(obj)
+}
+
+/// Entries from a Map/WeakMap iterable argument (`[[k, v], ...]`).
+fn map_entries_from(init: Option<&Val>) -> Result<Vec<(Val, Val)>, JsError> {
+    let mut pairs: Vec<(Val, Val)> = Vec::new();
+    if let Some(init) = init {
+        for entry in super::interp::for_of_items(init)? {
+            let (k, v) = match &entry {
+                Val::Obj(p) => match &p.borrow().kind {
+                    ObjKind::Array(kv) if kv.len() >= 2 => (kv[0].clone(), kv[1].clone()),
+                    _ => {
+                        return Err(JsError::throw(
+                            "TypeError: Map constructor entry is not a [key, value] pair",
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(JsError::throw(
+                        "TypeError: Map constructor entry is not a [key, value] pair",
+                    ))
+                }
+            };
+            match pairs.iter_mut().find(|(old, _)| strict_eq(old, &k)) {
+                Some(slot) => slot.1 = v,
+                None => pairs.push((k, v)),
+            }
+        }
+    }
+    Ok(pairs)
+}
+
+fn n_map(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let mut pairs = map_pairs(this)?;
+    let key = || args.first().cloned().unwrap_or(Val::Undefined);
+    match idx {
+        MAP_SIZE => Ok(Val::Num(pairs.len() as f64)),
+        0 => Ok(match pairs.iter().find(|(k, _)| strict_eq(k, &key())) {
+            Some((_, v)) => v.clone(),
+            None => Val::Undefined,
+        }),
+        1 => {
+            // set(k, v) — updates in place, keeps insertion order
+            let (k, v) = (key(), args.get(1).cloned().unwrap_or(Val::Undefined));
+            match pairs.iter_mut().find(|(old, _)| strict_eq(old, &k)) {
+                Some(slot) => slot.1 = v,
+                None => pairs.push((k, v)),
+            }
+            map_store(this, pairs);
+            Ok(this.clone())
+        }
+        2 => Ok(Val::Bool(pairs.iter().any(|(k, _)| strict_eq(k, &key())))),
+        3 => {
+            let k = key();
+            let before = pairs.len();
+            pairs.retain(|(old, _)| !strict_eq(old, &k));
+            let removed = pairs.len() != before;
+            if removed {
+                map_store(this, pairs);
+            }
+            Ok(Val::Bool(removed))
+        }
+        4 => {
+            map_store(this, Vec::new());
+            Ok(Val::Undefined)
+        }
+        5 => {
+            // forEach(cb[, thisArg]) — cb(value, key, map)
+            let cb = args.first().cloned().unwrap_or(Val::Undefined);
+            let this_arg = args.get(1).cloned().unwrap_or(Val::Undefined);
+            for (k, v) in pairs {
+                e.call(cb.clone(), this_arg.clone(), vec![v, k, this.clone()])?;
+            }
+            Ok(Val::Undefined)
+        }
+        6 => Ok(Val::new_array(pairs.into_iter().map(|(k, _)| k).collect())),
+        7 => Ok(Val::new_array(pairs.into_iter().map(|(_, v)| v).collect())),
+        8 => Ok(Val::new_array(
+            pairs
+                .into_iter()
+                .map(|(k, v)| Val::new_array(vec![k, v]))
+                .collect(),
+        )),
+        _ => Err(JsError::throw("TypeError: bad Map native")),
     }
 }

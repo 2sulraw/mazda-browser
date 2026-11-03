@@ -1,7 +1,9 @@
 //! Generator execution: a small resumable walker over the body shapes the
 //! parser accepts for generators (the parser restricts `yield` to a whole
 //! expression statement `yield v;` or a declarator initializer
-//! `let x = yield v`, and rejects try/catch-with-yield and async generators).
+//! `let x = yield v`, and rejects try/catch-with-yield; async generators
+//! use the same walker and run `await` blocking (yields are plain values,
+//! no promise wrapping — honest gap: `for await` is not implemented).
 //!
 //! # Design
 //! A `GenVm` holds an explicit frame stack (`GFrame`). `.next()` resumes by
@@ -763,9 +765,11 @@ fn step_stmt(
                 };
                 Ok(SStep::Yield(v))
             } else {
-                // parser guarantees the only yield-bearing expression
-                // statement is a plain `yield`
-                unreachable!("nested yield leaked past the parser")
+                // sync generators reject this at parse time; async
+                // generators defer it to call time (see parser docs)
+                return Err(JsError::throw(
+                    "TypeError: yield in this expression position is not supported by the resumable walker",
+                ));
             }
         }
         parser::StmtKind::VarDecl(kind, ds) => Ok(SStep::Decls {
@@ -896,8 +900,10 @@ fn step_stmt(
             });
             Ok(SStep::Pushed)
         }
-        // try-with-yield is a parse error; anything else with yield is
-        // rejected at parse time as well
-        _ => unreachable!("yield-bearing statement not in the walker's grammar"),
+        // try-with-yield is a parse error for sync generators; async
+        // generators reach here only at call time (honest error, no panic)
+        _ => Err(JsError::throw(
+            "TypeError: yield in this statement position is not supported by the resumable walker",
+        )),
     }
 }

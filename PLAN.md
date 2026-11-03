@@ -1445,6 +1445,71 @@ curve matters more than the baseline (near-flat as tabs grow).
   error); Wikipedia `JavaScript` 96.9 MB / 11404 runs with the same
   `match` error (99.4 MB on the first run, the known load-time noise) - no
   RAM or layout regression.
+  **(aa) DOM surface + modern JS gaps (svelte.dev boot chain)** - the Vite
+  preload helper and the Svelte entry chunk asked for a batch of standard
+  library surface; svelte.dev now boots all the way through and paints:
+  - DOM: `document.getElementsByTagName` (one `by_tag` walk in the host,
+    `"*"` = every element), `document.head` (synthesizes a `<head>` when the
+    parsed tree has none), `createElement` interns any tag on demand
+    (`Dom::tag_id` is now public), and a 15-entry reflected-attribute table
+    installs live `id`/`className`/`href`/`src`/`rel`/`type`/`name`/`value`/
+    `title`/`alt`/`width`/`height` accessors on every wrapper, so
+    `link.rel = "stylesheet"` reaches the attribute.
+  - `Object`: `fromEntries` (arrays of `[k, v]` pairs), `freeze`/`seal`
+    (identity), `is` (SameValue), `isFrozen`/`isSealed`, `hasOwn`,
+    `getOwnPropertyDescriptor(s)` with a real `get` slot for accessor
+    properties — enough for `Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype, "byteLength").get`.
+  - Collections: `Set`/`Map` plus `WeakMap`/`WeakSet`, all prototype-based
+    with a hidden own payload (`__set`/`__map`) and a `size` accessor, so
+    `instanceof` and `for…of` work through the prototype chain;
+    `for_of_items` iterates the hidden payloads.
+  - `Array.prototype.sort` (default lexicographic, stable insertion sort
+    with a comparator) and `reverse`.
+  - `Symbol` builtin (`iterator`/`asyncIterator`/`toStringTag`/
+    `hasInstance` statics); `typeof` returns `"symbol"` and the value
+    stringifies as `Symbol(desc)`.
+  - `TextEncoder`/`TextDecoder` (UTF-8 round trip), `atob`/`btoa`, a
+    `Uint8Array` stand-in (`toBase64`, `fromBase64`, `buffer`,
+    `byteLength`), `Buffer.from(...).toString("base64")`, and
+    `ArrayBuffer`/`SharedArrayBuffer` shells whose `byteLength` is a real
+    accessor.
+  - Parser: `async function*` (statement and expression), object-literal
+    `async m(){}` / `async *m(){}` / `*m(){}`, `for await` (accepted as
+    plain `for…of`), and `in` on function objects. The generator walker's
+    `unreachable!` yield positions are now honest call-time TypeErrors.
+  Honest shortcuts: symbols are unique objects with a hidden `__symbol`
+  prop rather than a primitive (usable as computed keys via their
+  `Symbol(desc)` text); typed arrays are plain arrays of byte values with
+  no element-type coercion or ArrayBuffer backing; `Object.freeze`/`seal`
+  do not record integrity levels; collection methods return arrays instead
+  of iterator objects and their hidden payload is enumerable;
+  `Object.fromEntries` accepts only array pairs; async generators run on
+  the existing blocking `await` walker, so an unsupported yield position
+  fails at call time instead of parse time; `for await` is `for…of`.
+  Tests (674 default / 678 with `engine-b woff2`):
+  `document_get_elements_by_tag_name_returns_descendants`,
+  `document_head_is_synthesized_when_missing`,
+  `reflected_properties_write_attributes`,
+  `object_from_entries_builds_objects`,
+  `object_from_entries_rejects_non_pairs`,
+  `set_builtin_dedupes_and_iterates`,
+  `map_builtin_holds_key_value_pairs`,
+  `weak_collections_store_by_identity`,
+  `symbol_builtin_is_unique_and_usable_as_a_key`,
+  `array_sort_and_reverse`,
+  `arraybuffer_byte_length_accessor`,
+  `object_integrity_and_descriptor_helpers`,
+  `text_encoder_decoder_round_trip`,
+  `base64_and_typed_array_stand_ins`,
+  `async_and_generator_object_method_shorthand`,
+  `async_generator_functions_parse_and_suspend_like_generators`,
+  `async_generator_parsing_and_for_await`.
+  Live: svelte.dev 92.8 MB / 291 runs with a clean render (logo, hero
+  conveyor image, hero copy, GET STARTED, footer) and no `[js]` failure;
+  MDN `/Web/JavaScript/.../Array` 89.8 MB / 7776 runs and Wikipedia
+  `/wiki/Web_browser` 92.4 MB / 5507 runs both keep their pre-existing
+  bundle errors and their layouts.
   **(z) next** - BigInt literals, `new.target`, `for await`, top-level
   `await`, import assertions, live module bindings, computed class
   accessors, class static blocks, canvas 2d context, and the Vite preload
@@ -1597,6 +1662,9 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 19 (dynamic import) | MDN `/Web/CSS/list-style-type` | 87.3 MB (2773 runs; same pre-existing bundle `length` error) |
 | 2026-11-03 | wave 19 (dynamic import) | Wikipedia `/wiki/JavaScript` | 96.9 MB (11404 runs; 99.4 MB on the first run, known load-time noise; same `match` error) |
 | 2026-11-03 | wave 19 (dynamic import) | local ESM probe (2 modules, nested + awaited imports) | 65.2 MB (1 run; `await import()` resumes inside an async arrow, module-relative specifiers resolve, the reaction's DOM write paints) |
+| 2026-11-03 | wave 20 (DOM surface + stdlib) | svelte.dev | 92.8 MB (291 runs; full render — logo, hero image, hero copy, GET STARTED, footer — and no `[js]` failure) |
+| 2026-11-03 | wave 20 (DOM surface + stdlib) | MDN `/Web/JavaScript/.../Array` | 89.8 MB (7776 runs; same pre-existing bundle `length` error, layout unchanged) |
+| 2026-11-03 | wave 20 (DOM surface + stdlib) | Wikipedia `/wiki/Web_browser` | 92.4 MB (5507 runs; same pre-existing inline `match` error, layout unchanged) |
 
 ### Phase 1c (Track A) findings
 
