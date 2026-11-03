@@ -9,6 +9,11 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_S
 
 [dependencies]
 ureq = "2"
+# TLS is rustls (already in the tree through ureq). It is a DIRECT dependency
+# so `net.rs` can order the ClientHello the way Chrome does; ureq still owns
+# the socket, proxies and HTTP/1.1 framing.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
 ab_glyph = "0.2.32"
 url = "2.5.8"
 encoding_rs = "0.8.42"

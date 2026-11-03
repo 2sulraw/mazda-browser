@@ -1146,6 +1146,54 @@ fn build_into(
                     out.push(g);
                     continue;
                 }
+                // <video>/<audio>: the media tier is gated (wave 28 ships the
+                // EME/playback fail-fast, not a decoder). A truthful
+                // placeholder beats the old empty hole; `poster` reuses the
+                // shared image pipeline, so a video that declares one still
+                // shows its frame.
+                if tag == "video" || tag == "audio" {
+                    let mut g = BoxNode::group(outcome.style, outcome.bx);
+                    g.node = Some(child);
+                    g.bx.cursor = cur;
+                    // UA replaced-element size (video 300x150, audio 300x32)
+                    let (dw, dh) = if tag == "video" {
+                        (300.0, 150.0)
+                    } else {
+                        (300.0, 32.0)
+                    };
+                    if g.bx.width.is_none() {
+                        g.bx.width = Some(Len::Px(dw));
+                    }
+                    // block boxes in this engine take their height from
+                    // content, so a declared/UA height becomes a min-height
+                    // floor (the `<button>` chrome uses the same idiom)
+                    if g.bx.min_height.is_none() {
+                        g.bx.min_height = Some(g.bx.height.unwrap_or(Len::Px(dh)));
+                    }
+                    let poster = dom.attr(child, "poster").filter(|p| !p.trim().is_empty());
+                    match poster {
+                        Some(p) => g.img = Some(ImgSlot::Pending(std::rc::Rc::from(p))),
+                        None => {
+                            let mut l = BoxNode::leaf(
+                                outcome.style,
+                                "[media] playback not supported".into(),
+                                false,
+                                child_link.clone(),
+                            );
+                            l.node = Some(child);
+                            l.bx.cursor = cur;
+                            g.children.push(l);
+                        }
+                    }
+                    // shortcut: the spec makes video/audio inline-level
+                    // replaced elements, but our inline flow sizes a box from
+                    // its text child and ignores the declared replaced height.
+                    // Sites almost always style video block anyway, so box it
+                    // block and let the UA/author height apply.
+                    g.inline = false;
+                    out.push(g);
+                    continue;
+                }
                 // <button> is a real CONTAINER, not a leaf control: its
                 // children (an icon <svg>, styled <span>s, an <img>) lay out
                 // inside it like any other element. Flattening them into one
@@ -10270,6 +10318,32 @@ line</textarea></div>"#,
         let d = &root.children[0].children[0];
         assert_eq!(d.w, 300.0, "details fills its container, not max-content");
         assert!(!d.inline, "details is block-level");
+    }
+
+    #[test]
+    fn video_and_audio_render_a_truthful_placeholder() {
+        let mut root = boxes_of(
+            r#"<div><video id="v"></video><audio id="a"></audio><video id="p" poster="/frame.png"></video></div>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let div = &root.children[0];
+        let v = &div.children[0];
+        assert_eq!((v.w, v.h), (300.0, 150.0), "UA replaced size");
+        assert!(
+            v.children.iter().any(|c| c.is_text && c.text.contains("playback not supported")),
+            "no silent empty hole"
+        );
+        let a = &div.children[1];
+        assert_eq!(a.h, 32.0, "audio UA height");
+        // poster goes through the same ImgSlot pipeline as <img>, and the
+        // text placeholder is suppressed (the poster IS the content)
+        let p = &div.children[2];
+        match &p.img {
+            Some(ImgSlot::Pending(src)) => assert_eq!(&**src, "/frame.png"),
+            _ => panic!("poster should enter the image pipeline"),
+        }
+        assert!(p.children.is_empty(), "poster replaces the text placeholder");
     }
 
     // ---- ::before/::after generated content ----

@@ -1681,6 +1681,40 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | Wikipedia `/wiki/Main_Page` | 105.7 MB (1434 runs; **zero `[js]` errors**; search toggle inside its box, no overlap with the personal links) |
 | 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests — clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport — plus the new tokenizer test and the whole suite: default **707**, `engine-b + woff2` **711**) |
 
+### Wave 28 findings
+
+- **TLS: tune rustls, not `wreq`** (decision record above, in the crate policy).
+  `src/net.rs` is the single network-identity module: Chrome UA + client hints +
+  `Accept-Language` per request, and a rustls provider whose cipher suites and
+  key-exchange groups are sorted into Chrome's order. Asserted by 5 unit tests.
+- **One identity, not two.** `navigator.userAgent` used to say `Mazda/1.0` while
+  the socket said something else — a one-line fingerprint. Both now read
+  `net::USER_AGENT`.
+- **Honest headers beat a long header list.** `Accept-Encoding` advertises
+  `gzip` only (ureq's default decoder), and `Accept` omits `image/avif` (we
+  cannot decode AVIF). Advertising `br`/`avif` would trade a fingerprint tell
+  for broken resources.
+- **ALPN stays `http/1.1`** because ureq is HTTP/1.1-only. Claiming `h2` would
+  break every request; the JA4 delta is accepted and recorded.
+- **EME fail-fast, DRM still parked.** `navigator.requestMediaKeySystemAccess`
+  and `mediaCapabilities.decodingInfo` exist and reject with a real
+  `NotSupportedError` promise (settled on the microtask queue, so `.catch` runs
+  instead of the caller throwing). Absent methods made players show the generic
+  "unsupported browser" wall.
+- **Media elements say no truthfully.** `canPlayType()` returns `""`, `play()`
+  rejects with `NotSupportedError`, `pause()`/`load()` are inert — on the shared
+  element prototype, so non-media elements are unaffected.
+- **`<video>`/`<audio>` render a placeholder, not a hole.** UA sizes (video
+  300×150, audio 300×32), `poster` through the existing image pipeline (so a
+  poster frame still paints), otherwise a `[media] playback not supported`
+  leaf. Engine rule re-learned: block boxes take height from content, so the UA
+  size lands as `min_height`; and this engine's inline flow sizes a box from its
+  text child, so media is boxed as block (spec says inline-level — recorded as a
+  shortcut in the code).
+- **Engine B** gets the same contract: UA constant, EME/mediaCapabilities
+  bootstrap eval, and `canPlayType`/`play`/`pause`/`load` on the shared
+  prototype (`play` rejects with a real rejected promise).
+
 ### Wave 27 findings
 
 - **The SVG paint pass is now a recursive element walk, not a streaming
@@ -1965,9 +1999,22 @@ licensed (MIT/Apache/BSD), well-download-counted, and must NOT be browser-engine
 projects (keeps the no-third-party-engine-code rule and the git-scrub rule clean).
 Approved for the next waves: `wuff` (WOFF2), `image-webp` (WebP), `brotli-decompressor`
 (WOFF2 fallback path), `symphonia-format-isomp4` + `rusty_h264`/`rust_h265` +
-`rusty-opus`/`rusty_mp3` (media tier, gated), `wreq` (Chrome-shaped TLS/JA3/JA4
-fetch — *decision pending tune-rustls vs wreq*). Each adopted crate gets a RAM
+`rusty-opus`/`rusty_mp3` (media tier, gated). Each adopted crate gets a RAM
 measurement row; a crate that costs more than it saves gets dropped.
+
+**Decision 2026-11-03 (wave 28): tune rustls, do NOT adopt `wreq`.** `wreq` was
+provisionally approved above; on inspection it fails two clauses of this policy.
+(1) It links `btls`/`btls-sys` = BoringSSL, C + FFI — the policy says pure Rust.
+(2) It needs rustc 1.98 + edition 2024 (toolchain here is 1.96), and it replaces
+the synchronous ureq worker with a tokio runtime, raising the per-page RAM floor.
+The shipped alternative is `rustls` as a DIRECT dependency (already in the tree
+via ureq, so no new build cost): Chrome-ordered cipher suites and curves, Chrome
+request headers, and the UA the JS and network layers both report. The honest
+limit is recorded in `src/net.rs`: rustls owns the ClientHello extension order
+and never emits GREASE, so **JA3 cannot match Chrome**; JA4 ignores order/GREASE
+but includes ALPN and ureq is HTTP/1.1-only, so it reports `h1` where Chrome
+reports `h2`. Revisit only if a pure-Rust ClientHello + HTTP/2 stack appears.
+No BoringSSL, not now or later, for a fingerprint.
 
 **User decision 2026-10-31: DRM parked (not "impossible").** The honest reasons,
 for the record: (1) an uncertified CDM gets refused or quality-capped by the

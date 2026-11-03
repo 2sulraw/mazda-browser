@@ -257,6 +257,13 @@ fn wrap_element(node: u32) -> Val {
     o.set("setClassName", js::Val::Native(n.el_set_class));
     o.set("focus", js::Val::Native(n.el_focus));
     o.set("submit", js::Val::Native(n.el_submit));
+    // media fail-fast (wave 28): the media tier is gated, so a player gets
+    // `canPlayType === ""` and `play()` rejects. On non-media elements these
+    // are inert, exactly like HTMLMediaElement.prototype not existing.
+    o.set("canPlayType", js::Val::Native(n.el_can_play));
+    o.set("play", js::Val::Native(n.el_media_play));
+    o.set("pause", js::Val::Native(n.el_media_noop));
+    o.set("load", js::Val::Native(n.el_media_noop));
     o
 }
 
@@ -382,11 +389,16 @@ struct Nids {
     style_set_prop: usize,
     style_get_prop: usize,
     style_remove_prop: usize,
+    el_can_play: usize,
+    el_media_play: usize,
+    el_media_noop: usize,
     loc_assign: usize,
     loc_reload: usize,
     win_add_listener: usize,
     match_media: usize,
     media_noop: usize,
+    eme: usize,
+    media_caps: usize,
     history_push: usize,
     history_replace: usize,
     history_go: usize,
@@ -509,12 +521,22 @@ const E_STYLE_SET_PROPERTY: u16 = 34;
 const E_STYLE_GET_PROPERTY: u16 = 35;
 const E_STYLE_REMOVE_PROPERTY: u16 = 36;
 const E_REMOVE: u16 = 37;
+/// media fail-fast group (wave 28: the media tier is gated; these answer
+/// feature probes truthfully instead of being absent)
+const E_CAN_PLAY: u16 = 38;
+const E_MEDIA_PLAY: u16 = 39;
+const E_MEDIA_NOOP: u16 = 40;
 /// location group idxs
 const L_ASSIGN: u16 = 30;
 const L_RELOAD: u16 = 31;
 /// window group idxs
 const W_ADD_LISTENER: u16 = 32;
 const W_MATCH_MEDIA: u16 = 34;
+/// EME fail-fast (wave 28): DRM is parked, so the only useful answer is a
+/// rejected `NotSupportedError` promise — not an absent method (which makes
+/// players fall through to the generic "unsupported browser" wall)
+const W_EME: u16 = 36;
+const W_MEDIA_CAPS: u16 = 37;
 /// history group idxs
 const H_PUSH: u16 = 0;
 const H_REPLACE: u16 = 1;
@@ -613,7 +635,7 @@ fn create_element(tag: &str) -> Result<Val, JsError> {
     }
 }
 
-fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let node = this_node(this)?;
     let a0 = args.first().cloned().unwrap_or(Val::Undefined);
     match idx {
@@ -782,6 +804,20 @@ fn el_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
             runtime::host_mut(|h| h.style_set(node, &name, ""));
             Ok(str_val(&old))
         }
+        // ---- media fail-fast (wave 28) ----
+        // no decoder is wired yet, so every MIME type is honestly unplayable
+        E_CAN_PLAY => Ok(str_val("")),
+        E_MEDIA_PLAY => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static NOTED: AtomicBool = AtomicBool::new(false);
+            if !NOTED.swap(true, Ordering::Relaxed) {
+                eprintln!("[media] playback not supported");
+            }
+            Ok(rejected_not_supported(e, "playback not supported"))
+        }
+        // pause()/load() are state changes on a player that does not exist;
+        // returning undefined keeps fire-and-forget callers running
+        E_MEDIA_NOOP => Ok(Val::Undefined),
         _ => Err(JsError::throw("TypeError: bad element native")),
     }
 }
@@ -808,7 +844,7 @@ fn loc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
 /// bubble chain on every event of that kind (window is the last stop).
 /// `window` aliases the global object, so the method sits on `globalThis`
 /// and doubles as a bare `addEventListener(...)`.
-fn win_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn win_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         W_ADD_LISTENER => {
             let Some(kind) = args.first().and_then(|v| v.as_string()) else {
@@ -844,6 +880,18 @@ fn win_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             Ok(list)
         }
         35 => Ok(Val::Undefined),
+        // EME is parked (PLAN: no certifiable CDM, legal exposure). The
+        // valuable half is failing fast and truthfully so players can pick a
+        // non-DRM rendition or show their own message.
+        W_EME => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static NOTED: AtomicBool = AtomicBool::new(false);
+            if !NOTED.swap(true, Ordering::Relaxed) {
+                eprintln!("[media] DRM not supported");
+            }
+            Ok(rejected_not_supported(e, "DRM not supported"))
+        }
+        W_MEDIA_CAPS => Ok(rejected_not_supported(e, "media capabilities not supported")),
         _ => Err(JsError::throw("TypeError: bad window native")),
     }
 }
@@ -971,6 +1019,49 @@ fn n_match_media(_e: &mut JsEngine, args: &[Val]) -> Result<Val, JsError> {
         o.set(name, Val::Native(noop));
     }
     Ok(o)
+}
+
+/// A `DOMException`-shaped rejected promise. Feature probes read `.name`
+/// (`NotSupportedError`), players read `.message`, and `.catch` must run — so
+/// this is a real promise settled on the engine's microtask queue, not a
+/// thrown exception (which would abort the caller's script).
+fn rejected_not_supported(e: &mut JsEngine, msg: &str) -> Val {
+    let p = e.new_promise();
+    let err = Val::new_object();
+    err.set("name", str_val("NotSupportedError"));
+    err.set("message", str_val(msg));
+    js::settle_promise(e, &p, Err(err));
+    Val::Obj(p)
+}
+
+/// `navigator.userAgentData` — the client-hint object matching [`USER_AGENT`].
+fn user_agent_data() -> Val {
+    let brands = [
+        ("Chromium", "142"),
+        ("Google Chrome", "142"),
+        ("Not_A Brand", "24"),
+    ];
+    let list = brands
+        .iter()
+        .map(|(b, v)| {
+            let o = Val::new_object();
+            o.set("brand", str_val(b));
+            o.set("version", str_val(v));
+            o
+        })
+        .collect();
+    let o = Val::new_object();
+    o.set("brands", Val::new_array(list));
+    o.set("mobile", Val::Bool(false));
+    let platform = if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
+    o.set("platform", str_val(platform));
+    o
 }
 
 fn fetch_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
@@ -1145,11 +1236,16 @@ impl PageScripts {
             style_set_prop: engine.register_native("CSSStyleDeclaration.setProperty", el_native, E_STYLE_SET_PROPERTY),
             style_get_prop: engine.register_native("CSSStyleDeclaration.getPropertyValue", el_native, E_STYLE_GET_PROPERTY),
             style_remove_prop: engine.register_native("CSSStyleDeclaration.removeProperty", el_native, E_STYLE_REMOVE_PROPERTY),
+            el_can_play: engine.register_native("Element.canPlayType", el_native, E_CAN_PLAY),
+            el_media_play: engine.register_native("Element.play", el_native, E_MEDIA_PLAY),
+            el_media_noop: engine.register_native("Element.pause", el_native, E_MEDIA_NOOP),
             loc_assign: engine.register_native("location.assign", loc_native, L_ASSIGN),
             loc_reload: engine.register_native("location.reload", loc_native, L_RELOAD),
             win_add_listener: engine.register_native("window.addEventListener", win_native, W_ADD_LISTENER),
             match_media: engine.register_native("window.matchMedia", win_native, W_MATCH_MEDIA),
             media_noop: engine.register_native("MediaQueryList.addEventListener", win_native, 35),
+            eme: engine.register_native("navigator.requestMediaKeySystemAccess", win_native, W_EME),
+            media_caps: engine.register_native("navigator.mediaCapabilities.decodingInfo", win_native, W_MEDIA_CAPS),
             history_push: engine.register_native("history.pushState", hist_native, H_PUSH),
             history_replace: engine.register_native("history.replaceState", hist_native, H_REPLACE),
             history_go: engine.register_native("history.back", hist_native, H_GO),
@@ -1208,9 +1304,11 @@ impl PageScripts {
         engine.set_global("localStorage", storage_obj.clone());
         engine.set_global("sessionStorage", storage_obj); // honest: same store
 
-        // navigator: fixed honest UA string (no engine names), nothing dynamic
+        // navigator: the UA is Chrome's and matches the network `User-Agent`
+        // byte for byte (net.rs) — a page that sees two identities is
+        // trivially fingerprinted. Platform/language stay host-truthful.
         let nav = Val::new_object();
-        nav.set("userAgent", str_val("Mazda/1.0"));
+        nav.set("userAgent", str_val(crate::net::USER_AGENT));
         // a host platform string, not a browser claim; sites use it to pick
         // keyboard-shortcut glyphs
         nav.set(
@@ -1224,6 +1322,14 @@ impl PageScripts {
             }),
         );
         nav.set("language", str_val("en-US"));
+        // Chrome client hints (feature probes and bot walls read these)
+        nav.set("userAgentData", user_agent_data());
+        // EME fail-fast: DRM is parked (PLAN), so reject cleanly and loudly
+        // instead of leaving the method absent.
+        nav.set("requestMediaKeySystemAccess", Val::Native(ids.eme));
+        let caps = Val::new_object();
+        caps.set("decodingInfo", Val::Native(ids.media_caps));
+        nav.set("mediaCapabilities", caps);
         engine.set_global("navigator", nav.clone());
 
         // history: the surface routers probe plus pushState-based SPA
@@ -2779,7 +2885,9 @@ mod tests {
         );
         let turn = ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "rs"), "complete");
-        assert_eq!(get_global_str(&mut ps, "ua"), "Mazda/1.0");
+        // wave 28: the JS identity matches the network `User-Agent` exactly
+        assert_eq!(get_global_str(&mut ps, "ua"), crate::net::USER_AGENT);
+        assert!(get_global_str(&mut ps, "ua").contains("Chrome/"));
         assert_eq!(get_global_str(&mut ps, "dark"), "true");
         assert_eq!(get_global_str(&mut ps, "light"), "false");
         assert_eq!(get_global_str(&mut ps, "other"), "false");
@@ -2790,6 +2898,40 @@ mod tests {
             Some("https://example.com/"),
             "location.reload re-navigates the current page"
         );
+    }
+
+    /// Wave 28: media/EME fail-fast. The APIs exist and reject/say "no"
+    /// truthfully, so a player can pick another rendition instead of hitting
+    /// an undefined-method TypeError (which sites surface as "unsupported
+    /// browser").
+    #[test]
+    fn media_and_eme_fail_fast() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.eme = "pending";
+                navigator.requestMediaKeySystemAccess("com.widevine.alpha", [{}])
+                    .catch(function (e) { window.eme = e.name + ":" + e.message; });
+                window.caps = "pending";
+                navigator.mediaCapabilities.decodingInfo({})
+                    .catch(function (e) { window.caps = e.name; });
+                var v = document.createElement("video");
+                window.can = v.canPlayType('video/mp4; codecs="avc1.42E01E"');
+                window.playState = "pending";
+                v.play().catch(function (e) { window.playState = e.name; });
+                window.paused = v.pause();
+                window.uaData = "pending";
+                if (navigator.userAgentData && navigator.userAgentData.platform) {
+                    window.uaData = navigator.userAgentData.platform;
+                }
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "eme"), "NotSupportedError:DRM not supported");
+        assert_eq!(get_global_str(&mut ps, "caps"), "NotSupportedError");
+        assert_eq!(get_global_str(&mut ps, "can"), "", "no codec claimed");
+        assert_eq!(get_global_str(&mut ps, "playState"), "NotSupportedError");
+        assert_eq!(get_global_str(&mut ps, "paused"), "undefined");
+        assert_ne!(get_global_str(&mut ps, "uaData"), "pending");
     }
 
     /// A click listener bubble to window can also veto (prevents bubbling

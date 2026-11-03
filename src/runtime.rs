@@ -1128,7 +1128,7 @@ pub mod engine_b {
     use boa_engine::{
         js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue,
         NativeFunction, Source,
-        object::{builtins::JsArray, FunctionObjectBuilder},
+        object::{builtins::JsArray, builtins::JsPromise, FunctionObjectBuilder},
     };
 
     /// Native fn-pointer shape the engine core accepts (0.22).
@@ -1478,6 +1478,29 @@ pub mod engine_b {
 
     // ---- natives: location / window / event object ----
 
+    /// wave 28 media fail-fast: no decoder is wired, so no MIME type is
+    /// playable. Returning `""` (rather than an absent method) lets players
+    /// show "no supported source" instead of throwing.
+    fn b_el_can_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+        Ok(s_val(""))
+    }
+
+    fn b_el_media_noop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+        Ok(JsValue::undefined())
+    }
+
+    /// A rejected `NotSupportedError` promise, the same contract as engine A:
+    /// `.catch` runs instead of the caller throwing a TypeError.
+    fn b_el_play(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+        let err = JsObject::with_object_proto(ctx.intrinsics());
+        set_own(&err, ctx, "name", s_val("NotSupportedError"));
+        set_own(&err, ctx, "message", s_val("playback not supported"));
+        Ok(JsValue::from(JsPromise::reject(
+            JsError::from_opaque(JsValue::from(err)),
+            ctx,
+        )?))
+    }
+
     fn b_loc_assign(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
         let target = arg_str(args, 0, ctx).unwrap_or_default();
         host_mut(|h| h.request_nav(&target));
@@ -1688,9 +1711,9 @@ pub mod engine_b {
         set_own(&global, ctx, "localStorage", st.clone());
         set_own(&global, ctx, "sessionStorage", st); // honest: same store
 
-        // -- navigator: fixed honest UA string (no engine names) --------
+        // -- navigator: the SAME identity as the HTTP layer (net.rs) ------
         let nav = obj_val(ctx);
-        set_own(&nav, ctx, "userAgent", s_val("Mazda/1.0"));
+        set_own(&nav, ctx, "userAgent", s_val(crate::net::USER_AGENT));
         set_own(&global, ctx, "navigator", nav);
 
         // -- window aliases the global object ---------------------------
@@ -1725,6 +1748,18 @@ pub mod engine_b {
             );
         }
         set_own(&global, ctx, "console", console);
+
+        // -- media/EME fail-fast (wave 28) ------------------------------
+        // Engine A installs these as natives; here the namespace is plain JS,
+        // so one bootstrap eval gives the same observable contract: EME and
+        // mediaCapabilities reject with `NotSupportedError`.
+        let _ = ctx.eval(Source::from_bytes(
+            r#"(function(n){
+                function ns(m){var e=new Error(m);e.name="NotSupportedError";return e;}
+                if(!n.requestMediaKeySystemAccess) n.requestMediaKeySystemAccess=function(){return Promise.reject(ns("DRM not supported"));};
+                if(!n.mediaCapabilities) n.mediaCapabilities={decodingInfo:function(){return Promise.reject(ns("media capabilities not supported"));}};
+            })(navigator);"#,
+        ));
     }
 
     /// The shared element-method prototype: 13 methods bound ONCE per page
@@ -1747,6 +1782,12 @@ pub mod engine_b {
             ("setClassName", 1, b_el_set_class),
             ("focus", 0, b_el_focus),
             ("submit", 0, b_el_submit),
+            // wave 28 media fail-fast: canPlayType says no, play() rejects,
+            // pause()/load() are inert (same observable contract as engine A)
+            ("canPlayType", 1, b_el_can_play),
+            ("play", 0, b_el_play),
+            ("pause", 0, b_el_media_noop),
+            ("load", 0, b_el_media_noop),
         ];
         for (name, len, f) in methods {
             set_own(&proto, ctx, name, fn_obj(ctx, &format!("Element.{name}"), *len, *f));

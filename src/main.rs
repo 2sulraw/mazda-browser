@@ -6,6 +6,7 @@ mod html;
 mod image;
 mod js;
 mod layout;
+mod net;
 mod runtime;
 mod script;
 mod srcset;
@@ -3798,8 +3799,11 @@ fn set_cookie_values(resp: &ureq::Response) -> Vec<String> {
 pub(crate) fn fetch_post(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>), String> {
     let mut req = http_agent()
         .post(url)
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)");
+        .set("Content-Type", "application/x-www-form-urlencoded");
+    // a form POST is a document navigation: the same identity every GET uses
+    for (name, value) in net::request_headers(None) {
+        req = req.set(name, &value);
+    }
     if let Some(c) = cookie::request_header(url) {
         req = req.set("Cookie", &c);
     }
@@ -4668,6 +4672,9 @@ fn http_agent() -> &'static ureq::Agent {
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(READ_TIMEOUT)
             .timeout_write(WRITE_TIMEOUT)
+            // Wave 28: rustls ordered like Chrome (see net.rs for the
+            // wreq-vs-tune-rustls decision and the honest JA3/JA4 limits)
+            .tls_config(net::tls_config())
             .build()
     })
 }
@@ -4685,11 +4692,9 @@ fn fetch_accept(
         eprintln!("[cache] hit {url}");
         return Ok(hit);
     }
-    let mut req = http_agent()
-        .get(url)
-        .set("User-Agent", "Mazda/0.1 (minimal Rust browser)");
-    if let Some(a) = accept {
-        req = req.set("Accept", a);
+    let mut req = http_agent().get(url);
+    for (name, value) in net::request_headers(accept) {
+        req = req.set(name, &value);
     }
     if let Some(c) = cookie::request_header(url) {
         req = req.set("Cookie", &c);

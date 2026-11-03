@@ -10,7 +10,7 @@ No Chromium, no WebView, no third-party engine code — just a renderer built ar
 [![License](https://img.shields.io/badge/license-MIT-3DA639?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4?style=flat-square)](https://github.com/2sulraw/mazda-browser)
 [![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](#status)
-[![Tests](https://img.shields.io/badge/tests-659-blueviolet?style=flat-square)](#status)
+[![Tests](https://img.shields.io/badge/tests-714-blueviolet?style=flat-square)](#status)
 
 [Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Configuration](#configuration) · [Memory](#memory) · [Plan](PLAN.md)
 
@@ -38,7 +38,7 @@ that gets cheaper per tab instead of more expensive.
 | 🖼️ | **Images** | PNG, JPEG, WebP, hand-written SVG rasterizer, `srcset`; probe-then-decode with a per-page pixel budget |
 | 🔤 | **Text** | Charset detection, gzip, CJK/Hangul fallback, `@font-face` (WOFF1, optional WOFF2), font stacks |
 | ⚙️ | **JavaScript** | From-scratch interpreter: classes, modules, promises, builtins, DOM APIs, events, `fetch`, timers — plus an optional full engine core |
-| 🌐 | **Networking** | HTTP(S), disk cache, persisted cookie jar, gzip |
+| 🌐 | **Networking** | HTTP(S) with a Chrome-shaped TLS/header profile (rustls: Chrome cipher + curve order, UA/client hints), disk cache, persisted cookie jar, gzip |
 | 🪟 | **Shell** | Tabs, history, address bar, scrollbar, form controls, hover, F11, settings overlay, element inspector, drag-select + copy, load progress bar, right-click menu, live RSS meter |
 | 🧠 | **Memory** | Worker-thread loading, DOM snapshots for tab restore, lazy fonts, hard decode budgets |
 
@@ -145,7 +145,9 @@ Mazda is **alpha** — it renders Wikipedia, MDN, Hacker News, rust-lang.org, an
 runs real page scripts, but it is not a daily driver.
 
 - **In scope:** HTML/CSS/layout, images, fonts, a JavaScript interpreter, forms, tabs
-- **Not yet:** GPU compositing, process sandbox, media playback, DRM, extensions, full DevTools
+- **Not yet:** GPU compositing, process sandbox, media playback (`<video>`/`<audio>` render a
+  labelled placeholder; `play()`/EME reject with `NotSupportedError` instead of being absent),
+  DRM, extensions, full DevTools
 - **Not a near-term target:** Chrome-scale JS applications — that needs their API surface and a JIT
 
 > JavaScript was originally a non-goal. It is now in scope as a from-scratch interpreter, with
