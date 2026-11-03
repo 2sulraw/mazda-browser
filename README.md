@@ -1,128 +1,162 @@
+<div align="center">
+
 # Mazda Browser
 
-A browser engine written in pure Rust from scratch — HTML parser, CSS cascade,
-layout, CPU rasterizer, and a JavaScript interpreter. One primary goal:
-**minimal RAM**, with the scaling curve mattering more than the baseline
-(near-flat as tabs grow).
+**A browser engine written in Rust from scratch.**
+No Chromium, no WebView, no third-party engine code — just a renderer built around one question:
+*how little RAM can a browser use?*
 
-No third-party engine code: the engine is ours. General-purpose utility
-codecs (image decoders, font containers) are adopted when they are pure Rust
-and permissively licensed.
+[![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-3DA639?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4?style=flat-square)](https://github.com/2sulraw/mazda-browser)
+[![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](#status)
+[![Tests](https://img.shields.io/badge/tests-659-blueviolet?style=flat-square)](#status)
+
+[Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Configuration](#configuration) · [Memory](#memory) · [Plan](PLAN.md)
+
+</div>
+
+---
+
+## Why another browser?
+
+Modern browsers ship a GPU process, a JIT, and a per-tab process model before they render a
+single paragraph. Mazda starts from the other end: **one process, a CPU rasterizer, an arena
+DOM, and a small interpreter**, with the memory curve as the primary design constraint.
+
+The result is not a Chrome replacement. It is a readable engine that renders real sites — and
+that gets cheaper per tab instead of more expensive.
 
 ## Features
 
-- **HTML → arena DOM** — tokenizer builds nodes as `u32` indices, tags interned
-  as `TagId(u16)`; declarative shadow DOM (`<template shadowrootmode>`) expanded
-  post-parse; inline `<svg>` reassembled and handed to the SVG rasterizer
-- **CSS** — class/id/type/attribute selectors (all operators), descendant/child
-  combinators, `:not()`/`:is()`/`:where()`/`:has()`, `:first-child`/
-  `:nth-child()`, `:link`, specificity + source-order cascade, inline `style=""`,
-  `@layer`, `@supports`, `@media` (evaluated once at parse time), `var()` with
-  theme scoping, `light-dark()` + `color-scheme`, `calc()`, CSS escapes
-  (Tailwind-style `.data-\[state\=closed\]:hidden`)
-- **Layout** — block flow, flexbox (row/column, wrap, grow/shrink/basis, order,
-  auto margins), grid (fr/px/% tracks, `repeat()`/`minmax()`, named lines),
-  relative/absolute/fixed/sticky positioning, `min-height`, borders (per-side,
-  radius rings), padding, `box-shadow`, `clip-path: inset()`, text-align and
-  line-height
-- **Rendering** — CPU software rasterizer (no GPU compositor), word wrap,
-  underlines/overline/line-through, per-box backgrounds, `:hover` restyling,
-  cursor changes, link hit-testing, click navigation, back history
-- **Images** — PNG, JPEG, WebP (VP8/VP8L/VP8X + alpha), SVG (hand-written
-  rasterizer: paths, arcs→cubics, transforms, fills, strokes, gradients as flat
-  midpoints), `srcset`; two-pass loading (header probe sizes the box pre-layout,
-  pixels decode straight to display size), 8M display-px/page budget
-- **Text & fonts** — charset detection (header → `<meta charset>` → UTF-8, BOM
-  aware), gzip, CJK/Hangul system fallback (range-gated so pages without those
-  scripts pay 0), `@font-face` webfonts (WOFF1 always, WOFF2 behind a feature),
-  font-family stacks, per-page decoded-font budget
-- **JavaScript** — from-scratch tree-walking interpreter: closures, classes
-  (`extends`/`super`/static/fields/accessors), template literals, optional
-  chaining, logical assignment, labels, `**`, destructuring, ES modules
-  (`import`/`export` over HTTP), Promise microtasks, JSON/Math/Array/Object/
-  Date/RegExp/URL builtins, DOM queries + mutation, `addEventListener` with
-  bubbling, `preventDefault`, `fetch`, timers, `localStorage`; depth-capped so
-  bad scripts error instead of crashing the tab
-  - Optional **engine B**: a full JS engine core (`boa_engine`) selectable in
-    settings, compiled in behind the `engine-b` cargo feature
-- **Networking** — HTTP(S) via `ureq`, gzip, disk-backed cache
-  (`%LOCALAPPDATA%\mazda-cache`, 5-min TTL, bounded files + size), persisted
-  cookie jar (4096-byte cookie cap) sent on every request, `document.cookie`
-  subset
-- **Shell** — `eframe`/`glow` window, tab strip (new/close/switch), address bar
-  (URL or DuckDuckGo search), back button, scrollbar, hover states, form
-  controls (text/password/checkbox/radio/button/textarea/select), F11
-  fullscreen, live RSS meter, settings overlay (⚙)
-- **Tab snapshots** — the parsed DOM is serialized and restored on tab
-  switch/back, skipping fetch + parse
-- **Background loading** — fetch/decode/parse/cascade/layout run on a worker
-  thread, so the UI keeps painting during navigation
+| | Area | What's inside |
+|---|---|---|
+| 🧱 | **HTML & DOM** | Streaming tokenizer → arena DOM (`u32` indices, interned tags), declarative shadow DOM, inline `<svg>` |
+| 🎨 | **CSS** | Type/class/id/attribute selectors, `:is()`/`:where()`/`:not()`/`:has()`, `nth-child`, cascade + specificity, `var()`, `@layer`, `@supports`, `calc()`, `light-dark()` |
+| 📐 | **Layout** | Block flow, flexbox (wrap/grow/shrink/basis), grid (fr, `repeat()`, named lines), relative/absolute/fixed/sticky, borders, radius, shadow, `clip-path` |
+| 🖌️ | **Rendering** | CPU software rasterizer, word wrap, text decorations, backgrounds, `:hover` restyling, cursor changes, link hit-testing |
+| 🖼️ | **Images** | PNG, JPEG, WebP, hand-written SVG rasterizer, `srcset`; probe-then-decode with a per-page pixel budget |
+| 🔤 | **Text** | Charset detection, gzip, CJK/Hangul fallback, `@font-face` (WOFF1, optional WOFF2), font stacks |
+| ⚙️ | **JavaScript** | From-scratch interpreter: classes, modules, promises, builtins, DOM APIs, events, `fetch`, timers — plus an optional full engine core |
+| 🌐 | **Networking** | HTTP(S), disk cache, persisted cookie jar, gzip |
+| 🪟 | **Shell** | Tabs, history, address bar, scrollbar, form controls, hover, F11, settings overlay, live RSS meter |
+| 🧠 | **Memory** | Worker-thread loading, DOM snapshots for tab restore, lazy fonts, hard decode budgets |
 
-## Non-goals (v1)
+## Architecture
 
-GPU compositor, process sandbox, full CSS, media playback, extensions,
-DevTools. JavaScript is in scope, but heavyweight JS applications
-(google.com-class) are not a near-term parity target: that needs a
-Chrome-scale API surface and a JIT. DRM/media are parked (see
-[PLAN.md](PLAN.md) for the reasoning and the ladder).
+```mermaid
+flowchart LR
+    subgraph Network
+        A([URL]) --> B[Fetch + disk cache]
+    end
 
-## Build & test
+    subgraph Engine
+        B --> C[HTML parser]
+        C --> D[(Arena DOM)]
+        D --> E[CSS cascade]
+        E --> F[Layout]
+        F --> G[CPU rasterizer]
+        D <--> J[JS interpreter]
+        J -.->|DOM mutation| D
+    end
 
+    subgraph Shell
+        G --> H[Page texture]
+        D --> I[DOM snapshot]
+        H --> K[eframe / glow]
+    end
 ```
+
+- **One thread for UI, one for the page.** Fetch, parse, cascade, layout, and JS run on a
+  worker; the shell keeps painting.
+- **Arena, not pointers.** Nodes are `u32` indices; tags are `u16` IDs. No per-node `String`s.
+- **Decode only what is visible.** Images are probed, then decoded straight to display size.
+- **Restore, don't refetch.** Tab switches and back-navigation replay a serialized DOM snapshot.
+
+## Quick start
+
+Requires **Rust 1.96+**.
+
+```bash
+git clone https://github.com/2sulraw/mazda-browser.git
+cd mazda-browser
+cargo run --release -- https://example.com/
+```
+
+Or build the binary and run it directly:
+
+```bash
 cargo build --release
+target\release\mazda.exe https://example.com/    # Windows
+./target/release/mazda https://example.com/      # Linux
+```
+
+> Windows is the primary target. The Linux paths compile but are not regularly exercised.
+
+Run the test suite:
+
+```bash
 cargo test
 ```
 
-Optional features (combine freely):
+Optional build features:
 
-```
+```bash
 cargo build --release --features woff2      # WOFF2 webfonts
 cargo build --release --features engine-b   # engine B (boa) selectable
 ```
 
-Run with a URL (or omit it for a blank tab):
+## Configuration
 
-```
-target\release\mazda.exe https://example.com/
-```
+Click the ⚙ button in the toolbar, or edit `%LOCALAPPDATA%\mazda.conf` directly:
 
-## Settings
-
-The ⚙ button opens the settings overlay. Choices are persisted to
-`%LOCALAPPDATA%\mazda.conf` and apply on the next navigation.
-
-```
+```ini
 engine=a   # a = built-in pure-Rust interpreter (default), b = engine B
 fonts=a    # a = WOFF2 webfonts, b = system fonts only
 ```
 
-Resolution order, per setting: `--engine=`/`--fonts=` flag >
-`MAZDA_ENGINE`/`MAZDA_FONTS` env var > `mazda.conf` > default `a`.
-Engine B only runs in builds compiled with `--features engine-b`.
+Resolution order, per setting:
 
-## RAM
+```text
+--engine= / --fonts=  >  MAZDA_ENGINE / MAZDA_FONTS  >  mazda.conf  >  default a
+```
 
-Measured RSS on Windows (status-bar meter):
+Both choices are independent and apply on the next navigation. Engine B only runs in builds
+compiled with `--features engine-b`.
+
+## Memory
+
+Measured RSS on Windows 11 with the status-bar meter:
 
 | Scenario | RSS |
-|---|---|
-| Idle window (`glow` + winit floor) | ~106 MB |
+|---|---:|
+| Idle window | ~106 MB |
 | Wikipedia article | ~100 MB |
 | MDN reference page | ~80–95 MB |
-| 1 active tab, more tabs restored from snapshots | grows with live pages only |
+| Additional tabs | restored from snapshots — no live renderer |
 
-The `glow`/winit GL context set the current floor (a software-framebuffer shell
-was ~15–20 MB but Windows-only). The near-flat curve as tabs grow is the real
-design goal: hibernated tabs cost a serialized DOM, not a live renderer.
-Every adoption is measured; see the measurements log in
-[PLAN.md](PLAN.md).
+The `glow`/winit GL context sets the floor. The real target is the **shape of the curve**: a
+hibernated tab costs a serialized DOM, not a second browser. Every dependency adoption is
+measured; the full log lives in [PLAN.md](PLAN.md).
 
-## Plan
+## Status
 
-[PLAN.md](PLAN.md) is the frozen architecture plan: phase status, RAM targets,
-measurements, known gaps, and recorded decisions (script runtime, font loading,
-crate policy, DRM).
+Mazda is **alpha** — it renders Wikipedia, MDN, Hacker News, rust-lang.org, and nextjs.org, and
+runs real page scripts, but it is not a daily driver.
+
+- **In scope:** HTML/CSS/layout, images, fonts, a JavaScript interpreter, forms, tabs
+- **Not yet:** GPU compositing, process sandbox, media playback, DRM, extensions, DevTools
+- **Not a near-term target:** Chrome-scale JS applications — that needs their API surface and a JIT
+
+> JavaScript was originally a non-goal. It is now in scope as a from-scratch interpreter, with
+> an optional full engine core selectable at runtime.
+
+Phase status, measurements, and recorded decisions: **[PLAN.md](PLAN.md)**.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © 2026 2sulraw
+
+<div align="center">
+<sub>Built from scratch, one layout pass at a time.</sub>
+</div>
