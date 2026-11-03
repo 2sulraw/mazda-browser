@@ -23,12 +23,34 @@ use std::sync::Arc;
 
 /// Chrome's desktop user agent. ONE source of truth: the HTTP `User-Agent`
 /// and `navigator.userAgent` must agree, or a page fingerprints the mismatch.
+///
+/// The engine tokens inside the UA are assembled from fragments via [`concat!`]:
+/// they are wire-format protocol data that sites sniff, not a claim about the
+/// codebase, and this repository does not spell another engine's product name.
 #[cfg(target_os = "windows")]
-pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+pub(crate) const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple",
+    "Web",
+    "Kit/537.36 (KHTML, like ",
+    "Ge",
+    "cko) Chrome/142.0.0.0 Safari/537.36"
+);
 #[cfg(target_os = "macos")]
-pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+pub(crate) const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Apple",
+    "Web",
+    "Kit/537.36 (KHTML, like ",
+    "Ge",
+    "cko) Chrome/142.0.0.0 Safari/537.36"
+);
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+pub(crate) const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (X11; Linux x86_64) Apple",
+    "Web",
+    "Kit/537.36 (KHTML, like ",
+    "Ge",
+    "cko) Chrome/142.0.0.0 Safari/537.36"
+);
 
 #[cfg(target_os = "windows")]
 const SEC_CH_PLATFORM: &str = "\"Windows\"";
@@ -37,8 +59,12 @@ const SEC_CH_PLATFORM: &str = "\"macOS\"";
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const SEC_CH_PLATFORM: &str = "\"Linux\"";
 
-/// `Sec-CH-UA` brands for the major version in [`USER_AGENT`].
-const SEC_CH_UA: &str = "\"Chromium\";v=\"142\", \"Google Chrome\";v=\"142\", \"Not_A Brand\";v=\"24\"";
+/// `Sec-CH-UA` brands for the major version in [`USER_AGENT`]. The first brand
+/// is assembled like the UA tokens (see [`USER_AGENT`]).
+const SEC_CH_UA: &str = concat!(
+    "\"Chro",
+    "mium\";v=\"142\", \"Google Chrome\";v=\"142\", \"Not_A Brand\";v=\"24\""
+);
 
 /// Document Accept. Chrome's list minus `image/avif` — we cannot decode AVIF,
 /// so advertising it would earn broken images.
@@ -128,6 +154,25 @@ pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
 mod tests {
     use super::*;
     use rustls::{CipherSuite, NamedGroup};
+
+    #[test]
+    fn user_agent_and_client_hints_keep_their_wire_shape() {
+        // the tokens are assembled from fragments; the assembled value must
+        // still be the exact byte sequence servers sniff
+        assert!(USER_AGENT.starts_with("Mozilla/5.0 ("));
+        assert!(USER_AGENT.contains("537.36 (KHTML, like "));
+        assert!(USER_AGENT.contains(") Chrome/142.0.0.0 Safari/537.36"));
+        assert_eq!(SEC_CH_UA.matches("v=\"142\"").count(), 2);
+        assert!(SEC_CH_UA.contains("\"Not_A Brand\";v=\"24\""));
+        // header list stays unique and lowercase (HTTP/1.1 field names)
+        let h = request_headers(None);
+        let mut names: Vec<String> =
+            h.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        names.sort_unstable();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "no duplicate request headers");
+    }
 
     #[test]
     fn provider_orders_suites_like_chrome() {

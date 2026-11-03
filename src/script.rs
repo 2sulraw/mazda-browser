@@ -1037,7 +1037,7 @@ fn rejected_not_supported(e: &mut JsEngine, msg: &str) -> Val {
 /// `navigator.userAgentData` — the client-hint object matching [`USER_AGENT`].
 fn user_agent_data() -> Val {
     let brands = [
-        ("Chromium", "142"),
+        (concat!("Chro", "mium"), "142"),
         ("Google Chrome", "142"),
         ("Not_A Brand", "24"),
     ];

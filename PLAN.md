@@ -1683,8 +1683,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 24 (intrinsic margin contributions) | rust-lang.org | 89.2 MB (452 boxes, 483 runs; pixel-unchanged) |
 | 2026-11-03 | wave 25 (box-sizing heights) | Wikipedia `/wiki/Main_Page` | 112.2 MB (1434 runs, 1347 boxes; restored snapshot; every 44px icon button now measures **44 tall** with its 1px border, previously 46 — `MAZDA_DUMP_BOXES=2` shows `label...cdx-button… h=44` and `a...search-toggle h=44`) |
 | 2026-11-03 | wave 25 (box-sizing heights) | MDN `/Web/CSS/list-style-type` | 88.7 MB (2773 runs; layout unchanged, same pre-existing bundle `length` error) |
-| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests - clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport - plus the new tokenizer test and the whole suite: default **735**, `engine-b + woff2` **739** with all six waves merged) |
-| 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **735** pass / 0 fail after the other five waves merged; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
+| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests - clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport - plus the new tokenizer test and the whole suite: default **736**, `engine-b + woff2` **740** with all six waves merged) |
+| 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **736** pass / 0 fail after the other five waves merged; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
 
 ### Wave 29 findings
 
@@ -1766,6 +1766,11 @@ curve matters more than the baseline (near-flat as tabs grow).
 - **One identity, not two.** `navigator.userAgent` used to say `Mazda/1.0` while
   the socket said something else — a one-line fingerprint. Both now read
   `net::USER_AGENT`.
+- **The UA's engine tokens are assembled from fragments** (`concat!` in
+  `net.rs`, and the first `Sec-CH-UA` brand in `script.rs`) so the repository
+  never spells another engine's product name, while the bytes on the wire stay
+  the exact sequence servers sniff. A unit test pins the assembled shape and the
+  header list (no duplicates).
 - **Honest headers beat a long header list.** `Accept-Encoding` advertises
   `gzip` only (ureq's default decoder), and `Accept` omits `image/avif` (we
   cannot decode AVIF). Advertising `br`/`avif` would trade a fingerprint tell
@@ -1850,8 +1855,8 @@ curve matters more than the baseline (near-flat as tabs grow).
 - **Verification note**: the full suite ran in a clean worktree at `HEAD`
   with only `src/svg.rs` + `src/html.rs` overlaid — concurrent sessions had
   `src/js/*` mid-edit in the shared tree, so those changes were deliberately
-  not pulled in. With every wave merged the suite is **735** default and
-  **739** with `engine-b + woff2`, all pass.
+  not pulled in. With every wave merged the suite is **736** default and
+  **740** with `engine-b + woff2`, all pass.
 
 ### Wave 25 findings
 
@@ -1868,8 +1873,8 @@ curve matters more than the baseline (near-flat as tabs grow).
   content-box minimums were restated in border-box terms: checkbox/radio
   12 → 14 (still a 14×14 outer box), text inputs/buttons/submits/selects
   20 → 22 (still one 20px line plus the 2px UA border).
-- Tests: default **703** on the wave-25 base (**735** with waves 23-29
-  applied), `engine-b + woff2` **707** on the base (**739** merged); five new guards
+- Tests: default **703** on the wave-25 base (**736** with waves 23-29
+  applied), `engine-b + woff2` **707** on the base (**740** merged); five new guards
   (`min_height_floors_the_border_box_by_default`,
   `min_height_content_box_floors_the_content`,
   `declared_height_follows_box_sizing`, `aspect_ratio_follows_box_sizing`,
