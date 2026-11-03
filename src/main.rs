@@ -285,6 +285,69 @@ struct Tab {
 }
 
 // ---------------------------------------------------------------------------
+// Tab store (Phase 3): the tab list lives on disk, so a restart reopens the
+// same tabs instead of one blank page. Each tab still loads on its first
+// activation and takes the DOM snapshot path when one exists, so a restored
+// session paints without a re-fetch.
+// ---------------------------------------------------------------------------
+
+/// Format: `active=<index>` then one URL per line, verbatim (no escaping, so
+/// a corrupt or over-long line is dropped instead of costing RAM).
+const SESSION_MAX_TABS: usize = 64;
+const SESSION_MAX_URL: usize = 16 * 1024;
+
+fn session_path() -> std::path::PathBuf {
+    cache_dir().join("session")
+}
+
+fn encode_session(tabs: &[Tab], active: usize) -> String {
+    let mut out = format!("active={active}\n");
+    for t in tabs.iter().take(SESSION_MAX_TABS) {
+        out.push_str(&t.url);
+        out.push('\n');
+    }
+    out
+}
+
+/// `None` = nothing usable on disk (missing, empty, or every line rejected),
+/// in which case the caller starts a fresh one-tab session.
+fn decode_session(text: &str) -> Option<(Vec<Tab>, usize)> {
+    let mut active = 0usize;
+    let mut tabs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(n) = line.strip_prefix("active=") {
+            active = n.trim().parse().unwrap_or(0);
+            continue;
+        }
+        let url = line.trim();
+        if url.is_empty() || url.len() > SESSION_MAX_URL || tabs.len() == SESSION_MAX_TABS {
+            continue;
+        }
+        tabs.push(Tab {
+            url: url.to_string(),
+            scroll: 0.0,
+        });
+    }
+    (!tabs.is_empty()).then_some((tabs, active))
+}
+
+/// FNV-1a over the URL list + active index: the file is written only when
+/// this changes, so idle frames never touch the disk.
+fn session_digest(tabs: &[Tab], active: usize) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325 ^ active as u64;
+    for t in tabs {
+        for &b in t.url.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+// ---------------------------------------------------------------------------
 // Window shell: eframe/egui with the glow backend. The page itself is still
 // rasterized by render() below into a CPU 0x00RRGGBB buffer and shown as a
 // single NEAREST texture; egui owns the window, tab strip and address bar.
@@ -394,6 +457,9 @@ struct App {
     /// persistent app settings (mazda.conf loaded/resolved at startup;
     /// written through whenever the settings page changes one)
     conf: Conf,
+    /// digest of the tab list last written to the session file; None until
+    /// the first frame writes it
+    session_saved: Option<u64>,
     /// the ⚙ settings overlay is open (drawn + interactive)
     settings_open: bool,
     /// hovered leaf DOM node from the last frame's hit test — the sheet's
@@ -520,15 +586,31 @@ impl App {
         // start URL = first arg that is not a `--knob` (the selectable
         // runtime/fonts CLI overrides may come in any position; every
         // `--xxx[=value]` knob is excluded, never mistaken for a URL)
-        let start = std::env::args()
-            .skip(1)
-            .find(|a| !a.starts_with("--"))
-            .unwrap_or_else(|| "https://example.com".to_string());
+        let cli = std::env::args().skip(1).find(|a| !a.starts_with("--"));
         // logical viewport = NativeOptions initial size; one texture pixel per
         // logical point (a HiDPI framebuffer upscales the texture — fine at
         // pixels_per_point 1.0; shortcut: no per-monitor DPI raster scale).
         let (pw, ph) = (1000usize, (700.0 - TAB_H - ADDR_H) as usize);
-        let url = address_target(start.trim());
+        // A page named on the command line starts a fresh one-tab session;
+        // otherwise the previous session comes back (the active tab loads
+        // below through the snapshot path, the rest wait for activation).
+        let restored = cli.is_none().then(|| {
+            std::fs::read_to_string(session_path())
+                .ok()
+                .and_then(|t| decode_session(&t))
+        });
+        let (tabs, active) = match restored.flatten() {
+            Some((tabs, active)) => {
+                let active = active.min(tabs.len() - 1);
+                (tabs, active)
+            }
+            None => {
+                let url =
+                    address_target(cli.as_deref().unwrap_or("https://example.com").trim());
+                (vec![Tab { url, scroll: 0.0 }], 0)
+            }
+        };
+        let url = tabs[active].url.clone();
         // The window opens immediately with a blank page; the first load runs
         // on the worker thread (it used to block window creation until the
         // network answered — the other half of the "stuck after clicking"
@@ -566,11 +648,8 @@ impl App {
         let mut app = App {
             fonts,
             page,
-            tabs: vec![Tab {
-                url: url.clone(),
-                scroll: 0.0,
-            }],
-            active: 0,
+            tabs,
+            active,
             back_stack: Vec::new(),
             address: url.clone(),
             address_focused: false,
@@ -593,6 +672,7 @@ impl App {
             pending_link: None,
             conf,
             settings_open: false,
+            session_saved: None,
             hovered: None,
             hover_wait: false,
             bar_grab: None,
@@ -608,6 +688,23 @@ impl App {
         // re-run, so listeners and dynamic content behave as on a fresh load).
         app.dispatch(&url, pw, ph, 0.0, true);
         app
+    }
+
+    /// Write the tab list when it changed. Called once per frame, so a page
+    /// load and a tab action both land here; an idle frame writes nothing.
+    fn sync_session(&mut self) {
+        let d = session_digest(&self.tabs, self.active);
+        if self.session_saved == Some(d) {
+            return;
+        }
+        let path = session_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, encode_session(&self.tabs, self.active)) {
+            eprintln!("[session] write failed {}: {e}", path.display());
+        }
+        self.session_saved = Some(d);
     }
 
     /// Queue a load of `url` on the worker thread (never blocks the UI).
@@ -1453,6 +1550,9 @@ impl eframe::App for App {
         // deferred cookie-jar write (worker mutations inside the same second
         // as the last write wait here; see cookie::flush)
         cookie::flush();
+        // tab store: persists the URL list whenever a load or tab action
+        // changed it (the digest gate keeps idle frames off the disk)
+        self.sync_session();
         // apply any finished page load (stale generations are dropped inside)
         {
             let (pw, ph) = self.vp_size;
@@ -5962,6 +6062,61 @@ fn working_set_mb() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_round_trips_caps_and_rejects_garbage() {
+        let tabs = vec![
+            Tab {
+                url: "https://a.example/".into(),
+                scroll: 0.0,
+            },
+            Tab {
+                url: "https://b.example/x?y=1&z=2".into(),
+                scroll: 0.0,
+            },
+        ];
+        let text = encode_session(&tabs, 1);
+        let (back, active) = decode_session(&text).expect("session");
+        assert_eq!(active, 1);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].url, "https://a.example/");
+        // `=` and `&` in a URL survive verbatim (no escaping in the format)
+        assert_eq!(back[1].url, "https://b.example/x?y=1&z=2");
+        // an out-of-range index is clamped by the caller, kept as written here
+        assert_eq!(
+            decode_session("active=9\nhttps://x.example/\n").unwrap().1,
+            9
+        );
+        // nothing usable: missing, blank, or only an active line
+        assert!(decode_session("").is_none());
+        assert!(decode_session("active=0\n\n\n").is_none());
+        // wrong line endings are tolerated
+        assert!(decode_session("active=0\r\nhttps://x.example/\r\n").is_some());
+        // caps: tab count and per-URL length
+        let many: String = (0..200).map(|i| format!("https://e.example/{i}\n")).collect();
+        assert_eq!(
+            decode_session(&format!("active=0\n{many}")).unwrap().0.len(),
+            SESSION_MAX_TABS
+        );
+        let long = format!("active=0\nhttps://e.example/{}\n", "x".repeat(SESSION_MAX_URL));
+        assert!(decode_session(&long).is_none());
+        // the write gate changes with the active tab and with any URL
+        assert_eq!(session_digest(&tabs, 0), session_digest(&tabs, 0));
+        assert_ne!(session_digest(&tabs, 0), session_digest(&tabs, 1));
+        let mut moved = vec![
+            Tab {
+                url: "https://a.example/z".into(),
+                scroll: 0.0,
+            },
+            Tab {
+                url: "https://b.example/x?y=1&z=2".into(),
+                scroll: 0.0,
+            },
+        ];
+        assert_ne!(session_digest(&tabs, 0), session_digest(&moved, 0));
+        moved[0].url.pop();
+        assert_eq!(session_digest(&tabs, 0), session_digest(&moved, 0));
+    }
 
     #[test]
     fn glyph_masks_cache_by_subpixel_pen() {

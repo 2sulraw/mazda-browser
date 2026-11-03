@@ -1523,10 +1523,11 @@ curve matters more than the baseline (near-flat as tabs grow).
   attribute property setters).
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
-  — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
+  - DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
   skips fetch+parse; cookies done in wave 11 (q): a persisted jar sends on every
-  request and `document.getCookie`/`setCookie` expose the script subset; forms /
-  hibernation-on-pressure / a real tab store are open.
+  request and `document.getCookie`/`setCookie` expose the script subset; the tab
+  store landed in wave 30 (the tab list persists across restarts and restores
+  through the same snapshot path). Forms / hibernation-on-pressure are open.
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
 
 ## Recommendations logged (from "translate HTML/CSS to Rust" discussion)
@@ -1685,6 +1686,41 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 25 (box-sizing heights) | MDN `/Web/CSS/list-style-type` | 88.7 MB (2773 runs; layout unchanged, same pre-existing bundle `length` error) |
 | 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests - clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport - plus the new tokenizer test and the whole suite: default **736**, `engine-b + woff2` **740** with all six waves merged) |
 | 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **736** pass / 0 fail after the other five waves merged; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
+| 2026-11-03 | wave 30 (tab store) | Wikipedia `/wiki/JavaScript` | 100.1 / 101.9 MB (10943 runs, restored snapshot) against 99.6 / 100.0 MB from a HEAD build run back-to-back on the same URL - the delta is run noise; the store holds only the URL strings, the page itself is untouched |
+| 2026-11-03 | wave 30 (tab store) | live restart probe | 2-tab `session` file -> two pills (second active) and the active tab taken from its DOM snapshot (`[dom] restored snapshot ... (no fetch)`); an explicit URL argument starts a fresh one-tab session; 14 s of idle frames left the file's mtime unchanged; suite **737** default / **741** `engine-b + woff2` |
+
+### Wave 30 findings
+
+- **The tab list now lives on disk.** `%LOCALAPPDATA%\mazda-cache\session`
+  (next to the DOM snapshots and the cookie jar) is `active=<index>` followed
+  by one URL per line, verbatim - no escaping, so `?`, `&`, `=` and `#` in a
+  URL cost nothing and a corrupt line is dropped instead of costing RAM. Caps:
+  64 tabs (`SESSION_MAX_TABS`), 16 KB per URL (`SESSION_MAX_URL`). A file with
+  no usable tab line reads as "no session" and the shell starts one blank tab,
+  so a truncated file costs the list, never a crash.
+- **Restore rides the existing snapshot path.** At startup with no URL on the
+  command line the saved list becomes the tabs and the active tab dispatches as
+  a restore (`LoadReq::Load { restore: true }`), which hits the wave-9 DOM
+  snapshot and skips fetch+parse; the live probe shows the header
+  `[dom] restored snapshot for https://en.wikipedia.org/wiki/JavaScript
+  (12788 nodes, no fetch)`. The other tabs stay URLs only and load on their
+  first activation, exactly like a hand-opened tab, so restoring 8 tabs costs
+  8 strings, not 8 pages.
+- **Writes are digest-gated.** `session_digest` (FNV-1a over the URL list plus
+  the active index) is compared against the last write; an idle frame, a
+  scroll, a hover relayout and a repaint all leave the file alone (verified:
+  mtime unchanged across 14 s of idle). The write happens from `ui()` rather
+  than `on_exit`, because the process is routinely killed (`Stop-Process`) and
+  a crash must not lose the list - eframe's `on_exit(&glow::Context)` would.
+- **Scroll offsets are not persisted.** Honest shortcut: a restored tab starts
+  at the top. Persisting them means another per-tab field in the format and a
+  scroll-into-place path after restore; tab switches inside one run still keep
+  their offset in RAM.
+- **Phase 3 is nearly closed by construction.** Tabs are reload-on-switch, so
+  no page is resident to hibernate: the DOM snapshot on disk *is* the
+  hibernated form and the pressure policy is "nothing to discard". What is
+  still open on that bullet is forms (POST bodies, `input` state across a
+  history move) rather than the store.
 
 ### Wave 29 findings
 
