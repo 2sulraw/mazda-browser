@@ -39,7 +39,7 @@ that gets cheaper per tab instead of more expensive.
 | 🔤 | **Text** | Charset detection, gzip, CJK/Hangul fallback, `@font-face` (WOFF1, optional WOFF2), font stacks |
 | ⚙️ | **JavaScript** | From-scratch interpreter: classes, modules, promises, builtins, DOM APIs, events, `fetch`, timers — plus an optional full engine core |
 | 🌐 | **Networking** | HTTP(S), disk cache, persisted cookie jar, gzip |
-| 🪟 | **Shell** | Tabs, history, address bar, scrollbar, form controls, hover, F11, settings overlay, element inspector, drag-select + copy, live RSS meter |
+| 🪟 | **Shell** | Tabs, history, address bar, scrollbar, form controls, hover, F11, settings overlay, element inspector, drag-select + copy, load progress bar, live RSS meter |
 | 🧠 | **Memory** | Worker-thread loading, DOM snapshots for tab restore, lazy fonts, hard decode budgets |
 
 ## Architecture

@@ -327,6 +327,21 @@ struct Selection {
     head: TextPos,
 }
 
+/// Right-click menu state for the page: where the click landed (screen
+/// points), what was under it, and the rect it painted last frame (the
+/// outside-click test needs it before this frame's layout exists).
+#[derive(Clone)]
+struct ContextMenu {
+    /// screen-space anchor — the menu opens down-right of it
+    pos: egui::Pos2,
+    /// resolved absolute target when the click was on a link
+    link: Option<String>,
+    /// DOM node under the pointer (drives "Inspect element")
+    node: Option<u32>,
+    /// painted bounds from the previous frame; None on the opening frame
+    rect: Option<egui::Rect>,
+}
+
 struct App {
     fonts: Fonts,
     page: Page,
@@ -407,6 +422,8 @@ struct App {
     selection: Option<Selection>,
     /// drag origin while the primary button is down; None = not selecting
     select_anchor: Option<TextPos>,
+    /// open page context menu (right-click); None = closed
+    menu: Option<ContextMenu>,
 }
 
 /// Address-bar heuristic (unchanged from the minifb shell): a dot and no
@@ -443,6 +460,10 @@ const BAR_W: usize = 8;
 /// Shortest thumb the bar will draw, so a barely-overflowing document
 /// still leaves something grabbable.
 const BAR_MIN: f32 = 24.0;
+/// Page-load progress bar: height in logical points, pinned to the top edge
+/// of the page viewport (same accent as the address pill's focus ring).
+const LOAD_BAR_H: f32 = 3.0;
+const LOAD_BAR_RGB: (u8, u8, u8) = (0x6a, 0x9c, 0xff);
 
 /// Horizontal band of the scrollbar in page-buffer pixels `(x0, x1)`.
 /// One source of truth for both painting and hit-testing.
@@ -579,6 +600,7 @@ impl App {
             pinned: None,
             selection: None,
             select_anchor: None,
+            menu: None,
         };
         // Startup on a previously visited URL counts as a restore: the DOM
         // snapshot skips the fetch exactly like a tab switch (scripts still
@@ -702,6 +724,11 @@ impl App {
             self.hover_wait = false;
             if done.panicked {
                 eprintln!("[nav] load #{} failed (pipeline panic)", done.id);
+                // a failed job must not leave the shell thinking it is still
+                // loading (that pinned the progress bar on and made the next
+                // tab click look ignored) — drop the in-flight marker
+                self.pending = None;
+                self.expect_nav = false;
                 continue;
             }
             // a script may have asked to navigate (location.assign etc.)
@@ -758,6 +785,9 @@ impl App {
             }
             let Some(mut wire) = done.page else {
                 eprintln!("[nav] load #{} returned no page", done.id);
+                // same rule as the panic branch: never leave a load hanging
+                self.pending = None;
+                self.expect_nav = false;
                 continue;
             };
             // adopt the worker's font state: stack ids baked into run styles
@@ -914,6 +944,44 @@ impl App {
             }
         }
         best
+    }
+
+    /// Link target under a content point (`x`, `y` before the scroll offset),
+    /// resolved against the page URL. Same run hit-test as a left click, so a
+    /// right click on a link reports exactly what a click would open.
+    fn link_at(&self, x: f32, y: f32, scroll: f32) -> Option<String> {
+        let run = self.page.laid.runs.iter().find(|r| {
+            let ry = if r.fixed { y } else { y + scroll };
+            r.link.is_some()
+                && x >= r.x
+                && x <= r.x + r.width
+                && ry >= r.y
+                && ry <= r.y + r.style.size * 1.35
+        })?;
+        let href = run.link.as_deref()?;
+        resolve(&self.page.url, href)
+    }
+
+    /// Select every laid-out text run (the "Select all" menu action). Empty
+    /// runs are skipped so the first/last positions always point at real
+    /// characters.
+    fn select_all(&mut self) {
+        let mut first = None;
+        let mut last = None;
+        for (i, r) in self.page.laid.runs.iter().enumerate() {
+            if r.text.is_empty() {
+                continue;
+            }
+            first.get_or_insert(TextPos { run: i, ch: 0 });
+            last = Some(TextPos {
+                run: i,
+                ch: r.text.len(),
+            });
+        }
+        self.selection = match (first, last) {
+            (Some(anchor), Some(head)) => Some(Selection { anchor, head }),
+            _ => None,
+        };
     }
 
     /// Text position under a content point (`x`, `y` are page-buffer units
@@ -1260,6 +1328,122 @@ fn paint_inspect_panel(
         painter.galley(at, galley, *color);
         at.y += size.y + 3.0;
     }
+}
+
+/// What a page context-menu row does when clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuAction {
+    Back,
+    Reload,
+    Copy,
+    SelectAll,
+    OpenLink,
+    OpenInNewTab,
+    CopyLink,
+    Inspect,
+}
+
+/// One row of the page context menu: an action (label + enabled) or a rule.
+enum MenuRow {
+    Action(MenuAction, String, bool),
+    Sep,
+}
+
+/// Row metrics for [`paint_context_menu`].
+const CTX_ROW_H: f32 = 24.0;
+const CTX_SEP_H: f32 = 7.0;
+const CTX_PAD_X: f32 = 13.0;
+const CTX_PAD_Y: f32 = 5.0;
+
+/// Paint the page context menu at `anchor` and report the clicked row. The
+/// rect is returned too: the outside-click test runs at the start of the
+/// next frame, before this frame's layout exists.
+fn paint_context_menu(
+    ui: &egui::Ui,
+    page: egui::Rect,
+    anchor: egui::Pos2,
+    rows: &[MenuRow],
+) -> (Option<MenuAction>, egui::Rect) {
+    let bg: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x1b, 0x1c, 0x1f, 245);
+    let border: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3d, 0x44);
+    let hover: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x3a, 0x4d);
+    let fg: egui::Color32 = egui::Color32::from_rgb(0xd7, 0xdb, 0xe0);
+    let dim: egui::Color32 = egui::Color32::from_rgb(0x6c, 0x71, 0x78);
+    let rule: egui::Color32 = egui::Color32::from_rgb(0x33, 0x36, 0x3c);
+    let font = egui::FontId::proportional(12.5);
+
+    let painter = ui.painter().with_clip_rect(page);
+    // width fits the widest label (floor 150 so short menus still look right)
+    let mut w = 150.0f32;
+    for row in rows {
+        if let MenuRow::Action(_, label, _) = row {
+            let galley = painter.layout_no_wrap(label.clone(), font.clone(), fg);
+            w = w.max(galley.size().x + 2.0 * CTX_PAD_X);
+        }
+    }
+    let h = rows
+        .iter()
+        .map(|r| match r {
+            MenuRow::Action(..) => CTX_ROW_H,
+            MenuRow::Sep => CTX_SEP_H,
+        })
+        .sum::<f32>()
+        + 2.0 * CTX_PAD_Y;
+    // open down-right of the click, flipped/shifted to stay inside the page
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(
+            anchor.x.min(page.right() - w - 4.0).max(page.left() + 4.0),
+            anchor.y.min(page.bottom() - h - 4.0).max(page.top() + 4.0),
+        ),
+        egui::vec2(w, h),
+    );
+    painter.rect_filled(rect, 6.0, bg);
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+
+    let mut out = None;
+    let mut y = rect.top() + CTX_PAD_Y;
+    for (i, row) in rows.iter().enumerate() {
+        match row {
+            MenuRow::Sep => {
+                let ly = y + CTX_SEP_H * 0.5;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 8.0, ly),
+                        egui::pos2(rect.right() - 8.0, ly),
+                    ],
+                    egui::Stroke::new(1.0, rule),
+                );
+                y += CTX_SEP_H;
+            }
+            MenuRow::Action(action, label, enabled) => {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 4.0, y),
+                    egui::vec2(w - 8.0, CTX_ROW_H),
+                );
+                let resp = ui.interact(r, ui.scope_id().with(("ctx_row", i)), egui::Sense::click());
+                if *enabled && resp.hovered() {
+                    painter.rect_filled(r, 4.0, hover);
+                }
+                painter.text(
+                    egui::pos2(r.left() + CTX_PAD_X - 4.0, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    font.clone(),
+                    if *enabled { fg } else { dim },
+                );
+                if *enabled && resp.clicked() {
+                    out = Some(*action);
+                }
+                y += CTX_ROW_H;
+            }
+        }
+    }
+    (out, rect)
 }
 
 impl eframe::App for App {
@@ -1669,6 +1853,33 @@ impl eframe::App for App {
                         }
                     }
 
+                    // ---- right-click menu ----
+                    // Opens at the pointer and remembers what was under it:
+                    // a link target adds its own rows, a hit-test node enables
+                    // "Inspect element". Right-clicking the scrollbar is left
+                    // to the shell (it would only offer a page menu).
+                    if resp.secondary_clicked() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            if !in_bar(p) {
+                                let rx = p.x - resp.rect.min.x - PADDING as f32;
+                                let my_doc = p.y - resp.rect.min.y - PADDING as f32;
+                                let node = self
+                                    .page
+                                    .laid
+                                    .hit_hover(rx, my_doc, self.scroll)
+                                    .map(|(n, _)| n);
+                                let link = self.link_at(rx, my_doc, self.scroll);
+                                eprintln!("[menu] open at ({:.0}, {:.0}) link={link:?}", p.x, p.y);
+                                self.menu = Some(ContextMenu {
+                                    pos: p,
+                                    link,
+                                    node,
+                                    rect: None,
+                                });
+                            }
+                        }
+                    }
+
                     // ---- drag to highlight text ----
                     // A press on page text starts (or clears) the selection;
                     // moving with the button held extends it toward the
@@ -1838,6 +2049,48 @@ impl eframe::App for App {
                             paint_inspect_panel(ui, resp.rect, info, self.pinned.is_some());
                         }
                     }
+
+                    // ---- page-load progress bar ----
+                    // `pending` is set by dispatch() (address bar, link click,
+                    // tab switch, reload) and cleared when the worker's page
+                    // lands, so the bar is honest: it runs exactly while a new
+                    // page is on its way, and the old page stays readable
+                    // underneath it.
+                    if self.pending.is_some() {
+                        let painter = ui.painter().with_clip_rect(resp.rect);
+                        let track = egui::Rect::from_min_max(
+                            resp.rect.left_top(),
+                            egui::pos2(resp.rect.right(), resp.rect.top() + LOAD_BAR_H),
+                        );
+                        let (r, g, b) = LOAD_BAR_RGB;
+                        // faint full-width track (also the "no estimate" cue)
+                        painter.rect_filled(
+                            track,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(r, g, b, 48),
+                        );
+                        // indeterminate sweep: one highlight crosses the
+                        // track, wrapping around (no byte-level progress is
+                        // exposed by the loader, so no fake percentage)
+                        let t = ui.input(|i| i.time) as f32;
+                        let span = 160.0f32;
+                        let sweep = track.width() + span;
+                        let x0 = track.left() - span + (t * 420.0) % sweep.max(1.0);
+                        let seg = egui::Rect::from_min_max(
+                            egui::pos2(x0, track.top()),
+                            egui::pos2(x0 + span, track.bottom()),
+                        )
+                        .intersect(track);
+                        if seg.is_positive() {
+                            painter.rect_filled(
+                                seg,
+                                0.0,
+                                egui::Color32::from_rgb(r, g, b),
+                            );
+                        }
+                        // the sweep moves every frame, not just on input
+                        ui.ctx().request_repaint();
+                    }
                 }
 
                 // RSS overlay, bottom-right (small and dim)
@@ -1899,8 +2152,13 @@ impl eframe::App for App {
         // ---- apply the deferred actions with the real page size ----
         if let Some(i) = activate {
             if i != self.active && i < self.tabs.len() {
+                // Only the scroll offset moves tabs now: a tab's `url` is the
+                // page it is loading OR showing, set at dispatch/land time.
+                // Copying `self.page.url` here used to overwrite the target
+                // with the previous tab's page while a switch was still in
+                // flight — the labels converged and clicking them reloaded the
+                // same page, which read as "switching doesn't switch".
                 self.tabs[self.active].scroll = self.scroll;
-                self.tabs[self.active].url = self.page.url.clone();
                 self.active = i;
                 let (url, saved) = (self.tabs[i].url.clone(), self.tabs[i].scroll);
                 self.reload_active(&url, pw, ph, saved);
@@ -1920,8 +2178,9 @@ impl eframe::App for App {
             }
         }
         if new_tab {
+            // same rule as activate: keep the finished tab's URL (it is
+            // already in `tabs`), carry only its scroll
             self.tabs[self.active].scroll = self.scroll;
-            self.tabs[self.active].url = self.page.url.clone();
             self.tabs.push(Tab {
                 url: "https://example.com".into(),
                 scroll: 0.0,
