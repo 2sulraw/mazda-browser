@@ -784,6 +784,34 @@ pub(crate) fn for_of_items(v: &Val) -> Result<Vec<Val>, JsError> {
 // Expressions
 // ---------------------------------------------------------------------------
 
+/// Arguments for a tagged template call: the strings array (carrying `.raw`)
+/// followed by the interpolated values. shortcut: `.raw` holds the cooked
+/// text — the original escape spelling is not preserved.
+fn tagged_args(e: &mut JsEngine, env: &Rc<Env>, segs: &[TplSeg]) -> Result<Vec<Val>, JsError> {
+    let mut cooked: Vec<Val> = Vec::new();
+    let mut vals: Vec<Val> = Vec::new();
+    for seg in segs {
+        match seg {
+            TplSeg::Lit(s) => cooked.push(Val::Str(s.clone())),
+            TplSeg::Expr(x) => vals.push(eval_expr(e, env, x)?),
+        }
+    }
+    let raw = Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::Array(cooked.clone()),
+        props: Vec::new(),
+        proto: None,
+    })));
+    let strings = Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::Array(cooked),
+        props: vec![(Rc::from("raw"), raw)],
+        proto: None,
+    })));
+    let mut out = Vec::with_capacity(vals.len() + 1);
+    out.push(strings);
+    out.extend(vals);
+    Ok(out)
+}
+
 pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsError> {
     e.tick()?;
     match &x.kind {
@@ -1033,6 +1061,12 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                         cur = e.call(f, recv, argvals)?;
                         after_prop = false;
                     }
+                    ChainStep::Tagged { segs } => {
+                        let f = cur;
+                        let args = tagged_args(e, env, segs)?;
+                        cur = e.call(f, Val::Obj(e.global_obj.clone()), args)?;
+                        after_prop = false;
+                    }
                 }
             }
             Ok(cur)
@@ -1178,6 +1212,11 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
                 }
             }
             Ok(Val::Str(Rc::from(out.as_str())))
+        }
+        ExprKind::TaggedTemplate { tag, segs } => {
+            let f = eval_expr(e, env, tag)?;
+            let args = tagged_args(e, env, segs)?;
+            e.call(f, Val::Obj(e.global_obj.clone()), args)
         }
         ExprKind::Regex { pattern, flags } => {
             let compiled = e.regex_from_literal(pattern.clone(), flags.clone())?;

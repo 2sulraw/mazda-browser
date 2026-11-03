@@ -687,6 +687,10 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
                     parser::ChainStep::Call { args, .. } => args.iter().any(|a| match a {
                         parser::CallArg::Arg(x) | parser::CallArg::Spread(x) => expr_has_yield(x),
                     }),
+                    parser::ChainStep::Tagged { segs } => segs.iter().any(|s| match s {
+                        parser::TplSeg::Lit(_) => false,
+                        parser::TplSeg::Expr(x) => expr_has_yield(x),
+                    }),
                 })
         }
         Array(items) => items
@@ -716,6 +720,13 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
             parser::TplSeg::Lit(_) => false,
             parser::TplSeg::Expr(x) => expr_has_yield(x),
         }),
+        TaggedTemplate { tag, segs } => {
+            expr_has_yield(tag)
+                || segs.iter().any(|s| match s {
+                    parser::TplSeg::Lit(_) => false,
+                    parser::TplSeg::Expr(x) => expr_has_yield(x),
+                })
+        }
     }
 }
 

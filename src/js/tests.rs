@@ -1657,3 +1657,110 @@ fn import_dot_meta_does_not_stop_parsing() {
     // TypeError, never a SyntaxError that aborts the whole script)
     assert_eq!(num("var n = 0; try { import.meta.url } catch (e) { n = 3 } n"), 3.0);
 }
+
+// -- wave 16: for heads, async/computed/private class members, tagged
+// templates ---------------------------------------------------------------
+
+#[test]
+fn for_head_declarator_list_without_initializer_on_the_first() {
+    // `for (var a, b, c = x; ...)` — the comma used to be a syntax error when
+    // the first declarator had no initializer
+    assert_eq!(num("var s = 0; for (var a, b, c = 3; c < 5; c++) s += c; s"), 7.0);
+    assert_eq!(num("var s = 0; for (var i = 0, j; i < 3; i++) s += i; s"), 3.0);
+}
+
+#[test]
+fn for_head_comma_expression_init() {
+    // non-declaration head: `for (n = f(), i = 0; ...)` is one comma
+    // expression for the init slot
+    assert_eq!(
+        num("var a = 0; var i; for (a = 5, i = 0; i < 2; i++) {} a + i"),
+        7.0
+    );
+}
+
+#[test]
+fn for_in_with_a_member_target() {
+    assert_eq!(
+        num("var o = {}; for (o['k' + 1] in {p: 1}) {} o.k1 === 'p' ? 1 : 0"),
+        1.0
+    );
+    assert_eq!(num("var n; for (n in {a: 1, b: 2}) {} n === 'b' ? 1 : 0"), 1.0);
+}
+
+#[test]
+fn in_suppression_stops_at_parentheses() {
+    // the head grammar suppresses `in`, but a parenthesized sub-expression
+    // is a full Expression again
+    assert_eq!(
+        num("var n = 0; for (var x = ('b' in {a: 1}); n < 1; n++) {} x ? 1 : 0"),
+        0.0
+    );
+    assert_eq!(
+        num("var n = 0; for (var y = ('a' in {a: 1}); n < 2; n++) {} y ? 1 : 0"),
+        1.0
+    );
+}
+
+#[test]
+fn async_and_generator_class_methods() {
+    assert_eq!(
+        string("class A { async m() { return 7 } } typeof new A().m().then"),
+        "function"
+    );
+    assert_eq!(
+        num("class B { *g() { yield 4; yield 5 } } var it = new B().g(); it.next().value + it.next().value"),
+        9.0
+    );
+    // a field named `async` still works
+    assert_eq!(num("class C { async = 3 } new C().async"), 3.0);
+}
+
+#[test]
+fn computed_class_member_names() {
+    assert_eq!(
+        num("class A { ['m' + 'x']() { return 8 } } new A().mx()"),
+        8.0
+    );
+    assert_eq!(
+        num("var k = 'v'; class B { [k] = 4; static [k + 's'] = 5 } new B().v + B.vs"),
+        9.0
+    );
+}
+
+#[test]
+fn private_class_fields_and_methods() {
+    assert_eq!(
+        num("class A { #v = 2; #m() { return this.#v + 1 } run() { return this.#m() } } new A().run()"),
+        3.0
+    );
+    // private state is not visible under its plain name
+    assert_eq!(
+        num("class B { #v = 1 } 'v' in new B() ? 1 : 0"),
+        0.0
+    );
+}
+
+#[test]
+fn template_hex_escape_is_decoded() {
+    // a template used to cut `\xHH` in half and report "bad \x escape"
+    assert_eq!(num("`\\xa9`.length"), 1.0);
+    assert_eq!(num("`\\u00e9\\n`.length"), 2.0);
+    assert_eq!(string("`a\\x41b`"), "aAb");
+}
+
+#[test]
+fn tagged_template_gets_strings_and_values() {
+    assert_eq!(
+        string("function t(s, v) { return s.length + '/' + s.raw.length + '/' + s[0] + v + s[1] } t`a${5}b`"),
+        "2/2/a5b"
+    );
+    assert_eq!(
+        num("var o = { t: function (s) { return s[0].length } }; o.t`abcd`"),
+        4.0
+    );
+    assert_eq!(
+        string("function u(s) { return s[0] }; u`x${1}y`.toUpperCase()"),
+        "X"
+    );
+}

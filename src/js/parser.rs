@@ -144,6 +144,13 @@ pub enum ExprKind {
     /// comma operator / expression lists
     Seq(Vec<Expr>),
     Template(Vec<TplSeg>),
+    /// tagged template: `` tag`a${x}b` `` — the tag is called with a frozen-
+    /// cookie strings array (`raw` is the cooked text: escape spelling is not
+    /// kept) followed by the interpolated values
+    TaggedTemplate {
+        tag: Box<Expr>,
+        segs: Vec<TplSeg>,
+    },
     Typeof(Box<Expr>),
     Void(Box<Expr>),
     Delete(Box<Expr>),
@@ -178,6 +185,7 @@ pub enum ChainStep {
         args: Vec<CallArg>,
         optional: bool,
     },
+    Tagged { segs: Vec<TplSeg> },
 }
 
 impl ChainStep {
@@ -186,6 +194,7 @@ impl ChainStep {
             ChainStep::Member { optional, .. }
             | ChainStep::Index { optional, .. }
             | ChainStep::Call { optional, .. } => *optional,
+            ChainStep::Tagged { .. } => false,
         }
     }
 }
@@ -508,12 +517,19 @@ pub type Program = Vec<Stmt>;
 /// What a `class` body accumulates. Lowered to statements once the whole
 /// body is parsed, in source order per list (instance members and static
 /// members keep their own relative order).
+/// A class member name: a literal key or `[expr]`.
+#[derive(Clone, Debug)]
+enum ClassKey {
+    Name(Rc<str>),
+    Computed(Expr),
+}
+
 #[derive(Clone, Debug)]
 enum ClassItem {
-    Method(Rc<FnDef>),
+    Method(ClassKey, Rc<FnDef>),
     Accessor(Rc<str>, Option<Rc<FnDef>>, Option<Rc<FnDef>>),
-    /// static field: `Class.name = init` at definition time
-    Field(Rc<str>, Option<Expr>),
+    /// field: `Class.name = init` (static) / `this.name = init` (instance)
+    Field(ClassKey, Option<Expr>),
 }
 
 /// Class context while parsing a method body: where `super` points and
@@ -544,6 +560,7 @@ pub fn parse(source: &str) -> Result<Program, JsError> {
         pos: 0,
         depth: 0,
         class_stack: Vec::new(),
+        no_in: false,
     };
     p.program()
 }
@@ -573,6 +590,9 @@ struct Parser<'a> {
     /// enclosing class contexts (innermost last); `super` resolves against
     /// the top entry
     class_stack: Vec<ClassCtx>,
+    /// inside a `for` head: `in` is part of the head grammar, so it must not
+    /// be consumed as the binary operator (cleared inside parentheses)
+    no_in: bool,
 }
 
 /// nesting cap; deep enough for any real page, shallow enough to stay far
@@ -1481,65 +1501,43 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             _ => {}
         }
         if kind.is_some() {
-            // declaration form: name-or-pattern, then `in`/`of`/`;`
-            let target = self.pattern_or_ident()?;
-            let target = match &target.1 {
-                Some(p) => ForTarget::Pat(p.clone()),
-                None => ForTarget::Name(target.0),
-            };
-            if self.eat_op(Op::Assign) {
-                // classic for with initializer: `for (var i = 0; ...)`
-                let init_expr = self.assign_expr()?;
-                let mut decls = vec![Declarator {
-                    name: match &target {
-                        ForTarget::Name(n) => n.clone(),
-                        ForTarget::Pat(_) => Rc::from(""),
-                    },
-                    pat: match target {
-                        ForTarget::Pat(p) => Some(p),
-                        _ => None,
-                    },
-                    init: Some(init_expr),
-                }];
-                while self.eat_punct(Punct::Comma) {
-                    let (name, pat) = self.pattern_or_ident()?;
-                    let init = if self.eat_op(Op::Assign) {
-                        Some(self.assign_expr()?)
-                    } else {
-                        None
-                    };
-                    decls.push(Declarator { name, pat, init });
+            // declaration form. Parse the whole declarator list with `in`
+            // suppressed so `for (var a, b, c = x; cond; upd)` works; a lone
+            // declarator may instead be a for-in / for-of target.
+            let mut decls: Vec<Declarator> = Vec::new();
+            let mut first: Option<ForTarget> = None;
+            loop {
+                let (name, pat) = self.pattern_or_ident()?;
+                if decls.is_empty() {
+                    first = Some(match &pat {
+                        Some(p) => ForTarget::Pat(p.clone()),
+                        None => ForTarget::Name(name.clone()),
+                    });
                 }
-                let init = Some(Box::new(Stmt {
-                    kind: StmtKind::VarDecl(kind.unwrap_or(VarKind::Var), decls),
-                    span: self.span_from(self.pos),
-                }));
-                return self.for_classic_tail(init);
+                let init = if self.eat_op(Op::Assign) {
+                    Some(self.no_in_assign_expr()?)
+                } else {
+                    None
+                };
+                decls.push(Declarator { name, pat, init });
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
             }
-            if self.eat_kw(Kw::In) {
-                let obj = self.expr()?;
-                return Ok(ForHead::In { kind, target, obj });
+            if decls.len() == 1 {
+                if let Some(target) = first {
+                    if self.eat_kw(Kw::In) {
+                        let obj = self.expr()?;
+                        return Ok(ForHead::In { kind, target, obj });
+                    }
+                    if self.eat_kw(Kw::Of) {
+                        let iter = self.assign_expr()?; // no comma in for-of head
+                        return Ok(ForHead::Of { kind, target, iter });
+                    }
+                }
             }
-            if self.eat_kw(Kw::Of) {
-                let iter = self.assign_expr()?; // no comma in for-of head
-                return Ok(ForHead::Of { kind, target, iter });
-            }
-            // `for (let i; ...)` — declaration without initializer
             let init = Some(Box::new(Stmt {
-                kind: StmtKind::VarDecl(
-                    kind.unwrap_or(VarKind::Var),
-                    vec![Declarator {
-                        name: match &target {
-                            ForTarget::Name(n) => n.clone(),
-                            ForTarget::Pat(_) => Rc::from(""),
-                        },
-                        pat: match target {
-                            ForTarget::Pat(p) => Some(p),
-                            _ => None,
-                        },
-                        init: None,
-                    }],
-                ),
+                kind: StmtKind::VarDecl(kind.unwrap_or(VarKind::Var), decls),
                 span: self.span_from(self.pos),
             }));
             return self.for_classic_tail(init);
@@ -1550,33 +1548,19 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             // consumes the init-terminating `;` itself
             return self.for_classic_tail(None);
         }
-        let e = self.expr()?;
+        let e = self.no_in_expr()?;
         if self.eat_kw(Kw::In) {
-            let name = match e.kind {
-                ExprKind::Ident(s) => s,
-                _ => return self.err("invalid for-in target"),
-            };
+            let target = self.expr_to_loop_target(&e, "invalid for-in target")?;
             let obj = self.expr()?;
             return Ok(ForHead::In {
                 kind: None,
-                target: ForTarget::Name(name),
+                target,
                 obj,
             });
         }
         if self.eat_kw(Kw::Of) {
             // assignment-destructuring form: `for ([a, b] of pairs)`
-            let target = if matches!(e.kind, ExprKind::Array(_)) {
-                ForTarget::Pat(expr_to_pat(&e).map_err(|m| {
-                    let t = self.cur();
-                    let (line, col) = line_col(self.src, t.start as usize);
-                    JsError::Syntax { msg: m, line, col }
-                })?)
-            } else {
-                match e.kind {
-                    ExprKind::Ident(s) => ForTarget::Name(s),
-                    _ => return self.err("invalid for-of target"),
-                }
-            };
+            let target = self.expr_to_loop_target(&e, "invalid for-of target")?;
             let iter = self.assign_expr()?;
             return Ok(ForHead::Of { kind: None, target, iter });
         }
@@ -1585,6 +1569,39 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             span: self.span_from(self.pos),
         }));
         self.for_classic_tail(init)
+    }
+
+    /// Parse a full expression (comma sequence included) with `in` treated as
+    /// a head delimiter (see `Parser::no_in`).
+    fn no_in_expr(&mut self) -> Result<Expr, JsError> {
+        let prev = self.no_in;
+        self.no_in = true;
+        let r = self.expr();
+        self.no_in = prev;
+        r
+    }
+
+    /// Plan an assignment expression (no comma) with `in` suppressed: used
+    /// for each declarator initializer, where a comma starts the next
+    /// declarator rather than a sequence expression.
+    fn no_in_assign_expr(&mut self) -> Result<Expr, JsError> {
+        let prev = self.no_in;
+        self.no_in = true;
+        let r = self.assign_expr();
+        self.no_in = prev;
+        r
+    }
+
+    /// A for-in / for-of head target: a bare name (fast path) or any
+    /// assignment target / destructuring pattern.
+    fn expr_to_loop_target(&mut self, e: &Expr, msg: &str) -> Result<ForTarget, JsError> {
+        if let ExprKind::Ident(s) = &e.kind {
+            return Ok(ForTarget::Name(s.clone()));
+        }
+        match expr_to_pat(e) {
+            Ok(p) => Ok(ForTarget::Pat(p)),
+            Err(_) => self.err(msg),
+        }
     }
 
     fn for_classic_tail(&mut self, init: Option<Box<Stmt>>) -> Result<ForHead, JsError> {
@@ -1825,16 +1842,21 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             let inits: Vec<Stmt> = fields
                 .iter()
                 .map(|(k, init)| {
-                    assign(
-                        member(
-                            Expr {
-                                kind: ExprKind::This,
-                                span,
+                    let this = Expr {
+                        kind: ExprKind::This,
+                        span,
+                    };
+                    let target = match k {
+                        ClassKey::Name(k) => member(this, k),
+                        ClassKey::Computed(k) => Expr {
+                            kind: ExprKind::Index {
+                                base: Box::new(this),
+                                index: Box::new(k.clone()),
                             },
-                            k,
-                        ),
-                        init.clone().unwrap_or_else(&undefined),
-                    )
+                            span,
+                        },
+                    };
+                    assign(target, init.clone().unwrap_or_else(&undefined))
                 })
                 .collect();
             let at = if super_name.is_some() {
@@ -1903,9 +1925,19 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             items
                 .into_iter()
                 .map(|it| match it {
-                    ClassItem::Method(f) => {
+                    ClassItem::Method(key, f) => {
                         let owner = if is_static { ident(&name) } else { proto_of(&name) };
-                        assign(member(owner, &f.name), Expr {
+                        let target = match key {
+                            ClassKey::Name(k) => member(owner, &k),
+                            ClassKey::Computed(k) => Expr {
+                                kind: ExprKind::Index {
+                                    base: Box::new(owner),
+                                    index: Box::new(k),
+                                },
+                                span,
+                            },
+                        };
+                        assign(target, Expr {
                             kind: ExprKind::Func(f),
                             span,
                         })
@@ -1920,7 +1952,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         span,
                     },
                     ClassItem::Field(key, init) => {
-                        assign(member(ident(&name), &key), init.unwrap_or_else(&undefined))
+                        let value = init.unwrap_or_else(&undefined);
+                        let target = match key {
+                            ClassKey::Name(k) => member(ident(&name), &k),
+                            ClassKey::Computed(k) => Expr {
+                                kind: ExprKind::Index {
+                                    base: Box::new(ident(&name)),
+                                    index: Box::new(k),
+                                },
+                                span,
+                            },
+                        };
+                        assign(target, value)
                     }
                 })
                 .collect()
@@ -1941,7 +1984,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             Option<Rc<FnDef>>,
             Vec<ClassItem>,
             Vec<ClassItem>,
-            Vec<(Rc<str>, Option<Expr>)>,
+            Vec<(ClassKey, Option<Expr>)>,
         ),
         JsError,
     > {
@@ -1949,7 +1992,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         let mut instance: Vec<ClassItem> = Vec::new();
         let mut statics: Vec<ClassItem> = Vec::new();
         // instance fields (static fields are ClassItem::Field in `statics`)
-        let mut fields: Vec<(Rc<str>, Option<Expr>)> = Vec::new();
+        let mut fields: Vec<(ClassKey, Option<Expr>)> = Vec::new();
         while !self.eat_punct(Punct::RBrace) {
             if self.eat_punct(Punct::Semi) {
                 continue;
@@ -1962,6 +2005,28 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
             if let Some(c) = self.class_stack.last_mut() {
                 c.is_static = is_static;
+            }
+            // `async` method modifier: `async foo()`, `async *foo()`. A field
+            // named `async` has `=`, `;`, a newline or the closing `}` next;
+            // `async()` is a method named `async`.
+            let mut is_async = false;
+            let mut is_gen = false;
+            if matches!(self.peek(), Tok::Kw(Kw::Async))
+                || matches!(self.peek(), Tok::Ident(s) if s.as_ref() == "async")
+            {
+                let is_async_method = !self.toks[(self.pos + 1).min(self.toks.len() - 1)].nl
+                    && matches!(
+                        self.peek_at(1),
+                        Tok::Ident(_) | Tok::Kw(_) | Tok::Str(_) | Tok::Num(_) | Tok::Op(Op::Mul)
+                    );
+                if is_async_method {
+                    self.next(); // `async`
+                    is_async = true;
+                }
+            }
+            if *self.peek() == Tok::Op(Op::Mul) {
+                self.next(); // `*`
+                is_gen = true;
             }
             // accessor: `get X(...)` / `set X(...)` (a method NAMED get/set
             // has `(` directly after the name)
@@ -2019,21 +2084,37 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
                 continue;
             }
-            let key = self.prop_name()?;
+            let key = if *self.peek() == Tok::Punct(Punct::LBrack) {
+                // computed member name: `[Symbol.iterator]() {}`
+                self.next();
+                let e = self.expr()?;
+                self.expect_punct(Punct::RBrack)?;
+                ClassKey::Computed(e)
+            } else {
+                ClassKey::Name(self.prop_name()?)
+            };
+            let key_name: Option<Rc<str>> = match &key {
+                ClassKey::Name(k) => Some(k.clone()),
+                ClassKey::Computed(_) => None,
+            };
             if *self.peek() == Tok::Punct(Punct::LParen) {
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let body = self.block_body()?;
                 let uses_arguments = scan_uses_arguments_stmts(&body);
-                let is_ctor = !is_static && key.as_ref() == "constructor";
+                let is_ctor = !is_static && key_name.as_deref() == Some("constructor");
                 let f = Rc::new(FnDef {
-                    name: if is_ctor { name.clone() } else { key.clone() },
+                    name: if is_ctor {
+                        name.clone()
+                    } else {
+                        key_name.clone().unwrap_or_else(|| Rc::from(""))
+                    },
                     params,
                     body: FnBody::Block(body),
                     uses_arguments,
-                    is_async: false,
-                    is_generator: false,
-                    has_yield: false,
+                    is_async: is_async && !is_ctor,
+                    is_generator: is_gen,
+                    has_yield: is_gen,
                 });
                 if is_ctor {
                     if ctor.is_some() {
@@ -2041,9 +2122,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                     ctor = Some(f);
                 } else if is_static {
-                    statics.push(ClassItem::Method(f));
+                    statics.push(ClassItem::Method(key, f));
                 } else {
-                    instance.push(ClassItem::Method(f));
+                    instance.push(ClassItem::Method(key, f));
                 }
             } else {
                 // public field: `x = init` / `x`
@@ -2351,6 +2432,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             pos: 0,
             depth: 0,
             class_stack: Vec::new(),
+            no_in: false,
         };
         let mut idx = 0usize;
         let params = sub.params_after_lparen(&mut idx)?;
@@ -2517,7 +2599,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 Tok::Op(Op::Le) => BinOp::Le,
                 Tok::Op(Op::Gt) => BinOp::Gt,
                 Tok::Op(Op::Ge) => BinOp::Ge,
-                Tok::Kw(Kw::In) => BinOp::In,
+                Tok::Kw(Kw::In) if !self.no_in => BinOp::In,
                 Tok::Kw(Kw::Instanceof) => BinOp::InstanceOf,
                 _ => break,
             };
@@ -2786,6 +2868,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         optional: false,
                     });
                 }
+                Tok::Template(parts) => {
+                    let parts = parts.clone();
+                    self.next();
+                    steps.push(ChainStep::Tagged {
+                        segs: self.template_segs(parts)?,
+                    });
+                }
                 _ => break,
             }
         }
@@ -2818,6 +2907,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         kind: ExprKind::Call {
                             callee: Box::new(e),
                             args,
+                        },
+                        span: self.span_from(start),
+                    },
+                    ChainStep::Tagged { segs } => Expr {
+                        kind: ExprKind::TaggedTemplate {
+                            tag: Box::new(e),
+                            segs,
                         },
                         span: self.span_from(start),
                     },
@@ -2868,6 +2964,37 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
         }
         Ok(args)
+    }
+
+    /// Turn lexed template parts into parsed segments (interpolations are
+    /// parsed by a sub-parser over the token slice the lexer produced).
+    fn template_segs(&mut self, parts: Vec<TplPart>) -> Result<Vec<TplSeg>, JsError> {
+        let mut segs = Vec::new();
+        for p in parts {
+            match p {
+                TplPart::Lit(s) => segs.push(TplSeg::Lit(s)),
+                TplPart::Expr(toks) => {
+                    let mut toks = toks;
+                    toks.push(Token {
+                        tok: Tok::Eof,
+                        start: 0,
+                        end: 0,
+                        nl: false,
+                    });
+                    let mut sub = Parser {
+                        src: self.src,
+                        toks,
+                        pos: 0,
+                        depth: 0,
+                        class_stack: Vec::new(),
+                        no_in: false,
+                    };
+                    let e = sub.expr()?;
+                    segs.push(TplSeg::Expr(e));
+                }
+            }
+        }
+        Ok(segs)
     }
 
     fn primary(&mut self) -> Result<Expr, JsError> {
@@ -2945,31 +3072,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
             Tok::Template(parts) => {
                 self.next();
-                let mut segs = Vec::new();
-                for p in parts {
-                    match p {
-                        TplPart::Lit(s) => segs.push(TplSeg::Lit(s)),
-                        TplPart::Expr(toks) => {
-                            let mut toks = toks;
-                            toks.push(Token {
-                                tok: Tok::Eof,
-                                start: 0,
-                                end: 0,
-                                nl: false,
-                            });
-                            let mut sub = Parser {
-                                src: self.src,
-                                toks,
-                                pos: 0,
-                                depth: 0,
-                                class_stack: Vec::new(),
-                            };
-                            let e = sub.expr()?;
-                            segs.push(TplSeg::Expr(e));
-                        }
-                    }
-                }
-                ExprKind::Template(segs)
+                ExprKind::Template(self.template_segs(parts)?)
             }
             Tok::Regex(p, f) => {
                 self.next();
@@ -3031,7 +3134,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
             Tok::Punct(Punct::LParen) => {
                 self.next();
-                let e = self.expr()?;
+                // the head grammar's `in` suppression does not reach inside
+                // parentheses: `for (var x = (a in b); ;)` is valid
+                let prev_no_in = self.no_in;
+                self.no_in = false;
+                let e = self.expr();
+                self.no_in = prev_no_in;
+                let e = e?;
                 self.expect_punct(Punct::RParen)?;
                 return Ok(e);
             }
@@ -3425,6 +3534,10 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
                     ChainStep::Call { args, .. } => args.iter().any(|a| match a {
                         CallArg::Arg(x) | CallArg::Spread(x) => expr_uses(x, k),
                     }),
+                    ChainStep::Tagged { segs } => segs.iter().any(|s| match s {
+                        TplSeg::Lit(_) => false,
+                        TplSeg::Expr(x) => expr_uses(x, k),
+                    }),
                 })
         }
         Array(items) => items.iter().any(|i| match i {
@@ -3447,6 +3560,13 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
             TplSeg::Lit(_) => false,
             TplSeg::Expr(x) => expr_uses(x, k),
         }),
+        TaggedTemplate { tag, segs } => {
+            expr_uses(tag, k)
+                || segs.iter().any(|s| match s {
+                    TplSeg::Lit(_) => false,
+                    TplSeg::Expr(x) => expr_uses(x, k),
+                })
+        }
         // literals / nested functions own their trees
         Ident(_) | Num(_) | Str(_) | Bool(_) | Null | This | Regex { .. } | Func(_)
         | Arrow(_) => false,
@@ -3824,6 +3944,10 @@ fn scan_expr_arguments(e: &Expr) -> bool {
                     ChainStep::Call { args, .. } => args.iter().any(|a| match a {
                         CallArg::Arg(x) | CallArg::Spread(x) => scan_expr_arguments(x),
                     }),
+                    ChainStep::Tagged { segs } => segs.iter().any(|s| match s {
+                        TplSeg::Lit(_) => false,
+                        TplSeg::Expr(x) => scan_expr_arguments(x),
+                    }),
                 })
         }
         Array(items) => items.iter().any(|i| match i {
@@ -3852,5 +3976,12 @@ fn scan_expr_arguments(e: &Expr) -> bool {
             TplSeg::Lit(_) => false,
             TplSeg::Expr(e) => scan_expr_arguments(e),
         }),
+        TaggedTemplate { tag, segs } => {
+            scan_expr_arguments(tag)
+                || segs.iter().any(|s| match s {
+                    TplSeg::Lit(_) => false,
+                    TplSeg::Expr(e) => scan_expr_arguments(e),
+                })
+        }
     }
 }

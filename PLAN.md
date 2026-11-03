@@ -1268,8 +1268,48 @@ curve matters more than the baseline (near-flat as tabs grow).
   5 module bundles; each one fails on private class fields, the next syntax
   batch). Wikipedia `JavaScript` unchanged at 11404 runs; svelte.dev
   unchanged at 291 runs.
-  **(v) next** - private `#fields` (the last common bundle-syntax gap),
-  BigInt literals, `new.target`, computed class keys, `for await`.
+  **(v) bundle syntax** - the four MDN client bundles wave 15 downloaded now
+  parse end to end:
+  - `for` heads are parsed as a head: the declarator list is a list
+    (`for (var a, b, c = x; ...)` no longer stops at the first comma when
+    the first declarator has no initializer), and `Parser::no_in` keeps `in`
+    out of the binary operators until the head ends (cleared inside
+    parentheses), so `for (x in o)`, `for (o[k] in o)`, `for (n = f(), i =
+    0; ...)` and `for (var x = ('a' in o); ...)` all parse.
+  - class bodies accept `async` methods (and `async *`), generator methods
+    (`*g()`), computed member names (`[Symbol.toPrimitive](v) {}`, static
+    and instance fields) and private names (`#x`, `#m()`, `this.#m`).
+  - tagged templates are real calls: `` tag`a${x}b` `` passes a strings
+    array (with `.raw`) followed by the interpolated values.
+  - the template scanner consumes a whole escape (`\xHH`, `\uHHHH`,
+    `\u{...}`, line continuations) instead of exactly two bytes; a Fluent
+    template containing `\xa9` used to fail with a bogus "bad \x escape"
+    reported at the template's start.
+  - `<script type>` is honored: only JavaScript MIME types and `module`
+    execute; JSON-LD, import maps and template blocks are skipped
+    (Wikipedia's inline `application/ld+json` block had been parsed as JS).
+  Honest shortcuts: computed accessors (`get [k]()`), class static blocks,
+  `#x in obj` brand checks and private-name scoping across a base/derived
+  pair are not implemented; private names are ordinary `#`-prefixed
+  properties; a computed instance field re-evaluates its key per instance;
+  `.raw` holds the cooked text (escape spelling is not preserved); engine B
+  still logs + skips module scripts.
+  Tests (624 default / 628 with `engine-b woff2`):
+  `for_head_declarator_list_without_initializer_on_the_first`,
+  `for_head_comma_expression_init`, `for_in_with_a_member_target`,
+  `in_suppression_stops_at_parentheses`,
+  `async_and_generator_class_methods`, `computed_class_member_names`,
+  `private_class_fields_and_methods`, `template_hex_escape_is_decoded`,
+  `tagged_template_gets_strings_and_values`,
+  `collect_scripts_skips_non_javascript_types`.
+  Live: all four MDN bundles parse; MDN `/Web/CSS/list-style-type` now runs
+  its module tree (2773 runs, 89.4-95.6 MB; the first executed bundle stops
+  on `Cannot read property 'prototype' of undefined` - the next runtime
+  gap), Wikipedia `JavaScript` 11404 runs / 92.1 MB, svelte.dev 291 runs /
+  83.7 MB.
+  **(w) next** - BigInt literals, `new.target`, `for await`, top-level
+  `await`, import assertions, live module bindings, computed class
+  accessors, class static blocks.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
   re-fetch** (Recommendations §2), cookies, forms, memory-pressure discarding policy
   — DOM half done in wave 9 (o): snapshots serialize the parsed tree and restore
@@ -1402,6 +1442,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 15 (ES modules) | MDN `/Web/CSS/list-style-type` | 85.7 MB (2773 runs; layout unchanged; 5 module bundles now fetched but fail on private class fields) |
 | 2026-11-03 | wave 15 (ES modules) | Wikipedia `/wiki/JavaScript` | 98.4 MB (11404 runs; identical) |
 | 2026-11-03 | wave 15 (ES modules) | svelte.dev | 111.2 MB (291 runs; unchanged; dynamic `import()` is now a runtime error, so earlier statements still run) |
+| 2026-11-03 | wave 16 (bundle syntax) | parse probe: the 4 MDN client bundles | 4/4 parse (was 0/4: `for` declarator list, `for (e in c)`, `async` method, computed class key, private `#m`, tagged template, template `\xa9`) |
+| 2026-11-03 | wave 16 (bundle syntax) | MDN `/Web/CSS/list-style-type` | 89.4-95.6 MB (2773 runs; module bundles now run instead of failing to parse; first bundle stops on `Cannot read property 'prototype' of undefined`) |
+| 2026-11-03 | wave 16 (bundle syntax) | Wikipedia `/wiki/JavaScript` | 92.1 MB (11404 runs; inline JSON-LD block no longer parsed as JS) |
+| 2026-11-03 | wave 16 (bundle syntax) | svelte.dev | 83.7 MB (291 runs; unchanged rendering) |
 
 ### Phase 1c (Track A) findings
 

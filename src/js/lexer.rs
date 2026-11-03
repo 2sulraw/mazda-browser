@@ -620,22 +620,42 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 Some(b'\\') => {
-                    // find raw run up to next escape/delimiter/interp, unescape it
+                    // consume exactly one escape sequence, then decode it.
+                    // (Previously this took a fixed 2 bytes, so `\xHH` /
+                    // `\uHHHH` in a template were cut in half and reported
+                    // as a bogus "bad \x escape" at the template start.)
                     let raw_start = self.pos;
-                    while let Some(b) = self.peek() {
-                        if b == b'\\' || b == b'`' || b == b'$' {
-                            break;
+                    self.pos += 1; // `\`
+                    match self.peek() {
+                        Some(b'x') => self.pos += 3, // \xHH
+                        Some(b'u') => {
+                            if self.peek2() == Some(b'{') {
+                                self.pos += 2; // `u{`
+                                while let Some(b) = self.peek() {
+                                    if b == b'`' || b == b'$' {
+                                        break;
+                                    }
+                                    self.pos += 1;
+                                    if b == b'}' {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                self.pos += 5; // \uHHHH
+                            }
                         }
-                        self.pos += 1;
+                        Some(b'\r') => {
+                            self.pos += 1;
+                            if self.peek() == Some(b'\n') {
+                                self.pos += 1;
+                            }
+                        }
+                        Some(_) => self.pos += 1,
+                        None => {}
                     }
-                    let raw = &self.src[raw_start..self.pos];
+                    let end = self.pos.min(self.src.len());
+                    let raw = &self.src[raw_start..end];
                     lit.push_str(&self.unescape(raw, start)?);
-                    if self.peek() == Some(b'\\') {
-                        let raw_start = self.pos;
-                        self.pos += 2;
-                        let raw = &self.src[raw_start..self.pos];
-                        lit.push_str(&self.unescape(raw, start)?);
-                    }
                 }
                 Some(_) => {
                     let raw_start = self.pos;
@@ -856,6 +876,21 @@ impl<'a> Lexer<'a> {
                     return Ok(Tok::Spread);
                 }
                 one!(Punct::Dot)
+            }
+            // private class name: `#field` / `#method`. Kept as an ordinary
+            // identifier with a `#` prefix so member access, class members
+            // and `this.#x` reuse the normal property machinery. shortcut:
+            // private names are per-property, not per-class, so same-named
+            // privates of a base and a derived class collide.
+            b'#' if matches!(self.peek2(), Some(c) if is_ident_start(c)) => {
+                self.pos += 1; // `#`
+                let name_start = self.pos;
+                self.pos += 1;
+                while matches!(self.peek(), Some(c) if is_ident_char(c)) {
+                    self.pos += 1;
+                }
+                let s = &self.src[name_start..self.pos];
+                return Ok(Tok::Ident(Rc::from(format!("#{}", s).as_str())));
             }
             _ => {
                 let ch_len = (1..=4)

@@ -1384,16 +1384,34 @@ pub(crate) fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
         match &dom.nodes[n as usize].kind {
             NodeKind::Element(_, _) => {
                 if dom.tag(n) == "script" {
-                    let ty = dom.attr(n, "type").unwrap_or("");
-                    let is_module = ty.trim().eq_ignore_ascii_case("module");
-                    out.push(ScriptSrc {
-                        text: child_text(dom, n),
-                        src: dom.attr(n, "src").map(|s| s.to_string()),
-                        is_module,
-                        // a boolean attribute may arrive as `""`, "nomodule" or
-                        // an empty value; presence is all that matters
-                        is_nomodule: dom.attr(n, "nomodule").is_some(),
-                    });
+                    let ty = dom.attr(n, "type").unwrap_or("").trim();
+                    // `type` may carry parameters (`text/javascript; charset=…`)
+                    let mime = ty.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                    let is_module = ty.eq_ignore_ascii_case("module");
+                    // Only JavaScript MIME types run: `application/ld+json`,
+                    // templates, import maps and the like are data blocks.
+                    let is_js = is_module
+                        || mime.is_empty()
+                        || matches!(
+                            mime.as_str(),
+                            "text/javascript"
+                                | "application/javascript"
+                                | "text/ecmascript"
+                                | "application/ecmascript"
+                                | "application/x-javascript"
+                                | "text/jscript"
+                                | "text/livescript"
+                        );
+                    if is_js {
+                        out.push(ScriptSrc {
+                            text: child_text(dom, n),
+                            src: dom.attr(n, "src").map(|s| s.to_string()),
+                            is_module,
+                            // a boolean attribute may arrive as `""`, "nomodule"
+                            // or an empty value; presence is all that matters
+                            is_nomodule: dom.attr(n, "nomodule").is_some(),
+                        });
+                    }
                 }
                 for &c in dom.nodes[n as usize].children.iter().rev() {
                     stack.push(c);
@@ -1660,6 +1678,25 @@ mod tests {
         assert_eq!(s[0].src, None);
         assert_eq!(s[1].src.as_deref(), Some("/a.js"));
         assert_eq!(s[2].text, "2");
+    }
+
+    #[test]
+    fn collect_scripts_skips_non_javascript_types() {
+        let dom = html::parse(
+            r#"<html><body>
+                <script type="application/ld+json">{"a":1}</script>
+                <script type="text/javascript">1</script>
+                <script type="application/javascript; charset=utf-8">2</script>
+                <script type="module">3</script>
+                <script type="text/template"><p>t</p></script>
+                <script type="importmap">{"imports":{}}</script>
+                <script>4</script>
+            </body></html>"#,
+        );
+        let s = collect_scripts(&dom);
+        let texts: Vec<&str> = s.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, vec!["1", "2", "3", "4"]);
+        assert!(s[2].is_module);
     }
 
     #[test]
