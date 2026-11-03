@@ -3429,17 +3429,54 @@ fn apply_event_value(kp: &mut KeptPage, node: u32, value: &str) {
 /// worker-side before listeners fire (the shell owns the click, the worker
 /// owns the DOM).
 fn apply_click_toggle(kp: &mut KeptPage, node: u32) {
-    if kp.dom.tag(node) != "input" {
+    toggle_control(&mut kp.dom, node);
+}
+
+/// The checked-state half of a click, DOM-only so it is testable without a
+/// page. A checkbox flips; a radio never unchecks (browsers keep a clicked
+/// radio selected) and picking one clears every other radio of the same
+/// group - same `name`, same form owner, or the whole document for a
+/// form-less group. Listeners/relayout are the caller's job.
+fn toggle_control(dom: &mut html::Dom, node: u32) {
+    if dom.tag(node) != "input" {
         return;
     }
-    let ty = kp.dom.attr(node, "type").unwrap_or("text").to_string();
-    if ty == "checkbox" || ty == "radio" {
-        if kp.dom.attr(node, "checked").is_some() {
-            remove_dom_attr(&mut kp.dom, node, "checked");
-        } else {
-            set_dom_attr(&mut kp.dom, node, "checked", "");
+    let ty = dom.attr(node, "type").unwrap_or("text").to_ascii_lowercase();
+    match ty.as_str() {
+        "checkbox" => {
+            if dom.attr(node, "checked").is_some() {
+                remove_dom_attr(dom, node, "checked");
+            } else {
+                set_dom_attr(dom, node, "checked", "");
+            }
         }
+        "radio" => {
+            // `name` is copied first: clearing the group mutates attributes
+            let name = dom.attr(node, "name").unwrap_or("").to_string();
+            let scope = form_ancestor(dom, node).unwrap_or(0);
+            if !name.is_empty() {
+                let group: Vec<u32> = (1..dom.nodes.len() as u32)
+                    .filter(|&i| i != node && same_radio_group(dom, i, &name, scope))
+                    .collect();
+                for i in group {
+                    remove_dom_attr(dom, i, "checked");
+                }
+            }
+            set_dom_attr(dom, node, "checked", "");
+        }
+        _ => {}
     }
+}
+
+/// True when `other` is a radio in the group `name` under `scope` (the form
+/// owner node, or 0 for form-less radios, which group per document).
+fn same_radio_group(dom: &html::Dom, other: u32, name: &str, scope: u32) -> bool {
+    dom.tag(other) == "input"
+        && dom
+            .attr(other, "type")
+            .is_some_and(|t| t.eq_ignore_ascii_case("radio"))
+        && dom.attr(other, "name") == Some(name)
+        && form_ancestor(dom, other).unwrap_or(0) == scope
 }
 
 fn kept_matches(kept: &Option<KeptPage>, url: &str) -> bool {
@@ -3693,22 +3730,53 @@ pub(crate) fn collect_form_pairs(
     dom: &html::Dom,
     form: u32,
     live: &HashMap<u32, String>,
+    submitter: Option<u32>,
 ) -> Vec<(String, String)> {
     fn walk(
         dom: &html::Dom,
         node: u32,
         live: &HashMap<u32, String>,
+        submitter: Option<u32>,
         out: &mut Vec<(String, String)>,
     ) {
         for &c in &dom.nodes[node as usize].children {
             let tag = dom.tag(c).to_ascii_lowercase();
-            // honest submission set: inputs + textarea. `<select>` values are
-            // inert (no popup — no user-editable state exists yet) and
-            // `<button>`/submit-kind inputs are excluded per the builder's
-            // shortcut, so the only successful controls are text-ish fields
-            // and checked checkboxes/radios. `type=hidden` still submits: it
-            // must never be editable, and the DOM (not the layout) is the
-            // source of truth here.
+            // disabled controls never submit - neither by their own
+            // attribute nor through a disabled <fieldset> ancestor (the
+            // spec's first-<legend> escape hatch is not modelled)
+            if control_disabled(dom, c) {
+                continue;
+            }
+            if tag == "select" {
+                // the select submits its selected option's value; the
+                // options are not controls, so no recursion
+                if let Some(name) = dom.attr(c, "name") {
+                    if let Some(v) = selected_option_value(dom, c) {
+                        out.push((name.to_string(), v));
+                    }
+                }
+                continue;
+            }
+            if tag == "button" {
+                // a submit button is a successful control only when it is
+                // the one that submitted this form
+                if Some(c) == submitter {
+                    let ty = dom.attr(c, "type").unwrap_or("submit");
+                    if ty.eq_ignore_ascii_case("submit") {
+                        if let Some(name) = dom.attr(c, "name") {
+                            out.push((
+                                name.to_string(),
+                                dom.attr(c, "value").unwrap_or("").to_string(),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+            // honest submission set: inputs + textarea. `type=hidden` still
+            // submits: it must never be editable, and the DOM (not the
+            // layout) is the source of truth here. `type=file` stays out
+            // (no picker UI exists).
             if matches!(tag.as_str(), "input" | "textarea") {
                 if let Some(name) = dom.attr(c, "name") {
                     let name = name.to_string();
@@ -3729,14 +3797,20 @@ pub(crate) fn collect_form_pairs(
                             .trim()
                             .to_ascii_lowercase();
                         match ty.as_str() {
-                            // buttons that submit (or reset/image) are never
-                            // successful pairs (see the [form] submit data
-                            // contract); `file` is the second honest shortcut
-                            // (no picker UI exists)
-                            "submit" | "reset" | "button" | "image" | "file" => {}
+                            // the activated submit button contributes its
+                            // own pair; reset/button/image never submit
+                            "submit" => {
+                                if Some(c) == submitter {
+                                    out.push((
+                                        name,
+                                        dom.attr(c, "value").unwrap_or("").to_string(),
+                                    ));
+                                }
+                            }
+                            "reset" | "button" | "image" | "file" => {}
                             // checked state lives engine-side in the worker
                             // DOM (the shell's click toggles carry through
-                            // `apply_click_toggle`): only checked boxes submit
+                            // `toggle_control`): only checked boxes submit
                             "checkbox" | "radio" => {
                                 if dom.attr(c, "checked").is_some() {
                                     // HTML default when no value attr: "on"
@@ -3748,7 +3822,7 @@ pub(crate) fn collect_form_pairs(
                                 }
                             }
                             // text-ish inputs + the inert generic types
-                            // (range/color/date — static value attr, no
+                            // (range/color/date - static value attr, no
                             // interaction to change it: submitted as-is)
                             _ => {
                                 let value = live
@@ -3762,12 +3836,73 @@ pub(crate) fn collect_form_pairs(
                     }
                 }
             }
-            walk(dom, c, live, out);
+            walk(dom, c, live, submitter, out);
         }
     }
     let mut out = Vec::new();
-    walk(dom, form, live, &mut out);
+    walk(dom, form, live, submitter, &mut out);
     out
+}
+
+/// A control is disabled by its own `disabled` attribute or by sitting in a
+/// disabled `<fieldset>`.
+fn control_disabled(dom: &html::Dom, node: u32) -> bool {
+    if dom.attr(node, "disabled").is_some() {
+        return true;
+    }
+    let mut cur = node;
+    while cur != 0 {
+        cur = match dom.nodes.get(cur as usize) {
+            Some(n) => n.parent,
+            None => return false,
+        };
+        if cur == 0 {
+            break;
+        }
+        if dom.tag(cur) == "fieldset" && dom.attr(cur, "disabled").is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Submitted value of a `<select>`: the selected option (browsers select the
+/// first option when none is marked), `value` attribute or its label text.
+/// shortcut: a `multiple` select submits only that one value - there is no
+/// popup to pick several options with.
+fn selected_option_value(dom: &html::Dom, select: u32) -> Option<String> {
+    fn collect(dom: &html::Dom, node: u32, out: &mut Vec<u32>) {
+        for &c in &dom.nodes[node as usize].children {
+            match dom.tag(c) {
+                "option" => out.push(c),
+                "optgroup" | "select" => collect(dom, c, out),
+                _ => {}
+            }
+        }
+    }
+    fn disabled_option(dom: &html::Dom, opt: u32) -> bool {
+        if dom.attr(opt, "disabled").is_some() {
+            return true;
+        }
+        let p = dom.nodes[opt as usize].parent;
+        p != 0 && dom.tag(p) == "optgroup" && dom.attr(p, "disabled").is_some()
+    }
+    let mut opts = Vec::new();
+    collect(dom, select, &mut opts);
+    // remembered selection wins even when disabled (the browser still has
+    // it selected); the implicit first selection skips disabled options
+    let pick = opts
+        .iter()
+        .copied()
+        .find(|&o| dom.attr(o, "selected").is_some())
+        .or_else(|| opts.iter().copied().find(|&o| !disabled_option(dom, o)))?;
+    Some(match dom.attr(pick, "value") {
+        Some(v) => v.to_string(),
+        None => crate::script::child_text(dom, pick)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    })
 }
 
 /// `application/x-www-form-urlencoded` serial (the `url` crate's
@@ -3871,7 +4006,7 @@ pub(crate) fn build_submission(
     base: &str,
 ) -> Option<SubmissionReq> {
     let form = form_ancestor(dom, activated)?;
-    let pairs = collect_form_pairs(dom, form, live);
+    let pairs = collect_form_pairs(dom, form, live, Some(activated));
     let body = urlencode_pairs(&pairs);
     let action = resolve_form_target(base, dom.attr(form, "action"))
         .or_else(|| resolve_form_target(base, None))
@@ -6785,8 +6920,9 @@ mod tests {
     /// text/password/textarea values, hidden inputs submit, checked state
     /// comes from the worker DOM's `checked` attribute (the shell's click
     /// toggles carry through), checked-only radios/checkboxes, and
-    /// unnamed/submitter/file controls never submit. The urlencoded serial
-    /// then turns spaces into `+` and escapes `&`/`=` (url crate).
+    /// unnamed/file controls never submit. A submit button is a pair only
+    /// when it is the activated one. The urlencoded serial then turns
+    /// spaces into `+` and escapes `&`/`=` (url crate).
     #[test]
     fn form_pairs_collect_and_encode() {
         let dom = html::parse(
@@ -6808,7 +6944,7 @@ mod tests {
         let form = (1..dom.nodes.len() as u32)
             .find(|&i| dom.tag(i) == "form")
             .unwrap();
-        let pairs = collect_form_pairs(&dom, form, &Default::default());
+        let pairs = collect_form_pairs(&dom, form, &Default::default(), None);
         let map: HashMap<&str, &str> =
             pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(map.get("user"), Some(&"Ann"));
@@ -6824,9 +6960,31 @@ mod tests {
         assert_eq!(map.get("esc"), Some(&"x&y=z"));
         assert!(!map.contains_key("cb2"), "unchecked box never submits");
         assert!(!map.contains_key("r2"), "unchecked radio never submits");
-        assert!(!map.contains_key("go"), "the submitter is never a pair");
+        assert!(
+            !map.contains_key("go"),
+            "a submit button is a pair only when it is the activated one"
+        );
         assert!(!map.contains_key("doc"), "file controls excluded (no picker)");
         assert!(!map.contains_key("anon"), "nameless controls excluded");
+        // activating the submit button adds its pair, in document order
+        let go = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.attr(i, "name") == Some("go"))
+            .unwrap();
+        let with_go = collect_form_pairs(&dom, form, &Default::default(), Some(go));
+        let gmap: HashMap<&str, &str> = with_go
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            gmap.get("go"),
+            Some(&"Go"),
+            "the activated submitter submits name=value"
+        );
+        assert_eq!(
+            gmap.len(),
+            map.len() + 1,
+            "activating a submit button adds exactly one pair"
+        );
         let ser = urlencode_pairs(&pairs);
         assert!(ser.contains("sp=a+b"), "space urlencodes to +");
         assert!(ser.contains("esc=x%26y%3Dz"), "& and = must escape");
@@ -6841,7 +6999,7 @@ mod tests {
             .find(|&i| dom2.tag(i) == "form")
             .unwrap();
         assert_eq!(
-            collect_form_pairs(&dom2, form2, &Default::default()),
+            collect_form_pairs(&dom2, form2, &Default::default(), None),
             vec![("cb".to_string(), "on".to_string())],
             "checkbox without a value attr submits \"on\""
         );
@@ -6865,9 +7023,211 @@ mod tests {
         let mut live: HashMap<u32, String> = HashMap::new();
         live.insert(node, "typed".to_string());
         assert_eq!(
-            collect_form_pairs(&dom, form, &live),
+            collect_form_pairs(&dom, form, &live, None),
             vec![("q".to_string(), "typed".to_string())],
             "the live typed value replaces the markup default"
+        );
+    }
+
+    /// Radio/checkbox click semantics: a radio click never unchecks it,
+    /// moves the `checked` flag across its whole group (same `name` + same
+    /// form owner), and leaves same-name radios in another form alone.
+    /// Checkboxes keep the plain toggle.
+    #[test]
+    fn radio_clicks_move_the_group_and_never_uncheck() {
+        let mut dom = html::parse(
+            r#"<html><body>
+                <form id="a">
+                    <input type="radio" name="size" value="s">
+                    <input type="radio" name="size" value="m">
+                    <input type="radio" name="other" value="x" checked>
+                    <input type="checkbox" name="cb" checked>
+                </form>
+                <form id="b">
+                    <input type="radio" name="size" value="s" checked>
+                    <input type="radio" name="size" value="l">
+                </form>
+                <input type="radio" name="loose" value="1">
+                <input type="radio" name="loose" value="2">
+            </body></html>"#,
+        );
+        let find = |dom: &html::Dom, pred: &dyn Fn(&html::Dom, u32) -> bool| -> u32 {
+            (1..dom.nodes.len() as u32)
+                .find(|&n| pred(dom, n))
+                .expect("node")
+        };
+        let size_m = find(&dom, &|d, n| {
+            d.attr(n, "name") == Some("size") && d.attr(n, "value") == Some("m")
+        });
+        let size_s_b = find(&dom, &|d, n| {
+            d.attr(n, "name") == Some("size")
+                && d.attr(n, "value") == Some("s")
+                && d.attr(n, "checked").is_some()
+        });
+        let other_x = find(&dom, &|d, n| d.attr(n, "name") == Some("other"));
+        let cb = find(&dom, &|d, n| d.tag(n) == "input" && d.attr(n, "type") == Some("checkbox"));
+        toggle_control(&mut dom, size_m);
+        assert!(
+            dom.attr(size_m, "checked").is_some(),
+            "clicking a radio checks it"
+        );
+        assert!(
+            dom.attr(size_s_b, "checked").is_some(),
+            "a same-name radio in ANOTHER form keeps its state"
+        );
+        toggle_control(&mut dom, size_m);
+        assert!(
+            dom.attr(size_m, "checked").is_some(),
+            "clicking a checked radio never unchecks it"
+        );
+        // the loose group is scoped to the document, so those two interact
+        let loose1 = find(&dom, &|d, n| {
+            d.attr(n, "name") == Some("loose") && d.attr(n, "value") == Some("1")
+        });
+        let loose2 = find(&dom, &|d, n| {
+            d.attr(n, "name") == Some("loose") && d.attr(n, "value") == Some("2")
+        });
+        toggle_control(&mut dom, loose2);
+        assert!(dom.attr(loose2, "checked").is_some());
+        toggle_control(&mut dom, loose1);
+        assert!(dom.attr(loose1, "checked").is_some());
+        assert!(
+            dom.attr(loose2, "checked").is_none(),
+            "form-less radios group per document"
+        );
+        // unrelated controls are untouched
+        assert!(dom.attr(other_x, "checked").is_some());
+        toggle_control(&mut dom, cb);
+        assert!(
+            dom.attr(cb, "checked").is_none(),
+            "a checkbox still unchecks on click"
+        );
+    }
+
+    /// Disabled controls never submit (own attribute or a disabled
+    /// `<fieldset>`), and a `<select>` submits its selected option's
+    /// `value` - or its label text when the option has no `value`.
+    #[test]
+    fn form_pairs_skip_disabled_and_submit_the_selected_option() {
+        let dom = html::parse(
+            r#"<html><body><form>
+                <input name="q" value="ok">
+                <input name="gone" value="x" disabled>
+                <fieldset disabled>
+                    <input name="inner" value="y">
+                    <textarea name="inner-area">z</textarea>
+                </fieldset>
+                <select name="lang">
+                    <option value="en">English</option>
+                    <option value="fr" selected>Francais</option>
+                </select>
+                <select name="region">
+                    <option selected>   Europe
+                        wide  </option>
+                    <option value="us">US</option>
+                </select>
+                <select name="off" disabled>
+                    <option value="zz" selected>off</option>
+                </select>
+                <select name="empty"></select>
+            </form></body></html>"#,
+        );
+        let form = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.tag(i) == "form")
+            .unwrap();
+        let pairs = collect_form_pairs(&dom, form, &Default::default(), None);
+        let map: HashMap<&str, &str> =
+            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(map.get("q"), Some(&"ok"));
+        assert!(!map.contains_key("gone"), "disabled control excluded");
+        assert!(
+            !map.contains_key("inner") && !map.contains_key("inner-area"),
+            "controls inside a disabled fieldset are excluded"
+        );
+        assert_eq!(
+            map.get("lang"),
+            Some(&"fr"),
+            "the selected option's value attribute submits"
+        );
+        assert_eq!(
+            map.get("region"),
+            Some(&"Europe wide"),
+            "no value attribute: the option label, whitespace collapsed"
+        );
+        assert!(!map.contains_key("off"), "a disabled select never submits");
+        assert!(
+            !map.contains_key("empty"),
+            "a select with no options contributes nothing"
+        );
+        // a checked radio in the same group as a re-clicked one keeps only
+        // one successful pair (the click side clears the rest)
+        let dom2 = html::parse(
+            r#"<html><body><form>
+                <select name="s"><option value="a">A</option><option value="b">B</option></select>
+            </form></body></html>"#,
+        );
+        let form2 = (1..dom2.nodes.len() as u32)
+            .find(|&i| dom2.tag(i) == "form")
+            .unwrap();
+        assert_eq!(
+            collect_form_pairs(&dom2, form2, &Default::default(), None),
+            vec![("s".to_string(), "a".to_string())],
+            "no selected option: the first enabled one is implicit"
+        );
+    }
+
+    /// Only the activated submit button contributes its pair; pressing
+    /// Enter in a text field (same builder, different `activated`) adds
+    /// nothing, which matches the shell's current implicit-submission rule.
+    #[test]
+    fn activated_submit_button_adds_its_pair() {
+        let dom = html::parse(
+            r#"<html><body><form action="/go">
+                <input name="q" value="x">
+                <button type="submit" name="act" value="save">Save</button>
+                <button type="submit" name="other" value="del">Delete</button>
+            </form></body></html>"#,
+        );
+        let find = |name: &str| -> u32 {
+            (1..dom.nodes.len() as u32)
+                .find(|&i| dom.attr(i, "name") == Some(name))
+                .unwrap()
+        };
+        let sub = build_submission(&dom, find("act"), &Default::default(), "https://e.com/")
+            .expect("submission");
+        assert_eq!(sub.body, "q=x&act=save", "the clicked button is included");
+        let enter = build_submission(&dom, find("q"), &Default::default(), "https://e.com/")
+            .expect("submission");
+        assert_eq!(
+            enter.body, "q=x",
+            "a text-field activation names no submitter"
+        );
+        // `<input type=submit>` behaves the same, but a reset button never
+        // becomes a pair
+        let dom2 = html::parse(
+            r#"<html><body><form action="/go">
+                <input type="submit" name="go" value="Go">
+                <input type="reset" name="wipe" value="Reset">
+            </form></body></html>"#,
+        );
+        let go = (1..dom2.nodes.len() as u32)
+            .find(|&i| dom2.attr(i, "name") == Some("go"))
+            .unwrap();
+        assert_eq!(
+            build_submission(&dom2, go, &Default::default(), "https://e.com/")
+                .unwrap()
+                .body,
+            "go=Go"
+        );
+        let wipe = (1..dom2.nodes.len() as u32)
+            .find(|&i| dom2.attr(i, "name") == Some("wipe"))
+            .unwrap();
+        assert_eq!(
+            build_submission(&dom2, wipe, &Default::default(), "https://e.com/")
+                .unwrap()
+                .body,
+            "",
+            "a reset button never submits"
         );
     }
 

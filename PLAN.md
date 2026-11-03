@@ -1527,7 +1527,10 @@ curve matters more than the baseline (near-flat as tabs grow).
   skips fetch+parse; cookies done in wave 11 (q): a persisted jar sends on every
   request and `document.getCookie`/`setCookie` expose the script subset; the tab
   store landed in wave 30 (the tab list persists across restarts and restores
-  through the same snapshot path). Forms / hibernation-on-pressure are open.
+  through the same snapshot path); submission fidelity landed in wave 31
+  (radio groups, disabled controls, `<select>` values, the activated submit
+  button's pair). Still open: implicit submission picking the form's default
+  button, a file picker, `<select>` popup, label-for activations.
 - [ ] Later — real CSS cascade/invalidation, damage tracking, fuzzing, sandbox study
 
 ## Recommendations logged (from "translate HTML/CSS to Rust" discussion)
@@ -1688,6 +1691,42 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **736** pass / 0 fail after the other five waves merged; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
 | 2026-11-03 | wave 30 (tab store) | Wikipedia `/wiki/JavaScript` | 100.1 / 101.9 MB (10943 runs, restored snapshot) against 99.6 / 100.0 MB from a HEAD build run back-to-back on the same URL - the delta is run noise; the store holds only the URL strings, the page itself is untouched |
 | 2026-11-03 | wave 30 (tab store) | live restart probe | 2-tab `session` file -> two pills (second active) and the active tab taken from its DOM snapshot (`[dom] restored snapshot ... (no fetch)`); an explicit URL argument starts a fresh one-tab session; 14 s of idle frames left the file's mtime unchanged; suite **737** default / **741** `engine-b + woff2` |
+| 2026-11-03 | wave 31 (form submission fidelity) | local `form31.html` probe (scripted `form.submit()`, no input synthesized) | `[js] form.submit() -> GET https://example.com/s?q=hi&lang=fr&region=Europe+wide` - the disabled input and the disabled `<fieldset>`'s control are gone, both `<select>`s submit (`selected` option value, label text with collapsed whitespace), suite **740** default / **744** `engine-b + woff2` |
+
+### Wave 31 findings
+
+- **A radio click now moves the whole group.** `toggle_control` (split out of
+  the old `apply_click_toggle` so it can be tested on a bare DOM) clears
+  `checked` from every same-`name` radio that shares the clicked radio's form
+  owner - or the whole document when the group has no form - and then sets
+  the clicked one. A click on an already-checked radio keeps it checked
+  (browsers never uncheck a radio by clicking it); checkboxes still toggle.
+  Same-name radios in a *different* form keep their state, which is the part
+  a naive "clear every radio with this name" would get wrong.
+- **Disabled controls are no longer submitted.** `control_disabled` checks the
+  control's own `disabled` attribute and any disabled `<fieldset>` ancestor;
+  the walk skips such subtrees, so a disabled fieldset costs one ancestor
+  check per node and nothing else. The spec's first-`<legend>` escape hatch is
+  not modelled (a control inside a disabled fieldset's first legend also
+  stays out).
+- **`<select>` submits its selected option.** Previously the whole control was
+  inert, so any GET/POST form with a language/region/filter select went out
+  without it. The submitted value is the option's `value` attribute, else its
+  label text with whitespace collapsed; a select with no marked option uses
+  the first enabled one (browsers' implicit selection), disabled options are
+  skipped for that implicit pick, and a disabled select contributes nothing.
+  `multiple` still submits one value: no popup exists to pick several.
+- **The activated submit button submits its own pair.** `collect_form_pairs`
+  grew a `submitter: Option<u32>` argument; `build_submission` passes the node
+  the shell activated, so a clicked `<button type=submit>` / `<input
+  type=submit>` contributes `name=value` while the other buttons in the form
+  do not. A text-field activation (Enter) names no submitter, so it still adds
+  no pair - the implicit-submission rule that would pick the form's default
+  button is not modelled (one line to add later if a site depends on it).
+- Live proof stayed input-free: a local page's inline script calls
+  `form.submit()`, and the worker's `[js] form.submit() -> GET ...` line shows
+  exactly the pair set above. The click side (radios, submitter) is covered by
+  the in-crate tests, since this shell never synthesizes user input.
 
 ### Wave 30 findings
 
