@@ -1764,3 +1764,194 @@ fn tagged_template_gets_strings_and_values() {
         "X"
     );
 }
+
+// -- wave 17: URL / URLSearchParams ---------------------------------------
+
+#[test]
+fn url_components() {
+    assert_eq!(string("new URL('https://example.com/a/b?x=1#f').protocol"), "https:");
+    assert_eq!(string("new URL('https://example.com/a/b?x=1#f').hostname"), "example.com");
+    assert_eq!(string("new URL('https://example.com/a/b?x=1#f').pathname"), "/a/b");
+    assert_eq!(string("new URL('https://example.com/a/b?x=1#f').search"), "?x=1");
+    assert_eq!(string("new URL('https://example.com/a/b?x=1#f').hash"), "#f");
+    assert_eq!(string("new URL('https://example.com/a/b?x=1#f').origin"), "https://example.com");
+    assert_eq!(
+        string("new URL('http://example.com:8080/').host"),
+        "example.com:8080"
+    );
+    assert_eq!(string("new URL('http://example.com:80/').port"), "");
+}
+
+#[test]
+fn url_resolves_against_a_base() {
+    assert_eq!(
+        string("new URL('../c?q=1', 'https://example.com/a/b').href"),
+        "https://example.com/c?q=1"
+    );
+    assert_eq!(
+        string("new URL('/x', 'https://example.com/a/b').pathname"),
+        "/x"
+    );
+    assert_eq!(
+        string("new URL('https://example.com/a b').pathname"),
+        "/a%20b"
+    );
+}
+
+#[test]
+fn url_rejects_bad_input_and_requires_new() {
+    assert!(matches!(
+        err("new URL('not a url')"),
+        JsError::Throw(_)
+    ));
+    assert!(matches!(err("URL('https://example.com/')"), JsError::Throw(_)));
+    assert!(boolean("new URL('https://example.com/') instanceof URL"));
+}
+
+#[test]
+fn url_search_params() {
+    assert_eq!(
+        string("new URL('https://e.com/?a=1&b=2&a=3').searchParams.get('a')"),
+        "1"
+    );
+    assert_eq!(
+        num("new URL('https://e.com/?a=1&b=2&a=3').searchParams.getAll('a').length"),
+        2.0
+    );
+    assert!(boolean("new URL('https://e.com/?a=1').searchParams.has('a')"));
+    assert!(!boolean("new URL('https://e.com/?a=1').searchParams.has('z')"));
+}
+
+#[test]
+fn url_search_params_mutate_and_serialize() {
+    // `set` deletes the old entries and appends the new one at the end
+    // (spec behavior), hence b=2&a=9 rather than a=9&b=2
+    assert_eq!(
+        string(
+            "var p = new URLSearchParams('a=1'); \
+             p.append('b', '2'); p.set('a', '9'); p.toString()"
+        ),
+        "b=2&a=9"
+    );
+    assert_eq!(
+        string("var p = new URLSearchParams('a=1&b=2&a=3'); p.delete('a'); p.toString()"),
+        "b=2"
+    );
+    assert_eq!(
+        string("var p = new URLSearchParams('b=2&a=3&a=1'); p.sort(); p.toString()"),
+        "a=1&a=3&b=2"
+    );
+    assert_eq!(
+        string("var p = new URLSearchParams('a=1'); p.append('b', 'hello world'); p.toString()"),
+        "a=1&b=hello+world"
+    );
+}
+
+#[test]
+fn url_search_params_from_object_and_arrays() {
+    assert_eq!(
+        string("new URLSearchParams({a: 1, b: 'x y'}).toString()"),
+        "a=1&b=x+y"
+    );
+    assert_eq!(
+        string("var p = new URLSearchParams(''); p.append('k', 'v'); p.get('k')"),
+        "v"
+    );
+    assert_eq!(
+        string("var p = new URLSearchParams('a=1&b=2'); var out = []; p.forEach(function (v, k) { out.push(k + v) }); out.join(',')"),
+        "a1,b2"
+    );
+    assert_eq!(
+        string("new URLSearchParams('a=1&b=2').entries().map(function (e) { return e[0] }).join('')"),
+        "ab"
+    );
+}
+
+// -- wave 17: Object.prototype inheritance --------------------------------
+
+#[test]
+fn object_prototype_is_reachable_and_inherited() {
+    // borrowing the method off the prototype is how most libraries test keys
+    assert!(boolean(
+        "Object.prototype.hasOwnProperty.call({a: 1}, 'a')"
+    ));
+    assert!(!boolean(
+        "Object.prototype.hasOwnProperty.call({a: 1}, 'b')"
+    ));
+    // plain objects inherit it lazily as well
+    assert!(boolean("({a: 1}).hasOwnProperty('a')"));
+    assert!(boolean("({}).hasOwnProperty('x') === false"));
+    // arrays inherit Object.prototype through Array.prototype
+    assert!(boolean("[1, 2].hasOwnProperty(0)"));
+    assert!(boolean("Object.getPrototypeOf(Object.prototype) === null"));
+}
+
+#[test]
+fn object_create_and_property_names() {
+    assert_eq!(
+        num("var p = {greet: function () { return 1 }}; var o = Object.create(p); o.greet()"),
+        1.0
+    );
+    // shortcut: a null prototype is stored as "not attached yet" (see
+    // Object.create) — a dictionary still works for its documented use
+    assert_eq!(
+        num("var d = Object.create(null); d.k = 1; d.k + Object.keys(d).length"),
+        2.0
+    );
+    assert_eq!(
+        string("Object.getOwnPropertyNames({a: 1, b: 2}).join(',')"),
+        "a,b"
+    );
+    assert_eq!(num("Object.getOwnPropertyNames([7, 8]).length"), 2.0);
+}
+
+// -- wave 17: runtime error locations --------------------------------------
+
+#[test]
+fn escaping_error_names_the_source_that_threw() {
+    let mut e = JsEngine::new();
+    // the thrower lives in its own script; the member read is on line 2 of
+    // that script, not in whoever calls it
+    e.exec("var boom = function () {\n    return null.length;\n};")
+        .unwrap();
+    let msg = format!("{}", e.exec("\n\n\n\n\nboom();").unwrap_err());
+    assert!(msg.contains("line 2"), "{msg}");
+    assert!(msg.contains("col"), "{msg}");
+}
+
+#[test]
+fn caught_errors_keep_their_value() {
+    // the location is appended to the log line only: a caught value must be
+    // exactly what `throw` passed
+    assert_eq!(num("var v; try { throw 'boom' } catch (e) { v = e } v.length"), 4.0);
+    assert_eq!(string("var v; try { throw 'boom' } catch (e) { v = e } v"), "boom");
+}
+
+#[test]
+fn a_caught_error_does_not_block_the_next_location() {
+    let mut e = JsEngine::new();
+    e.exec("try { throw 'first' } catch (x) { }").unwrap();
+    let msg = format!("{}", e.exec("\nnull.x").unwrap_err());
+    assert!(msg.contains("line 2"), "{msg}");
+}
+
+#[test]
+fn syntax_errors_report_their_own_position() {
+    match err("var a = 1;\nvar b = ;") {
+        JsError::Syntax { line, .. } => assert_eq!(line, 2),
+        other => panic!("expected SyntaxError, got {other}"),
+    }
+}
+
+#[test]
+fn url_accepts_a_url_instance_as_base() {
+    assert_eq!(
+        string("new URL('.', new URL('https://example.com/a/b')).href"),
+        "https://example.com/a/"
+    );
+    assert_eq!(
+        string("new URL('c', new URL('https://example.com/a/b')).pathname"),
+        "/a/c"
+    );
+    assert_eq!(string("new URL('https://example.com/x').toString()"), "https://example.com/x");
+}

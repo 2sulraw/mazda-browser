@@ -257,6 +257,14 @@ pub(crate) fn run_block(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) -> Resu
 pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, JsError> {
     e.cur_span = s.span.start as usize; // budget error names this statement
     e.tick()?;
+    let r = eval_stmt_inner(e, env, s);
+    if let Err(err) = &r {
+        e.note_error(err);
+    }
+    r
+}
+
+fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, JsError> {
     match &s.kind {
         StmtKind::Expr(x) => {
             eval_expr(e, env, x)?;
@@ -427,6 +435,9 @@ pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flo
             let mut result = run_block(e, env, block);
             if let (Some(v), Some(cat)) = (as_err_ref(&result), catch) {
                 let v = v.clone();
+                // the caught error is gone; the next throw in this turn must
+                // be able to record its own location
+                e.err_located = false;
                 let cenv = Env::child(env);
                 cenv.declare(cat.name.clone(), v, false);
                 result = run_block(e, &cenv, &cat.block);
@@ -813,7 +824,22 @@ fn tagged_args(e: &mut JsEngine, env: &Rc<Env>, segs: &[TplSeg]) -> Result<Vec<V
 }
 
 pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsError> {
+    if x.span.start > 0 {
+        // the innermost expression start is the best runtime-error location;
+        // `note_error` records it and `finish_error` resolves it against the
+        // source of the running function
+        e.cur_span = x.span.start as usize;
+    }
     e.tick()?;
+    let r = eval_expr_inner(e, env, x);
+    if let Err(err) = &r {
+        // remember the origin for the log line; the value stays untouched
+        e.note_error(err);
+    }
+    r
+}
+
+fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsError> {
     match &x.kind {
         ExprKind::Ident(name) => Ok(e.env_get(env, name)),
         ExprKind::Num(n) => Ok(Val::Num(*n)),
@@ -1457,9 +1483,32 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
             // shortcut: natives aren't real constructors; the only native
             // `instanceof` that answers true is Date (kind-tagged objects)
             // or a plain array (checked against the shared array prototype)
-            Val::Native(_) => Val::Bool(match l {
+            Val::Native(id) => Val::Bool(match l {
                 Val::Obj(o) => {
-                    matches!(o.borrow().kind, ObjKind::Date(_))
+                    // a registered `.prototype` (URL, URLSearchParams, …) is
+                    // matched against the value's chain like a real constructor
+                    let registered = match e.native_prop(*id, "prototype") {
+                        Some(Val::Obj(p)) => {
+                            let mut cur = o.borrow().proto.clone();
+                            let mut found = false;
+                            for _ in 0..100 {
+                                match cur {
+                                    None => break,
+                                    Some(c) => {
+                                        if Rc::ptr_eq(&c, &p) {
+                                            found = true;
+                                            break;
+                                        }
+                                        cur = c.borrow().proto.clone();
+                                    }
+                                }
+                            }
+                            found
+                        }
+                        _ => false,
+                    };
+                    registered
+                        || matches!(o.borrow().kind, ObjKind::Date(_))
                         || e
                             .array_proto
                             .as_ref()
@@ -2048,6 +2097,8 @@ pub(crate) fn call_method(
                         is_async: false,
                         is_generator: false,
                         has_yield: false,
+                        // the wrapped function's own frame supplies the source
+                        src: 0,
                     });
                     Ok(Val::Func(Rc::new(Closure {
                         def,

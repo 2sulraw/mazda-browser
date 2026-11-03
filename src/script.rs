@@ -889,6 +889,18 @@ impl PageScripts {
 
         let loc = Val::new_object();
         loc.set("href", str_val(base));
+        // The rest of the readable location surface comes from the same URL
+        // parser `window.URL` uses, so scripts can read location.hostname etc.
+        if let Some(p) = js::url::parts(base) {
+            loc.set("protocol", str_val(&p.protocol));
+            loc.set("host", str_val(&p.host));
+            loc.set("hostname", str_val(&p.hostname));
+            loc.set("port", str_val(&p.port));
+            loc.set("pathname", str_val(&p.pathname));
+            loc.set("search", str_val(&p.search));
+            loc.set("hash", str_val(&p.hash));
+            loc.set("origin", str_val(&p.origin));
+        }
         loc.set("assign", Val::Native(ids.loc_assign));
         loc.set("replace", Val::Native(ids.loc_assign)); // shortcut: same as assign
         loc.set("reload", Val::Native(ids.loc_reload));

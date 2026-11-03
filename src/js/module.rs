@@ -28,7 +28,7 @@ use std::rc::Rc;
 
 use super::interp;
 use super::parser::{self, ExportKind, ImportBinding, Stmt};
-use super::{Env, JsEngine, Val};
+use super::{Env, JsEngine, JsError, Val};
 
 /// `exported name -> value` for one module.
 pub(crate) type Exports = Rc<RefCell<HashMap<Rc<str>, Val>>>;
@@ -76,16 +76,19 @@ impl ModuleLoader {
         if let Some(x) = self.cache.get(url) {
             return Ok(x.clone());
         }
-        let program = parser::parse(src).map_err(|err| format!("{url}: {err}"))?;
+        let src_id = e.register_source(src);
+        let program = parser::parse(src, src_id).map_err(|err| format!("{url}: {err}"))?;
         // each module body is its own execution turn (same budget reset as
         // `JsEngine::exec`), so a huge dependency graph is not starved by
         // whichever module ran first
         e.steps = 0;
         e.call_depth = 0;
+        e.cur_src = src_id;
+        e.err_located = false;
         let ns: Exports = Rc::new(RefCell::new(HashMap::new()));
         self.cache.insert(url.to_string(), ns.clone());
         self.active.push(url.to_string());
-        let r = self.run_body(e, url, &program, &ns);
+        let r = self.run_body(e, url, src, &program, &ns);
         self.active.pop();
         if r.is_err() {
             // a failed module must not stay cached as a half namespace
@@ -99,11 +102,18 @@ impl ModuleLoader {
         &mut self,
         e: &mut JsEngine,
         url: &str,
+        src: &str,
         program: &[Stmt],
         ns: &Exports,
     ) -> Result<(), String> {
         let env = Env::child(&e.global_env);
         interp::hoist(e, &env, program);
+
+        // A runtime throw carries its own `(line, col)` from `finish_error`;
+        // the module URL is all this frame adds.
+        let named = |e: &mut JsEngine, err: JsError| -> String {
+            format!("{url}: {}", e.finish_error(err, src))
+        };
 
         // 1) resolve every import first (document order, depth first)
         for st in program {
@@ -137,8 +147,7 @@ impl ModuleLoader {
                 } => match kind {
                     ExportKind::Decl | ExportKind::Default => {
                         if let Some(inner) = inner {
-                            interp::eval_stmt(e, &env, inner)
-                                .map_err(|err| format!("{url}: {err}"))?;
+                            interp::eval_stmt(e, &env, inner).map_err(|err| named(e, err))?;
                         }
                         for (exported, local) in names {
                             let v = e.env_get(&env, local);
@@ -180,7 +189,7 @@ impl ModuleLoader {
                     }
                 },
                 _ => {
-                    interp::eval_stmt(e, &env, st).map_err(|err| format!("{url}: {err}"))?;
+                    interp::eval_stmt(e, &env, st).map_err(|err| named(e, err))?;
                 }
             }
         }

@@ -1307,7 +1307,61 @@ curve matters more than the baseline (near-flat as tabs grow).
   on `Cannot read property 'prototype' of undefined` - the next runtime
   gap), Wikipedia `JavaScript` 11404 runs / 92.1 MB, svelte.dev 291 runs /
   83.7 MB.
-  **(w) next** - BigInt literals, `new.target`, `for await`, top-level
+  **(w) URL + Object.prototype** - the web-platform objects MDN's bundles
+  assume, plus error text that names the right file:
+  - `URL` and `URLSearchParams` are real prototype-based natives over the
+    `url` crate (`src/js/url.rs`): `href`, `protocol`, `host`, `hostname`,
+    `port`, `pathname`, `search`, `hash`, `origin`, `username`, `password`,
+    `searchParams`, `toString`/`toJSON`; `URLSearchParams` has `get`,
+    `getAll`, `has`, `set`, `append`, `delete`, `sort`, `forEach`, `entries`,
+    `keys`, `values`, `toString`, and accepts a query string, an array of
+    pairs or a plain object. `new URL('.', someUrlInstance)` uses the base's
+    `href` (a URL stringifies to it), which was a hard error on svelte.dev.
+  - a native constructor can own `.prototype` (engine side table
+    `native_props`), so a bundle's `o.U.prototype = URL.prototype` lines work
+    and `instanceof` walks the registered prototype chain.
+  - `Object.prototype` exists, `Object.getPrototypeOf` returns it, and plain
+    objects and arrays inherit it lazily - `({}).hasOwnProperty('k')` and
+    `Object.prototype.hasOwnProperty.call(o, 'k')` both work.
+    `Object.create(proto)` and `Object.getOwnPropertyNames` added.
+  - `location` exposes `protocol`, `host`, `hostname`, `port`, `pathname`,
+    `search`, `hash`, `origin`.
+  - runtime errors now name the position in the file that *threw*, not in the
+    caller: every parsed source is registered by id (`register_source`,
+    bounded to 256 sources / 4 MB per page) and each `FnDef` stamps its
+    source id, which `call` swaps into `cur_src`. The innermost
+    `eval_expr`/`eval_stmt` records the throw's origin once (`note_error`);
+    only the escaping error's log text gains `(line L, col C)`, so a caught
+    value is still exactly what `throw` passed. `(in f <- g)` frames stay.
+  Honest shortcuts: `URL` components are snapshots (no setters) and
+  `searchParams` is not live-linked to `href`; `URL.createObjectURL` is
+  absent; `Object.create(null)` still inherits `Object.prototype` lazily; no
+  `Object.defineProperties`/`freeze`/`seal`; string concat of an object uses
+  the engine's own text rather than a script-defined `toString`; a throw
+  from a span-less internal path (destructuring/spread helpers) reports the
+  last evaluated expression's position; sources past the retention cap report
+  the error without a position.
+  Tests (641 default / 645 with `engine-b woff2`): `url_components`,
+  `url_resolves_against_a_base`, `url_rejects_bad_input_and_requires_new`,
+  `url_search_params`, `url_search_params_mutate_and_serialize`,
+  `url_search_params_from_object_and_arrays`,
+  `url_accepts_a_url_instance_as_base`,
+  `object_prototype_is_reachable_and_inherited`,
+  `object_create_and_property_names`,
+  `escaping_error_names_the_source_that_threw`,
+  `caught_errors_keep_their_value`,
+  `a_caught_error_does_not_block_the_next_location`,
+  `syntax_errors_report_their_own_position`.
+  Live: MDN `/Web/CSS/list-style-type` 79.8-91.2 MB and its content renders
+  (the two earlier `o.U.prototype=URL.prototype` and `hasOwnProperty of
+  undefined` bundle errors are gone; one module still stops on `Cannot read
+  property 'length' of undefined` - a lit/telemetry path, next gap); MDN
+  reports that throw's position in the right bundle file (previously the
+  caller's); svelte.dev 79.3-83.6 MB (the `new URL('.', urlObject)` error is
+  gone; remaining inline errors are a canvas-2d context - `getContext`
+  returns undefined - and one `parentElement` read); Wikipedia `JavaScript`
+  101.6 MB / 11404 runs (identical).
+  **(x) next** - BigInt literals, `new.target`, `for await`, top-level
   `await`, import assertions, live module bindings, computed class
   accessors, class static blocks.
 - [ ] **Phase 3** — tabs + **hibernation: restore from serialized DOM+layout on disk, not
@@ -1446,6 +1500,10 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 16 (bundle syntax) | MDN `/Web/CSS/list-style-type` | 89.4-95.6 MB (2773 runs; module bundles now run instead of failing to parse; first bundle stops on `Cannot read property 'prototype' of undefined`) |
 | 2026-11-03 | wave 16 (bundle syntax) | Wikipedia `/wiki/JavaScript` | 92.1 MB (11404 runs; inline JSON-LD block no longer parsed as JS) |
 | 2026-11-03 | wave 16 (bundle syntax) | svelte.dev | 83.7 MB (291 runs; unchanged rendering) |
+| 2026-11-03 | wave 17 (URL + Object.prototype) | MDN `/Web/CSS/list-style-type` | 79.8-91.2 MB (2773 runs; `o.U.prototype=URL.prototype` and `hasOwnProperty of undefined` bundle errors gone, page content renders) |
+| 2026-11-03 | wave 17 (URL + Object.prototype) | svelte.dev | 79.3-83.6 MB (291 runs; `new URL('.', urlObject)` fixed; remaining inline errors are a missing canvas-2d context and one `parentElement` read) |
+| 2026-11-03 | wave 17 (URL + Object.prototype) | runtime-error locations | parse probe: a thrower in script A called from script B now reports line 2 of A (was: the caller's source, or no position) |
+| 2026-11-03 | wave 17 (URL + Object.prototype) | Wikipedia `/wiki/JavaScript` | 101.6 MB (11404 runs; identical; one inline script stops on `Cannot read property 'match' of undefined`) |
 
 ### Phase 1c (Track A) findings
 

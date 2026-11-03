@@ -85,7 +85,11 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&object), "setPrototypeOf", Val::Native(sp));
     let gp = e.register_native("Object.getPrototypeOf", n_object, O_GET_PROTO);
     obj_set_own(own(&object), "getPrototypeOf", Val::Native(gp));
-    e.set_global("Object", object);
+    let cr = e.register_native("Object.create", n_object, O_CREATE);
+    obj_set_own(own(&object), "create", Val::Native(cr));
+    let opn = e.register_native("Object.getOwnPropertyNames", n_object, O_PROP_NAMES);
+    obj_set_own(own(&object), "getOwnPropertyNames", Val::Native(opn));
+    e.set_global("Object", object.clone());
 
     // Object.prototype + Array.prototype chain
     let obj_proto = Val::new_object();
@@ -93,6 +97,14 @@ pub(crate) fn install(e: &mut JsEngine) {
     let ho = e.register_native("hasOwnProperty", n_objproto, 1);
     obj_set_own(own(&obj_proto), "toString", Val::Native(ts));
     obj_set_own(own(&obj_proto), "hasOwnProperty", Val::Native(ho));
+    // `Object.prototype` is reachable as a property, so libraries that borrow
+    // methods (`Object.prototype.hasOwnProperty.call(o, k)`) work. Plain
+    // objects also lazily inherit it on first member access (get_member), so
+    // `({}).hasOwnProperty` resolves.
+    if let Val::Obj(o) = &obj_proto {
+        e.object_proto = Some(o.clone());
+    }
+    obj_set_own(own(&object), "prototype", obj_proto.clone());
 
     let arr_proto = Val::new_object();
     if let Val::Obj(o) = &arr_proto {
@@ -199,6 +211,45 @@ pub(crate) fn install(e: &mut JsEngine) {
     // -- RegExp (callable constructor; same behavior plain or `new`) --------
     let rc = e.register_native("RegExp", n_regexp, 0);
     e.set_global("RegExp", Val::Native(rc));
+
+    // -- URL / URLSearchParams --------------------------------------------
+    // Both are ordinary prototype-based constructors: the shared prototype
+    // object holds the methods, every instance points at it, and the
+    // constructor native carries `.prototype` in the native side table.
+    let url_proto = Val::new_object();
+    for (i, name) in ["toString", "toJSON"].iter().enumerate() {
+        let id = e.register_native(&format!("URL.prototype.{name}"), n_url, i as u16);
+        obj_set_own(own(&url_proto), name, Val::Native(id));
+    }
+    let params_proto = Val::new_object();
+    for (i, name) in [
+        "get",
+        "getAll",
+        "has",
+        "set",
+        "append",
+        "delete",
+        "toString",
+        "sort",
+        "forEach",
+        "entries",
+        "keys",
+        "values",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = e.register_native(&format!("URLSearchParams.prototype.{name}"), n_params, i as u16);
+        obj_set_own(own(&params_proto), name, Val::Native(id));
+    }
+    let uc = e.register_native("URL", n_url_ctor, 0);
+    e.set_native_prop(uc, "prototype", url_proto.clone());
+    e.set_global("URL", Val::Native(uc));
+    e.url_proto = Some(own(&url_proto).clone());
+    let upc = e.register_native("URLSearchParams", n_params_ctor, 0);
+    e.set_native_prop(upc, "prototype", params_proto.clone());
+    e.set_global("URLSearchParams", Val::Native(upc));
+    e.params_proto = Some(own(&params_proto).clone());
 
     // -- global aliases ----------------------------------------------------
     let g = Val::Obj(e.global_obj.clone());
@@ -594,6 +645,8 @@ const O_ASSIGN: u16 = 3;
 const O_DEFINE_PROP: u16 = 4;
 const O_SET_PROTO: u16 = 5;
 const O_GET_PROTO: u16 = 6;
+const O_CREATE: u16 = 7;
+const O_PROP_NAMES: u16 = 8;
 
 fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
@@ -720,6 +773,36 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 Val::Func(f) => f.proto.borrow().clone().unwrap_or(Val::Null),
                 _ => Val::Null,
             })
+        }
+        O_CREATE => {
+            // shortcut: a `null` prototype is stored as "not attached yet", so
+            // the new object still picks up Object.prototype on first access
+            // (this engine only enumerates own props, so dictionaries behave).
+            let proto = match args.first() {
+                Some(Val::Obj(p)) => Some(p.clone()),
+                _ => None,
+            };
+            Ok(Val::Obj(Rc::new(RefCell::new(Obj {
+                kind: ObjKind::Plain,
+                props: Vec::new(),
+                proto,
+            }))))
+        }
+        O_PROP_NAMES => {
+            let o = args.first().cloned().unwrap_or(Val::Undefined);
+            let keys: Vec<Val> = match &o {
+                Val::Obj(b) => {
+                    let b = b.borrow();
+                    match &b.kind {
+                        ObjKind::Array(items) => (0..items.len())
+                            .map(|i| Val::Str(Rc::from(i.to_string().as_str())))
+                            .collect(),
+                        _ => b.props.iter().map(|(k, _)| Val::Str(k.clone())).collect(),
+                    }
+                }
+                _ => Vec::new(),
+            };
+            Ok(Val::new_array(keys))
         }
         _ => Ok(Val::Undefined),
     }
@@ -1546,3 +1629,290 @@ fn n_regexp(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Va
 }
 
 // -- end regex helper stub
+
+// ---------------------------------------------------------------------------
+// URL / URLSearchParams
+// ---------------------------------------------------------------------------
+
+/// Hidden own property holding a URLSearchParams' serialized query.
+/// `\u{1}` cannot appear in an identifier, so page code never collides with it
+/// by accident (a computed string key still could — harmless).
+const USP_DATA: &str = "\u{1}pairs";
+
+const U_TO_STRING: u16 = 0;
+const U_TO_JSON: u16 = 1;
+
+const P_GET: u16 = 0;
+const P_GET_ALL: u16 = 1;
+const P_HAS: u16 = 2;
+const P_SET: u16 = 3;
+const P_APPEND: u16 = 4;
+const P_DELETE: u16 = 5;
+const P_TO_STRING: u16 = 6;
+const P_SORT: u16 = 7;
+const P_FOREACH: u16 = 8;
+const P_ENTRIES: u16 = 9;
+const P_KEYS: u16 = 10;
+const P_VALUES: u16 = 11;
+
+/// A fresh plain object pointing at `proto`.
+fn proto_instance(proto: Option<Rc<RefCell<Obj>>>) -> Val {
+    Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::Plain,
+        props: Vec::new(),
+        proto,
+    })))
+}
+
+/// The serialized query of a URLSearchParams value.
+fn usp_data(v: &Val) -> Option<String> {
+    match v {
+        Val::Obj(o) => o
+            .borrow()
+            .props
+            .iter()
+            .find(|(k, _)| k.as_ref() == USP_DATA)
+            .and_then(|(_, v)| match v {
+                Val::Str(s) => Some(s.to_string()),
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+fn usp_store(v: &Val, query: &str) {
+    if let Val::Obj(o) = v {
+        obj_set_own(o, USP_DATA, Val::Str(Rc::from(query)));
+    }
+}
+
+/// Build a URLSearchParams instance (shared by its constructor and by
+/// `url.searchParams`).
+fn make_params(e: &JsEngine, query: &str) -> Val {
+    let v = proto_instance(e.params_proto.clone());
+    usp_store(&v, query);
+    v
+}
+
+fn arg_str(args: &[Val], i: usize) -> String {
+    args.get(i).map(|v| v.to_string()).unwrap_or_default()
+}
+
+fn n_url_ctor(e: &mut JsEngine, _idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if !is_ctor_call(e, this) {
+        return Err(JsError::throw("TypeError: URL is not a constructor function"));
+    }
+    let input = match args.first() {
+        Some(Val::Undefined) | None => {
+            return Err(JsError::throw("TypeError: URL: 1 argument required"))
+        }
+        Some(v) => v.to_string(),
+    };
+    let abs = match args.get(1) {
+        Some(base) if !matches!(base, Val::Undefined) => {
+            match crate::js::url::join(&url_base(base), &input) {
+                Some(u) => u,
+                None => return Err(JsError::throw(&format!("TypeError: URL: invalid URL '{input}'"))),
+            }
+        }
+        _ => input.clone(),
+    };
+    let p = match crate::js::url::parts(&abs) {
+        Some(p) => p,
+        None => return Err(JsError::throw(&format!("TypeError: URL: invalid URL '{input}'"))),
+    };
+    let obj = proto_instance(e.url_proto.clone());
+    let o = own(&obj);
+    for (k, v) in [
+        ("href", p.href),
+        ("protocol", p.protocol),
+        ("host", p.host),
+        ("hostname", p.hostname),
+        ("port", p.port),
+        ("pathname", p.pathname),
+        ("search", p.search.clone()),
+        ("hash", p.hash),
+        ("origin", p.origin),
+        ("username", p.username),
+        ("password", p.password),
+    ] {
+        obj_set_own(o, k, Val::Str(Rc::from(v)));
+    }
+    let params = make_params(e, &p.search);
+    obj_set_own(o, "searchParams", params);
+    Ok(obj)
+}
+
+/// The string a base argument contributes. A URL instance stringifies to its
+/// `href` (that is what its prototype `toString` returns), so
+/// `new URL('.', u)` must not fall back to the engine's structural object
+/// text.
+fn url_base(v: &Val) -> String {
+    if let Val::Obj(o) = v {
+        let href = o
+            .borrow()
+            .props
+            .iter()
+            .find(|(k, _)| k.as_ref() == "href")
+            .and_then(|(_, v)| match v {
+                Val::Str(s) => Some(s.to_string()),
+                _ => None,
+            });
+        if let Some(h) = href {
+            return h;
+        }
+    }
+    v.to_string()
+}
+
+fn n_url(_e: &mut JsEngine, _idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    match this {
+        Val::Obj(o) => {
+            let href = o
+                .borrow()
+                .props
+                .iter()
+                .find(|(k, _)| k.as_ref() == "href")
+                .and_then(|(_, v)| match v {
+                    Val::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| Rc::from(""));
+            Ok(Val::Str(href))
+        }
+        _ => Err(JsError::throw("TypeError: URL method called on non-URL")),
+    }
+}
+
+fn n_params_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let query = match args.first() {
+        None | Some(Val::Undefined) => String::new(),
+        Some(Val::Str(s)) => s.strip_prefix('?').unwrap_or(s).to_string(),
+        Some(v @ Val::Obj(o)) => {
+            if let Some(q) = usp_data(v) {
+                q
+            } else {
+                // array of pairs, or a plain object's own enumerable props
+                let b = o.borrow();
+                let pairs: Vec<(String, String)> = match &b.kind {
+                    ObjKind::Array(items) => items
+                        .iter()
+                        .map(|it| match it {
+                            Val::Obj(p) => match &p.borrow().kind {
+                                ObjKind::Array(kv) => (
+                                    kv.first().map(|v| v.to_string()).unwrap_or_default(),
+                                    kv.get(1).map(|v| v.to_string()).unwrap_or_default(),
+                                ),
+                                _ => (it.to_string(), String::new()),
+                            },
+                            v => (v.to_string(), String::new()),
+                        })
+                        .collect(),
+                    _ => b
+                        .props
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                };
+                drop(b);
+                crate::js::url::encode_pairs(&pairs)
+            }
+        }
+        Some(other) => other.to_string(),
+    };
+    Ok(make_params(e, &query))
+}
+
+fn n_params(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let query = match usp_data(this) {
+        Some(q) => q,
+        None => return Err(JsError::throw("TypeError: URLSearchParams method called on non-params")),
+    };
+    let mut pairs = crate::js::url::parse_query(&query);
+    let name = || arg_str(args, 0);
+    let value = || arg_str(args, 1);
+    match idx {
+        P_GET => Ok(match pairs.iter().find(|(k, _)| *k == name()) {
+            Some((_, v)) => Val::Str(Rc::from(v.as_str())),
+            None => Val::Null,
+        }),
+        P_GET_ALL => Ok(Val::new_array(
+            pairs
+                .iter()
+                .filter(|(k, _)| *k == name())
+                .map(|(_, v)| Val::Str(Rc::from(v.as_str())))
+                .collect(),
+        )),
+        P_HAS => Ok(Val::Bool(pairs.iter().any(|(k, _)| *k == name()))),
+        P_SET => {
+            let (n, v) = (name(), value());
+            pairs.retain(|(k, _)| *k != n);
+            pairs.push((n, v));
+            let s = crate::js::url::encode_pairs(&pairs);
+            usp_store(this, &s);
+            Ok(Val::Undefined)
+        }
+        P_APPEND => {
+            pairs.push((name(), value()));
+            let s = crate::js::url::encode_pairs(&pairs);
+            usp_store(this, &s);
+            Ok(Val::Undefined)
+        }
+        P_DELETE => {
+            let n = name();
+            pairs.retain(|(k, _)| *k != n);
+            let s = crate::js::url::encode_pairs(&pairs);
+            usp_store(this, &s);
+            Ok(Val::Undefined)
+        }
+        P_TO_STRING => Ok(Val::Str(Rc::from(
+            crate::js::url::encode_pairs(&pairs).as_str(),
+        ))),
+        P_SORT => {
+            pairs.sort_by(|(a1, a2), (b1, b2)| a1.cmp(b1).then_with(|| a2.cmp(b2)));
+            let s = crate::js::url::encode_pairs(&pairs);
+            usp_store(this, &s);
+            Ok(Val::Undefined)
+        }
+        P_FOREACH => {
+            let cb = args.first().cloned().unwrap_or(Val::Undefined);
+            let this_arg = args.get(1).cloned().unwrap_or(Val::Undefined);
+            for (k, v) in &pairs {
+                e.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    vec![
+                        Val::Str(Rc::from(v.as_str())),
+                        Val::Str(Rc::from(k.as_str())),
+                        this.clone(),
+                    ],
+                )?;
+            }
+            Ok(Val::Undefined)
+        }
+        P_ENTRIES => Ok(Val::new_array(
+            pairs
+                .iter()
+                .map(|(k, v)| {
+                    Val::new_array(vec![
+                        Val::Str(Rc::from(k.as_str())),
+                        Val::Str(Rc::from(v.as_str())),
+                    ])
+                })
+                .collect(),
+        )),
+        P_KEYS => Ok(Val::new_array(
+            pairs
+                .iter()
+                .map(|(k, _)| Val::Str(Rc::from(k.as_str())))
+                .collect(),
+        )),
+        P_VALUES => Ok(Val::new_array(
+            pairs
+                .iter()
+                .map(|(_, v)| Val::Str(Rc::from(v.as_str())))
+                .collect(),
+        )),
+        _ => Ok(Val::Undefined),
+    }
+}

@@ -486,6 +486,12 @@ pub struct FnDef {
     /// parse-time rollup: does the body contain a `yield` in an evaluable
     /// position? Gates the cheap walk when no generator machinery is needed.
     pub has_yield: bool,
+    /// engine source id this function was parsed from (see
+    /// [`JsEngine::register_source`]). A function can be called from a script
+    /// or module other than the one that defined it, so this is the only way
+    /// a runtime error can report a location in the right file. 0 = unknown
+    /// (dynamically built functions such as `new Function`).
+    pub src: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -545,7 +551,7 @@ struct ClassCtx {
 // Parser
 // ---------------------------------------------------------------------------
 
-pub fn parse(source: &str) -> Result<Program, JsError> {
+pub fn parse(source: &str, src_id: u32) -> Result<Program, JsError> {
     let toks = tokenize(source).map_err(|le| {
         let (line, col) = line_col(source, le.offset as usize);
         JsError::Syntax {
@@ -556,6 +562,7 @@ pub fn parse(source: &str) -> Result<Program, JsError> {
     })?;
     let mut p = Parser {
         src: source,
+        src_id,
         toks,
         pos: 0,
         depth: 0,
@@ -582,6 +589,8 @@ pub(crate) fn line_col(source: &str, offset: usize) -> (u32, u32) {
 
 struct Parser<'a> {
     src: &'a str,
+    /// engine source id stamped onto every `FnDef` this parse produces
+    src_id: u32,
     toks: Vec<Token>,
     pos: usize,
     /// recursion guard: pathological nesting (`((((...))))`, `[[[[...]]]]`,
@@ -909,6 +918,7 @@ impl<'a> Parser<'a> {
                     Rc::from(format!("__default{}", next_class_id()).as_str());
                 (
                     Rc::new(FnDef {
+                        src: self.src_id,
                         name: name.clone(),
                         ..(*f).clone()
                     }),
@@ -1654,6 +1664,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         }
         let uses_arguments = scan_uses_arguments_stmts(&body_stmts);
         Ok(Rc::new(FnDef {
+            src: self.src_id,
             name,
             params,
             body: FnBody::Block(body_stmts),
@@ -1821,6 +1832,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 None => Vec::new(),
             };
             Rc::new(FnDef {
+                src: self.src_id,
                 name: name.clone(),
                 params: Vec::new(),
                 body: FnBody::Block(body),
@@ -1871,6 +1883,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             };
             body.splice(at..at, inits);
             ctor_def = Rc::new(FnDef {
+                src: self.src_id,
                 body: FnBody::Block(body),
                 ..(*ctor_def).clone()
             });
@@ -2045,6 +2058,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let body = self.block_body()?;
                 let uses_arguments = scan_uses_arguments_stmts(&body);
                 let f = Rc::new(FnDef {
+                    src: self.src_id,
                     name: key.clone(),
                     params,
                     body: FnBody::Block(body),
@@ -2104,6 +2118,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let uses_arguments = scan_uses_arguments_stmts(&body);
                 let is_ctor = !is_static && key_name.as_deref() == Some("constructor");
                 let f = Rc::new(FnDef {
+                    src: self.src_id,
                     name: if is_ctor {
                         name.clone()
                     } else {
@@ -2197,6 +2212,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let body = self.arrow_body()?;
                 return Ok(Expr {
                     kind: ExprKind::Arrow(Rc::new(FnDef {
+                        src: self.src_id,
                         name: Rc::from(""),
                         params: vec![Param {
                             name: s,
@@ -2224,6 +2240,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     let body = self.arrow_body()?;
                     return Ok(Expr {
                         kind: ExprKind::Arrow(Rc::new(FnDef {
+                            src: self.src_id,
                             name: Rc::from(""),
                             params: vec![Param {
                                 name: s,
@@ -2247,6 +2264,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     let body = self.arrow_body()?;
                     return Ok(Expr {
                         kind: ExprKind::Arrow(Rc::new(FnDef {
+                            src: self.src_id,
                             name: Rc::from(""),
                             params,
                             body,
@@ -2266,6 +2284,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let body = self.arrow_body()?;
                 return Ok(Expr {
                     kind: ExprKind::Arrow(Rc::new(FnDef {
+                        src: self.src_id,
                         name: Rc::from(""),
                         params,
                         body,
@@ -2428,6 +2447,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         });
         let mut sub = Parser {
             src: self.src,
+            src_id: self.src_id,
             toks: inner,
             pos: 0,
             depth: 0,
@@ -2983,6 +3003,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     });
                     let mut sub = Parser {
                         src: self.src,
+                        src_id: self.src_id,
                         toks,
                         pos: 0,
                         depth: 0,
@@ -3192,6 +3213,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             let uses_arguments = scan_uses_arguments_stmts(&body);
                             Expr {
                                 kind: ExprKind::Func(Rc::new(FnDef {
+                                    src: self.src_id,
                                     name: Rc::from(""),
                                     params,
                                     body: FnBody::Block(body),
@@ -3231,6 +3253,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let body = self.block_body()?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
+                            src: self.src_id,
                             name: key.clone(),
                             params,
                             body: FnBody::Block(body),
@@ -3255,6 +3278,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let body = self.block_body()?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
+                            src: self.src_id,
                             name: key,
                             params,
                             body: FnBody::Block(body),

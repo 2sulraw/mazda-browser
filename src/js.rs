@@ -45,6 +45,7 @@ mod lexer;
 mod module;
 mod parser;
 mod regex;
+pub(crate) mod url;
 
 pub use module::ModuleLoader;
 
@@ -764,6 +765,8 @@ pub struct JsEngine {
     pub(crate) global_obj: Rc<RefCell<Obj>>,
     /// shared prototype for every array (lazy-attached on first access)
     pub(crate) array_proto: Option<Rc<RefCell<Obj>>>,
+    /// shared `Object.prototype`: every plain object inherits it lazily
+    pub(crate) object_proto: Option<Rc<RefCell<Obj>>>,
     pub(crate) natives: Vec<NativeEntry>,
     pub(crate) natives_by_name: HashMap<Rc<str>, usize>,
     pub(crate) call_depth: usize,
@@ -777,6 +780,13 @@ pub struct JsEngine {
     /// Promise.resolve/reject/... statics installed by builtins; reachable
     /// through member lookup on the constructor native
     pub(crate) promise_statics: Option<Rc<RefCell<Obj>>>,
+    /// own data properties of native constructor values. Natives are ids, not
+    /// objects, so `.prototype` and friends live in this side table (builtins
+    /// fills it in; `get_member`/`instanceof` consult it).
+    pub(crate) native_props: HashMap<usize, Vec<(Rc<str>, Val)>>,
+    /// shared `URL.prototype` / `URLSearchParams.prototype`
+    pub(crate) url_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) params_proto: Option<Rc<RefCell<Obj>>>,
     /// compiled-once regex literal cache, keyed by (pattern, flags). Regex
     /// literals are program text, so this cache is bounded by the number of
     /// distinct (pattern, flags) literals the page can create; still capped
@@ -801,9 +811,37 @@ pub struct JsEngine {
     /// label of the loop currently being entered (`outer: for (...)`); the
     /// loop arm takes it so `continue outer` knows its own label
     pub(crate) pending_label: Option<Rc<str>>,
+    /// names of the JS functions currently on the call stack (innermost
+    /// last). Only for diagnostics: a runtime TypeError names the function
+    /// it happened in when the exact span is not enough.
+    pub(crate) call_names: Vec<Rc<str>>,
+    /// source text of every parsed script/module, indexed by
+    /// `FnDef::src - 1` (see [`JsEngine::register_source`]). Keeping the text
+    /// is what lets a throw report a location in the file that *defined* the
+    /// running function, even when another script called it.
+    pub(crate) sources: Vec<Rc<str>>,
+    pub(crate) sources_bytes: usize,
+    /// source the currently running code belongs to (set by `exec`/the module
+    /// loader, then per call from `FnDef::src`)
+    pub(crate) cur_src: u32,
+    /// origin of the throw currently unwinding (span + source), recorded once
+    /// by [`JsEngine::note_error`]
+    pub(crate) throw_span: usize,
+    pub(crate) throw_src: u32,
+    /// a throw already noted its origin; later frames in the unwind must not
+    /// overwrite it
+    pub(crate) err_located: bool,
+    /// the escaping error text already carries its `(line, col)`
+    pub(crate) err_decorated: bool,
 }
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
+
+/// Retained runtime-error sources per engine and their total byte budget.
+/// Diagnostics are worth a few MB, never an unbounded amount: a page with
+/// more/larger scripts than this simply reports errors without line/col.
+pub(crate) const SOURCES_MAX: usize = 256;
+pub(crate) const SOURCES_BYTES_MAX: usize = 4 << 20;
 
 /// Default per-turn statement/expression dispatch cap. Sized so real
 /// page bundles (70KB startup script ≈ low-millions of dispatches) run
@@ -829,6 +867,7 @@ impl JsEngine {
                 proto: None,
             })),
             array_proto: None,
+            object_proto: None,
             natives: Vec::new(),
             natives_by_name: HashMap::new(),
             call_depth: 0,
@@ -836,12 +875,23 @@ impl JsEngine {
             microtasks: Vec::new(),
             promise_slots: Vec::new(),
             promise_statics: None,
+            native_props: HashMap::new(),
+            url_proto: None,
+            params_proto: None,
             regex_cache: HashMap::new(),
             next_timer_id: 1.0,
             steps: 0,
             step_budget: DEFAULT_STEP_BUDGET,
             cur_span: 0,
             pending_label: None,
+            call_names: Vec::new(),
+            sources: Vec::new(),
+            sources_bytes: 0,
+            cur_src: 0,
+            throw_span: 0,
+            throw_src: 0,
+            err_located: false,
+            err_decorated: false,
             rng_state: 0x9e37_79b9_7f4a_7c15 ^ std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -879,30 +929,27 @@ impl JsEngine {
     /// (JS `eval` completion-value semantics; declarations contribute
     /// nothing). Handy for embedder/tests; not observable from script code.
     pub fn exec(&mut self, source: &str) -> Result<Val, JsError> {
-        let program: Program = parser::parse(source)?;
+        let src_id = self.register_source(source);
+        let program: Program = parser::parse(source, src_id)?;
         self.call_depth = 0;
         self.steps = 0;
         self.cur_span = 0;
+        self.cur_src = src_id;
+        self.err_located = false;
+        self.err_decorated = false;
         let env = self.global_env.clone();
         interp::hoist(self, &env, &program);
         let mut last = Val::Undefined;
         for st in program.iter() {
-            // a Budget error from this turn names the spinning statement:
-            // resolve the recorded byte offset to line/col (only `exec`
-            // has the source at hand)
+            // a Budget error from this turn names the spinning statement;
+            // `finish_error` resolves the recorded offset to line/col
             let r = match &st.kind {
                 parser::StmtKind::Expr(e) => interp::eval_expr(self, &env, e).map(|v| {
                     last = v;
                 }),
                 _ => interp::eval_stmt(self, &env, st).map(|_| ()),
             };
-            r.map_err(|err| match err {
-                JsError::Budget { .. } => {
-                    let (line, col) = parser::line_col(source, self.cur_span);
-                    JsError::Budget { line, col }
-                }
-                other => other,
-            })?;
+            r.map_err(|err| self.finish_error(err, source))?;
         }
         // microtask quiescence at the end of every execution turn (idempotent
         // with the embedder's own drain later)
@@ -918,7 +965,88 @@ impl JsEngine {
         // own budget — one runaway handler must not starve later turns
         self.steps = 0;
         self.cur_span = 0;
-        self.call(func.clone(), this, args.to_vec())
+        self.err_located = false;
+        self.err_decorated = false;
+        let r = self.call(func.clone(), this, args.to_vec());
+        r.map_err(|err| self.finish_error(err, ""))
+    }
+
+    /// Register a source text for runtime error locations; returns its id
+    /// (1-based, 0 = not retained). Retention is bounded: a page pays at most
+    /// [`SOURCES_BYTES_MAX`] of extra RAM for diagnostics, past which errors
+    /// simply lose their line/col rather than the page losing memory.
+    pub(crate) fn register_source(&mut self, src: &str) -> u32 {
+        if self.sources.len() >= SOURCES_MAX || self.sources_bytes + src.len() > SOURCES_BYTES_MAX {
+            return 0;
+        }
+        self.sources_bytes += src.len();
+        self.sources.push(Rc::from(src));
+        self.sources.len() as u32
+    }
+
+    fn source_text(&self, id: u32) -> Option<Rc<str>> {
+        if id == 0 {
+            None
+        } else {
+            self.sources.get(id as usize - 1).cloned()
+        }
+    }
+
+    /// Record where a runtime throw originated, at most once per error: the
+    /// deepest `eval_expr`/`eval_stmt` that saw it wins. The thrown value is
+    /// never touched, so `catch (e)` still receives exactly what `throw`
+    /// passed — the location is only added to the text an escaping error is
+    /// logged with (see [`finish_error`]).
+    pub(crate) fn note_error(&mut self, err: &JsError) {
+        if self.err_located || !matches!(err, JsError::Throw(_)) {
+            return;
+        }
+        self.err_located = true;
+        self.throw_span = self.cur_span;
+        self.throw_src = self.cur_src;
+    }
+
+    /// Turn an escaping error into what the embedder logs: `(line, col)` from
+    /// the recorded origin, resolved against the source of the function that
+    /// threw. Budget errors get theirs here too (a turn boundary is the last
+    /// frame that knows the source).
+    pub(crate) fn finish_error(&mut self, err: JsError, fallback: &str) -> JsError {
+        match err {
+            JsError::Budget { .. } => {
+                let src = self.source_text(self.cur_src);
+                match src {
+                    Some(s) => {
+                        let (line, col) = parser::line_col(&s, self.cur_span);
+                        JsError::Budget { line, col }
+                    }
+                    None if fallback.is_empty() => JsError::Budget { line: 0, col: 0 },
+                    None => {
+                        let (line, col) = parser::line_col(fallback, self.cur_span);
+                        JsError::Budget { line, col }
+                    }
+                }
+            }
+            JsError::Throw(Val::Str(msg)) => {
+                if self.err_decorated {
+                    return JsError::Throw(Val::Str(msg));
+                }
+                let Some(src) = self.source_text(self.throw_src) else {
+                    return JsError::Throw(Val::Str(msg));
+                };
+                if self.throw_span == 0 || self.throw_span >= src.len() {
+                    return JsError::Throw(Val::Str(msg));
+                }
+                let (line, col) = parser::line_col(&src, self.throw_span);
+                if line == 0 {
+                    return JsError::Throw(Val::Str(msg));
+                }
+                self.err_decorated = true;
+                JsError::Throw(Val::Str(Rc::from(
+                    format!("{msg} (line {line}, col {col})").as_str(),
+                )))
+            }
+            other => other,
+        }
     }
 
     /// One interpreter dispatch. Every `eval_stmt`/`eval_expr` (and the
@@ -1063,6 +1191,26 @@ impl JsEngine {
         self.natives_by_name.get(name).copied()
     }
 
+    /// Attach an own data property to a native constructor value (natives are
+    /// ids, so this is the only place their properties can live).
+    pub(crate) fn set_native_prop(&mut self, id: usize, name: &str, val: Val) {
+        let entry = self.native_props.entry(id).or_default();
+        let key = Rc::from(name);
+        if let Some(slot) = entry.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = val;
+        } else {
+            entry.push((key, val));
+        }
+    }
+
+    pub(crate) fn native_prop(&self, id: usize, name: &str) -> Option<Val> {
+        self.native_props
+            .get(&id)?
+            .iter()
+            .find(|(k, _)| k.as_ref() == name)
+            .map(|(_, v)| v.clone())
+    }
+
     pub(crate) fn random_f64(&mut self) -> f64 {
         let mut x = self.rng_state;
         x ^= x << 13;
@@ -1081,9 +1229,42 @@ impl JsEngine {
             ));
         }
         self.call_depth += 1;
+        // diagnostics only: remember the JS frames so a TypeError can name
+        // them (see `stack_hint`) and the executing function's source so a
+        // throw resolves against the file that defined it (see `finish_error`)
+        let before = self.call_names.len();
+        let outer_src = self.cur_src;
+        if let Val::Func(c) = &callee {
+            let n = if c.def.name.is_empty() {
+                Rc::from("<anonymous>")
+            } else {
+                c.def.name.clone()
+            };
+            self.call_names.push(n);
+            self.cur_src = c.def.src;
+        }
         let r = self.call_inner(callee, this, args);
+        self.call_names.truncate(before);
+        self.cur_src = outer_src;
         self.call_depth -= 1;
         r
+    }
+
+    /// Innermost call-frame names, for error text: `" (in b <- a)"`.
+    /// Bounded to three frames so a deep stack cannot bloat a log line.
+    pub(crate) fn stack_hint(&self) -> String {
+        if self.call_names.is_empty() {
+            return String::new();
+        }
+        let mut names: Vec<&str> = self
+            .call_names
+            .iter()
+            .rev()
+            .take(3)
+            .map(|n| n.as_ref())
+            .collect();
+        names.reverse();
+        format!(" (in {})", names.join(" <- "))
     }
 
     fn call_inner(&mut self, callee: Val, this: Val, args: Vec<Val>) -> Result<Val, JsError> {
@@ -1676,9 +1857,10 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
         // (get_member unwraps them); unreachable in practice
         Val::Acc(_) => Ok(Val::Undefined),
         Val::Undefined | Val::Null => Err(JsError::Throw(Val::Str(Rc::from(format!(
-            "TypeError: Cannot read property '{}' of {}",
+            "TypeError: Cannot read property '{}' of {}{}",
             key,
-            base.type_of()
+            base.type_of(),
+            e.stack_hint()
         ))))),
         Val::Str(s) => {
             if key == "length" {
@@ -1799,13 +1981,17 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
                 }
             }
         }
-        Val::Native(_) => {
+        Val::Native(id) => {
             match key {
                 "call" => Ok(Val::Method(Meth::FnCall)),
                 "apply" => Ok(Val::Method(Meth::FnApply)),
                 "bind" => Ok(Val::Method(Meth::FnBind)),
                 "now" => Ok(Val::Method(Meth::DateNow)), // Date.now
                 _ => {
+                    // own props of native constructors (`URL.prototype`, …)
+                    if let Some(v) = e.native_prop(*id, key) {
+                        return Ok(v);
+                    }
                     // Promise statics hang off the constructor value
                     // (`Promise.resolve(5)` etc.) via a small engine-side
                     // table instead of per-native property storage
@@ -1828,10 +2014,21 @@ pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val,
         Val::Obj(o) => {
             // lazy prototype attach: engine-created arrays (literals,
             // builtins, embedder-made) pick up Array.prototype on first
-            // property access, so they never pay for it up front.
-            if matches!(o.borrow().kind, ObjKind::Array(_)) && o.borrow().proto.is_none() {
-                if let Some(p) = &e.array_proto {
-                    o.borrow_mut().proto = Some(p.clone());
+            // property access, so they never pay for it up front. Plain
+            // objects pick up Object.prototype the same way.
+            {
+                let mut b = o.borrow_mut();
+                if b.proto.is_none() {
+                    if matches!(b.kind, ObjKind::Array(_)) {
+                        if let Some(p) = &e.array_proto {
+                            b.proto = Some(p.clone());
+                        }
+                    } else if let Some(p) = &e.object_proto {
+                        // the prototype object itself never points at itself
+                        if !Rc::ptr_eq(p, o) {
+                            b.proto = Some(p.clone());
+                        }
+                    }
                 }
             }
             {
