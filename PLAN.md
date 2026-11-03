@@ -1665,6 +1665,62 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 20 (DOM surface + stdlib) | svelte.dev | 92.8 MB (291 runs; full render — logo, hero image, hero copy, GET STARTED, footer — and no `[js]` failure) |
 | 2026-11-03 | wave 20 (DOM surface + stdlib) | MDN `/Web/JavaScript/.../Array` | 89.8 MB (7776 runs; same pre-existing bundle `length` error, layout unchanged) |
 | 2026-11-03 | wave 20 (DOM surface + stdlib) | Wikipedia `/wiki/Web_browser` | 92.4 MB (5507 runs; same pre-existing inline `match` error, layout unchanged) |
+| 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | MDN homepage | 96.3 MB (615 runs; hero no longer one word per line - 505px copy column inside an 872px header, featured-article cards in two columns; same pre-existing bundle `length` error) |
+| 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | react.dev | 158.3 MB (1534 runs; dark theme, hero copy and buttons; Next router still logs `parsePath`) |
+| 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | svelte.dev | 127.4 MB (291 runs; pixel-unchanged) |
+| 2026-11-03 | wave 21 (prototypes + CSS4 colour + grid) | Wikipedia `/wiki/Main_Page` | 103.2 MB (1433 runs; unchanged, same 2 script errors) |
+
+### Wave 21 findings
+
+- **`ToString` on an object was walking its properties** (exponential on a
+  cyclic graph such as `window`). gtag.js evaluates `window == null`, which
+  coerced the global object and ballooned to gigabytes before the page rendered.
+  `ToString`/`to_primitive` now follow the spec tag (`[object Object]`,
+  `[object Function]`); `inspect()` kept only for `console.log`.
+- **Contextual `of`**: only the for-head separator is special; `var of = 3` and
+  `of(4)` are plain identifiers again. `no_in` suppression resets inside parens
+  and object/array literals so `'a' in o` survives any for-init.
+- **Prototype surface for feature probes**: primitive prototypes (String,
+  Number, Boolean, Symbol, Function), `Function.prototype.call/apply/bind/
+  toString`, `Object.prototype.propertyIsEnumerable/valueOf/isPrototypeOf`,
+  `Object.defineProperties`, `Error.prototype.toString` + per-class prototypes
+  + `.stack`, `Promise.prototype` (`then`/`catch`/`finally`),
+  `RegExp.prototype`, well-known `Symbol.*`, `Array.of/from`,
+  `String.prototype.charCodeAt`, `Array.prototype.splice`, and callable
+  `Object`/`Array` (hidden `__call` hook).
+- **The 112KB core-js bundle now runs with zero errors.** Root cause of the last
+  failure was `Promise.prototype` not existing: `pm = Promise.prototype` gave
+  `undefined`, so the polyfill's own `then` install threw. A real prototype
+  object plus promise instances chained to it fixed it.
+- **react.dev now loads with no chunk errors**: `window.history`
+  (push/replaceState, back/forward/go, `scrollRestoration`, `state`,
+  `length`), `navigator.platform`/`language`, `MediaQueryList.addEventListener`
+  (no-ops), and the Error family above were the missing pieces.
+- **CSS Color 4 syntax** (`rgb(35 39 47 / var(--tw-text-opacity))`,
+  `hsl(... / 0.5)`, percentage channels) now parses. react.dev's hero text was
+  white because the colour declaration had been dropped as invalid, not because
+  of a cascade bug.
+- **Grid fidelity**:
+  - `grid-column-end` and the `a / b` shorthand now span named lines (start
+    resolves through `-start`, end through `-end`); only `grid-column-start`
+    used to be read.
+  - `justify-content: normal` = stretch: leftover space is shared by `auto`
+    tracks.
+  - Tracks are "maximized" with an equal share of the free space (freezing at
+    each growth limit) instead of greedily feeding the first track.
+  - A grid item whose overflow is not visible has an automatic minimum of 0,
+    so a clipped decorative panel cannot starve the text column beside it.
+  On MDN's homepage these four turn a 177px one-word-per-line hero into the
+  reference layout (505px copy in an 872px header; reference 533/877) and put
+  the featured-article cards in two columns.
+- **Known gaps after wave 21**: MDN's client bundle still throws `Cannot read
+  property 'length' of undefined` (index.js col 19277); Wikipedia still throws
+  inline `match` of undefined + `load.php` `undefined is not a function`; Next.js
+  client routing stops on `parsePath` of undefined (caught, logged bare); SVG
+  `<text>`/`textPath` are not painted (MDN's mandala); the Vector 2022 header
+  search/menu boxes still overlap the logo; no real `symbol` primitive, BigInt,
+  `new.target`, class static blocks, `#x in obj`, typed arrays, or live module
+  bindings; `Set`/`Map` iterators are emulated by core-js.
 
 ### Phase 1c (Track A) findings
 
