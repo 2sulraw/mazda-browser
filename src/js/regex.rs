@@ -4,7 +4,7 @@
 //!
 //! # Design (one paragraph)
 //! Patterns are parsed into a small AST, then compiled to a flat instruction
-//! program (Char/Any/Class/Split/Jmp/Save/Backref/Assert/Look/SubEnd/Match â€”
+//! program (Char/Any/Class/Split/Jmp/Save/Backref/Assert/Look/SubEnd/Match —
 //! a textbook backtracking VM layout). Matching itself is a NON-RECURSIVE
 //! loop with an explicit backtrack stack, because loops must not consume
 //! native stack for long inputs and backrefs/lookaround need the exact
@@ -14,7 +14,7 @@
 //! `Rc::make_mut`, so restoring `k` stack entries costs O(1) unless the
 //! branches actually diverged.
 //!
-//! # Resource bounds (RAM/CPU honesty) â€” hard caps, not best effort
+//! # Resource bounds (RAM/CPU honesty) — hard caps, not best effort
 //! - `MAX_STEPS` (100k instruction dispatches per `find` call): a
 //!   catastrophic-backtracking pattern (`(a+)+$` vs a long failing string)
 //!   terminates at the cap and reports NO MATCH (with the honest limitation
@@ -24,13 +24,13 @@
 //!   memory is ~200 KB per running match.
 //! - Capture groups capped at 99 (`\1`..`\99`); lookahead nesting capped at
 //!   6; `{n,m}` unrolling capped so a compiled program stays under
-//!   `MAX_PROG` (50k instructions) â€” bigger is an honest compile error.
+//!   `MAX_PROG` (50k instructions) — bigger is an honest compile error.
 //! - Compiled programs are deduped per (pattern, flags) on the engine
 //!   (see `JsEngine::regex_cache`), so a literal pays one compile.
 
 use std::rc::Rc;
 
-/// CPU bound: instruction dispatches per `find` call. Exceed â†’ no match.
+/// CPU bound: instruction dispatches per `find` call. Exceed → no match.
 pub(crate) const MAX_STEPS: usize = 100_000;
 /// RAM bound: backtrack stack entries (~24 B each + shared caps).
 pub(crate) const MAX_BACKTRACK: usize = 8_000;
@@ -58,7 +58,7 @@ fn rerr<T>(msg: impl Into<String>) -> Result<T, RegexError> {
 pub(crate) enum Inst {
     /// match one exact char (case folded at match time when ci)
     Char(char),
-    /// `.` â€” matches any char except `\n` unless dot_all
+    /// `.` — matches any char except `\n` unless dot_all
     Any(bool),
     /// char class: sorted inclusive ranges, negated
     Class(Box<ClassSet>),
@@ -74,9 +74,9 @@ pub(crate) enum Inst {
     /// end of a lookaround sub program (never reached by the main path)
     SubEnd,
     Match,
-    /// `^` â€” multiline
+    /// `^` — multiline
     AssertStart(bool),
-    /// `$` â€” multiline
+    /// `$` — multiline
     AssertEnd(bool),
     /// `\b` (true) / `\B` (false)
     WordB(bool),
@@ -632,7 +632,7 @@ fn compile_node(n: &Node, dot_all: bool) -> Result<(Vec<Inst>, Option<char>), Re
     cx.prog.push(Inst::Save(1));
     cx.prog.push(Inst::Match);
     // leading literal: the first non-skippable instruction, when it is
-    // exactly a Char â€” lets non-anchored find loops skip hopeless starts
+    // exactly a Char — lets non-anchored find loops skip hopeless starts
     let mut first_char = None;
     for inst in cx.prog.iter() {
         match inst {
@@ -860,7 +860,7 @@ enum VmErr {
 }
 
 /// lowercase fold for `i`-flag comparisons (ASCII fast path, then the first
-/// Unicode lowercase mapping â€” an honest simplification)
+/// Unicode lowercase mapping — an honest simplification)
 fn ch_fold(ch: char) -> char {
     if ch.is_ascii() {
         ch.to_ascii_lowercase()
@@ -889,7 +889,7 @@ fn in_class(set: &ClassSet, ch: char, ci: bool) -> bool {
 }
 
 /// explicit backtrack frame: caps ride along so restoring a frame restores
-/// the exact capture state (copy-on-write Rc â€” the clone is a pointer bump
+/// the exact capture state (copy-on-write Rc — the clone is a pointer bump
 /// until a Save actually mutates through `Rc::make_mut`)
 #[derive(Clone)]
 struct Frame {

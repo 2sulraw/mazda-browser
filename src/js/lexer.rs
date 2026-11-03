@@ -4,11 +4,11 @@
 //!
 //! shortcuts (v1, all honest):
 //! - regex literal vs division is decided with the standard lexical
-//!   previous-token heuristic (a `/` after a value-ish token â€” number, str,
-//!   template, identifier, `)`, `]`, prefix/postfix `++`/`--` â€” reads as
+//!   previous-token heuristic (a `/` after a value-ish token — number, str,
+//!   template, identifier, `)`, `]`, prefix/postfix `++`/`--` — reads as
 //!   division; anything else starts a regex literal). This cannot see parser
 //!   state, so pathological spacing like `var r = {a:1} /2` (object literal
-//!   then division) would mislex as a regex â€” such shapes are vanishingly
+//!   then division) would mislex as a regex — such shapes are vanishingly
 //!   rare in real code and produce a regex-parse error, not silent misbehavior.
 //! - identifiers are ASCII-only (`A-Za-z_$` + digits). Non-ASCII bytes outside
 //!   strings/comments/templates are a syntax error. Unicode identifiers are a
@@ -38,10 +38,13 @@ pub enum Tok {
     /// Expr (and the whole template into string concatenation).
     Template(Vec<TplPart>),
     Ident(Rc<str>),
-    /// regex literal `/pattern/flags` â€” pattern and flags kept raw (escapes
+    /// integer literal with the `n` suffix (`123n`), stored as normalized
+    /// decimal digits so the parser does not need the source slice
+    BigInt(Rc<str>),
+    /// regex literal `/pattern/flags` — pattern and flags kept raw (escapes
     /// unescaped later by the regex engine, which owns them)
     Regex(Rc<str>, Rc<str>),
-    /// `...` â€” spread in calls/arrays/objects, rest in params/patterns
+    /// `...` — spread in calls/arrays/objects, rest in params/patterns
     Spread,
     Kw(Kw),
     Op(Op),
@@ -190,12 +193,13 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 /// Lexical regex-vs-division decision (see module docs): a `/` directly
 /// following a value-ish token is division; otherwise it opens a regex
 /// literal. We deliberately cannot see parser state (block vs object `}`), so
-/// after `}` we choose regex â€” statement boundaries are the common real-world
+/// after `}` we choose regex — statement boundaries are the common real-world
 /// reading.
 fn regex_allowed(prev: Option<&Tok>) -> bool {
     !matches!(
         prev,
         Some(Tok::Num(_))
+            | Some(Tok::BigInt(_))
             | Some(Tok::Str(_))
             | Some(Tok::Template(_))
             | Some(Tok::Ident(_))
@@ -390,10 +394,15 @@ impl<'a> Lexer<'a> {
                     while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric()) {
                         self.pos += 1;
                     }
-                    if self.peek() == Some(b'n') {
-                        return self.err("BigInt literals are not supported (later wave)", start);
+                    let mut digits = &self.src[dstart..self.pos];
+                    let big = digits.ends_with('n');
+                    if big {
+                        digits = &digits[..digits.len() - 1];
+                        return match i128::from_str_radix(digits, radix) {
+                            Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
+                            Err(_) => self.err("BigInt literal too large", start),
+                        };
                     }
-                    let digits = &self.src[dstart..self.pos];
                     return match u64::from_str_radix(digits, radix) {
                         Ok(v) => Ok(Tok::Num(v as f64)),
                         Err(_) => self.err("malformed numeric literal", start),
@@ -426,7 +435,17 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.peek() == Some(b'n') {
-            return self.err("BigInt literals are not supported (later wave)", start);
+            // `123n` is a BigInt literal; a fraction or exponent before the
+            // suffix is a syntax error (`1.5n`, `1e3n`)
+            let text = &self.src[start..self.pos];
+            if text.contains(['.', 'e', 'E']) {
+                return self.err("invalid BigInt literal", start);
+            }
+            self.pos += 1; // `n`
+            return match text.parse::<i128>() {
+                Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
+                Err(_) => self.err("BigInt literal too large", start),
+            };
         }
         let s = &self.src[start..self.pos];
         match s.parse::<f64>() {
@@ -459,7 +478,7 @@ impl<'a> Lexer<'a> {
 
     /// Scan a regex literal body (already past the opening `/`): `[...]`
     /// classes protect an inner `/`, `\x` escapes protect the next char.
-    /// Pattern text is kept raw â€” the regex engine unescapes it, because it
+    /// Pattern text is kept raw — the regex engine unescapes it, because it
     /// owns the escape sub-language.
     fn read_regex(&mut self, start: usize) -> Result<Tok, LexError> {
         let body_start = self.pos; // after the `/`

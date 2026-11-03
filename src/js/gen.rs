@@ -120,7 +120,7 @@ enum SStep {
     Flow(Flow),
     /// suspend on this statement's yield
     Yield(Val),
-    /// declarator list containing a yield â€” needs frame treatment
+    /// declarator list containing a yield — needs frame treatment
     Decls {
         kind: parser::VarKind,
         ds: Rc<Vec<parser::Declarator>>,
@@ -218,11 +218,11 @@ fn gen_vm(this: &Val) -> Result<Rc<RefCell<GenVm>>, JsError> {
     }
 }
 
-/// `.next(arg)` â€” run until the next yield, or completion
+/// `.next(arg)` — run until the next yield, or completion
 pub(crate) fn gen_next(e: &mut JsEngine, this: &Val, arg: Val) -> Result<Val, JsError> {
     let vm = gen_vm(this)?;
     // reentrant `.next` on a running generator is an honest TypeError (a
-    // RefCell borrow would panic â€” this check converts it to an error)
+    // RefCell borrow would panic — this check converts it to an error)
     if vm.try_borrow_mut().is_err() {
         return Err(JsError::throw(
             "TypeError: generator is already running (reentrant .next)",
@@ -233,19 +233,37 @@ pub(crate) fn gen_next(e: &mut JsEngine, this: &Val, arg: Val) -> Result<Val, Js
         return Ok(result_val(Val::Undefined, true));
     }
     vm.running = true;
+    // resume inside the frame that DEFINED the generator, not whatever script
+    // happened to call `.next()` (an error thrown mid-body must resolve its
+    // offset against this function's source text)
+    let saved_src = e.cur_src;
+    let saved_located = e.err_located;
+    e.cur_src = vm.def.src;
+    e.err_located = false;
     // deliver the resume value to the suspended yield's declarator (if any)
-    if let Some((bind, env)) = vm.pending.take() {
+    let bind_res = if let Some((bind, env)) = vm.pending.take() {
         match bind {
             PendBind::Name { kind, name } => match kind {
-                parser::VarKind::Var => e.env_set(&env, &name, arg)?,
+                parser::VarKind::Var => e.env_set(&env, &name, arg),
                 // let/const in a resumed loop body must replace the prior
                 // iteration's binding, not append a shadowed duplicate
-                k => env.rebind(name, arg),
+                k => {
+                    env.rebind(name, arg);
+                    Ok(())
+                }
             },
             PendBind::Pat { kind, pat } => {
-                interp::bind_pat(e, &env, &pat, arg, interp::BindKind::Decl(kind))?;
+                interp::bind_pat(e, &env, &pat, arg, interp::BindKind::Decl(kind))
             }
         }
+    } else {
+        Ok(())
+    };
+    if let Err(err) = bind_res {
+        vm.running = false;
+        e.cur_src = saved_src;
+        e.err_located = saved_located;
+        return Err(err);
     }
     let out = match drive(e, &mut vm) {
         Ok(out) => out,
@@ -255,10 +273,14 @@ pub(crate) fn gen_next(e: &mut JsEngine, this: &Val, arg: Val) -> Result<Val, Js
             vm.done = true;
             vm.frames.clear();
             vm.running = false;
+            e.cur_src = saved_src;
+            e.err_located = saved_located;
             return Err(err);
         }
     };
     vm.running = false;
+    e.cur_src = saved_src;
+    e.err_located = saved_located;
     Ok(match out {
         GOut::Yield(v) => result_val(v, false),
         GOut::Ret(v) => {
@@ -269,7 +291,7 @@ pub(crate) fn gen_next(e: &mut JsEngine, this: &Val, arg: Val) -> Result<Val, Js
     })
 }
 
-/// `.return(v)` â€” minimal: terminate the body now with value v
+/// `.return(v)` — minimal: terminate the body now with value v
 /// (try/finally interaction cannot occur: the parser rejects try-with-yield)
 pub(crate) fn gen_return(this: &Val, v: Val) -> Result<Val, JsError> {
     let vm = gen_vm(this)?;
@@ -652,7 +674,7 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
     use parser::ExprKind::*;
     match &x.kind {
         Yield(_) => true,
-        Ident(_) | Num(_) | Str(_) | Bool(_) | Null | This | Regex { .. } => false,
+        Ident(_) | Num(_) | BigInt(_) | Str(_) | Bool(_) | Null | This | Regex { .. } => false,
         Unary { expr, .. } | Typeof(expr) | Void(expr) | Delete(expr) | Await(expr) => {
             expr_has_yield(expr)
         }
@@ -729,6 +751,8 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
                     parser::TplSeg::Expr(x) => expr_has_yield(x),
                 })
         }
+        NewTarget => false,
+        PrivateIn { obj, .. } => expr_has_yield(obj),
     }
 }
 
@@ -749,7 +773,7 @@ fn step_stmt(
 ) -> Result<SStep, JsError> {
     if !stmt_has_yield(st) {
         // no suspension point: run it wholesale in the interpreter (this is
-        // also the fast path â€” loops without yield pay no frame overhead)
+        // also the fast path — loops without yield pay no frame overhead)
         let f = interp::eval_stmt(e, env, st)?;
         return Ok(match f {
             Flow::Normal => SStep::Done,
@@ -857,7 +881,7 @@ fn step_stmt(
             kind,
         } => {
             let it = eval_expr(e, env, iter)?;
-            let items = interp::for_of_items(&it)?;
+            let items = interp::for_of_items(e, &it)?;
             vm.frames.push(GFrame::ForEach {
                 target: target.clone(),
                 kind: *kind,

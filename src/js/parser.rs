@@ -34,10 +34,20 @@ pub struct Expr {
 pub enum ExprKind {
     Ident(Rc<str>),
     Num(f64),
+    /// `123n` — i128-backed (see the BigInt builtins for the documented range)
+    BigInt(i128),
     Str(Rc<str>),
     Bool(bool),
     Null,
     This,
+    /// `new.target`: the constructor being run by `new`, or undefined
+    NewTarget,
+    /// `#field in obj` — private-brand check (our privates are ordinary
+    /// `#name` keys, so this is a chain has-property test)
+    PrivateIn {
+        name: Rc<str>,
+        obj: Box<Expr>,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
@@ -2638,6 +2648,24 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         let start = self.pos;
         let mut l = self.shift_expr()?;
         loop {
+            // `#x in obj`: private brand check, not the generic `in`
+            // operator (the left side is lexed as a private identifier).
+            if matches!(self.peek(), Tok::Kw(Kw::In) if !self.no_in) {
+                if let ExprKind::Ident(name) = &l.kind {
+                    if name.starts_with('#') {
+                        self.next(); // `in`
+                        let obj = self.shift_expr()?;
+                        l = Expr {
+                            kind: ExprKind::PrivateIn {
+                                name: name.clone(),
+                                obj: Box::new(obj),
+                            },
+                            span: self.span_from(start),
+                        };
+                        continue;
+                    }
+                }
+            }
             let op = match self.peek() {
                 Tok::Op(Op::Lt) => BinOp::Lt,
                 Tok::Op(Op::Le) => BinOp::Le,
@@ -2804,6 +2832,17 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     fn lhs_expr(&mut self) -> Result<Expr, JsError> {
         let start = self.pos;
         let mut e = if self.eat_kw(Kw::New) {
+            // `new.target` (meta-property) before the constructor grammar
+            if self.eat_punct(Punct::Dot) {
+                let key = self.prop_name()?;
+                if key.as_ref() != "target" {
+                    return self.err("expected `new.target`");
+                }
+                Expr {
+                    kind: ExprKind::NewTarget,
+                    span: self.span_from(start),
+                }
+            } else {
             // new callee(args) — callee is a member chain WITHOUT a call
             let mut c = self.primary()?;
             while self.eat_punct(Punct::Dot) {
@@ -2838,6 +2877,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     args,
                 },
                 span: self.span_from(start),
+            }
             }
         } else {
             self.primary()?
@@ -3048,6 +3088,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             Tok::Num(n) => {
                 self.next();
                 ExprKind::Num(n)
+            }
+            Tok::BigInt(s) => {
+                self.next();
+                match s.parse::<i128>() {
+                    Ok(n) => ExprKind::BigInt(n),
+                    Err(_) => return self.err("BigInt literal too large"),
+                }
             }
             Tok::Str(s) => {
                 self.next();
@@ -3569,6 +3616,7 @@ fn pat_binding_names(p: &Pat, out: &mut Vec<Rc<str>>) {
 fn tok_str(t: &Tok) -> String {
     match t {
         Tok::Num(n) => format!("{}", n),
+        Tok::BigInt(s) => format!("{}n", s),
         Tok::Str(s) => format!("{:?}", s),
         Tok::Template(_) => "template literal".into(),
         Tok::Regex(..) => "regex literal".into(),
@@ -3682,8 +3730,11 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
                 })
         }
         // literals / nested functions own their trees
-        Ident(_) | Num(_) | Str(_) | Bool(_) | Null | This | Regex { .. } | Func(_)
+        Ident(_) | Num(_) | BigInt(_) | Str(_) | Bool(_) | Null | This | Regex { .. } | Func(_)
         | Arrow(_) => false,
+        // `new.target` is a plain meta-property
+        NewTarget => false,
+        PrivateIn { obj, .. } => expr_uses(obj, k),
     }
 }
 
@@ -4012,7 +4063,7 @@ fn scan_expr_arguments(e: &Expr) -> bool {
     use ExprKind::*;
     match &e.kind {
         Ident(s) => s.as_ref() == "arguments",
-        Num(_) | Str(_) | Bool(_) | Null | This | Regex { .. } => false,
+        Num(_) | BigInt(_) | Str(_) | Bool(_) | Null | This | Regex { .. } => false,
         Unary { expr, .. } | Typeof(expr) | Void(expr) | Delete(expr) | Await(expr) => {
             scan_expr_arguments(expr)
         }
@@ -4097,5 +4148,7 @@ fn scan_expr_arguments(e: &Expr) -> bool {
                     TplSeg::Expr(e) => scan_expr_arguments(e),
                 })
         }
+        NewTarget => false,
+        PrivateIn { obj, .. } => scan_expr_arguments(obj),
     }
 }

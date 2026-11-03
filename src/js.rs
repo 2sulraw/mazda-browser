@@ -1,4 +1,4 @@
-﻿//! JavaScript interpreter core â€” a from-scratch tree-walking evaluator for a
+﻿//! JavaScript interpreter core — a from-scratch tree-walking evaluator for a
 //! useful ES5+ subset. This is the foundation wave: pure logic, no DOM, no
 //! event loop; the embedder (later waves) drives script execution and drains
 //! the timer queue itself.
@@ -10,7 +10,7 @@
 //! - Values (`Val`) are a compact 24-byte enum: primitives inline, heap
 //!   payloads behind `Rc` (strings are fat `Rc<str>` pointers, saving one
 //!   indirection on the hot path). Objects are `Rc<RefCell<Obj>>` with an
-//!   insertion-ordered property `Vec` (linear scan â€” fine at this stage;
+//!   insertion-ordered property `Vec` (linear scan — fine at this stage;
 //!   shortcut comment) plus an optional dense array exotic.
 //! - Scopes: an `Rc<Env>` chain; `let/const` get a child env per block,
 //!   `var`/function decls hoist to the function env (naive walk at call
@@ -33,7 +33,7 @@
 //! templates, lookbehind/named groups/`u`-flag regex, full ASI,
 //! per-iteration `let` bindings in loops, iterator protocol (for-of/spread
 //! only handle arrays/strings), boxed primitives, Date string parsing.
-//! Async/await runs to completion (see `await_promise` â€” an `await` of a
+//! Async/await runs to completion (see `await_promise` — an `await` of a
 //! promise settled only by a timer/macrotask errors honestly instead of
 //! suspending the interpreter stack).
 #![allow(dead_code)] // the embedder hasn't wired this module up yet
@@ -75,6 +75,9 @@ pub enum Val {
     Bool(bool),
     Num(f64),
     Str(Rc<str>),
+    /// `123n`: i128-backed BigInt (documented range; operations that leave
+    /// i128 throw a RangeError instead of silently losing precision)
+    BigInt(Rc<i128>),
     Obj(Rc<RefCell<Obj>>),
     Func(Rc<Closure>),
     Native(usize),
@@ -139,6 +142,10 @@ pub enum Meth {
     // generator methods (this must be a generator object)
     GenNext,
     GenReturn,
+    // built-in iterator methods (this must be an Iterator object)
+    IterNext,
+    IterSelf,
+    IterReturn,
     // regex methods (this must be a regex object)
     RegexTest,
     RegexExec,
@@ -153,7 +160,7 @@ pub enum Meth {
 #[derive(Debug)]
 pub struct Obj {
     pub kind: ObjKind,
-    /// Own properties in insertion order. shortcut: linear scan on lookup â€”
+    /// Own properties in insertion order. shortcut: linear scan on lookup —
     /// O(n) per access; fine for typical script objects (tens of props), to
     /// be revisited with a real shape/map if profiles ever demand it.
     pub props: Vec<(Rc<str>, Val)>,
@@ -185,6 +192,211 @@ pub enum ObjKind {
     /// / `style_set` (installed by the embedder, so this module stays
     /// DOM-free). Own props still hold the method natives and `__node`.
     Style(u32),
+    /// live iterator object (`array.values()`, `set.entries()`, a user
+    /// `Symbol.iterator` result is a plain object with `next`; this is the
+    /// built-in fast path). `next()` reads the CURRENT source by index, so
+    /// mutation during iteration follows the spec's live-view behavior.
+    Iterator(IterState),
+    /// real byte buffer shared by every view over it
+    ArrayBuffer(Rc<RefCell<Vec<u8>>>),
+    /// fixed-width view into an ArrayBuffer
+    TypedArray(TypedArray),
+}
+
+/// Which built-in iterator this is (keys/values/entries).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IterKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+#[derive(Debug)]
+pub struct IterState {
+    /// array / typed array / Set / Map / string being walked
+    pub source: Val,
+    pub kind: IterKind,
+    pub index: usize,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TypedKind {
+    I8,
+    U8,
+    U8Clamp,
+    I16,
+    U16,
+    I32,
+    U32,
+    F32,
+    F64,
+    BigI64,
+    BigU64,
+}
+
+impl TypedKind {
+    pub fn size(self) -> usize {
+        match self {
+            TypedKind::I8 | TypedKind::U8 | TypedKind::U8Clamp => 1,
+            TypedKind::I16 | TypedKind::U16 => 2,
+            TypedKind::I32 | TypedKind::U32 | TypedKind::F32 => 4,
+            TypedKind::F64 | TypedKind::BigI64 | TypedKind::BigU64 => 8,
+        }
+    }
+    pub fn is_big(self) -> bool {
+        matches!(self, TypedKind::BigI64 | TypedKind::BigU64)
+    }
+    pub fn from_index(i: u16) -> Option<TypedKind> {
+        Some(match i {
+            0 => TypedKind::I8,
+            1 => TypedKind::U8,
+            2 => TypedKind::U8Clamp,
+            3 => TypedKind::I16,
+            4 => TypedKind::U16,
+            5 => TypedKind::I32,
+            6 => TypedKind::U32,
+            7 => TypedKind::F32,
+            8 => TypedKind::F64,
+            9 => TypedKind::BigI64,
+            10 => TypedKind::BigU64,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct TypedArray {
+    pub kind: TypedKind,
+    pub buf: Rc<RefCell<Obj>>,
+    /// byte offset into the buffer
+    pub offset: usize,
+    /// element count
+    pub len: usize,
+}
+
+pub(crate) const SYMBOL_ITERATOR: &str = "Symbol(iterator)";
+
+impl TypedArray {
+    /// Element count (the `.length` value).
+    pub fn length(&self) -> usize {
+        self.len
+    }
+}
+
+/// Read element `i` (bounds-checked by the caller) as a JS value.
+pub(crate) fn typed_read(ta: &TypedArray, i: usize) -> Val {
+    if i >= ta.len {
+        return Val::Undefined;
+    }
+    let size = ta.kind.size();
+    let at = ta.offset + i * size;
+    let r = ta.buf.borrow();
+    let bcell = match &r.kind {
+        ObjKind::ArrayBuffer(b) => b,
+        _ => return Val::Undefined,
+    };
+    let bytes = bcell.borrow();
+    if at + size > bytes.len() {
+        return Val::Undefined;
+    }
+    let b = &bytes[at..at + size];
+    match ta.kind {
+        TypedKind::I8 => Val::Num(b[0] as i8 as f64),
+        TypedKind::U8 | TypedKind::U8Clamp => Val::Num(b[0] as f64),
+        TypedKind::I16 => Val::Num(i16::from_le_bytes([b[0], b[1]]) as f64),
+        TypedKind::U16 => Val::Num(u16::from_le_bytes([b[0], b[1]]) as f64),
+        TypedKind::I32 => Val::Num(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        TypedKind::U32 => Val::Num(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        TypedKind::F32 => Val::Num(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        TypedKind::F64 => Val::Num(f64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ])),
+        TypedKind::BigI64 => Val::BigInt(Rc::new(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]) as i128)),
+        TypedKind::BigU64 => Val::BigInt(Rc::new(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]) as i128)),
+    }
+}
+
+/// Write element `i` with the spec's conversion for the element type.
+pub(crate) fn typed_write(ta: &TypedArray, i: usize, v: &Val) {
+    if i >= ta.len {
+        return;
+    }
+    let size = ta.kind.size();
+    let at = ta.offset + i * size;
+    let r = ta.buf.borrow();
+    let bcell = match &r.kind {
+        ObjKind::ArrayBuffer(b) => b,
+        _ => return,
+    };
+    let mut bytes = bcell.borrow_mut();
+    if at + size > bytes.len() {
+        return;
+    }
+    let n = v.to_number();
+    let big = |v: &Val| -> i128 {
+        match v {
+            Val::BigInt(n) => **n,
+            _ => {
+                let n = v.to_number();
+                if n.is_finite() {
+                    n.trunc() as i128
+                } else {
+                    0
+                }
+            }
+        }
+    };
+    match ta.kind {
+        TypedKind::I8 => bytes[at] = (n as i64 as i8) as u8,
+        TypedKind::U8 => bytes[at] = n as i64 as u8,
+        TypedKind::U8Clamp => {
+            // ToUint8Clamp: round half to even, clamp 0..255
+            let c = if n.is_nan() {
+                0.0
+            } else {
+                let f = n.floor();
+                let diff = n - f;
+                let r = if diff < 0.5 {
+                    f
+                } else if diff > 0.5 {
+                    f + 1.0
+                } else if (f as i64) % 2 == 0 {
+                    f
+                } else {
+                    f + 1.0
+                };
+                r.clamp(0.0, 255.0)
+            };
+            bytes[at] = c as u8;
+        }
+        TypedKind::I16 => bytes[at..at + 2].copy_from_slice(&(n as i64 as i16).to_le_bytes()),
+        TypedKind::U16 => bytes[at..at + 2].copy_from_slice(&(n as i64 as u16).to_le_bytes()),
+        TypedKind::I32 => bytes[at..at + 4].copy_from_slice(&(n as i64 as i32).to_le_bytes()),
+        TypedKind::U32 => bytes[at..at + 4].copy_from_slice(&(n as i64 as u32).to_le_bytes()),
+        TypedKind::F32 => bytes[at..at + 4].copy_from_slice(&(n as f32).to_le_bytes()),
+        TypedKind::F64 => bytes[at..at + 8].copy_from_slice(&n.to_le_bytes()),
+        TypedKind::BigI64 => {
+            let x = big(v) as u64;
+            bytes[at..at + 8].copy_from_slice(&x.to_le_bytes());
+        }
+        TypedKind::BigU64 => {
+            let x = big(v) as u64;
+            bytes[at..at + 8].copy_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
+/// Join a typed array's elements (its `toString`).
+fn typed_join(ta: &TypedArray) -> String {
+    (0..ta.len)
+        .map(|i| typed_read(ta, i).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// per-instance regex state (see `ObjKind::Regex`)
@@ -313,6 +525,7 @@ impl Val {
             Val::Bool(_) => "boolean",
             Val::Num(_) => "number",
             Val::Str(_) => "string",
+            Val::BigInt(_) => "bigint",
             Val::Obj(o) => {
                 // symbol stand-ins: unique objects with a hidden `__symbol`
                 // description (see builtins::install)
@@ -365,6 +578,7 @@ impl Val {
             Val::Bool(b) => *b,
             Val::Num(n) => *n != 0.0 && !n.is_nan(),
             Val::Str(s) => !s.is_empty(),
+            Val::BigInt(n) => **n != 0,
             Val::Obj(_) | Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_) => true,
         }
     }
@@ -383,6 +597,11 @@ impl Val {
             }
             Val::Num(n) => *n,
             Val::Str(s) => str_to_number(s),
+            // ToNumber on a BigInt throws in the spec; arithmetic paths that
+            // may legally see one branch before calling this (see binary_op),
+            // and `Number(1n)` is an explicit conversion handled by the
+            // builtin, so this is only the lossy fallback.
+            Val::BigInt(n) => **n as f64,
             Val::Obj(_) => str_to_number(&self.to_string()),
             _ => f64::NAN,
         }
@@ -424,6 +643,9 @@ impl Val {
                     ObjKind::Promise(_) => "[object Promise]".into(),
                     ObjKind::Generator(_) => "[object Generator]".into(),
                     ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::Iterator(_) => "[object Iterator]".into(),
+                    ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
+                    ObjKind::TypedArray(ta) => typed_join(ta),
                     ObjKind::Plain => {
                         // symbols are unique objects with a hidden
                         // `__symbol` description (see builtins)
@@ -455,6 +677,7 @@ impl Val {
             Val::Bool(b) => b.to_string(),
             Val::Num(n) => num_to_str(*n),
             Val::Str(s) => s.to_string(),
+            Val::BigInt(n) => n.to_string(),
             Val::Obj(o) => {
                 let b = o.borrow();
                 match &b.kind {
@@ -494,6 +717,9 @@ impl Val {
                     ObjKind::Regex(ri) => format!("/{}/{}", ri.re.src, ri.re.flags),
                     ObjKind::Generator(_) => "[object Generator]".into(),
                     ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::Iterator(_) => "[object Iterator]".into(),
+                    ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
+                    ObjKind::TypedArray(ta) => typed_join(ta),
                 }
             }
             Val::Func(c) => format!("function {}() {{ [code] }}", c.def.name),
@@ -819,7 +1045,7 @@ pub(crate) enum Job {
 pub(crate) struct ComboState {
     /// the combined promise; `None` once it has settled
     pub result: Option<Rc<RefCell<Obj>>>,
-    /// combined promise already settled â€” later element outcomes are dropped
+    /// combined promise already settled — later element outcomes are dropped
     pub done: bool,
     /// how many elements still owe an outcome
     pub remaining: usize,
@@ -864,7 +1090,7 @@ pub struct JsEngine {
     /// deferred `new Promise` resolver slots: slot index -> the promise the
     /// registered `resolve`/`reject` natives settle. The slot is emptied on
     /// settle, so the engine holds no reference afterwards (script-level
-    /// `Rc`s are the only refs from then on â€” normal refcount release).
+    /// `Rc`s are the only refs from then on — normal refcount release).
     pub(crate) promise_slots: Vec<Option<Rc<RefCell<Obj>>>>,
     /// Promise.resolve/reject/... statics installed by builtins; reachable
     /// through member lookup on the constructor native
@@ -890,6 +1116,12 @@ pub struct JsEngine {
     pub(crate) uint8_to_b64: usize,
     pub(crate) buffer_to_string: usize,
     pub(crate) arraybuffer_proto: Option<Rc<RefCell<Obj>>>,
+    /// shared natives for typed-array methods (registered once by builtins)
+    pub(crate) typed_set: usize,
+    pub(crate) typed_subarray: usize,
+    pub(crate) typed_slice: usize,
+    /// typed-array prototype (`Uint8Array.prototype`, `%TypedArray%.prototype`)
+    pub(crate) typed_proto: Option<Rc<RefCell<Obj>>>,
     /// `Function.prototype` — the fallback prototype for function values
     pub(crate) function_proto: Option<Rc<RefCell<Obj>>>,
     /// `Error.prototype` — parent of every error instance, so `extends
@@ -900,7 +1132,7 @@ pub struct JsEngine {
     /// compiled-once regex literal cache, keyed by (pattern, flags). Regex
     /// literals are program text, so this cache is bounded by the number of
     /// distinct (pattern, flags) literals the page can create; still capped
-    /// at `REGEX_CACHE_MAX` (RAM honesty) â€” beyond the cap compiles are
+    /// at `REGEX_CACHE_MAX` (RAM honesty) — beyond the cap compiles are
     /// per-eval (correct, just not cached).
     pub(crate) regex_cache: HashMap<(Rc<str>, Rc<str>), Rc<Regex>>,
     pub(crate) next_timer_id: f64,
@@ -918,6 +1150,10 @@ pub struct JsEngine {
     /// error reports line/col through this (enriched in `exec`, which has
     /// the source; dispatch turns only carry the offset)
     pub(crate) cur_span: usize,
+    /// constructor value set by an enclosing `new` expression immediately
+    /// before the call; `call_inner` takes it and binds `#new.target` in the
+    /// callee's environment
+    pub(crate) pending_construct: Option<Val>,
     /// label of the loop currently being entered (`outer: for (...)`); the
     /// loop arm takes it so `continue outer` knows its own label
     pub(crate) pending_label: Option<Rc<str>>,
@@ -1017,6 +1253,10 @@ impl JsEngine {
             uint8_to_b64: 0,
             buffer_to_string: 0,
             arraybuffer_proto: None,
+            typed_set: 0,
+            typed_subarray: 0,
+            typed_slice: 0,
+            typed_proto: None,
             function_proto: None,
         error_proto: None,
             fn_body_native: 0,
@@ -1025,6 +1265,7 @@ impl JsEngine {
             steps: 0,
             step_budget: DEFAULT_STEP_BUDGET,
             cur_span: 0,
+            pending_construct: None,
             pending_label: None,
             call_names: Vec::new(),
             sources: Vec::new(),
@@ -1071,7 +1312,7 @@ impl JsEngine {
     }
 
     /// Parse + run a script. State (globals) persists across `exec` calls on
-    /// the same engine â€” that's what makes multi-`<script>` pages work.
+    /// the same engine — that's what makes multi-`<script>` pages work.
     /// The returned value is the last evaluated expression statement's value
     /// (JS `eval` completion-value semantics; declarations contribute
     /// nothing). Handy for embedder/tests; not observable from script code.
@@ -1090,6 +1331,7 @@ impl JsEngine {
         for st in program.iter() {
             // a Budget error from this turn names the spinning statement;
             // `finish_error` resolves the recorded offset to line/col
+            self.err_located = false;
             let r = match &st.kind {
                 parser::StmtKind::Expr(e) => interp::eval_expr(self, &env, e).map(|v| {
                     last = v;
@@ -1282,7 +1524,7 @@ impl JsEngine {
     }
 
     /// Take the queue of pending `setTimeout` jobs (FIFO). The embedder runs
-    /// them however it likes â€” the interpreter has no timer thread.
+    /// them however it likes — the interpreter has no timer thread.
     pub fn drain_timers(&mut self) -> Vec<TimerTask> {
         std::mem::take(&mut self.timers)
     }
@@ -1447,6 +1689,10 @@ impl JsEngine {
     }
 
     fn call_inner(&mut self, callee: Val, this: Val, args: Vec<Val>) -> Result<Val, JsError> {
+        // only the direct callee of `new` sees this; a plain call made from
+        // inside the constructor takes it during ITS own call_inner, so the
+        // binding never leaks into helper functions
+        let construct_target = self.pending_construct.take();
         match callee {
             Val::Func(c) => {
                 let env = Env::child(&c.env);
@@ -1459,6 +1705,14 @@ impl JsEngine {
                     this
                 };
                 env.declare(Rc::from("this"), this_val.clone(), false);
+                if !c.is_arrow {
+                    // arrows see the enclosing function's `new.target`
+                    env.declare(
+                        Rc::from("#new.target"),
+                        construct_target.unwrap_or(Val::Undefined),
+                        false,
+                    );
+                }
                 if !c.is_arrow && c.def.uses_arguments {
                     let items = args.clone();
                     env.declare(Rc::from("arguments"), Val::new_array(items), false);
@@ -1555,7 +1809,7 @@ impl JsEngine {
     }
 
     /// Assignment: walks the chain; const bindings throw; unknown names are
-    /// (sloppily) created as globals â€” real-world scripts rely on that.
+    /// (sloppily) created as globals — real-world scripts rely on that.
     pub(crate) fn env_set(&mut self, env: &Rc<Env>, name: &str, v: Val) -> Result<(), JsError> {
         let mut cur: &Env = env;
         loop {
@@ -1644,7 +1898,7 @@ pub(crate) fn settle_promise(e: &mut JsEngine, p: &Rc<RefCell<Obj>>, out: Result
 
 /// the `resolve` function semantics: adopt our promises (chaining), else
 /// fulfill directly. shortcut: foreign thenables (objects with a
-/// user-defined `then`) resolve as plain values â€” documented.
+/// user-defined `then`) resolve as plain values — documented.
 pub(crate) fn resolve_promise(e: &mut JsEngine, p: &Rc<RefCell<Obj>>, v: Val) {
     if let Val::Obj(o) = &v {
         if Rc::ptr_eq(o, p) {
@@ -1678,7 +1932,7 @@ pub(crate) fn resolve_promise(e: &mut JsEngine, p: &Rc<RefCell<Obj>>, v: Val) {
     settle_promise(e, p, Ok(v));
 }
 
-/// `.then(onOk, onErr)` â€” creates the derived promise, queues (or fires)
+/// `.then(onOk, onErr)` — creates the derived promise, queues (or fires)
 /// the reaction; the derived promise is returned so `.then` chains.
 pub(crate) fn promise_then(
     e: &mut JsEngine,
@@ -2146,6 +2400,14 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             };
             Ok(m.map(Val::Method).unwrap_or(Val::Undefined))
         }
+        Val::BigInt(_) => {
+            let m = if key == "toString" || key == "valueOf" {
+                Some(Meth::NumToString)
+            } else {
+                None
+            };
+            Ok(m.map(Val::Method).unwrap_or(Val::Undefined))
+        }
         Val::Bool(_) => {
             let m = if key == "toString" || key == "valueOf" {
                 Some(Meth::NumToString) // dispatches on this type
@@ -2381,6 +2643,45 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                         _ => {}
                     }
                 }
+                if let ObjKind::Iterator(_) = b.kind {
+                    match key {
+                        "next" => return Ok(Val::Method(Meth::IterNext)),
+                        "return" => return Ok(Val::Method(Meth::IterReturn)),
+                        // `it[Symbol.iterator]() === it`
+                        k if k == SYMBOL_ITERATOR => {
+                            return Ok(Val::Method(Meth::IterSelf))
+                        }
+                        _ => {}
+                    }
+                }
+                if let ObjKind::ArrayBuffer(bytes) = &b.kind {
+                    if key == "byteLength" {
+                        return Ok(Val::Num(bytes.borrow().len() as f64));
+                    }
+                }
+                if let ObjKind::TypedArray(ta) = &b.kind {
+                    match key {
+                        "length" => return Ok(Val::Num(ta.len as f64)),
+                        "byteLength" => {
+                            return Ok(Val::Num((ta.len * ta.kind.size()) as f64))
+                        }
+                        "byteOffset" => return Ok(Val::Num(ta.offset as f64)),
+                        "BYTES_PER_ELEMENT" => {
+                            return Ok(Val::Num(ta.kind.size() as f64))
+                        }
+                        "buffer" => return Ok(Val::Obj(ta.buf.clone())),
+                        "set" => return Ok(Val::Native(e.typed_set)),
+                        "subarray" => return Ok(Val::Native(e.typed_subarray)),
+                        "slice" => return Ok(Val::Native(e.typed_slice)),
+                        k if k == SYMBOL_ITERATOR => {
+                            return Ok(Val::Method(Meth::IterSelf))
+                        }
+                        _ => {}
+                    }
+                    if let Ok(i) = key.parse::<usize>() {
+                        return Ok(typed_read(ta, i));
+                    }
+                }
             }
             // prototype walk with accessor interception: an own OR inherited
             // `Val::Acc` property invokes its getter (receiver = `base`)
@@ -2491,6 +2792,17 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
                     }
                 }
             }
+            // typed arrays: an index write goes through the element
+            // conversion into the shared buffer (and never creates an own
+            // property on the view)
+            if let Ok(b) = o.try_borrow() {
+                if let ObjKind::TypedArray(ta) = &b.kind {
+                    if let Ok(i) = key.parse::<usize>() {
+                        typed_write(ta, i, &v);
+                        return Ok(());
+                    }
+                }
+            }
             // accessor interception walk
             let mut cur = Some(o.clone());
             for _ in 0..PROTO_WALK_CAP {
@@ -2581,7 +2893,7 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
     }
 }
 
-/// JS `ToPrimitive` (default hint): what `+`/`==` do with objects â€” objects
+/// JS `ToPrimitive` (default hint): what `+`/`==` do with objects — objects
 /// collapse to their string form (arrays join, errors "Name: msg", plain
 /// objects "[object Object]").
 fn to_primitive(v: &Val) -> Val {
@@ -2598,6 +2910,13 @@ pub(crate) fn loose_eq(l: &Val, r: &Val) -> bool {
         (Undefined, Null) | (Null, Undefined) => true,
         (Null, Null) | (Undefined, Undefined) => true,
         (Num(a), Num(b)) => a == b,
+        (BigInt(a), BigInt(b)) => a == b,
+        (BigInt(a), Num(b)) | (Num(b), BigInt(a)) => {
+            b.is_finite() && b.fract() == 0.0 && **a as f64 == *b
+        }
+        (BigInt(a), Str(b)) | (Str(b), BigInt(a)) => {
+            b.trim().parse::<i128>().map_or(false, |v| v == **a)
+        }
         (Str(a), Str(b)) => a == b,
         (Bool(a), Bool(b)) => a == b,
         (Num(_), Str(_)) | (Str(_), Num(_)) => l.to_number() == r.to_number(),
@@ -2614,6 +2933,7 @@ pub(crate) fn strict_eq(l: &Val, r: &Val) -> bool {
     use Val::*;
     match (l, r) {
         (Num(a), Num(b)) => a == b && !(a.is_nan() && b.is_nan()),
+        (BigInt(a), BigInt(b)) => a == b,
         (Str(a), Str(b)) => a == b,
         (Bool(a), Bool(b)) => a == b,
         (Obj(a), Obj(b)) => Rc::ptr_eq(a, b),

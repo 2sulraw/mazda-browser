@@ -321,7 +321,7 @@ fn recursion() {
 #[test]
 fn stack_overflow_guard_returns_err_not_panic() {
     // debug-build interpreter frames are fat: run the runaway-recursion case
-    // on a thread with a generous stack ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the ENGINE's own guard (depth cap)
+    // on a thread with a generous stack ÃƒÂ¢Ã¢‚Â¬Ã¢€Â the ENGINE's own guard (depth cap)
     // must fire long before this thread's stack runs out, exactly like the
     // release browser build.
     let h = std::thread::Builder::new()
@@ -346,7 +346,7 @@ fn stack_overflow_guard_returns_err_not_panic() {
 #[test]
 fn recursion_10000_deep_is_err_not_panic() {
     // A 10000-frame chain is 10x over MAX_CALL_DEPTH (1000): the engine's
-    // guard must surface a RangeError Err ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â never a native stack overflow or
+    // guard must surface a RangeError Err ÃƒÂ¢Ã¢‚Â¬Ã¢€Â never a native stack overflow or
     // panic. Same generous-stack thread rationale as the runaway case above.
     let h = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -815,7 +815,7 @@ fn json_round_trip() {
     // unicode escape round-trip
     assert_eq!(string("JSON.parse(JSON.stringify('\\u0041'))"), "A");
     // surrogate pair: our lexer maps lone surrogate escapes to U+FFFD (see
-    // lexer.rs shortcut note), so this yields 2 chars ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the same `.length`
+    // lexer.rs shortcut note), so this yields 2 chars ÃƒÂ¢Ã¢‚Â¬Ã¢€Â the same `.length`
     // real JS reports (2 UTF-16 units) for this input.
     assert_eq!(num("JSON.parse('\"\\ud83d\\ude00\"').length"), 2.0);
 }
@@ -881,9 +881,15 @@ fn set_builtin_dedupes_and_iterates() {
     assert_eq!(num("var s = new Set([1, 2, 2, 3]); s.size"), 3.0);
     assert!(boolean("var s = new Set([1]); s.has(1) && !s.has(2)"));
     assert_eq!(
-        string("var s = new Set([1, 2]); s.add(3); s.delete(1); s.values().join(',')"),
+        string("var s = new Set([1, 2]); s.add(3); s.delete(1); [...s.values()].join(',')"),
         "2,3"
     );
+    // real iterator: `.next()` handshake and `keys()`/`entries()`
+    assert_eq!(
+        string("var it = new Set(['a']).entries().next(); it.value.join(':') + it.done"),
+        "a:afalse"
+    );
+    assert!(boolean("var it = new Set([1]).values(); it[Symbol.iterator]() === it"));
     assert_eq!(
         string("var s = new Set(['a', 'b']); var out = ''; for (var x of s) out += x; out"),
         "ab"
@@ -911,8 +917,12 @@ fn map_builtin_holds_key_value_pairs() {
         "a1"
     );
     assert_eq!(
-        string("var m = new Map([['a', 1], ['b', 2]]); m.entries().map(function (e) { return e[0] + e[1]; }).join(',')"),
+        string("var m = new Map([['a', 1], ['b', 2]]); Array.from(m.entries()).map(function (e) { return e[0] + e[1]; }).join(',')"),
         "a1,b2"
+    );
+    assert_eq!(
+        string("var m = new Map([['a', 1], ['b', 2]]); var out = ''; for (var k of m.keys()) out += k; out"),
+        "ab"
     );
     assert!(boolean("new Map() instanceof Map"));
     assert_eq!(
@@ -971,7 +981,7 @@ fn object_integrity_and_descriptor_helpers() {
 }
 
 #[test]
-fn base64_and_typed_array_stand_ins() {
+fn base64_and_typed_arrays() {
     assert_eq!(string("btoa('hi')"), "aGk=");
     assert_eq!(string("atob('aGk=')"), "hi");
     assert_eq!(string("new Uint8Array([104, 105]).toBase64()"), "aGk=");
@@ -982,6 +992,106 @@ fn base64_and_typed_array_stand_ins() {
     assert_eq!(num("new Uint8Array(3).length"), 3.0);
     assert_eq!(string("Buffer.from('hi').toString('base64')"), "aGk=");
     assert_eq!(num("Uint8Array.fromBase64('aGk=').buffer.byteLength"), 2.0);
+}
+
+#[test]
+fn typed_array_views_share_storage() {
+    // writes coerce to the element width and views alias the buffer
+    assert_eq!(num("var a = new Uint8Array(2); a[0] = 300; a[0]"), 44.0);
+    assert_eq!(num("var a = new Int16Array(2); a[1] = -2; a[1]"), -2.0);
+    assert_eq!(
+        string("var b = new ArrayBuffer(4); var a = new Uint8Array(b); a[0] = 7; new Uint8Array(b)[0]"),
+        "7"
+    );
+    assert_eq!(
+        num("var a = new Float64Array([1.5, 2.5]); a.slice(1)[0]"),
+        2.5
+    );
+    assert_eq!(
+        string("var b = new ArrayBuffer(8); var a = new Uint16Array(b); a.set([1, 2], 1); a[0] + ',' + a[1] + ',' + a[2]"),
+        "0,1,2"
+    );
+    assert!(boolean("ArrayBuffer.isView(new Int8Array(1)) && !ArrayBuffer.isView({})"));
+    assert_eq!(num("Uint16Array.BYTES_PER_ELEMENT"), 2.0);
+    assert_eq!(
+        string("var a = new Uint8Array([1, 2, 3, 4]); var s = a.subarray(1, 3); s[0] = 9; a[1]"),
+        "9"
+    );
+}
+
+#[test]
+fn bigint_arithmetic_and_conversions() {
+    assert_eq!(string("typeof 10n"), "bigint");
+    assert_eq!(string("10n + 5n"), "15");
+    assert_eq!(string("2n ** 10n"), "1024");
+    assert_eq!(string("(7n / 2n) + ',' + (7n % 2n)"), "3,1");
+    assert!(boolean("1n === 1n && 1n !== 1 && 1n == 1"));
+    assert!(boolean("1n < 2n && 3n >= 3n"));
+    assert_eq!(string("BigInt('42') + 1n"), "43");
+    assert_eq!(string("BigInt.asIntN(8, 255n)"), "-1");
+    assert_eq!(string("BigInt.asUintN(8, -1n)"), "255");
+    assert_eq!(string("(255n).toString(16)"), "ff");
+    // mixing is an honest TypeError
+    err("1n + 1");
+    err("+1n");
+}
+
+#[test]
+fn bigint_pow_does_not_spin_on_huge_exponents() {
+    // |base| <= 1 never overflows, so the multiply loop would run the whole
+    // exponent (u32::MAX here) — must be answered directly instead
+    assert_eq!(string("1n ** 4294967295n"), "1");
+    assert_eq!(string("0n ** 4294967295n"), "0");
+    assert_eq!(string("0n ** 0n"), "1");
+    assert_eq!(string("(-1n) ** 4294967295n"), "-1");
+    assert_eq!(string("(-1n) ** 4294967294n"), "1");
+    // anything bigger than 1 overflows i128 long before the 128th squaring
+    err("2n ** 400n");
+    err("2n ** -1n");
+}
+
+#[test]
+fn typed_array_length_ctor_zero_fills_without_a_value_vector() {
+    assert_eq!(
+        string("var a = new Uint8Array(3); a.length + ',' + a[0] + ',' + (a instanceof Uint8Array)"),
+        "3,0,true"
+    );
+    assert_eq!(string("new Int32Array(2).byteLength"), "8");
+    // the element-count cap still applies
+    err("new Uint8Array(1 << 25)");
+}
+
+#[test]
+fn new_target_and_private_brand_checks() {
+    assert!(boolean(
+        "function F() { this.ok = new.target === F } new F().ok"
+    ));
+    assert!(boolean("function F() { return new.target } F() === undefined"));
+    assert_eq!(
+        string("class A { #x = 1; static has(o) { return #x in o } } A.has(new A()) + ',' + A.has({})"),
+        "true,false"
+    );
+    // an arrow inside a constructor sees the constructor's new.target
+    assert!(boolean(
+        "function F() { this.ok = (() => new.target === F)(); } new F().ok"
+    ));
+}
+
+#[test]
+fn user_defined_iterator_protocol() {
+    // for..of is lazy: it stops calling `next` at `break`
+    assert_eq!(
+        num("var n = 0; var it = { [Symbol.iterator]() { return { next() { n++; return { value: n, done: n > 10 } } } } }; for (var v of it) { if (v === 2) break } n"),
+        2.0
+    );
+    assert_eq!(
+        string("var it = { [Symbol.iterator]() { var i = 0; return { next() { return { value: i++, done: i > 3 } } } } }; [...it].join(',')"),
+        "0,1,2"
+    );
+    assert_eq!(
+        string("var it = { [Symbol.iterator]() { var i = 0; return { next() { return { value: i++, done: i > 2 } } } } }; Array.from(it).join('+')"),
+        "0+1"
+    );
 }
 
 #[test]
@@ -1289,7 +1399,7 @@ fn exec_returns_last_expression_value() {
 
 #[test]
 fn val_is_compact() {
-    // RAM guard: Val must stay 24 bytes ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â this is the hot unit. (24 = 8-byte
+    // RAM guard: Val must stay 24 bytes ÃƒÂ¢Ã¢‚Â¬Ã¢€Â this is the hot unit. (24 = 8-byte
     // tag/padding + the 16-byte fat Rc<str> pointer; thinning strings would
     // cost an extra indirection per string.)
     assert!(
@@ -1648,7 +1758,7 @@ fn await_values() {
     // async fn + plain chaining both refill a shared queue; each pending
     // await pumps what's queued (sequential awaits keep order). Note (honest
     // design tradeoff): awaiting an ALREADY-settled promise unwraps inline,
-    // so microtask interleaving is not spec-FIFO here â€” "acbd"-style
+    // so microtask interleaving is not spec-FIFO here — "acbd"-style
     // interleaving assertions are out of scope for this wave
     assert_eq!(
         mstring(
@@ -2357,4 +2467,30 @@ fn function_to_string_reports_a_function() {
     );
     // natives advertise themselves as native, as feature probes expect
     assert!(boolean("String(Math.max).indexOf('native code') > 0"));
+}
+
+#[test]
+fn caught_errors_do_not_shift_later_error_locations() {
+    // a caught throw leaves `err_located` set; the next statement's throw
+    // must still resolve against its own line (MDN's length-of-undefined
+    // reports came from errors labelled with an earlier position)
+    let mut e = JsEngine::new();
+    let err = e
+        .exec("try { throw new Error('caught') } catch (e) {}\nvar a = 1;\nnull.foo;")
+        .err()
+        .expect("script must throw");
+    let s = err.to_string();
+    assert!(s.contains("line 3"), "expected line 3, got: {s}");
+}
+
+#[test]
+fn module_body_error_locations_stay_per_statement() {
+    let mut e = JsEngine::new();
+    let err = e
+        .load_module_source(
+            "https://example.test/m.js",
+            "try { throw new Error('first') } catch (e) {}\nnull.foo;",
+        )
+        .expect_err("module must throw");
+    assert!(err.contains("line 2"), "expected line 2, got: {err}");
 }

@@ -341,14 +341,16 @@ pub struct BoxStyle {
     pub width: Option<Len>,
     pub max_width: Option<Len>,
     /// `box-sizing`: false = border-box (the engine default AND the CSS
-    /// initial-value shortcut — a declared `width` includes padding +
-    /// border, see layout.rs `place()`); true = content-box (declared
-    /// width measures content only, padding+border add outside)
+    /// initial-value shortcut — declared `width`/`height`/`min-height`
+    /// include padding + border, see layout.rs `place()`); true = content-box
+    /// (declared sizes measure content only, padding+border add outside)
     pub content_box: bool,
-    /// explicit height — shortcut: only consulted for replaced (`<img>`) boxes
+    /// explicit height — shortcut: only consulted for replaced (`<img>`) boxes,
+    /// aspect-ratio boxes and grid percent rows; `box-sizing` applies
     pub height: Option<Len>,
-    /// `min-height` — floor on the box's content height (hero sections use
-    /// `min-h-[560px]` + `justify-end` to push content to the bottom)
+    /// `min-height` — floor on the box's used height (border-box by default;
+    /// content height under `box-sizing: content-box`). Hero sections use
+    /// `min-h-[560px]` + `justify-end` to push content to the bottom
     pub min_height: Option<Len>,
     pub margin_x_auto: bool,
     /// `flex-grow` — share of a flex ROW's free space this item absorbs

@@ -1679,7 +1679,61 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | svelte.dev | 91.9 MB (291 runs; pixel-unchanged) |
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | MDN homepage | 98.5 MB (615 runs; unchanged; same single bundle `length` error) |
 | 2026-11-03 | wave 22 (flex/float measure + document.cookie) | Wikipedia `/wiki/Main_Page` | 105.7 MB (1434 runs; **zero `[js]` errors**; search toggle inside its box, no overlap with the personal links) |
-| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests — clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport — plus the new tokenizer test and the whole suite: default **707**, `engine-b + woff2` **711**) |
+| 2026-11-03 | wave 25 (box-sizing heights) | Wikipedia `/wiki/Main_Page` | 112.2 MB (1434 runs, 1347 boxes; restored snapshot; every 44px icon button now measures **44 tall** with its 1px border, previously 46 — `MAZDA_DUMP_BOXES=2` shows `label...cdx-button… h=44` and `a...search-toggle h=44`) |
+| 2026-11-03 | wave 25 (box-sizing heights) | MDN `/Web/CSS/list-style-type` | 88.7 MB (2773 runs; layout unchanged, same pre-existing bundle `length` error) |
+| 2026-11-03 | wave 27 (SVG clipPath/mask/filter/pattern/use) | in-crate SVG + tokenizer probe | n/a (no live page; 17 SVG tests - clip/mask/pattern/use/symbol/filter pixels, mask fill inheritance, nested viewport - plus the new tokenizer test and the whole suite: default **707**, `engine-b + woff2` **711**) |
+| 2026-11-03 | wave 29 (JS gaps: error positions, real iterators, typed arrays, BigInt, `new.target`, private brand checks) | in-crate JS probe | n/a (no live page; whole suite **725** pass / 0 fail; new tests: BigInt arithmetic + conversions, typed-array aliasing/width coercion/ArrayBuffer views, `new.target` + `#x in o`, user `[Symbol.iterator]` laziness, caught-error and module-body error positions) |
+
+### Wave 29 findings
+
+- **MDN's `length-of-undefined` was not a missing property — it was the error
+  *position*.** `err_located` latched for a whole execution turn, so a throw
+  that a `try`/`catch` had already swallowed made the next escaping throw report
+  the earlier statement's offset. Two more paths moved the diagnostic cursor
+  without putting it back: loading a module body (`cur_src` stayed on the
+  module's source) and resuming a generator (`.next()` ran with the *caller's*
+  source). Fix: `eval_stmt` / module bodies reset the cursor per statement, and
+  module loads + generator resumes save and restore `cur_src`/`err_located`.
+  Regression tests: `caught_errors_do_not_shift_later_error_locations`,
+  `module_body_error_locations_stay_per_statement`.
+- **Iterators are real objects now** (`ObjKind::Iterator` + `IterState`), not
+  arrays dressed up: `.next()` returns `{value, done}`, `it[Symbol.iterator]()
+  === it`, `return()` closes. `for..of` is the lazy protocol (one `.next()` per
+  element, so `break` stops pulling from an infinite generator); spread,
+  `Array.from`, destructuring and the built-in constructors collect through the
+  same path with a 100k cap (a runaway user iterator fails instead of hanging).
+  User objects only need `[Symbol.iterator]`; arrays/strings/typed arrays/Set/
+  Map are fast-pathed.
+- **Set/Map `keys`/`values`/`entries` return iterator objects** and both
+  prototypes carry `Symbol.iterator`. Set's `keys === values`; Map's `entries`
+  yields `[k, v]`, `keys` the key and `values` the value. Tests that used to call
+  `.join()` on the result now spread it.
+- **Typed arrays are real views over real bytes.** Eleven constructors
+  (`Int8Array` … `BigUint64Array`) share `%TypedArray%.prototype`; each view is
+  `kind + byteOffset + length` over an `ArrayBuffer`'s `Rc<RefCell<Vec<u8>>>`,
+  so `subarray` aliases, `slice` copies, index writes coerce to the element
+  width (`a[0] = 300` on a `Uint8Array` stores 44), and `ArrayBuffer.isView`,
+  `BYTES_PER_ELEMENT`, `buffer`, `byteLength`, `byteOffset` all report truth.
+  `Buffer.from(str)` is a `Uint8Array` view with a base64-aware `toString`.
+- **BigInt is `i128`, and says so.** Decimal/hex/oct/bin `n` literals, arithmetic
+  (including `**`, `/`, `%`, bitwise), mixed BigInt comparisons, `typeof`,
+  `toString(radix)`, `BigInt()`, `BigInt.asIntN`/`asUintN`. Mixing BigInt and
+  Number throws an honest `TypeError`; values or results outside `i128` throw a
+  `RangeError` rather than silently wrapping (documented range limit).
+- **`new.target`** is parsed as its own expression and bound in every non-arrow
+  function env, so arrows inherit it lexically (the `new.target === F` check
+  inside an arrow in a constructor works). Plain calls see `undefined`.
+- **`#x in obj`** evaluates as a has-property check on the private name. Private
+  fields remain ordinary `#name` props, so this is not per-class mangling: two
+  different classes declaring the same `#x` cannot tell their brands apart. The
+  common bundler/`instanceof`-style brand check works; the corner case is
+  recorded here rather than hidden.
+- **Shortcut, typed arrays**: methods are `set`, `subarray`, `slice`, `join`,
+  `toString`, `toBase64` only — no `map`/`filter`/`forEach`/`sort`/`indexOf`.
+  `BigInt64Array`/`BigUint64Array` store through the same numeric conversion
+  (i128 → f64) instead of a true 64-bit integer path.
+- **Wave numbering note**: waves 27 (SVG paint pass) and 28 (TLS/media) landed
+  first; this JS wave is 29.
 
 ### Wave 28 findings
 
@@ -1773,6 +1827,33 @@ curve matters more than the baseline (near-flat as tabs grow).
   with only `src/svg.rs` + `src/html.rs` overlaid — concurrent sessions had
   `src/js/*` mid-edit in the shared tree, so those changes were deliberately
   not pulled in. Default **707** tests, `engine-b + woff2` **711**, all pass.
+
+### Wave 25 findings
+
+- **`height`/`min-height` now follow `box-sizing` like `width`.** The engine's
+  height model was content-box while widths were border-box, so a
+  `min-height: 44px` touch target with a 1px border rendered 46 tall. A new
+  `as_content_h()` helper converts a declared height to the content height
+  `place()` stores: border-box (the engine default) subtracts the vertical
+  padding+border once, `box-sizing: content-box` keeps the declaration as
+  content height. `min-height`, replaced `<img>` heights, aspect-ratio heights
+  and grid percent-row available height all route through it, so a 44px button
+  is 44 tall and a `width:100px; aspect-ratio:2` box is 100×50 outer.
+- **UA control heights keep their old outer size.** `control_chrome`'s
+  content-box minimums were restated in border-box terms: checkbox/radio
+  12 → 14 (still a 14×14 outer box), text inputs/buttons/submits/selects
+  20 → 22 (still one 20px line plus the 2px UA border).
+- Tests: default **703** on the wave-25 base (**725** with waves 27-29 applied),
+  `engine-b + woff2` **707** on the base; five new guards
+  (`min_height_floors_the_border_box_by_default`,
+  `min_height_content_box_floors_the_content`,
+  `declared_height_follows_box_sizing`, `aspect_ratio_follows_box_sizing`,
+  `grid_percent_rows_resolve_against_the_content_height`), plus the mask paint
+  snapshot updated to the new border-box `min-height:60px` geometry.
+- Known gaps: declared `height` on a plain block is still ignored (only
+  replaced/aspect-ratio/grid boxes consult it); `%` `min-height` still resolves
+  against width, not the container height; `%` vertical padding uses the same
+  width-basis shortcut as before.
 
 ### Wave 22 findings
 

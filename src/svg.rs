@@ -1,4 +1,4 @@
-//! Minimal SVG rasterizer ΓÇö enough for site logos and icons (Phase 1f).
+//! Minimal SVG rasterizer — enough for site logos and icons (Phase 1f).
 //!
 //! Supports: `path` (M/L/H/V/C/S/Q/T/A/Z, abs+rel), rect (incl. rx/ry),
 //! circle, ellipse, polygon, polyline, line; `g`/svg `transform`
@@ -11,7 +11,7 @@
 
 use crate::image::ImageData;
 
-/// 2x2 supersampling ΓÇö cheap antialiasing for thin logo strokes.
+/// 2x2 supersampling — cheap antialiasing for thin logo strokes.
 const SS: usize = 2;
 
 /// Intrinsic size from the root `<svg>` width/height (fallback: viewBox,
@@ -30,7 +30,7 @@ pub fn probe(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w.unwrap_or(300.0) as u32, h.unwrap_or(150.0) as u32)) // spec default
 }
 
-/// Rasterize at the requested size (vector â†’ pixel-exact at any scale).
+/// Rasterize at the requested size (vector → pixel-exact at any scale).
 pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<ImageData> {
     let txt = std::str::from_utf8(bytes).ok()?;
     let base = root_space(txt, w, h)?;
@@ -153,7 +153,7 @@ fn root_content(txt: &str) -> Option<(&str, usize, usize)> {
     Some((t.attrs, i, ce))
 }
 
-/// Root user space â†’ supersampled image pixels (`viewBox` fit, xMidYMid meet).
+/// Root user space → supersampled image pixels (`viewBox` fit, xMidYMid meet).
 fn root_space(txt: &str, w: u32, h: u32) -> Option<M> {
     let (_, root_attrs) = root_tag(txt)?;
     let vb = get_attr(root_attrs, "viewBox")
@@ -295,7 +295,7 @@ fn translate(x: f64, y: f64) -> M {
     M { e: x, f: y, ..M::id() }
 }
 
-/// Nested `<svg>` viewport â†’ (content matrix, viewBox width, viewBox height).
+/// Nested `<svg>` viewport → (content matrix, viewBox width, viewBox height).
 fn nested_viewport(m: M, attrs: &str, parent_vp: (f64, f64)) -> (M, f64, f64) {
     let x = attrf(attrs, "x");
     let y = attrf(attrs, "y");
@@ -388,7 +388,7 @@ fn resolve_fill(p: &Paint, ctx: &Ctx) -> Option<FillSrc> {
         Paint::None => None,
         Paint::Color(c) => Some(FillSrc::Color(*c)),
         Paint::Url(id) => {
-            // unknown gradient id â†’ per spec the element is not rendered
+            // unknown gradient id → per spec the element is not rendered
             if let Some((_, c)) = ctx.grads.iter().find(|(k, _)| k == id) {
                 return Some(FillSrc::Color(*c));
             }
@@ -400,7 +400,7 @@ fn resolve_fill(p: &Paint, ctx: &Ctx) -> Option<FillSrc> {
     }
 }
 
-/// `url(#id)` in a presentation attribute or inline style; `none` â†’ None.
+/// `url(#id)` in a presentation attribute or inline style; `none` → None.
 fn ref_id(raw: &str, key: &str) -> Option<String> {
     let v = get_style(raw, key).or_else(|| get_attr(raw, key))?.trim();
     if v.eq_ignore_ascii_case("none") || v.is_empty() {
@@ -558,7 +558,7 @@ fn paint_geometry(
     }
 
     if let (Some(col), Some(subs)) = (st.stroke.resolve(ctx.grads), stroke_subs) {
-        // matrix already maps to supersampled space â†’ hypot gives super px
+        // matrix already maps to supersampled space → hypot gives super px
         let sw = st.sw * (m.a.hypot(m.b) + m.c.hypot(m.d)) / 2.0;
         if sw > 0.0 {
             let polys = stroke_polys(subs, m, sw);
@@ -818,7 +818,7 @@ fn paint_mask_shapes(
             if polys.is_empty() {
                 continue;
             }
-            // luminance (default mask-type) Ã— fill alpha Ã— opacities
+            // luminance (default mask-type) × fill alpha × opacities
             let Some(col) = st.fill.resolve(ctx.grads) else { continue };
             let r = ((col >> 16) & 255) as f64;
             let g = ((col >> 8) & 255) as f64;
@@ -1674,7 +1674,7 @@ fn attrf(raw: &str, key: &str) -> f64 {
     get_attr(raw, key).and_then(parse_px).unwrap_or(0.0)
 }
 
-/// "12" / "12px" / "12.5" ΓåÆ number; %, em, url(ΓÇª), missing ΓåÆ None.
+/// "12" / "12px" / "12.5" → number; %, em, url(…), missing → None.
 fn parse_px(s: &str) -> Option<f64> {
     let s = s.trim();
     let n: String = s
@@ -1803,7 +1803,7 @@ impl Paint {
         match self {
             Paint::None => None,
             Paint::Color(c) => Some(*c),
-            // unknown gradient id ΓåÆ per spec the element is not rendered
+            // unknown gradient id → per spec the element is not rendered
             Paint::Url(id) => grads.iter().find(|(k, _)| k == id).map(|(_, c)| *c),
         }
     }
@@ -1881,8 +1881,8 @@ impl Style {
         Paint::Color(parse_color(v).unwrap_or(0xff00_0000))
     }
 
-    /// Fold element opacity into the two opacities (group opacity Γëê inherited
-    /// ΓÇö shortcut: overlapping children inside an opacity group blend twice).
+    /// Fold element opacity into the two opacities (group opacity ≈ inherited
+    /// — shortcut: overlapping children inside an opacity group blend twice).
     fn effective(&self) -> Style {
         let mut s = self.clone();
         s.fill_opacity *= s.opacity;
@@ -1963,7 +1963,7 @@ struct Sub {
     closed: bool,
 }
 
-/// Full path-data parser ΓåÆ flattened subpaths (curves become polylines).
+/// Full path-data parser → flattened subpaths (curves become polylines).
 fn parse_path(d: &str) -> Vec<Sub> {
     let b = d.as_bytes();
     let mut i = 0usize;
@@ -2161,7 +2161,7 @@ fn flatten_quad(out: &mut Vec<(f64, f64)>, p0: (f64, f64), p1: (f64, f64), p2: (
     flatten_cubic(out, p0, c1, c2, p2);
 }
 
-/// Arc ΓåÆ cubic segments (endpoint-to-center per SVG spec F.6).
+/// Arc → cubic segments (endpoint-to-center per SVG spec F.6).
 fn flatten_arc(out: &mut Vec<(f64, f64)>, p0: (f64, f64), rx: f64, ry: f64, laf: bool, sf: bool, p1: (f64, f64)) {
     if rx <= 0.0 || ry <= 0.0 || (p0.0 == p1.0 && p0.1 == p1.1) {
         out.push(p1); // degenerate: line to end (spec: identical ends draw nothing)
@@ -2359,9 +2359,9 @@ fn scale_alpha(col: u32, k: u32) -> u32 {
     a << 24 | col & 0x00ff_ffff
 }
 
-// ---------- gradients (flat midpoint ΓÇö shortcut) ----------
+// ---------- gradients (flat midpoint — shortcut) ----------
 
-/// `id ΓåÆ average of first/last stop color` for linear/radial gradients.
+/// `id → average of first/last stop color` for linear/radial gradients.
 fn harvest_gradients(txt: &str) -> Vec<(String, u32)> {
     let mut out: Vec<(String, u32)> = Vec::new();
     let mut i = 0usize;
@@ -2433,7 +2433,7 @@ mod tests {
 
     #[test]
     fn evenodd_hole_and_none_fill() {
-        // two stacked squares, even-odd ΓåÆ middle is a hole
+        // two stacked squares, even-odd → middle is a hole
         let s = br#"<svg width="10" height="10" fill-rule="evenodd"><path d="M0 0h10v10H0z M2 2h6v6H2z" fill="black"/></svg>"#;
         let img = render(s, 10, 10).unwrap();
         assert_eq!(img.px[5 * 10 + 5], 0); // hole

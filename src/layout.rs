@@ -1203,7 +1203,9 @@ fn build_into(
                 // form submission still reads its label text.
                 if tag == "button" {
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
-                    control_chrome(&mut g.bx, 20.0, None);
+                    // min-height is border-box now: 22 = the old 20px content
+                    // height + the 2px UA border, so the outer box is unchanged
+                    control_chrome(&mut g.bx, 22.0, None);
                     g.node = Some(child);
                     g.bx.cursor = cur;
                     // UA default is inline-block (joins the surrounding text
@@ -1311,20 +1313,19 @@ fn build_into(
                             };
                             let text = if body.is_empty() { None } else { Some(body) };
                             let (min_h, def_w) = match kind {
-                                // 14x14 OUTER: min-height is content-box in
-                                // this engine (width is border-box), so the
-                                // UA 1px border (×2) must be subtracted
-                                FormKind::Checkbox | FormKind::Radio => (12.0, Some(14.0)),
+                                // 14x14 OUTER: min-height is border-box now,
+                                // so the UA 1px border is already inside it
+                                FormKind::Checkbox | FormKind::Radio => (14.0, Some(14.0)),
                                 // text-ish inputs: the classic ~20ch (~170px)
                                 // default width whether empty or filled —
                                 // longer values are tail-clipped at the box
                                 // edge during layout (see layout_in_forms)
-                                FormKind::TextInput { .. } => (20.0, Some(170.0)),
+                                FormKind::TextInput { .. } => (22.0, Some(170.0)),
                                 // button-ish inputs shrink to their label
-                                FormKind::Submit => (20.0, None),
-                                FormKind::Select => (20.0, None),
+                                FormKind::Submit => (22.0, None),
+                                FormKind::Select => (22.0, None),
                                 // generic chrome box: shrink to its value text
-                                FormKind::Generic => (20.0, None),
+                                FormKind::Generic => (22.0, None),
                             };
                             let centered = matches!(kind, FormKind::Submit);
                             (text, min_h, def_w, centered)
@@ -3625,6 +3626,11 @@ fn place(
         // exceed max-width by the pads, per spec)
         w += pl + pr + bl + br;
     }
+    // vertical padding+border, added back to every content height at the end
+    // of place(); `box-sizing` decides whether a declared height/min-height
+    // already includes this (border-box, the engine default) or sits inside
+    // it (content-box) — see `as_content_h`
+    let v_extra = pt + pb + bt + bb;
     // auto margins: both horizontal auto → center; only-left-auto → the
     // auto margin absorbs free space on the left, pushing the box right
     // (right-auto-only needs no branch — the box already hugs the left).
@@ -3645,11 +3651,15 @@ fn place(
     if n.img.is_some() {
         // replaced element: no children — height from declared height,
         // else the declared aspect ratio, else the intrinsic ratio of the
-        // content width (no size known: 0 → invisible)
+        // content width (no size known: 0 → invisible). A declared height
+        // and a ratio-derived height span the box `box-sizing` names: the
+        // border box by default (then padding/border are inside it), the
+        // content box under `content-box`.
         n.h = match n.bx.height {
-            Some(l) => resolve_len(l, avail),
+            Some(l) => as_content_h(resolve_len(l, avail), n.bx.content_box, v_extra),
             None => match n.bx.aspect_ratio {
-                Some(r) => n.w / r,
+                Some(r) if n.bx.content_box => n.w / r,
+                Some(r) => (w / r - v_extra).max(0.0),
                 None => match n.img.as_ref().and_then(ImgSlot::dims) {
                     Some((iw, ih)) => n.w * ih as f32 / (iw as f32).max(1.0),
                     None => 0.0,
@@ -3665,32 +3675,36 @@ fn place(
             _ => block(n, measure, runs, uls, flt), // Block / Auto(block tag)
         }
         // aspect-ratio with auto height: the box keeps the ratio from its
-        // content width and its content is laid out inside (content taller
-        // than the ratio box overflows, per spec — no min-height rescuing
-        // here beyond the explicit `min-height` floor below). A declared
-        // height + ratio pins that height (blocks otherwise ignore `height`).
+        // width and its content is laid out inside (content taller than the
+        // ratio box overflows, per spec — no min-height rescuing here beyond
+        // the explicit `min-height` floor below). A declared height + ratio
+        // pins that height (blocks otherwise ignore `height`). The ratio
+        // spans the box `box-sizing` names: the border box by default, the
+        // content box under `content-box`.
         // shortcut: flex/grid cross-axis stretch still decides its own axis
         // (the ratio only feeds this place() derivation).
         if let Some(r) = n.bx.aspect_ratio {
             n.h = match n.bx.height {
-                Some(l) => resolve_len(l, avail),
-                None => n.w / r,
+                Some(l) => as_content_h(resolve_len(l, avail), n.bx.content_box, v_extra),
+                None if n.bx.content_box => n.w / r,
+                None => (w / r - v_extra).max(0.0),
             };
         }
     }
-    // min-height: floor the content height. A flex column with vertical
-    // `justify` pushes its stack into the freed space (hero uses
-    // `min-h-[560px] justify-end` so the NEXT outline floats above the pill),
-    // and a centred single-line flex ROW centres its items in the same space
-    // (a 44px icon button must centre its 10px glyph).
+    // min-height: floor the used height in the SAME box `height`/`width`
+    // use, so a 44px border-box touch target with a 1px border is exactly 44
+    // tall (under the old content-box floor it was 46; `box-sizing:
+    // content-box` keeps flooring the content height and grows outward).
+    // A flex column with vertical `justify` pushes its stack into the freed
+    // space (hero uses `min-h-[560px] justify-end` so the NEXT outline floats
+    // above the pill), and a centred single-line flex ROW centres its items in
+    // the same space (a 44px icon button must centre its 10px glyph).
     // shortcut: `%` min-height resolves against width, not the container
-    // height (real pages use px here). `min-height` floors the CONTENT
-    // height (the engine's height model is content-box; widths are
-    // border-box), so a 44px icon button with a 1px border is 46 tall.
+    // height (real pages use px here).
     if let Some(mh) = n.bx.min_height {
-        let min_px = resolve_len(mh, avail);
-        if n.h < min_px {
-            let extra = min_px - n.h;
+        let floor = as_content_h(resolve_len(mh, avail), n.bx.content_box, v_extra);
+        if n.h < floor {
+            let extra = floor - n.h;
             let dy = match (n.bx.display, n.bx.dir, n.bx.justify, n.bx.align) {
                 (Display::Flex, Dir::Column, Justify::Center, _) => extra * 0.5,
                 (Display::Flex, Dir::Column, Justify::End, _) => extra,
@@ -3709,7 +3723,7 @@ fn place(
                     u.1 += dy;
                 }
             }
-            n.h = min_px;
+            n.h = floor;
         }
     }
     // restore border-box coords; height includes vertical padding + borders
@@ -4045,6 +4059,27 @@ fn as_content_decl(w: f32, bx: &BoxStyle, base: f32) -> f32 {
         + resolve_len(bx.border[1], base)
         + resolve_len(bx.border[3], base);
     (w - pb).max(0.0)
+}
+
+/// Vertical padding+border for a height declaration, resolved against `basis`
+/// (a content width — the same shortcut `place()` uses for %-padding).
+fn vertical_extra(bx: &BoxStyle, basis: f32) -> f32 {
+    resolve_len(bx.pad[0], basis)
+        + resolve_len(bx.pad[2], basis)
+        + resolve_len(bx.border[0], basis)
+        + resolve_len(bx.border[2], basis)
+}
+
+/// Content height a declared `height`/`min-height` must carry. `place()`
+/// adds `v_extra` back after layout, so under the engine's border-box default
+/// a declared height already includes padding+border and they come out once
+/// here; `box-sizing: content-box` treats the declaration as content height.
+fn as_content_h(h: f32, content_box: bool, v_extra: f32) -> f32 {
+    if content_box {
+        h
+    } else {
+        (h - v_extra).max(0.0)
+    }
 }
 
 /// max-content (unwrapped) width of a node, including horizontal padding.
@@ -5719,9 +5754,11 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         (x, w)
     };
     let nrows = spots.iter().map(|s| s.1).max().unwrap_or(1);
-    // percent row tracks need a definite grid height; otherwise they are auto
+    // percent row tracks need a definite grid height; a declared px height is
+    // a border-box height by default (subtract the vertical padding+border
+    // that place() adds back), content-box under `box-sizing: content-box`
     let row_avail_h = match n.bx.height {
-        Some(Len::Px(h)) => h,
+        Some(Len::Px(h)) => as_content_h(h, n.bx.content_box, vertical_extra(&n.bx, n.w)),
         _ => 0.0,
     };
     let mut y = n.y;
@@ -7800,6 +7837,127 @@ mod tests {
         assert!((n.x - 39.0).abs() < 0.01, "box x={}", n.x);
         // text starts at the content origin: x + border + padding = 50
         assert!((l.runs[0].x - 50.0).abs() < 0.01, "run x={}", l.runs[0].x);
+    }
+
+    #[test]
+    fn min_height_floors_the_border_box_by_default() {
+        // the Wikipedia touch target: `min-height: 44px` + a 1px border is
+        // 44 tall OUTER, not the 46 the old content-box floor produced
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                min_height: Some(Len::Px(44.0)),
+                border: [Len::Px(1.0); 4],
+                ..BoxStyle::default()
+            },
+        );
+        layout_tree(&mut n, 200.0, &m4);
+        assert!((n.h - 44.0).abs() < 0.01, "border box h={}", n.h);
+    }
+
+    #[test]
+    fn min_height_content_box_floors_the_content() {
+        // content-box keeps the declaration as the content floor; padding and
+        // border add outside it (44 + 10 pad + 2 border = 56)
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                min_height: Some(Len::Px(44.0)),
+                pad: [Len::Px(5.0), Len::Px(0.0), Len::Px(5.0), Len::Px(0.0)],
+                border: [Len::Px(1.0); 4],
+                content_box: true,
+                ..BoxStyle::default()
+            },
+        );
+        layout_tree(&mut n, 200.0, &m4);
+        assert!((n.h - 56.0).abs() < 0.01, "border box h={}", n.h);
+    }
+
+    #[test]
+    fn declared_height_follows_box_sizing() {
+        // replaced element: border-box height is the outer height…
+        let mut bb = img_box(BoxStyle {
+            height: Some(Len::Px(80.0)),
+            pad: [Len::Px(5.0); 4],
+            border: [Len::Px(1.0); 4],
+            ..BoxStyle::default()
+        });
+        layout_tree(&mut bb, 300.0, &m4);
+        assert!((bb.h - 80.0).abs() < 0.01, "border-box h={}", bb.h);
+        // …content-box grows by the same vertical padding+border
+        let mut cb = img_box(BoxStyle {
+            height: Some(Len::Px(80.0)),
+            pad: [Len::Px(5.0); 4],
+            border: [Len::Px(1.0); 4],
+            content_box: true,
+            ..BoxStyle::default()
+        });
+        layout_tree(&mut cb, 300.0, &m4);
+        assert!((cb.h - 92.0).abs() < 0.01, "content-box h={}", cb.h);
+    }
+
+    #[test]
+    fn aspect_ratio_follows_box_sizing() {
+        let ratio_h = |content_box| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    width: Some(Len::Px(100.0)),
+                    aspect_ratio: Some(2.0),
+                    pad: [Len::Px(5.0); 4],
+                    border: [Len::Px(1.0); 4],
+                    content_box,
+                    ..BoxStyle::default()
+                },
+            );
+            layout_tree(&mut n, 500.0, &m4);
+            n.h
+        };
+        // border-box: 100 × 50 outer
+        assert!((ratio_h(false) - 50.0).abs() < 0.01, "border-box h={}", ratio_h(false));
+        // content-box: 100 × 50 content + 10 padding + 2 border
+        assert!((ratio_h(true) - 62.0).abs() < 0.01, "content-box h={}", ratio_h(true));
+    }
+
+    #[test]
+    fn grid_percent_rows_resolve_against_the_content_height() {
+        let second_row_y = |content_box| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Grid,
+                    cols: vec![Track::Fr(1.0)],
+                    rows: vec![Track::Pct(50.0), Track::Pct(50.0)],
+                    height: Some(Len::Px(200.0)),
+                    pad: [Len::Px(10.0), Len::Px(0.0), Len::Px(10.0), Len::Px(0.0)],
+                    border: [Len::Px(1.0); 4],
+                    content_box,
+                    ..BoxStyle::default()
+                },
+            );
+            for t in ["a", "b"] {
+                let mut g = BoxNode::group(
+                    Style::new(),
+                    BoxStyle {
+                        display: Display::Block,
+                        ..BoxStyle::default()
+                    },
+                );
+                g.children = vec![leaf(t)];
+                n.children.push(g);
+            }
+            layout_tree(&mut n, 300.0, &m4);
+            (n.children[1].y, n.h)
+        };
+        // border-box: content starts at the 11px pad/border inset; 200 outer
+        // − 22 padding/border = 178 content, so rows are 89 (11 + 89 = 100)
+        let (y, h) = second_row_y(false);
+        assert!((y - 100.0).abs() < 0.01, "border-box row y={}", y);
+        assert!((h - 200.0).abs() < 0.01, "border-box h={}", h);
+        // content-box: the declared 200 is content height, rows 100 (11 + 100)
+        let (y, h) = second_row_y(true);
+        assert!((y - 111.0).abs() < 0.01, "content-box row y={}", y);
+        assert!((h - 222.0).abs() < 0.01, "content-box h={}", h);
     }
 
     #[test]
@@ -10956,11 +11114,11 @@ line</textarea></div>"#,
         assert_eq!(
             rects,
             vec![
-                (0.0, 0.0, 100.0, 64.0, 0x3366ff), // bg-color rect
+                (0.0, 0.0, 100.0, 60.0, 0x3366ff), // bg-color rect
                 (0.0, 0.0, 100.0, 2.0, 0x000000),  // strips: top
-                (0.0, 62.0, 100.0, 2.0, 0x000000), // bottom
-                (0.0, 2.0, 2.0, 60.0, 0x000000),   // left
-                (98.0, 2.0, 2.0, 60.0, 0x000000),  // right
+                (0.0, 58.0, 100.0, 2.0, 0x000000), // bottom
+                (0.0, 2.0, 2.0, 56.0, 0x000000),   // left
+                (98.0, 2.0, 2.0, 56.0, 0x000000),  // right
             ],
             "rect channel byte-identical to the pre-mask build"
         );

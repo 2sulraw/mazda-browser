@@ -233,6 +233,15 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("Number", Val::Native(num_id));
     e.set_global("Boolean", Val::Native(bool_id));
 
+    // -- BigInt ------------------------------------------------------------
+    // i128-backed (the documented range); see the BigInt helpers in interp.
+    let bigint_id = e.register_native("BigInt", n_bigint, 0);
+    e.set_global("BigInt", Val::Native(bigint_id));
+    let as_int = e.register_native("BigInt.asIntN", n_bigint, 1);
+    let as_uint = e.register_native("BigInt.asUintN", n_bigint, 2);
+    e.set_native_prop(bigint_id, "asIntN", Val::Native(as_int));
+    e.set_native_prop(bigint_id, "asUintN", Val::Native(as_uint));
+
     // -- primitive prototypes ----------------------------------------------
     // Bundles probe `"trimStart" in String.prototype` to decide whether to
     // install a polyfill, and borrow the method (`String.prototype.slice
@@ -430,6 +439,8 @@ pub(crate) fn install(e: &mut JsEngine) {
     let sc = e.register_native("Set", n_set_ctor, 0);
     e.set_native_prop(sc, "prototype", set_proto.clone());
     e.set_global("Set", Val::Native(sc));
+    let set_values = obj_get_own(own(&set_proto), "values");
+    obj_set_own(own(&set_proto), crate::js::SYMBOL_ITERATOR, set_values);
     e.set_proto = Some(own(&set_proto).clone());
 
     let map_proto = Val::new_object();
@@ -454,6 +465,8 @@ pub(crate) fn install(e: &mut JsEngine) {
     let mc = e.register_native("Map", n_map_ctor, 0);
     e.set_native_prop(mc, "prototype", map_proto.clone());
     e.set_global("Map", Val::Native(mc));
+    let map_entries = obj_get_own(own(&map_proto), "entries");
+    obj_set_own(own(&map_proto), crate::js::SYMBOL_ITERATOR, map_entries);
     e.map_proto = Some(own(&map_proto).clone());
 
     // -- Symbol ------------------------------------------------------------
@@ -541,18 +554,52 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("TextDecoder", Val::Native(tdc));
     e.text_decoder_proto = Some(own(&td_proto).clone());
 
-    // -- base64 + Uint8Array/Buffer stand-ins -------------------------------
-    // shortcut: a "typed array" is a plain JS array of byte values with
-    // `toBase64`/`buffer`/`byteLength` own props; there is no ArrayBuffer
-    // type and no element-size coercion beyond `& 0xff`.
+    // -- typed arrays / ArrayBuffer / Buffer --------------------------------
+    // Real byte storage: `ArrayBuffer` owns a `Vec<u8>`; every typed array is
+    // a fixed-width view (kind + byte offset + element count) into it.
+    let typed_proto = Val::new_object();
+    let typed_set = e.register_native("TypedArray.prototype.set", n_typed, T_SET);
+    let typed_sub = e.register_native("TypedArray.prototype.subarray", n_typed, T_SUBARRAY);
+    let typed_slice = e.register_native("TypedArray.prototype.slice", n_typed, T_SLICE);
+    e.typed_set = typed_set;
+    e.typed_subarray = typed_sub;
+    e.typed_slice = typed_slice;
+    obj_set_own(own(&typed_proto), "set", Val::Native(typed_set));
+    obj_set_own(own(&typed_proto), "subarray", Val::Native(typed_sub));
+    obj_set_own(own(&typed_proto), "slice", Val::Native(typed_slice));
+    let typed_join_id = e.register_native("TypedArray.prototype.join", n_typed, T_JOIN);
+    obj_set_own(own(&typed_proto), "join", Val::Native(typed_join_id));
+    obj_set_own(own(&typed_proto), "toString", Val::Native(typed_join_id));
+
     let u8_to_b64 = e.register_native("Uint8Array.prototype.toBase64", n_u8, 0);
     let u8_from_b64 = e.register_native("Uint8Array.fromBase64", n_u8, 1);
     e.uint8_to_b64 = u8_to_b64;
-    let u8_proto = Val::new_object();
-    let u8c = e.register_native("Uint8Array", n_u8_ctor, 0);
-    e.set_native_prop(u8c, "prototype", u8_proto);
-    e.set_native_prop(u8c, "fromBase64", Val::Native(u8_from_b64));
-    e.set_global("Uint8Array", Val::Native(u8c));
+    obj_set_own(own(&typed_proto), "toBase64", Val::Native(u8_to_b64));
+
+    const TYPED_NAMES: [&str; 11] = [
+        "Int8Array",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float32Array",
+        "Float64Array",
+        "BigInt64Array",
+        "BigUint64Array",
+    ];
+    for (i, name) in TYPED_NAMES.iter().enumerate() {
+        let ctor = e.register_native(name, n_typed_ctor, i as u16);
+        e.set_native_prop(ctor, "prototype", typed_proto.clone());
+        let kind = TypedKind::from_index(i as u16).unwrap();
+        e.set_native_prop(ctor, "BYTES_PER_ELEMENT", Val::Num(kind.size() as f64));
+        if *name == "Uint8Array" {
+            e.set_native_prop(ctor, "fromBase64", Val::Native(u8_from_b64));
+        }
+        e.set_global(name, Val::Native(ctor));
+    }
+    e.typed_proto = Some(own(&typed_proto).clone());
 
     let buf_to_string = e.register_native("Buffer.prototype.toString", n_buffer, 0);
     e.buffer_to_string = buf_to_string;
@@ -567,10 +614,8 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("btoa", Val::Native(btoa_id));
 
     // -- ArrayBuffer / SharedArrayBuffer ------------------------------------
-    // shortcut: a byteLength-bearing shell; no real backing store. The
-    // accessor exists so `Object.getOwnPropertyDescriptor(...).get` works.
-    let ab_len = e.register_native("get ArrayBuffer.prototype.byteLength", n_ab, 0);
     let ab_proto = Val::new_object();
+    let ab_len = e.register_native("get ArrayBuffer.prototype.byteLength", n_ab, 0);
     obj_set_own(
         own(&ab_proto),
         "byteLength",
@@ -579,6 +624,8 @@ pub(crate) fn install(e: &mut JsEngine) {
             setter: None,
         })),
     );
+    let ab_slice = e.register_native("ArrayBuffer.prototype.slice", n_ab, 3);
+    obj_set_own(own(&ab_proto), "slice", Val::Native(ab_slice));
     let ab_ctor = e.register_native("ArrayBuffer", n_ab, 1);
     e.set_native_prop(ab_ctor, "prototype", ab_proto.clone());
     let ab_view = e.register_native("ArrayBuffer.isView", n_ab, 2);
@@ -723,6 +770,12 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
             }
         }
         Val::Str(s) => json_str(s, out),
+        // JSON has no BigInt representation (toJSON is not consulted here)
+        Val::BigInt(_) => {
+            return Err(JsError::throw(
+                "TypeError: Do not know how to serialize a BigInt",
+            ))
+        }
         Val::Obj(o) => {
             let b = o.borrow();
             match &b.kind {
@@ -750,6 +803,25 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                 // regex/generator instances: no own enumerable props -> {}
                 ObjKind::Regex(_) | ObjKind::Generator(_) | ObjKind::Style(_) => {
                     out.push_str("{}");
+                }
+                ObjKind::Iterator(_) | ObjKind::ArrayBuffer(_) => {
+                    out.push_str("{}");
+                }
+                // typed arrays serialize their indexed elements, like arrays
+                ObjKind::TypedArray(ta) => {
+                    out.push('{');
+                    for i in 0..ta.len {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        json_str(&Rc::from(i.to_string().as_str()), out);
+                        out.push(':');
+                        let v = crate::js::typed_read(ta, i);
+                        if !json_write(e, &v, depth + 1, out)? {
+                            out.push_str("null");
+                        }
+                    }
+                    out.push('}');
                 }
                 ObjKind::Plain => {
                     out.push('{');
@@ -1316,6 +1388,9 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                         ObjKind::Array(items) => (0..items.len())
                             .map(|i| Val::Str(Rc::from(i.to_string().as_str())))
                             .collect(),
+                        ObjKind::TypedArray(ta) => (0..ta.len)
+                            .map(|i| Val::Str(Rc::from(i.to_string().as_str())))
+                            .collect(),
                         _ => b.props.iter().map(|(k, _)| Val::Str(k.clone())).collect(),
                     }
                 }
@@ -1345,6 +1420,21 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
                 ObjKind::Regex(_) => "[object RegExp]",
                 ObjKind::Generator(_) => "[object Generator]",
                 ObjKind::Style(_) => "[object CSSStyleDeclaration]",
+                ObjKind::Iterator(_) => "[object Iterator]",
+                ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]",
+                ObjKind::TypedArray(ta) => match ta.kind {
+                    TypedKind::I8 => "[object Int8Array]",
+                    TypedKind::U8 => "[object Uint8Array]",
+                    TypedKind::U8Clamp => "[object Uint8ClampedArray]",
+                    TypedKind::I16 => "[object Int16Array]",
+                    TypedKind::U16 => "[object Uint16Array]",
+                    TypedKind::I32 => "[object Int32Array]",
+                    TypedKind::U32 => "[object Uint32Array]",
+                    TypedKind::F32 => "[object Float32Array]",
+                    TypedKind::F64 => "[object Float64Array]",
+                    TypedKind::BigI64 => "[object BigInt64Array]",
+                    TypedKind::BigU64 => "[object BigUint64Array]",
+                },
             },
             // callables report their tag too (`classof`-style feature tests
             // in published bundles rely on it)
@@ -1563,7 +1653,7 @@ fn n_array_call(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result
         _ => {
             let mut items = match args.first() {
                 None => Vec::new(),
-                Some(v) => match super::interp::for_of_items(v) {
+                Some(v) => match super::interp::for_of_items(e, v) {
                     Ok(items) => items,
                     // not iterable: accept an array-like (`length` + index
                     // keys), which `for..of` rightly rejects
@@ -2342,7 +2432,10 @@ fn n_promise(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Va
             Ok(Val::Obj(p))
         }
         PS_ALL | PS_ANY | PS_RACE | PS_ALL_SETTLED => {
-            let items = interp::for_of_items(&args.first().cloned().unwrap_or(Val::Undefined))?;
+            let items = interp::for_of_items(
+                e,
+                &args.first().cloned().unwrap_or(Val::Undefined),
+            )?;
             let result = e.new_promise();
             let n = items.len();
             let mode = match idx {
@@ -3046,70 +3139,287 @@ fn b64_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Byte view of a typed-array stand-in (plain array or string).
-fn u8_bytes(v: &Val) -> Vec<u8> {
+// -- typed-array helpers ---------------------------------------------------
+
+const T_SET: u16 = 0;
+const T_SUBARRAY: u16 = 1;
+const T_SLICE: u16 = 2;
+const T_JOIN: u16 = 3;
+
+fn new_arraybuffer(data: Vec<u8>) -> Val {
+    Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::ArrayBuffer(Rc::new(RefCell::new(data))),
+        props: Vec::new(),
+        proto: None,
+    })))
+}
+
+fn make_view(
+    e: &JsEngine,
+    kind: TypedKind,
+    buf: Rc<RefCell<Obj>>,
+    offset: usize,
+    len: usize,
+) -> Val {
+    Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::TypedArray(TypedArray {
+            kind,
+            buf,
+            offset,
+            len,
+        }),
+        props: Vec::new(),
+        proto: e.typed_proto.clone(),
+    })))
+}
+
+/// Allocate a fresh zero-filled buffer and wrap a view of `kind` over it.
+/// Used by `new TypedArray(len)`: going through a `Vec<Val>` of length `len`
+/// would cost ~24 bytes per element on top of the bytes themselves.
+fn typed_zeroed(e: &JsEngine, kind: TypedKind, len: usize) -> Val {
+    let buf = new_arraybuffer(vec![0u8; len * kind.size()]);
+    let b = match &buf {
+        Val::Obj(o) => o.clone(),
+        _ => unreachable!(),
+    };
+    make_view(e, kind, b, 0, len)
+}
+
+/// Allocate a fresh buffer and fill a view of `kind` with `vals`.
+fn typed_from_values(e: &JsEngine, kind: TypedKind, vals: &[Val]) -> Val {
+    let buf = new_arraybuffer(vec![0u8; vals.len() * kind.size()]);
+    let b = match &buf {
+        Val::Obj(o) => o.clone(),
+        _ => unreachable!(),
+    };
+    let v = make_view(e, kind, b, 0, vals.len());
+    if let Val::Obj(o) = &v {
+        if let ObjKind::TypedArray(ta) = &o.borrow().kind {
+            for (i, val) in vals.iter().enumerate() {
+                crate::js::typed_write(ta, i, val);
+            }
+        }
+    }
+    v
+}
+
+/// Byte copy of a typed array / Buffer (empty for other values).
+fn typed_bytes_copy(v: &Val) -> Vec<u8> {
+    if let Val::Obj(o) = v {
+        let b = o.borrow();
+        if let ObjKind::TypedArray(ta) = &b.kind {
+            let r = ta.buf.borrow();
+            if let ObjKind::ArrayBuffer(bytes) = &r.kind {
+                let bytes = bytes.borrow();
+                let n = ta.len * ta.kind.size();
+                if ta.offset + n <= bytes.len() {
+                    return bytes[ta.offset..ta.offset + n].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn kind_of(v: &Val) -> Option<TypedKind> {
     match v {
         Val::Obj(o) => match &o.borrow().kind {
-            ObjKind::Array(items) => items
-                .iter()
-                .map(|x| (x.to_number() as i64 & 0xff) as u8)
-                .collect(),
-            _ => Vec::new(),
+            ObjKind::TypedArray(ta) => Some(ta.kind),
+            _ => None,
         },
-        Val::Str(s) => s.as_bytes().to_vec(),
-        _ => Vec::new(),
+        _ => None,
     }
 }
 
-fn u8_value(e: &JsEngine, bytes: Vec<u8>) -> Val {
-    let len = bytes.len();
-    let arr = Val::new_array(bytes.into_iter().map(|b| Val::Num(b as f64)).collect());
-    if let Val::Obj(o) = &arr {
-        obj_set_own(o, "toBase64", Val::Native(e.uint8_to_b64));
-        obj_set_own(o, "byteLength", Val::Num(len as f64));
-        let buf = Val::new_object();
-        obj_set_own(own(&buf), "byteLength", Val::Num(len as f64));
-        obj_set_own(o, "buffer", buf);
-    }
-    arr
-}
-
-fn n_u8_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
-    let bytes = match args.first() {
-        Some(Val::Num(n)) => vec![0u8; (*n as i64).clamp(0, 1 << 24) as usize],
-        Some(v) => u8_bytes(v),
-        None => Vec::new(),
+fn n_typed_ctor(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let Some(kind) = TypedKind::from_index(idx) else {
+        return Err(JsError::throw("TypeError: unknown typed-array kind"));
     };
-    Ok(u8_value(e, bytes))
+    let Some(first) = args.first() else {
+        return Ok(typed_from_values(e, kind, &[]));
+    };
+    match first {
+        Val::Num(n) => {
+            if !n.is_finite() {
+                return Err(JsError::throw("RangeError: invalid typed array length"));
+            }
+            let len = (*n as i64).max(0) as usize;
+            if len > (1 << 24) {
+                return Err(JsError::throw("RangeError: typed array is too large"));
+            }
+            Ok(typed_zeroed(e, kind, len))
+        }
+        Val::Obj(o) => {
+            let ab_len = {
+                let ob = o.borrow();
+                match &ob.kind {
+                    ObjKind::ArrayBuffer(bytes) => Some(bytes.borrow().len()),
+                    _ => None,
+                }
+            };
+            if let Some(byte_len) = ab_len {
+                let offset = args
+                    .get(1)
+                    .map(|v| v.to_number().max(0.0) as usize)
+                    .unwrap_or(0);
+                let len = args.get(2).map(|v| v.to_number().max(0.0) as usize);
+                let max = byte_len.saturating_sub(offset) / kind.size();
+                return Ok(make_view(
+                    e,
+                    kind,
+                    o.clone(),
+                    offset,
+                    len.unwrap_or(max).min(max),
+                ));
+            }
+            let src_kind = kind_of(first);
+            if src_kind.is_some() {
+                // copy element-wise (handles width/signedness conversion)
+                let vals: Vec<Val> = {
+                    let mut out = Vec::new();
+                    if let Val::Obj(o) = first {
+                        let b = o.borrow();
+                        if let ObjKind::TypedArray(ta) = &b.kind {
+                            for i in 0..ta.len {
+                                out.push(crate::js::typed_read(ta, i));
+                            }
+                        }
+                    }
+                    out
+                };
+                return Ok(typed_from_values(e, kind, &vals));
+            }
+            let vals = super::interp::for_of_items(e, first)?;
+            Ok(typed_from_values(e, kind, &vals))
+        }
+        Val::Str(_) => {
+            let vals = super::interp::for_of_items(e, first)?;
+            Ok(typed_from_values(e, kind, &vals))
+        }
+        _ => Ok(typed_from_values(e, kind, &[])),
+    }
+}
+
+fn n_typed(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let (kind, src_len, src_offset) = match this {
+        Val::Obj(o) => match &o.borrow().kind {
+            ObjKind::TypedArray(ta) => (ta.kind, ta.len, ta.offset),
+            _ => {
+                return Err(JsError::throw(
+                    "TypeError: typed-array method called on incompatible receiver",
+                ))
+            }
+        },
+        _ => {
+            return Err(JsError::throw(
+                "TypeError: typed-array method called on incompatible receiver",
+            ))
+        }
+    };
+    match idx {
+        T_JOIN => {
+            let mut parts = Vec::with_capacity(src_len);
+            if let Val::Obj(o) = this {
+                let b = o.borrow();
+                if let ObjKind::TypedArray(ta) = &b.kind {
+                    for i in 0..ta.len {
+                        parts.push(crate::js::typed_read(ta, i).to_string());
+                    }
+                }
+            }
+            Ok(Val::Str(Rc::from(parts.join(",").as_str())))
+        }
+        T_SET => {
+            let vals = args.first().cloned().unwrap_or(Val::Undefined);
+            let items = super::interp::for_of_items(e, &vals)?;
+            let offset = args
+                .get(1)
+                .map(|v| v.to_number().max(0.0) as usize)
+                .unwrap_or(0);
+            if let Val::Obj(o) = this {
+                let b = o.borrow();
+                if let ObjKind::TypedArray(ta) = &b.kind {
+                    for (i, v) in items.iter().enumerate().take(src_len.saturating_sub(offset)) {
+                        crate::js::typed_write(ta, offset + i, v);
+                    }
+                }
+            }
+            Ok(Val::Undefined)
+        }
+        T_SUBARRAY | T_SLICE => {
+            let n = src_len as i64;
+            let (a, b) = slice_bounds(args.first().map(|v| v.to_number()).unwrap_or(f64::NAN), args.get(1), n);
+            let (a, b) = (a as usize, b as usize);
+            let len = b.saturating_sub(a);
+            if idx == T_SLICE {
+                // slice copies into a fresh buffer
+                let mut vals = Vec::with_capacity(len);
+                if let Val::Obj(o) = this {
+                    let ob = o.borrow();
+                    if let ObjKind::TypedArray(ta) = &ob.kind {
+                        for i in 0..len {
+                            vals.push(crate::js::typed_read(ta, a + i));
+                        }
+                    }
+                }
+                Ok(typed_from_values(e, kind, &vals))
+            } else {
+                // subarray shares the same backing store
+                let buf = match this {
+                    Val::Obj(o) => match &o.borrow().kind {
+                        ObjKind::TypedArray(ta) => Some(ta.buf.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match buf {
+                    Some(b) => Ok(make_view(
+                        e,
+                        kind,
+                        b,
+                        src_offset + a * kind.size(),
+                        len,
+                    )),
+                    None => Err(JsError::throw("TypeError: typed array expected")),
+                }
+            }
+        }
+        _ => Err(JsError::throw("TypeError: bad typed-array method")),
+    }
 }
 
 fn n_u8(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
-        0 => Ok(Val::Str(Rc::from(b64_encode(&u8_bytes(this)).as_str()))),
-        _ => Ok(u8_value(e, b64_decode(&arg_str(args, 0)))),
+        0 => Ok(Val::Str(Rc::from(b64_encode(&typed_bytes_copy(this)).as_str()))),
+        _ => {
+            let bytes = b64_decode(&arg_str(args, 0));
+            Ok(typed_from_values(
+                e,
+                TypedKind::U8,
+                &bytes
+                    .into_iter()
+                    .map(|b| Val::Num(b as f64))
+                    .collect::<Vec<_>>(),
+            ))
+        }
     }
 }
 
 fn n_buffer(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     if idx == 1 {
-        // Buffer.from(str)
+        // Buffer.from(str) -> Uint8Array bytes with a base64-aware toString
         let s = arg_str(args, 0);
-        let o = Val::new_object();
-        obj_set_own(own(&o), "__buf", Val::Str(Rc::from(s.as_str())));
-        obj_set_own(own(&o), "toString", Val::Native(e.buffer_to_string));
-        return Ok(o);
+        let vals: Vec<Val> = s.as_bytes().iter().map(|b| Val::Num(*b as f64)).collect();
+        let v = typed_from_values(e, TypedKind::U8, &vals);
+        if let Val::Obj(o) = &v {
+            obj_set_own(o, "toString", Val::Native(e.buffer_to_string));
+        }
+        return Ok(v);
     }
-    let s = match this {
-        Val::Obj(o) => match o.borrow().props.iter().find(|(k, _)| &**k == "__buf") {
-            Some((_, Val::Str(s))) => s.to_string(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    };
     let out = if arg_str(args, 0) == "base64" {
-        b64_encode(s.as_bytes())
+        b64_encode(&typed_bytes_copy(this))
     } else {
-        s
+        String::from_utf8_lossy(&typed_bytes_copy(this)).to_string()
     };
     Ok(Val::Str(Rc::from(out.as_str())))
 }
@@ -3125,28 +3435,120 @@ fn n_b64_global(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Resul
     }
 }
 
-fn n_ab(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_ab(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         0 => {
             let n = match this {
-                Val::Obj(o) => o
-                    .borrow()
-                    .props
-                    .iter()
-                    .find(|(k, _)| &**k == "__ab")
-                    .map(|(_, v)| v.to_number())
-                    .unwrap_or(0.0),
-                _ => 0.0,
+                Val::Obj(o) => match &o.borrow().kind {
+                    ObjKind::ArrayBuffer(bytes) => bytes.borrow().len(),
+                    _ => 0,
+                },
+                _ => 0,
             };
-            Ok(Val::Num(n))
+            Ok(Val::Num(n as f64))
         }
-        2 => Ok(Val::Bool(false)),
+        2 => Ok(Val::Bool(matches!(
+            args.first(),
+            Some(Val::Obj(o)) if matches!(o.borrow().kind, ObjKind::TypedArray(_))
+        ))),
+        3 => {
+            // slice(begin, end) copies the requested byte range
+            let src = match this {
+                Val::Obj(o) => match &o.borrow().kind {
+                    ObjKind::ArrayBuffer(bytes) => bytes.borrow().clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let n = src.len() as i64;
+            let (a, b) = slice_bounds(args.first().map(|v| v.to_number()).unwrap_or(f64::NAN), args.get(1), n);
+            Ok(new_arraybuffer(src[a..b].to_vec()))
+        }
         _ => {
             let len = args.first().map(|v| v.to_number()).unwrap_or(0.0);
-            let o = proto_instance(e.arraybuffer_proto.clone());
-            obj_set_own(own(&o), "__ab", Val::Num(len));
-            Ok(o)
+            if !len.is_finite() || len < 0.0 || len > (1 << 26) as f64 {
+                return Err(JsError::throw("RangeError: invalid ArrayBuffer length"));
+            }
+            Ok(new_arraybuffer(vec![0u8; len as usize]))
         }
+    }
+}
+
+fn n_bigint(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let arg = args.first().cloned().unwrap_or(Val::Undefined);
+    match idx {
+        1 | 2 => {
+            let bits = arg.to_number().max(0.0) as u64;
+            let n = match args.get(1) {
+                Some(v) => bigint_value(v)?,
+                None => {
+                    return Err(JsError::throw(
+                        "TypeError: BigInt.asIntN requires a BigInt argument",
+                    ))
+                }
+            };
+            let bits = bits.min(128);
+            let out = if bits == 0 {
+                0i128
+            } else if bits >= 128 {
+                n
+            } else {
+                let mask = (1u128 << bits) - 1;
+                let low = (n as u128) & mask;
+                if idx == 1 && low >= (1u128 << (bits - 1)) {
+                    (low as i128) - (1i128 << bits)
+                } else {
+                    low as i128
+                }
+            };
+            Ok(Val::BigInt(Rc::new(out)))
+        }
+        _ => {
+            if is_ctor_call(e, this) {
+                return Err(JsError::throw("TypeError: BigInt is not a constructor"));
+            }
+            Ok(Val::BigInt(Rc::new(bigint_value(&arg)?)))
+        }
+    }
+}
+
+/// ToBigInt for the constructor / asIntN / asUintN arguments.
+fn bigint_value(v: &Val) -> Result<i128, JsError> {
+    match v {
+        Val::BigInt(n) => Ok(**n),
+        Val::Num(n) => {
+            if n.is_finite() && n.fract() == 0.0 {
+                if *n < i128::MIN as f64 || *n > i128::MAX as f64 {
+                    return Err(JsError::throw(
+                        "RangeError: BigInt value is out of the supported i128 range",
+                    ));
+                }
+                Ok(*n as i128)
+            } else {
+                Err(JsError::throw(
+                    "RangeError: The number cannot be converted to a BigInt because it is not an integer",
+                ))
+            }
+        }
+        Val::Str(s) => {
+            let t = s.trim();
+            let parsed = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                i128::from_str_radix(h, 16)
+            } else if let Some(o) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+                i128::from_str_radix(o, 8)
+            } else if let Some(b) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+                i128::from_str_radix(b, 2)
+            } else {
+                t.parse::<i128>()
+            };
+            parsed.map_err(|_| {
+                JsError::throw(&format!("SyntaxError: Cannot convert {} to a BigInt", t))
+            })
+        }
+        Val::Bool(b) => Ok(if *b { 1 } else { 0 }),
+        _ => Err(JsError::throw(
+            "TypeError: Cannot convert undefined or null to a BigInt",
+        )),
     }
 }
 
@@ -3188,7 +3590,7 @@ fn n_text(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val,
 
 fn n_weakmap_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let obj = proto_instance(e.weakmap_proto.clone());
-    let pairs = map_entries_from(args.first())?;
+    let pairs = map_entries_from(e, args.first())?;
     map_store(&obj, pairs);
     Ok(obj)
 }
@@ -3197,7 +3599,7 @@ fn n_weakset_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Res
     let obj = proto_instance(e.weakset_proto.clone());
     let mut items: Vec<Val> = Vec::new();
     if let Some(init) = args.first() {
-        for v in super::interp::for_of_items(init)? {
+        for v in super::interp::for_of_items(e, init)? {
             if !items.iter().any(|x| strict_eq(x, &v)) {
                 items.push(v);
             }
@@ -3211,7 +3613,7 @@ fn n_set_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<
     let obj = proto_instance(e.set_proto.clone());
     let mut items: Vec<Val> = Vec::new();
     if let Some(init) = args.first() {
-        for v in super::interp::for_of_items(init)? {
+        for v in super::interp::for_of_items(e, init)? {
             if !items.iter().any(|x| strict_eq(x, &v)) {
                 items.push(v);
             }
@@ -3267,29 +3669,24 @@ fn n_set(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, Js
             }
             Ok(Val::Undefined)
         }
-        5 | 6 => Ok(Val::new_array(items)),
-        7 => Ok(Val::new_array(
-            items
-                .into_iter()
-                .map(|v| Val::new_array(vec![v.clone(), v]))
-                .collect(),
-        )),
+        5 | 6 => Ok(super::interp::make_iterator(this.clone(), crate::js::IterKind::Values)),
+        7 => Ok(super::interp::make_iterator(this.clone(), crate::js::IterKind::Entries)),
         _ => Err(JsError::throw("TypeError: bad Set native")),
     }
 }
 
 fn n_map_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let obj = proto_instance(e.map_proto.clone());
-    let pairs = map_entries_from(args.first())?;
+    let pairs = map_entries_from(e, args.first())?;
     map_store(&obj, pairs);
     Ok(obj)
 }
 
 /// Entries from a Map/WeakMap iterable argument (`[[k, v], ...]`).
-fn map_entries_from(init: Option<&Val>) -> Result<Vec<(Val, Val)>, JsError> {
+fn map_entries_from(e: &mut JsEngine, init: Option<&Val>) -> Result<Vec<(Val, Val)>, JsError> {
     let mut pairs: Vec<(Val, Val)> = Vec::new();
     if let Some(init) = init {
-        for entry in super::interp::for_of_items(init)? {
+        for entry in super::interp::for_of_items(e, init)? {
             let (k, v) = match &entry {
                 Val::Obj(p) => match &p.borrow().kind {
                     ObjKind::Array(kv) if kv.len() >= 2 => (kv[0].clone(), kv[1].clone()),
@@ -3357,14 +3754,9 @@ fn n_map(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, Js
             }
             Ok(Val::Undefined)
         }
-        6 => Ok(Val::new_array(pairs.into_iter().map(|(k, _)| k).collect())),
-        7 => Ok(Val::new_array(pairs.into_iter().map(|(_, v)| v).collect())),
-        8 => Ok(Val::new_array(
-            pairs
-                .into_iter()
-                .map(|(k, v)| Val::new_array(vec![k, v]))
-                .collect(),
-        )),
+        6 => Ok(super::interp::make_iterator(this.clone(), crate::js::IterKind::Keys)),
+        7 => Ok(super::interp::make_iterator(this.clone(), crate::js::IterKind::Values)),
+        8 => Ok(super::interp::make_iterator(this.clone(), crate::js::IterKind::Entries)),
         _ => Err(JsError::throw("TypeError: bad Map native")),
     }
 }

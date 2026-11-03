@@ -283,6 +283,8 @@ pub(crate) fn run_block(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) -> Resu
 
 pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, JsError> {
     e.cur_span = s.span.start as usize; // budget error names this statement
+    // a throw that a previous statement caught must not label this one
+    e.err_located = false;
     e.tick()?;
     let r = eval_stmt_inner(e, env, s);
     if let Err(err) = &r {
@@ -410,8 +412,17 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
         }
         StmtKind::ForOf { kind, target, iter, body } => {
             let label = e.pending_label.take();
-            let it = eval_expr(e, env, iter)?;
-            for v in for_of_items(&it)? {
+            let iterable = eval_expr(e, env, iter)?;
+            // lazy `@@iterator` loop: one `.next()` per element, so early
+            // `break` stops pulling values from an infinite generator
+            let it = get_iterator(e, &iterable)?;
+            let next = get_member(e, &it, "next")?;
+            loop {
+                let step = e.call(next.clone(), it.clone(), Vec::new())?;
+                if get_member(e, &step, "done")?.to_bool() {
+                    break;
+                }
+                let v = get_member(e, &step, "value")?;
                 let benv = bind_for_iter(e, env, kind.unwrap_or(VarKind::Var), target, v)?;
                 match loop_flow(eval_stmt(e, &benv, body)?, &label) {
                     LoopFlow::Next => {}
@@ -601,7 +612,7 @@ pub(crate) fn bind_pat(
     match pat {
         Pat::Name(t) => bind_target(e, env, t, value, kind),
         Pat::Arr(parts) => {
-            let items = iter_src(&value)?;
+            let items = iter_src(e, &value)?;
             bind_arr(e, env, parts, &items, kind)
         }
         Pat::Obj(parts) => bind_obj(e, env, parts, &value, kind),
@@ -800,48 +811,243 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
 
 /// shortcut: no iterator protocol — arrays and strings only; anything else
 /// throws a clear TypeError (custom iterables, Maps, Sets are later waves).
-pub(crate) fn for_of_items(v: &Val) -> Result<Vec<Val>, JsError> {
-    match v {
+/// Build a built-in iterator object over `source`.
+pub(crate) fn make_iterator(source: Val, kind: IterKind) -> Val {
+    Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::Iterator(IterState {
+            source,
+            kind,
+            index: 0,
+            done: false,
+        }),
+        props: Vec::new(),
+        proto: None,
+    })))
+}
+
+/// The raw sequence slot `i` (for Map sources this is the `[k, v]` pair).
+fn iter_slot(source: &Val, i: usize) -> Option<Val> {
+    match source {
+        Val::Str(s) => s.chars().nth(i).map(|c| Val::Str(Rc::from(c.to_string()))),
         Val::Obj(o) => {
-            // arrays iterate their elements
+            let is_typed = matches!(o.borrow().kind, ObjKind::TypedArray(_));
+            if is_typed {
+                if let ObjKind::TypedArray(ta) = &o.borrow().kind {
+                    return if i < ta.len {
+                        Some(crate::js::typed_read(ta, i))
+                    } else {
+                        None
+                    };
+                }
+            }
             let direct = {
                 let b = o.borrow();
                 match &b.kind {
-                    ObjKind::Array(items) => Some(items.clone()),
+                    ObjKind::Array(items) => Some(items.get(i).cloned()),
                     _ => None,
                 }
             };
-            if let Some(items) = direct {
-                return Ok(items);
+            if let Some(v) = direct {
+                return v;
             }
-            // Set/Map builtins carry their payload in a hidden own prop
-            // (`__set` values / `__map` [key, value] pairs); iterating either
-            // yields that array (Map yields pairs, like its real iterator).
-            let hidden = {
-                let b = o.borrow();
-                b.props
-                    .iter()
-                    .find(|(k, _)| &**k == "__set" || &**k == "__map")
-                    .map(|(_, v)| v.clone())
-            };
+            let hidden = o
+                .borrow()
+                .props
+                .iter()
+                .find(|(k, _)| &**k == "__set" || &**k == "__map")
+                .map(|(_, v)| v.clone());
             match hidden {
                 Some(Val::Obj(a)) => match &a.borrow().kind {
-                    ObjKind::Array(items) => Ok(items.clone()),
-                    _ => Err(JsError::throw(
-                        "TypeError: for...of cannot iterate this object",
-                    )),
+                    ObjKind::Array(items) => items.get(i).cloned(),
+                    _ => None,
                 },
-                _ => Err(JsError::throw(
-                    "TypeError: for...of supports arrays, strings, Sets and Maps only (iterator protocol: later wave)",
-                )),
+                _ => None,
             }
         }
-        Val::Str(s) => Ok(s.chars().map(|c| Val::Str(Rc::from(c.to_string()))).collect()),
-        _ => Err(JsError::throw(
-            "TypeError: for...of supports arrays and strings only (iterator protocol: later wave)",
-        )),
+        _ => None,
     }
 }
+
+/// One step of a built-in iterator: `Some(value)` or `None` when done.
+pub(crate) fn iter_step(it: &mut IterState) -> Option<Val> {
+    if it.done {
+        return None;
+    }
+    let raw = iter_slot(&it.source, it.index)?;
+    let idx = it.index;
+    it.index += 1;
+    Some(match it.kind {
+        IterKind::Values => raw,
+        IterKind::Keys => keys_value(&it.source, idx, raw),
+        IterKind::Entries => entries_value(&it.source, idx, raw),
+    })
+}
+
+/// `has_hidden` reports whether the source object carries a given hidden
+/// payload prop (`__set` / `__map`).
+fn has_hidden(source: &Val, name: &str) -> bool {
+    matches!(source, Val::Obj(o) if o.borrow().props.iter().any(|(k, _)| k.as_ref() == name))
+}
+
+/// Keys: Map pairs expose their first element, Sets expose their values, and
+/// arrays/typed arrays/strings expose their indices.
+fn keys_value(source: &Val, idx: usize, raw: Val) -> Val {
+    if has_hidden(source, "__map") {
+        if let Val::Obj(p) = &raw {
+            if let ObjKind::Array(kv) = &p.borrow().kind {
+                return kv.first().cloned().unwrap_or(Val::Undefined);
+            }
+        }
+        return Val::Undefined;
+    }
+    if has_hidden(source, "__set") {
+        return raw;
+    }
+    Val::Num(idx as f64)
+}
+
+fn entries_value(source: &Val, idx: usize, raw: Val) -> Val {
+    if has_hidden(source, "__map") {
+        return raw;
+    }
+    if has_hidden(source, "__set") {
+        return Val::new_array(vec![raw.clone(), raw]);
+    }
+    Val::new_array(vec![Val::Num(idx as f64), raw])
+}
+
+/// `{ value, done }` step object.
+fn step_object(done: bool, value: Val) -> Val {
+    let o = Val::new_object();
+    obj_set_own(own(&o), "value", value);
+    obj_set_own(own(&o), "done", Val::Bool(done));
+    o
+}
+
+/// Advance an `ObjKind::Iterator` object (shared by `.next()` and `for..of`).
+pub(crate) fn iterator_next(this: &Val) -> Result<Val, JsError> {
+    let Val::Obj(o) = this else {
+        return Err(JsError::throw(
+            "TypeError: Iterator method called on incompatible receiver",
+        ));
+    };
+    let step = {
+        let mut b = o.borrow_mut();
+        match &mut b.kind {
+            ObjKind::Iterator(it) => {
+                let v = iter_step(it);
+                if v.is_none() {
+                    it.done = true;
+                }
+                v
+            }
+            _ => {
+                return Err(JsError::throw(
+                    "TypeError: Iterator method called on incompatible receiver",
+                ))
+            }
+        }
+    };
+    Ok(match step {
+        Some(v) => step_object(false, v),
+        None => step_object(true, Val::Undefined),
+    })
+}
+
+/// The iterator object for an iterable value (`@@iterator()`).
+pub(crate) fn get_iterator(e: &mut JsEngine, v: &Val) -> Result<Val, JsError> {
+    match v {
+        Val::Str(_) => return Ok(make_iterator(v.clone(), IterKind::Values)),
+        Val::Obj(o) => {
+            let builtin = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(_) | ObjKind::TypedArray(_) => Some(IterKind::Values),
+                    ObjKind::Iterator(_) => return Ok(v.clone()),
+                    _ => {
+                        if b.props.iter().any(|(k, _)| &**k == "__set") {
+                            Some(IterKind::Values)
+                        } else if b.props.iter().any(|(k, _)| &**k == "__map") {
+                            Some(IterKind::Entries)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(kind) = builtin {
+                return Ok(make_iterator(v.clone(), kind));
+            }
+            // user object: consult `[Symbol.iterator]`
+            let f = get_member(e, v, crate::js::SYMBOL_ITERATOR)?;
+            if is_callable(&f) {
+                let it = e.call(f, v.clone(), Vec::new())?;
+                if matches!(it, Val::Obj(_)) {
+                    return Ok(it);
+                }
+                return Err(JsError::throw(
+                    "TypeError: Result of the Symbol.iterator method is not an object",
+                ));
+            }
+            Err(JsError::throw(
+                "TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))",
+            ))
+        }
+        _ => Err(JsError::throw(&format!(
+            "TypeError: {} is not iterable",
+            v.type_of()
+        ))),
+    }
+}
+
+/// Collect every value of an iterable (used by spread / Array.from /
+/// built-in constructors). Bounded so a runaway user iterator fails
+/// honestly instead of hanging the page.
+const ITER_CAP: usize = 100_000;
+
+pub(crate) fn for_of_items(e: &mut JsEngine, v: &Val) -> Result<Vec<Val>, JsError> {
+    let it = get_iterator(e, v)?;
+    let mut out = Vec::new();
+    // fast path: engine iterator object, no `.next()` call overhead
+    if let Val::Obj(o) = &it {
+        let mut fast = false;
+        {
+            let mut b = o.borrow_mut();
+            if let ObjKind::Iterator(state) = &mut b.kind {
+                fast = true;
+                loop {
+                    match iter_step(state) {
+                        Some(v) => {
+                            if out.len() >= ITER_CAP {
+                                return Err(JsError::throw(
+                                    "RangeError: iterator produced too many values",
+                                ));
+                            }
+                            out.push(v);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        if fast {
+            return Ok(out);
+        }
+    }
+    // generic protocol: call `.next()` until `done`
+    let next = get_member(e, &it, "next")?;
+    for _ in 0..ITER_CAP {
+        let step = e.call(next.clone(), it.clone(), Vec::new())?;
+        if get_member(e, &step, "done")?.to_bool() {
+            return Ok(out);
+        }
+        out.push(get_member(e, &step, "value")?);
+    }
+    Err(JsError::throw(
+        "RangeError: iterator produced too many values",
+    ))
+}
+
 
 // ---------------------------------------------------------------------------
 // Expressions
@@ -894,6 +1100,17 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
 fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsError> {
     match &x.kind {
         ExprKind::Ident(name) => Ok(e.env_get(env, name)),
+        ExprKind::BigInt(n) => Ok(Val::BigInt(Rc::new(*n))),
+        ExprKind::NewTarget => Ok(e.env_get(env, "#new.target")),
+        ExprKind::PrivateIn { name, obj } => {
+            let v = eval_expr(e, env, obj)?;
+            let found = match &v {
+                Val::Obj(o) => obj_has(o, name),
+                Val::Func(c) => c.props.borrow().iter().any(|(k, _)| k == name),
+                _ => false,
+            };
+            Ok(Val::Bool(found))
+        }
         ExprKind::Num(n) => Ok(Val::Num(*n)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
@@ -901,6 +1118,28 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
         ExprKind::This => Ok(e.env_get(env, "this")),
         ExprKind::Unary { op, expr } => {
             let v = eval_expr(e, env, expr)?;
+            if let Val::BigInt(n) = &v {
+                let n = **n;
+                let overflow =
+                    || JsError::throw("RangeError: BigInt result is out of the supported i128 range");
+                let nv = match op {
+                    UnaryOp::Neg => Val::BigInt(Rc::new(n.checked_neg().ok_or_else(overflow)?)),
+                    UnaryOp::Pos => {
+                        return Err(JsError::throw(
+                            "TypeError: Cannot convert a BigInt value to a number",
+                        ))
+                    }
+                    UnaryOp::Not => return Ok(Val::Bool(n == 0)),
+                    UnaryOp::BitNot => Val::BigInt(Rc::new(!n)),
+                    UnaryOp::PreInc | UnaryOp::PreDec => {
+                        let d = if matches!(op, UnaryOp::PreInc) { 1 } else { -1 };
+                        let nv = Val::BigInt(Rc::new(n.checked_add(d).ok_or_else(overflow)?));
+                        assign_target(e, env, expr, nv.clone())?;
+                        nv
+                    }
+                };
+                return Ok(nv);
+            }
             Ok(match op {
                 UnaryOp::Neg => Val::Num(-v.to_number()),
                 UnaryOp::Pos => Val::Num(v.to_number()),
@@ -917,6 +1156,16 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
         }
         ExprKind::Postfix { target, inc } => {
             let v = eval_target_value(e, env, target)?;
+            if let Val::BigInt(n) = &v {
+                let d = if *inc { 1 } else { -1 };
+                let nv = Val::BigInt(Rc::new(
+                    (**n)
+                        .checked_add(d)
+                        .ok_or_else(|| JsError::throw("RangeError: BigInt result is out of range"))?,
+                ));
+                assign_target(e, env, target, nv)?;
+                return Ok(v); // postfix yields the OLD value
+            }
             let n = v.to_number() + if *inc { 1.0 } else { -1.0 };
             assign_target(e, env, target, Val::Num(n))?;
             Ok(v) // postfix yields the OLD value
@@ -1048,6 +1297,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             };
             // `new Promise(executor)` needs to run its executor arg; handled
             // generically: natives get the fresh object as `this`
+            e.pending_construct = Some(f.clone());
             let res = e.call(f, fresh.clone(), argvals)?;
             // constructor returning an object overrides `this`
             Ok(if matches!(res, Val::Obj(_)) { res } else { fresh })
@@ -1156,8 +1406,8 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                     ArrayElem::Item(x) => vals.push(eval_expr(e, env, x)?),
                     ArrayElem::Hole => vals.push(Val::Undefined), // hole -> undefined (dense shortcut)
                     ArrayElem::Spread(sp) => {
-                        // sparse: here strings expand to char-code arrays
-                        vals.extend(iter_src(&eval_expr(e, env, sp)?)?);
+                        let src = eval_expr(e, env, sp)?;
+                        vals.extend(iter_src(e, &src)?);
                     }
                 }
             }
@@ -1367,8 +1617,8 @@ fn await_value(e: &mut JsEngine, v: Val) -> Result<Val, JsError> {
 
 /// spread sources: arrays expand element-wise, strings to chars; anything
 /// else is an honest error (no iterator protocol in this wave)
-pub(crate) fn iter_src(v: &Val) -> Result<Vec<Val>, JsError> {
-    for_of_items(v)
+pub(crate) fn iter_src(e: &mut JsEngine, v: &Val) -> Result<Vec<Val>, JsError> {
+    for_of_items(e, v)
 }
 
 fn own(v: &Val) -> &Rc<RefCell<Obj>> {
@@ -1386,7 +1636,7 @@ fn eval_args(e: &mut JsEngine, env: &Rc<Env>, args: &[CallArg]) -> Result<Vec<Va
             CallArg::Arg(x) => out.push(eval_expr(e, env, x)?),
             CallArg::Spread(sp) => {
                 let src = eval_expr(e, env, sp)?;
-                out.extend(iter_src(&src)?);
+                out.extend(iter_src(e, &src)?);
             }
         }
     }
@@ -1450,8 +1700,140 @@ pub(crate) fn ensure_prototype(c: &Rc<Closure>) -> Rc<RefCell<Obj>> {
     proto
 }
 
+/// BigInt toString with an optional radix (2..=36).
+fn bigint_radix(n: i128, radix: u32) -> String {
+    if radix == 10 {
+        return n.to_string();
+    }
+    let neg = n < 0;
+    let mut v = n.unsigned_abs();
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    if v == 0 {
+        out.push(b'0');
+    }
+    while v > 0 {
+        out.push(digits[(v % radix as u128) as usize]);
+        v /= radix as u128;
+    }
+    if neg {
+        out.push(b'-');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// BigInt arithmetic. `None` = neither side is a BigInt (or this is a
+/// comparison / string concatenation, handled by the generic paths).
+fn bigint_binary(op: BinOp, l: &Val, r: &Val) -> Option<Result<Val, JsError>> {
+    use BinOp::*;
+    let a = match l {
+        Val::BigInt(n) => Some(**n),
+        _ => None,
+    };
+    let b = match r {
+        Val::BigInt(n) => Some(**n),
+        _ => None,
+    };
+    if a.is_none() && b.is_none() {
+        return None;
+    }
+    let arithmetic = matches!(
+        op,
+        Add | Sub | Mul | Div | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr
+    );
+    if !arithmetic {
+        return None; // ==, ===, <, ... use the shared comparison helpers
+    }
+    // `1n + "x"` is string concatenation, not an arithmetic mix
+    if op == Add && (matches!(l, Val::Str(_)) || matches!(r, Val::Str(_))) {
+        return None;
+    }
+    let (Some(a), Some(b)) = (a, b) else {
+        return Some(Err(JsError::throw(
+            "TypeError: Cannot mix BigInt and other types, use explicit conversions",
+        )));
+    };
+    let overflow = || JsError::throw("RangeError: BigInt result is out of the supported i128 range");
+    let val = |n: i128| Ok(Val::BigInt(Rc::new(n)));
+    Some(match op {
+        Add => a.checked_add(b).map(val).unwrap_or_else(|| Err(overflow())),
+        Sub => a.checked_sub(b).map(val).unwrap_or_else(|| Err(overflow())),
+        Mul => a.checked_mul(b).map(val).unwrap_or_else(|| Err(overflow())),
+        Div => {
+            if b == 0 {
+                Err(JsError::throw("RangeError: Division by zero"))
+            } else {
+                a.checked_div(b).map(val).unwrap_or_else(|| Err(overflow()))
+            }
+        }
+        Mod => {
+            if b == 0 {
+                Err(JsError::throw("RangeError: Division by zero"))
+            } else {
+                a.checked_rem(b).map(val).unwrap_or_else(|| Err(overflow()))
+            }
+        }
+        Pow => {
+            if b < 0 {
+                Err(JsError::throw("RangeError: BigInt exponent must be non-negative"))
+            } else if b > u32::MAX as i128 {
+                Err(overflow())
+            } else {
+                // |base| <= 1 never overflows, so the loop below would spin
+                // for the full exponent (up to u32::MAX iterations — seconds
+                // of frozen page, and the JS step budget does not cover
+                // builtin loops). Answer those directly.
+                match a {
+                    0 => val(if b == 0 { 1 } else { 0 }),
+                    1 => val(1),
+                    -1 => val(if b % 2 == 0 { 1 } else { -1 }),
+                    // any larger base leaves i128 by the 128th multiplication
+                    _ if b > 127 => Err(overflow()),
+                    _ => {
+                        let mut acc: i128 = 1;
+                        let mut ok = true;
+                        for _ in 0..b {
+                            match acc.checked_mul(a) {
+                                Some(v) => acc = v,
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok { val(acc) } else { Err(overflow()) }
+                    }
+                }
+            }
+        }
+        BitAnd => val(a & b),
+        BitOr => val(a | b),
+        BitXor => val(a ^ b),
+        Shl => {
+            if b < 0 || b > 127 {
+                Err(overflow())
+            } else {
+                a.checked_shl(b as u32).map(val).unwrap_or_else(|| Err(overflow()))
+            }
+        }
+        Shr => {
+            if b < 0 || b > 127 {
+                // shifting a BigInt right by more than its width is 0 / -1
+                val(if a < 0 { -1 } else { 0 })
+            } else {
+                val(a >> b)
+            }
+        }
+        _ => unreachable!(),
+    })
+}
+
 fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> {
     use BinOp::*;
+    if let Some(result) = bigint_binary(op, l, r) {
+        return result;
+    }
     Ok(match op {
         Add => {
             // string concat if either side is (or stringifies to) a string
@@ -1678,6 +2060,15 @@ fn relational(op: BinOp, l: &Val, r: &Val) -> bool {
             BinOp::Le => a.as_bytes() <= b.as_bytes(),
             BinOp::Gt => a.as_bytes() > b.as_bytes(),
             BinOp::Ge => a.as_bytes() >= b.as_bytes(),
+            _ => unreachable!(),
+        };
+    }
+    if let (Val::BigInt(a), Val::BigInt(b)) = (l, r) {
+        return match op {
+            BinOp::Lt => a < b,
+            BinOp::Le => a <= b,
+            BinOp::Gt => a > b,
+            BinOp::Ge => a >= b,
             _ => unreachable!(),
         };
     }
@@ -2008,6 +2399,14 @@ pub(crate) fn call_method(
         NumToString => match this {
             Val::Num(n) => Ok(Val::Str(Rc::from(num_to_str(*n).as_str()))),
             Val::Bool(b) => Ok(Val::Str(Rc::from(b.to_string()))),
+            Val::BigInt(n) => {
+                let radix = args
+                    .first()
+                    .map(|v| v.to_number())
+                    .filter(|r| *r >= 2.0 && *r <= 36.0)
+                    .unwrap_or(10.0) as u32;
+                Ok(Val::Str(Rc::from(bigint_radix(**n, radix).as_str())))
+            }
             _ => Err(JsError::throw("TypeError: Number method called on wrong type")),
         },
         NumToFixed => {
@@ -2091,6 +2490,17 @@ pub(crate) fn call_method(
         GenReturn => {
             let arg = args.first().cloned().unwrap_or(Val::Undefined);
             gen::gen_return(this, arg)
+        }
+        IterNext => iterator_next(this),
+        IterSelf => Ok(this.clone()),
+        IterReturn => {
+            if let Val::Obj(o) = this {
+                if let ObjKind::Iterator(it) = &mut o.borrow_mut().kind {
+                    it.done = true;
+                }
+            }
+            let v = args.first().cloned().unwrap_or(Val::Undefined);
+            Ok(step_object(true, v))
         }
 
         // -- regex methods (this = regex object) ----------------------------

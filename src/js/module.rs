@@ -99,14 +99,22 @@ impl ModuleLoader {
         e.steps = 0;
         let saved_depth = e.call_depth;
         e.call_depth = 0;
+        // the diagnostic cursor belongs to the calling turn; running a module
+        // body must not leave `cur_src` pointing at this module afterwards
+        // (that is what made a later page-script throw resolve its offset
+        // against the module's text)
+        let outer_src = e.cur_src;
+        let outer_located = e.err_located;
         e.cur_src = src_id;
         e.err_located = false;
         let ns: Exports = Rc::new(RefCell::new(HashMap::new()));
         self.cache.insert(url.to_string(), ns.clone());
         self.active.push(url.to_string());
-        let r = self.run_body(e, url, src, &program, &ns);
+        let r = self.run_body(e, url, src, src_id, &program, &ns);
         self.active.pop();
         e.call_depth = saved_depth;
+        e.cur_src = outer_src;
+        e.err_located = outer_located;
         if r.is_err() {
             // a failed module must not stay cached as a half namespace
             self.cache.remove(url);
@@ -120,6 +128,7 @@ impl ModuleLoader {
         e: &mut JsEngine,
         url: &str,
         src: &str,
+        src_id: u32,
         program: &[Stmt],
         ns: &Exports,
     ) -> Result<(), String> {
@@ -135,7 +144,12 @@ impl ModuleLoader {
         // 1) resolve every import first (document order, depth first)
         for st in program {
             if let parser::StmtKind::Import { source, bindings } = &st.kind {
+                // loading a dependency runs another module body; come back
+                // with THIS module's diagnostic cursor
+                e.cur_src = src_id;
+                e.err_located = false;
                 let dep = self.load_dep(e, url, source)?;
+                e.cur_src = src_id;
                 for b in bindings {
                     match b {
                         ImportBinding::Named { imported, local } => {
@@ -154,6 +168,11 @@ impl ModuleLoader {
 
         // 2) run the body, recording exports as the declarations happen
         for st in program {
+            // per-statement diagnostic origin: a caught/handled error in an
+            // earlier statement must not label a later throw (and nested
+            // module loads move `cur_src`)
+            e.cur_src = src_id;
+            e.err_located = false;
             match &st.kind {
                 parser::StmtKind::Import { .. } => {}
                 parser::StmtKind::Export {
