@@ -182,12 +182,13 @@ curve matters more than the baseline (near-flat as tabs grow).
   Follow-up DONE (SVG class-paint round): site CSS coloring an inline-SVG's
   children by single-class rule (`.logo__letter { fill: … }`) now reaches the
   rasterizer — `parse_decls` keeps the paint props (added to `KNOWN`),
-  `Sheet::class_paint` resolves last-in-cascade var()-substituted +
+  `Sheet::svg_decls` resolves last-in-cascade var()-substituted +
   `light-dark()`-picked values, and `build()` injects them into each open tag's
   inline `style` (which svg.rs prefers over presentation attributes). MDN's
-  logo went from solid black to blue letters + light wordmark. shortcut: simple
-  single-class selectors only (no descendant chains / tag / id / attr /
-  pseudo); SVGs with no matching rule pass through byte-identical (verified
+  logo went from solid black to blue letters + light wordmark. Wave 35 closed
+  the single-class shortcut: descendant/child chains, tag/id/attribute
+  compounds and `font-size` (rem/em) resolve too, which is what draws the
+  homepage mandala; SVGs no rule matches pass through byte-identical (verified
   nextjs + rust-lang unchanged)
 - [x] **Selector-list split fix** — ~~footer/nav text piled at top-left~~ **DONE
   (`split_selectors` replaces `sel_text.split(',')`: commas inside `(...)`/`[...]`
@@ -548,7 +549,7 @@ curve matters more than the baseline (near-flat as tabs grow).
   (records `PseudoEl` on the last Seg; static pseudo-classes may precede,
   nothing may follow; `spec_of` adds +1 type; `seg_matches` ignores the field so
   `li::before` matches the `<li>`); pseudo rules are PARTITIONED at parse into
-  `Sheet::pseudo` buckets so the origin element's `resolve`/`class_paint`/
+  `Sheet::pseudo` buckets so the origin element's `resolve`/SVG paint/
   color-scheme never see them (zero hot-path cost; `resolve_pseudo` cascades a
   bucket over the origin's computed `Style`); `content` parses `none`/
   string/`attr(name)` raw onto `BoxStyle.content` (attr resolves at box
@@ -1696,6 +1697,48 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 32 (label activation + implicit submission) | local `form31.html` probe with a label + checked box | `[js] form.submit() -> GET ...?agree=1&q=hi&lang=fr&region=Europe+wide` (still no submitter pair for a scripted submit - regression-free); label->control resolution covered by an in-crate test over `collect_elements`; suite **741** default / **745** `engine-b + woff2` |
 | 2026-11-04 | wave 33 (grid span sizing + intrinsic whitespace) | MDN homepage, same build pair back-to-back (`MAZDA_DUMP_RUNS=2`) | the "Latest news" date moved from x=121 (on top of the source link) to x=398 in a card ending at 463 - right-aligned like the reference; the `max-content` column is the 58px date again instead of the 615px summary, `1fr` takes the rest; card/did-you-know grid re-wraps unchanged otherwise (2542px total both builds, 615 runs); Wikipedia `/wiki/JavaScript` 24365 -> 24454px because intrinsic text widths no longer count source indentation (a paragraph beside the infobox wraps one line earlier); suite **744** default / **748** `engine-b + woff2` |
 | 2026-11-04 | wave 34 (grid row spans) | MDN homepage + Wikipedia `/wiki/JavaScript`, same build pair | a spanning grid item's height now stretches the rows it covers instead of overhanging them: MDN's hero grid grew 288 -> 420px because `div.homepage-header__mandala` (351x420) spans both header rows, so "Featured articles" moves down 132px (page 2542 -> 2675px, 615 runs); Wikipedia unchanged at 24454px (10943 runs) because no grid there has a row span; suite **745** default / **749** `engine-b + woff2` |
+| 2026-11-05 | wave 35 (page CSS inside inline SVG) | MDN homepage + a local page with the real mandala markup and the page's rules | the mandala now paints (5 concentric rings of slashes, was blank): the page's `.mandala svg>text` and `.mandala textPath[href="#circleN"]` rules reach the rasterizer through a mini-cascade over the SVG's ancestor chain, and `font-size: 1.5rem` resolves in svg.rs; page height 2675px, 615 runs and ~100 MB unchanged, Wikipedia unchanged at 24454px; suite **746** default / **750** `engine-b + woff2` |
+
+### Wave 35 findings
+
+- **The gap was the cascade, not the rasterizer.** Inline `<svg>` is RAW_TEXT
+  in the DOM, so `svg.rs` rasterizes it with no access to the page's styles:
+  an SVG child only painted if it carried its own `fill`/`font-size`. Wave 21
+  closed the easy half by baking *single-class* rules into inline `style`;
+  MDN's homepage mandala defeated that shortcut — its colours come from
+  `.mandala svg>text { fill: var(--color-border-primary) }` (HTML ancestor,
+  descendant + child combinators) and its ring sizes from
+  `.mandala textPath[href="#circle1"] { font-size: 1.5rem }` (attribute
+  selector), so the SVG root's `fill="none"` won and nothing painted.
+- **Mini-cascade over the SVG's ancestor chain.** `Sheet::svg_candidates`
+  prefilters rules once per SVG (subject tag must occur in the markup;
+  pseudo-classes, `:not()`, pseudo-elements and sibling combinators are out),
+  and `Sheet::svg_decls` matches one element against a `SvgElem` chain:
+  tag / `#id` / `.class` / `[attr]` compounds with descendant and child
+  combinators, last-in-cascade wins per property, `var()` resolved against
+  the page palette and `light-dark()` against the page polarity — the same
+  values the text cascade would produce. `layout::build` hands in the `<svg>`
+  element's real HTML ancestors (walked via `Node::parent`), and the markup
+  walker pushes/pops the SVG's own open elements, so `.mandala svg>text`
+  matches the wrapping `<div class="mandala">` and not some unrelated rule.
+  `font-size` joined the merged property list, and `svg.rs` now resolves
+  `rem` (16 px root) and `em` (relative to the current size).
+- **Live effect.** The MDN homepage hero's right side went from empty to the
+  five rings of slashes (colour `--color-border-primary`, sizes 1.5/1.3/1.2/
+  1.1/1 rem at the viewBox scale). Page height (2675 px), runs (615) and RAM
+  (~100 MB) are unchanged — SVG text is blitted by the shell, not counted in
+  the layout run list. Wikipedia `/wiki/JavaScript` is unchanged
+  (24454 px / 10943 runs). A local probe with the real mandala markup plus
+  the page's own rules paints the same five rings; the same page with MDN's
+  3.8 MB stylesheet loads in 308 ms, so the candidate prefilter keeps the
+  per-tag scan cheap (rules whose subject tag isn't in the SVG are dropped
+  once, before the walk).
+- **Limits.** Sibling combinators (`+`, `~`) and pseudo-classes never match
+  inside the injected markup; `<style>` blocks authored *inside* an SVG are
+  still not read; custom properties resolve against `:root`'s palette, not a
+  `style="--x:…"` on an SVG node (those nodes aren't in the DOM and so have
+  no `VarScope`); and attribute names compare case-insensitively while values
+  follow the selector's operator (`=` folds ASCII case, like the DOM path).
 
 ### Wave 34 findings
 

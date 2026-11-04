@@ -860,7 +860,7 @@ pub struct Sheet {
     var_rules: Vec<Rule>,
     /// pseudo-element rules, bucketed by kind ([0] `::before`, [1] `::after`,
     /// [2] `::marker`), cascade-sorted like `rules`. Kept OUT of `rules` so
-    /// the origin element's cascade, `class_paint` and the `color-scheme`
+    /// the origin element's cascade, the SVG paint injector and the `color-scheme`
     /// slice never see them — a `p::before` rule must not style the `p` —
     /// and so pages without pseudo rules pay nothing extra.
     pseudo: [Vec<Rule>; 3],
@@ -1246,8 +1246,9 @@ const KNOWN: &[&str] = &[
     "list-style-position",
     "list-style",
     // SVG paint properties — the rasterizer supports these; kept in decls so
-    // Sheet::class_paint can resolve class-colored inline-SVG children
-    // (fill/stroke/… on <path>/<rect>), which the text cascade never reaches
+    // the SVG paint injector can resolve page-CSS paint for inline-SVG
+    // children (fill/stroke/… on <path>/<rect>), which the text cascade
+    // never reaches
     "fill",
     "stroke",
     "fill-opacity",
@@ -1390,7 +1391,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     rules.sort_by_key(|r| (r.spec, r.order));
     var_rules.sort_by_key(|r| (r.spec, r.order));
     // pseudo-element rules cascade SEPARATELY (resolve_pseudo): partition
-    // them out so the origin element's cascade, class_paint and the
+    // them out so the origin element's cascade, the SVG paint injector and the
     // color-scheme slice below never see a `p::before` rule. Each bucket
     // keeps the (spec, order) order — the subset of a sorted list is sorted.
     // `:hover` rules are pulled out the same way (into `hover`), but only
@@ -1866,50 +1867,175 @@ impl Sheet {
         self.used_dark(dom, node, dom.attr(node, "style"))
     }
 
-    /// Resolve an SVG paint property (`fill`/`stroke`/`opacity`/…) for an
-    /// element matched only by single-class rules — the common way sites color
-    /// inline-SVG children (`.logo__letter { fill: … }`). Returns the
-    /// last-in-cascade value (var()-substituted, `light-dark()` branch-picked)
-    /// or None when no such rule applies.
-    /// shortcut: simple single-class selectors only — no descendant chains,
-    /// tag/id/attr qualifiers, pseudo-classes, or `<style>` blocks in the SVG.
-    pub fn class_paint(&self, classes: &str, prop: &str, dark: bool) -> Option<String> {
-        let toks: Vec<&str> = classes.split_whitespace().collect();
-        let mut val: Option<String> = None;
-        for rule in &self.rules {
-            // a single compound segment with exactly one class, nothing else
-            if rule.segs.len() != 1 {
-                continue;
-            }
-            let seg = &rule.segs[0];
-            if seg.tag.is_some()
-                || seg.id.is_some()
-                || !seg.attrs.is_empty()
-                || !seg.pseudos.is_empty()
-                || !seg.nots.is_empty()
-                || seg.child
+    /// Tags an inline SVG's markup contains, for [`Sheet::svg_candidates`].
+    /// (The SVG's inner tags are raw text in the DOM, so their names come
+    /// from the reassembled markup, not from `dom.tag`.)
+    pub fn svg_candidates(&self, tags: &[&str]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (i, rule) in self.rules.iter().enumerate() {
+            let Some(last) = rule.segs.last() else { continue };
+            // pseudo-classes (`:hover`, …), `:not()`, pseudo-elements and
+            // sibling combinators need pointer/state/sibling context the
+            // injected markup doesn't have - leave those rules out
+            if rule
+                .segs
+                .iter()
+                .any(|s| !s.pseudos.is_empty() || !s.nots.is_empty() || s.pseudo_el.is_some() || s.adj)
             {
                 continue;
             }
-            if seg.classes.len() != 1 || !toks.contains(&seg.classes[0].as_str()) {
+            // a tag-qualified subject that the markup doesn't contain can
+            // never match; tagless (class/id/attr) rules stay candidates
+            if let Some(t) = &last.tag {
+                if !tags.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                    continue;
+                }
+            }
+            out.push(i as u32);
+        }
+        out
+    }
+
+    /// Resolve the paint/type properties `want` for one element inside an
+    /// inline SVG, from the candidate rules [`Sheet::svg_candidates`]
+    /// returned. `chain` runs outermost-first and ends with the subject's
+    /// parent: the SVG's HTML ancestors, then the `<svg>` root and every
+    /// open element inside it. Last match in cascade order wins, per
+    /// property. `var()` and `light-dark()` resolve exactly like the DOM
+    /// cascade's (`scope_vars` palette, the page's polarity).
+    pub fn svg_decls(
+        &self,
+        cands: &[u32],
+        chain: &[SvgElem],
+        subject: &SvgElem,
+        want: &[&str],
+        dark: bool,
+    ) -> Vec<(String, String)> {
+        let mut vals: Vec<(String, String)> = Vec::new();
+        for &ri in cands {
+            let rule = &self.rules[ri as usize];
+            let Some(last) = rule.segs.last() else { continue };
+            if !svg_seg_matches(last, subject) {
+                continue;
+            }
+            // ancestors: nearest first, one compound at a time (the same
+            // greedy walk the DOM matcher does; `>` requires the immediate
+            // parent, else the segment may match any ancestor)
+            let mut idx = rule.segs.len() - 1;
+            let mut pos = chain.len();
+            let mut ok = true;
+            while idx > 0 {
+                let need_child = rule.segs[idx].child;
+                idx -= 1;
+                loop {
+                    if pos == 0 {
+                        ok = false;
+                        break;
+                    }
+                    pos -= 1;
+                    if svg_seg_matches(&rule.segs[idx], &chain[pos]) {
+                        break;
+                    }
+                    if need_child {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok {
                 continue;
             }
             for d in &rule.decls {
-                if d.0 == prop {
-                    let sd = self.subst(d);
-                    let picked = pick_light_dark(&sd.1, dark);
-                    // normalize a color value to canonical #rrggbb (a
-                    // light-dark() branch or var() may yield a named color);
-                    // non-color values (fill-rule, stroke-width) pass through
-                    val = Some(match parse_color(picked) {
-                        Some(c) => format!("#{:06x}", c & 0x00ff_ffff),
-                        None => picked.to_string(),
-                    });
+                if !want.contains(&d.0.as_str()) {
+                    continue;
+                }
+                let sd = self.subst(d);
+                let picked = pick_light_dark(&sd.1, dark);
+                // normalize a color value to canonical #rrggbb (a light-dark()
+                // branch or var() may yield a named color); non-color values
+                // (fill-rule, stroke-width, font-size) pass through
+                let v = match parse_color(picked) {
+                    Some(c) => format!("#{:06x}", c & 0x00ff_ffff),
+                    None => picked.to_string(),
+                };
+                match vals.iter_mut().find(|(k, _)| *k == sd.0) {
+                    Some(slot) => slot.1 = v,
+                    None => vals.push((sd.0.clone(), v)),
                 }
             }
         }
-        val
+        vals
     }
+}
+
+/// One element in an inline-SVG selector context. The SVG's inner markup is
+/// raw text (not part of the DOM), so the shell hands the chain in rather
+/// than a node id.
+pub struct SvgElem<'a> {
+    pub tag: &'a str,
+    /// attributes as the markup spells them (attribute names compare
+    /// case-insensitively; values follow the selector operator's rule)
+    pub attrs: &'a [(String, String)],
+}
+
+impl SvgElem<'_> {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn has_class(&self, c: &str) -> bool {
+        self.attr("class")
+            .map(|v| v.split_whitespace().any(|w| w == c))
+            .unwrap_or(false)
+    }
+}
+
+/// Does `seg` hold for one inline-SVG element? Only tag / `#id` / `.class` /
+/// `[attr…]` compounds take part (callers exclude the rest).
+fn svg_seg_matches(seg: &Seg, el: &SvgElem) -> bool {
+    if let Some(t) = &seg.tag {
+        if !el.tag.eq_ignore_ascii_case(t) {
+            return false;
+        }
+    }
+    if let Some(id) = &seg.id {
+        if el.attr("id") != Some(id.as_str()) {
+            return false;
+        }
+    }
+    for c in &seg.classes {
+        if !el.has_class(c) {
+            return false;
+        }
+    }
+    for (name, op, want) in &seg.attrs {
+        let Some(v) = el.attr(name) else {
+            return false;
+        };
+        let Some(w) = want else { continue }; // `[attr]` - presence only
+        let ok = match op {
+            AttrOp::Exists => true,
+            AttrOp::Equals => v.eq_ignore_ascii_case(w),
+            AttrOp::Includes => v.split_whitespace().any(|t| t.eq_ignore_ascii_case(w)),
+            AttrOp::Dash => {
+                let sv = v.to_ascii_lowercase();
+                sv == *w || (sv.starts_with(w.as_str()) && sv.as_bytes().get(w.len()) == Some(&b'-'))
+            }
+            AttrOp::Prefix => v.to_ascii_lowercase().starts_with(w.as_str()),
+            AttrOp::Suffix => v.to_ascii_lowercase().ends_with(w.as_str()),
+            AttrOp::Contains => v.to_ascii_lowercase().contains(w),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 /// Replace every `var(--name[, fallback])` in `v`, asking `get` for each
@@ -7861,49 +7987,68 @@ mod tests {
     }
 
     #[test]
-    fn class_paint_resolves_fill_from_single_class_rules() {
-        // inline-SVG children colored by class rule (the common way sites
-        // theme a logo) — the rasterizer has no cascade, so layout bakes the
-        // resolved value into an inline style
+    fn svg_decls_resolve_class_var_light_dark_and_ancestor_chains() {
+        // inline-SVG children are styled by page rules (the common way sites
+        // theme a logo or a mandala) — the rasterizer has no cascade, so
+        // layout bakes the resolved values into inline styles
         let mut sheet = parse(
             ".logo__letter { fill: #0a5dbd } \
              .logo__text { fill: var(--color-text-primary) } \
              .logo__letter { stroke: light-dark(#111111, #eeeeee) } \
-             .nav > .logo__letter { fill: #ff0000 }",
+             .nav > .logo__letter { fill: #ff0000 } \
+             .nav path[data-k=\"v\"] { font-size: 1.5rem }",
         );
-        let dom = dom_of("<div></div>");
         // custom property for the var() test
         sheet.vars.insert(
             "--color-text-primary".to_string(),
             "light-dark(black, white)".to_string(),
         );
-        // single-class rule → its fill
-        assert_eq!(
-            sheet.class_paint("logo__letter", "fill", false),
-            Some("#0a5dbd".to_string()),
-            "single-class fill resolved"
-        );
+        let cands = sheet.svg_candidates(&["path"]);
+        let want = ["fill", "stroke", "font-size"];
+        fn get<'a>(v: &'a [(String, String)], k: &str) -> Option<&'a str> {
+            v.iter().find(|(n, _)| n == k).map(|(_, x)| x.as_str())
+        }
+        let mk = |name: &str, val: &str| vec![(name.to_string(), val.to_string())];
+
+        let a = mk("class", "logo__letter");
+        let el = SvgElem { tag: "path", attrs: &a };
+        let v = sheet.svg_decls(&cands, &[], &el, &want, false);
+        assert_eq!(get(&v, "fill"), Some("#0a5dbd"), "single-class fill");
+        assert_eq!(get(&v, "stroke"), Some("#111111"), "light-dark light branch");
+
         // var() + light-dark() branches pick correctly
-        assert_eq!(
-            sheet.class_paint("logo__text", "fill", false),
-            Some("#000000".to_string()),
-            "light branch of light-dark"
-        );
-        assert_eq!(
-            sheet.class_paint("logo__text", "fill", true),
-            Some("#ffffff".to_string()),
-            "dark branch of light-dark"
-        );
-        // a descendant/child selector (.nav > .logo__letter) is NOT applied
-        // (documented shortcut: single-class only)
-        assert_eq!(
-            sheet.class_paint("logo__letter", "fill", false),
-            Some("#0a5dbd".to_string()),
-            "child combinator ignored — last single-class wins"
-        );
-        // no rule for this class/prop → None
-        assert_eq!(sheet.class_paint("nope", "fill", false), None);
-        assert_eq!(sheet.class_paint("logo__letter", "stroke-width", false), None);
+        let a = mk("class", "logo__text");
+        let el2 = SvgElem { tag: "text", attrs: &a };
+        let cands_all = sheet.svg_candidates(&["path", "text"]);
+        let v = sheet.svg_decls(&cands_all, &[], &el2, &want, false);
+        assert_eq!(get(&v, "fill"), Some("#000000"), "light branch of a var");
+        let v = sheet.svg_decls(&cands_all, &[], &el2, &want, true);
+        assert_eq!(get(&v, "fill"), Some("#ffffff"), "dark branch of a var");
+
+        // `.nav > .logo__letter` applies once the HTML ancestor chain has it
+        // (and does not without it — see the empty-chain value above)
+        let nav = mk("class", "nav");
+        let outer: Vec<(String, Vec<(String, String)>)> = vec![("div".to_string(), nav)];
+        let chain: Vec<SvgElem> = outer
+            .iter()
+            .map(|(t, a)| SvgElem { tag: t, attrs: a })
+            .collect();
+        let a = mk("class", "logo__letter");
+        let el = SvgElem { tag: "path", attrs: &a };
+        let v = sheet.svg_decls(&cands, &chain, &el, &want, false);
+        assert_eq!(get(&v, "fill"), Some("#ff0000"), "child combinator wins");
+
+        // attribute selector on the subject
+        let a = mk("data-k", "v");
+        let el = SvgElem { tag: "path", attrs: &a };
+        let v = sheet.svg_decls(&cands, &chain, &el, &want, false);
+        assert_eq!(get(&v, "font-size"), Some("1.5rem"), "attr selector");
+
+        // no rule for this class/prop
+        let a = mk("class", "nope");
+        let el = SvgElem { tag: "path", attrs: &a };
+        let v = sheet.svg_decls(&cands, &[], &el, &want, false);
+        assert!(v.is_empty(), "nothing matches: {v:?}");
     }
 
     #[test]

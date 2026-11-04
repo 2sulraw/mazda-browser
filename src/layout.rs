@@ -1119,13 +1119,15 @@ fn build_into(
                         }
                     }
                     markup.push_str("</svg>");
-                    // class-based paint: site CSS coloring this SVG's
-                    // children by class rule (e.g. `.logo__letter { fill: …
-                    // }`) — merged in as inline `style`, which the rasterizer
-                    // prefers over presentation attributes. SVGs without
-                    // matching single-class rules pass through unchanged.
+                    // page-CSS paint: rules that reach this SVG's children
+                    // (`path`, `.logo__letter { fill: … }`, `.mandala
+                    // svg>text`, `textPath[href="#c1"]`) are merged in as
+                    // inline `style`, which the rasterizer prefers over
+                    // presentation attributes. SVGs no rule matches pass
+                    // through unchanged.
                     let dark = sheet.is_dark(dom, child);
-                    let markup = inject_svg_class_paint(&markup, sheet, dark);
+                    let outer = svg_outer_chain(dom, child);
+                    let markup = inject_svg_paint(&markup, sheet, dark, &outer);
                     // currentColor = the element's cascaded color (class
                     // rules like .text-next-blue already resolved via var())
                     let hex = format!("#{:06x}", outcome.style.color & 0x00ff_ffff);
@@ -4398,46 +4400,41 @@ fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     }
 }
 
-/// Merge site-CSS class-based paint into one open `tag` (whose text includes
-/// the leading `<`). When a single-class rule sets a paint property (`fill`,
-/// `stroke`, …) for one of the tag's classes and the tag doesn't already
-/// declare it inline, append `prop: value` to the tag's `style="…"` (or add
-/// one). Returns the rewritten tag text.
-fn inject_tag_paint(
-    tag: &str,
-    classes: &str,
-    sheet: &crate::css::Sheet,
-    dark: bool,
-) -> String {
-    // paint properties an SVG rasterizer understands; only these are merged
-    const PROPS: [&str; 8] = [
-        "fill",
-        "stroke",
-        "fill-opacity",
-        "stroke-opacity",
-        "fill-rule",
-        "stroke-width",
-        "stroke-linejoin",
-        "opacity",
-    ];
-    let mut adds: Vec<(String, String)> = Vec::new();
-    for p in PROPS {
-        // an inline style already setting the property wins (skip)
-        if let Some(st) = attr_value(tag, "style") {
-            if st.split(';').any(|d| {
-                d.split_once(':').map(|(k, _)| k.trim()) == Some(p)
-            }) {
-                continue;
+/// Paint/font properties an SVG rasterizer understands; only these are merged
+/// from the page cascade.
+const SVG_PROPS: [&str; 9] = [
+    "fill",
+    "stroke",
+    "fill-opacity",
+    "stroke-opacity",
+    "fill-rule",
+    "stroke-width",
+    "stroke-linejoin",
+    "opacity",
+    "font-size",
+];
+
+/// Merge resolved page-CSS declarations into one open `tag` (whose text
+/// includes the leading `<`). A declaration the tag already carries inline or
+/// as a presentation attribute wins (inline style beats an attribute); the
+/// rest are appended to `style="…"`, or a new one is added before the tag
+/// closes. Returns the rewritten tag text.
+fn inject_tag_paint(tag: &str, vals: &[(String, String)]) -> String {
+    let adds: Vec<&(String, String)> = vals
+        .iter()
+        .filter(|(p, _)| {
+            // an inline style already setting the property wins (skip)
+            if let Some(st) = attr_value(tag, "style") {
+                if st.split(';').any(|d| {
+                    d.split_once(':').map(|(k, _)| k.trim()) == Some(p.as_str())
+                }) {
+                    return false;
+                }
             }
-        }
-        // a presentation attribute on the tag itself also wins
-        if attr_value(tag, p).is_some() {
-            continue;
-        }
-        if let Some(v) = sheet.class_paint(classes, p, dark) {
-            adds.push((p.to_string(), v));
-        }
-    }
+            // a presentation attribute on the tag itself also wins
+            attr_value(tag, p).is_none()
+        })
+        .collect();
     if adds.is_empty() {
         return tag.to_string();
     }
@@ -4497,13 +4494,131 @@ fn replace_attr(tag: &str, name: &str, val: &str) -> String {
     out
 }
 
-/// Walk the reassembled SVG markup and merge class-based paint into each open
-/// tag that carries `class="…"`. Slice-copy (never re-parse) so the raw
-/// markup — including any unbalanced `<` in text — stays byte-identical
-/// except for the injected styles.
-fn inject_svg_class_paint(markup: &str, sheet: &crate::css::Sheet, dark: bool) -> String {
-    let mut out = String::with_capacity(markup.len());
+/// Attributes of one open tag (values unquoted, names as written).
+fn tag_attrs(tag: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let b = tag.as_bytes();
+    let mut i = 1usize; // skip '<'
+    while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' && b[i] != b'/' {
+        i += 1;
+    }
+    while i < b.len() {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] == b'>' || b[i] == b'/' {
+            break;
+        }
+        let ns = i;
+        while i < b.len()
+            && !b[i].is_ascii_whitespace()
+            && b[i] != b'='
+            && b[i] != b'>'
+            && b[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &tag[ns..i];
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut val = "";
+        if i < b.len() && b[i] == b'=' {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+                let q = b[i];
+                i += 1;
+                let vs = i;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                val = &tag[vs..i];
+                if i < b.len() {
+                    i += 1;
+                }
+            } else {
+                let vs = i;
+                while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                    i += 1;
+                }
+                val = &tag[vs..i];
+            }
+        }
+        if !name.is_empty() {
+            out.push((name.to_string(), val.to_string()));
+        }
+    }
+    out
+}
+
+/// Element name of one open tag (`<textPath …>` → `textPath`).
+fn tag_name(tag: &str) -> &str {
+    let s = tag.trim_start_matches('<');
+    let end = s
+        .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// The SVG element's HTML ancestors, outermost first: `(tag, attributes)`.
+/// The page cascade sees these when a rule like `.mandala svg>text` names
+/// something outside the SVG markup.
+fn svg_outer_chain(dom: &crate::html::Dom, node: u32) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    let mut cur = dom.nodes[node as usize].parent;
+    while cur != 0 {
+        if let crate::html::NodeKind::Element(_, attrs) = &dom.nodes[cur as usize].kind {
+            out.push((dom.tag(cur).to_string(), attrs.to_vec()));
+        }
+        let next = dom.nodes[cur as usize].parent;
+        if next == cur {
+            break; // document root points at itself
+        }
+        cur = next;
+    }
+    out.reverse();
+    out
+}
+
+/// Walk the reassembled SVG markup and merge the page cascade's paint/font
+/// declarations into every open tag. The SVG's inner elements are raw text
+/// (not DOM nodes), so the selector chain is rebuilt here: the HTML ancestors
+/// of the `<svg>` root, then the open elements inside the markup. Slice-copy
+/// (never re-parse the tree) so the raw markup — including any unbalanced `<`
+/// in text — stays byte-identical except for the injected styles.
+fn inject_svg_paint(
+    markup: &str,
+    sheet: &crate::css::Sheet,
+    dark: bool,
+    outer: &[(String, Vec<(String, String)>)],
+) -> String {
+    // candidate prefilter: a rule whose subject tag the markup doesn't
+    // contain can never match (a big stylesheet would otherwise be scanned
+    // for every tag)
+    let mut tags: Vec<String> = Vec::new();
     let mut rest = markup;
+    while let Some(lt) = rest.find('<') {
+        let after_lt = &rest[lt..];
+        let Some(gt) = after_lt.find('>') else { break };
+        let tag = &after_lt[..=gt];
+        if !tag.starts_with("</") && !tag.starts_with("<!") && !tag.starts_with("<?") {
+            let name = tag_name(tag);
+            if !name.is_empty() && !tags.iter().any(|t| t.eq_ignore_ascii_case(name)) {
+                tags.push(name.to_string());
+            }
+        }
+        rest = &after_lt[gt + 1..];
+    }
+    let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+    let cands = sheet.svg_candidates(&tag_refs);
+
+    let mut out = String::with_capacity(markup.len() + 64);
+    let mut rest = markup;
+    // open elements inside the SVG: (tag, attributes), root first
+    let mut stack: Vec<(String, Vec<(String, String)>)> = Vec::new();
     while let Some(lt) = rest.find('<') {
         out.push_str(&rest[..lt]);
         let after_lt = &rest[lt..];
@@ -4512,16 +4627,25 @@ fn inject_svg_class_paint(markup: &str, sheet: &crate::css::Sheet, dark: bool) -
             return out;
         };
         let tag = &after_lt[..=gt];
-        // only open tags (not `</close>` or `<!--`) with a class attribute
         let is_open = !tag.starts_with("</") && !tag.starts_with("<!") && !tag.starts_with("<?");
         if is_open {
-            if let Some(classes) = attr_value(tag, "class") {
-                let rewritten = inject_tag_paint(tag, classes, sheet, dark);
-                out.push_str(&rewritten);
-            } else {
-                out.push_str(tag);
+            let attrs = tag_attrs(tag);
+            let name = tag_name(tag);
+            let vals = {
+                let mut chain: Vec<crate::css::SvgElem> = Vec::with_capacity(outer.len() + stack.len());
+                chain.extend(outer.iter().map(|(t, a)| crate::css::SvgElem { tag: t, attrs: a }));
+                chain.extend(stack.iter().map(|(t, a)| crate::css::SvgElem { tag: t, attrs: a }));
+                let subject = crate::css::SvgElem { tag: name, attrs: &attrs };
+                sheet.svg_decls(&cands, &chain, &subject, &SVG_PROPS, dark)
+            };
+            out.push_str(&inject_tag_paint(tag, &vals));
+            if !tag[..tag.len() - 1].ends_with('/') {
+                stack.push((name.to_string(), attrs));
             }
         } else {
+            if tag.starts_with("</") {
+                stack.pop();
+            }
             out.push_str(tag);
         }
         rest = &after_lt[gt + 1..];
@@ -9315,7 +9439,7 @@ mod tests {
 
     #[test]
     fn svg_without_matching_class_rule_is_unchanged() {
-        // no single-class fill rule → markup passes through byte-identical
+        // no matching rule → markup passes through byte-identical
         // (the common case; nextjs/rust-lang hero SVGs stay untouched)
         let dom = crate::html::parse(
             r#"<body><svg viewBox="0 0 10 10"><path class="other" d="M0 0h10"/></svg></body>"#,
@@ -9339,16 +9463,58 @@ mod tests {
         let sheet = crate::css::parse(
             r#".a { fill: #111111 } .b { fill: #222222; stroke: #333333 }"#,
         );
+        let cands = sheet.svg_candidates(&["path"]);
+        let vals = |classes: &str| {
+            let attrs = vec![("class".to_string(), classes.to_string())];
+            let el = crate::css::SvgElem { tag: "path", attrs: &attrs };
+            sheet.svg_decls(&cands, &[], &el, &SVG_PROPS, false)
+        };
         // merges into an existing style="…" (semicolon-joined)
-        let out = inject_tag_paint("<path class=\"a\" style=\"opacity:.5\" d=\"x\"/>", "a", &sheet, false);
+        let out = inject_tag_paint("<path class=\"a\" style=\"opacity:.5\" d=\"x\"/>", &vals("a"));
         assert!(out.contains("opacity:.5;fill:#111111"), "merged: {out:?}");
         // a tag already declaring fill keeps its own value (no override)
-        let out = inject_tag_paint("<path class=\"a\" fill=\"#ff0000\" d=\"x\"/>", "a", &sheet, false);
+        let out = inject_tag_paint("<path class=\"a\" fill=\"#ff0000\" d=\"x\"/>", &vals("a"));
         assert!(!out.contains("fill:#111111"), "declared fill wins: {out:?}");
         // adds a style attribute when none exists, before the self-closing /
-        let out = inject_tag_paint("<path class=\"b\" d=\"x\"/>", "b", &sheet, false);
+        let out = inject_tag_paint("<path class=\"b\" d=\"x\"/>", &vals("b"));
         assert!(out.contains("style=\""), "style added: {out:?}");
         assert!(out.contains("fill:#222222") && out.contains("stroke:#333333"), "both props: {out:?}");
+    }
+
+    #[test]
+    fn svg_page_css_reaches_inner_tags_through_the_ancestor_chain() {
+        // page CSS targeting SVG internals: `.mandala` is an HTML ancestor of
+        // the <svg>, `>text` a child compound, `textPath[href=…]` an attribute
+        // selector. The rasterizer has no cascade, so build() must bake both
+        // into the reassembled markup (the MDN mandala case).
+        let markup = r##"<div class="mandala"><svg fill="none" viewBox="0 0 10 10"><text><textPath href="#c1">/</textPath></text></svg></div>"##;
+        let sheet = crate::css::parse(
+            r##".mandala svg>text { fill: #8a8f98 } .mandala textPath[href="#c1"] { font-size: 1.5rem }"##,
+        );
+        let dom = crate::html::parse(&format!("<body>{markup}</body>"));
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        fn find_svg(n: &BoxNode) -> Option<&ImgSlot> {
+            if n.img.is_some() {
+                return n.img.as_ref();
+            }
+            n.children.iter().find_map(find_svg)
+        }
+        let Some(ImgSlot::Pending(src)) = find_svg(&root) else {
+            panic!("svg should produce a pending img slot");
+        };
+        assert!(src.contains("fill:#8a8f98"), "descendant/child fill: {src:?}");
+        assert!(src.contains("font-size:1.5rem"), "attribute selector font: {src:?}");
+
+        // without the `.mandala` ancestor the descendant rule must not fire
+        let dom = crate::html::parse(
+            r##"<body><div><svg fill="none"><text><textPath href="#c1">/</textPath></text></svg></div></body>"##,
+        );
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let Some(ImgSlot::Pending(src)) = find_svg(&root) else {
+            panic!("svg should produce a pending img slot");
+        };
+        assert!(!src.contains("fill:#8a8f98"), "no .mandala ancestor → no fill: {src:?}");
+        assert!(!src.contains("font-size:1.5rem"), "no .mandala ancestor → no size: {src:?}");
     }
 
     #[test]

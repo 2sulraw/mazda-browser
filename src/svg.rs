@@ -2150,6 +2150,11 @@ impl Style {
             "font-size" => {
                 if let Some(n) = parse_px(v) {
                     self.fs = n.max(0.0)
+                } else if let Some(n) = v.strip_suffix("rem").and_then(|n| n.trim().parse::<f64>().ok()) {
+                    // CSS px root (16): the SVG viewBox scale is applied later
+                    self.fs = (n * 16.0).max(0.0)
+                } else if let Some(n) = v.strip_suffix("em").and_then(|n| n.trim().parse::<f64>().ok()) {
+                    self.fs = (n * self.fs).max(0.0)
                 }
             }
             "text-anchor" => {
