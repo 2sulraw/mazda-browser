@@ -192,6 +192,11 @@ pub enum ObjKind {
     /// / `style_set` (installed by the embedder, so this module stays
     /// DOM-free). Own props still hold the method natives and `__node`.
     Style(u32),
+    /// live ES-module namespace: every read consults the module's export map
+    /// at access time. A snapshot taken while the module is still evaluating
+    /// (an entry chunk that imports itself — rspack/webpack emit exactly
+    /// that) must see the exports its body records later.
+    ModuleNs(Rc<RefCell<std::collections::HashMap<Rc<str>, Val>>>),
     /// live iterator object (`array.values()`, `set.entries()`, a user
     /// `Symbol.iterator` result is a plain object with `next`; this is the
     /// built-in fast path). `next()` reads the CURRENT source by index, so
@@ -643,6 +648,7 @@ impl Val {
                     ObjKind::Promise(_) => "[object Promise]".into(),
                     ObjKind::Generator(_) => "[object Generator]".into(),
                     ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::ModuleNs(_) => "[object Module]".into(),
                     ObjKind::Iterator(_) => "[object Iterator]".into(),
                     ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
                     ObjKind::TypedArray(ta) => typed_join(ta),
@@ -717,6 +723,7 @@ impl Val {
                     ObjKind::Regex(ri) => format!("/{}/{}", ri.re.src, ri.re.flags),
                     ObjKind::Generator(_) => "[object Generator]".into(),
                     ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::ModuleNs(_) => "[object Module]".into(),
                     ObjKind::Iterator(_) => "[object Iterator]".into(),
                     ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
                     ObjKind::TypedArray(ta) => typed_join(ta),
@@ -2250,6 +2257,9 @@ fn deliver_combo(
 /// Own-property read (no prototype walk, no methods).
 pub fn obj_get_own(o: &Rc<RefCell<Obj>>, key: &str) -> Val {
     let b = o.borrow();
+    if let ObjKind::ModuleNs(xs) = &b.kind {
+        return xs.borrow().get(key).cloned().unwrap_or(Val::Undefined);
+    }
     if let ObjKind::Array(items) = &b.kind {
         if let Ok(i) = key.parse::<usize>() {
             return items.get(i).cloned().unwrap_or(Val::Undefined);
@@ -2317,6 +2327,10 @@ pub fn obj_has(o: &Rc<RefCell<Obj>>, key: &str) -> bool {
             Some(c) => c,
         };
         let b = c.borrow();
+        if let ObjKind::ModuleNs(xs) = &b.kind {
+            // a namespace has no prototype; unknown names are absent
+            return xs.borrow().contains_key(key);
+        }
         if let ObjKind::Array(items) = &b.kind {
             if key == "length" {
                 return true;
@@ -2554,7 +2568,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             // objects pick up Object.prototype the same way.
             {
                 let mut b = o.borrow_mut();
-                if b.proto.is_none() {
+                if b.proto.is_none() && !matches!(b.kind, ObjKind::ModuleNs(_)) {
                     if matches!(b.kind, ObjKind::Array(_)) {
                         if let Some(p) = &e.array_proto {
                             b.proto = Some(p.clone());
@@ -2706,6 +2720,11 @@ fn chain_get(
         };
         let (found, next) = {
             let b = c.borrow();
+            if let ObjKind::ModuleNs(xs) = &b.kind {
+                // live namespace: the export map is the object's own storage
+                // (and it has no prototype)
+                return Ok(xs.borrow().get(key).cloned());
+            }
             if let ObjKind::Array(items) = &b.kind {
                 if key == "length" {
                     return Ok(Some(Val::Num(items.len() as f64)));

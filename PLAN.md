@@ -1698,6 +1698,43 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-04 | wave 33 (grid span sizing + intrinsic whitespace) | MDN homepage, same build pair back-to-back (`MAZDA_DUMP_RUNS=2`) | the "Latest news" date moved from x=121 (on top of the source link) to x=398 in a card ending at 463 - right-aligned like the reference; the `max-content` column is the 58px date again instead of the 615px summary, `1fr` takes the rest; card/did-you-know grid re-wraps unchanged otherwise (2542px total both builds, 615 runs); Wikipedia `/wiki/JavaScript` 24365 -> 24454px because intrinsic text widths no longer count source indentation (a paragraph beside the infobox wraps one line earlier); suite **744** default / **748** `engine-b + woff2` |
 | 2026-11-04 | wave 34 (grid row spans) | MDN homepage + Wikipedia `/wiki/JavaScript`, same build pair | a spanning grid item's height now stretches the rows it covers instead of overhanging them: MDN's hero grid grew 288 -> 420px because `div.homepage-header__mandala` (351x420) spans both header rows, so "Featured articles" moves down 132px (page 2542 -> 2675px, 615 runs); Wikipedia unchanged at 24454px (10943 runs) because no grid there has a row span; suite **745** default / **749** `engine-b + woff2` |
 | 2026-11-05 | wave 35 (page CSS inside inline SVG) | MDN homepage + a local page with the real mandala markup and the page's rules | the mandala now paints (5 concentric rings of slashes, was blank): the page's `.mandala svg>text` and `.mandala textPath[href="#circleN"]` rules reach the rasterizer through a mini-cascade over the SVG's ancestor chain, and `font-size: 1.5rem` resolves in svg.rs; page height 2675px, 615 runs and ~100 MB unchanged, Wikipedia unchanged at 24454px; suite **746** default / **750** `engine-b + woff2` |
+| 2026-11-05 | wave 36 (live ES-module namespaces) | MDN homepage + Wikipedia `/wiki/JavaScript` + nextjs.org | MDN's client bundle now runs to completion - the `Cannot read property 'length' of undefined` at `index.08e…js` col 19277 is gone and the page logs no `[js]` errors (page 2675px / 615 runs / 100.5 MB, one layout); Wikipedia unchanged at 24454px / 10943 runs / 101.6 MB; nextjs.org 7032px / 502 runs / 141.4 MB (fresh 256 KB page, unchanged by this wave); suite **748** default / **752** `engine-b + woff2` |
+
+### Wave 36 findings
+
+- **The failing read was in the shared runtime, not the entry chunk.** MDN's
+  `runtime.7038046b4a18dfad.js` defines `m = s => { … for (i = 0; i < r.length; i++) … }`
+  where `r = s.__rspack_esm_ids`. The entry chunk imports the runtime, then at
+  the tail of its own body calls `e.C(r)` — passing **its own namespace** as
+  `r` (rspack/webpack emit exactly that self-import shape). Imports resolve
+  before the body executes, so `r` was a namespace snapshot taken when the
+  entry had exported nothing yet: `r.__rspack_esm_ids` was `undefined` and
+  `.length` threw.
+- **Namespaces are now live views, not copies.** `import * as ns` (and
+  `import()`'s value) builds an `ObjKind::ModuleNs(Exports)` object whose own
+  storage *is* the module's export map. `chain_get`, `obj_get_own`, `obj_has`,
+  `for..in`, `Object.keys/values/entries`, `JSON.stringify`,
+  `Object.prototype.toString` and value printing all consult that map at access
+  time, so a self-importing entry chunk sees the exports its body records
+  later. Namespaces get no `Object.prototype` link (`'toString' in ns` is
+  false), matching the spec's null-prototype namespace exotic.
+- **The error log also named the wrong file.** A throw inside the runtime was
+  attributed to the entry chunk (the module being evaluated) while the
+  `(line, col)` resolved against the runtime's source — which is why the
+  reported column landed inside a CSS string. When the throwing function's
+  source differs from the evaluating module, the log now says
+  `entry.js (throw in runtime.js): …`; the location and the file agree.
+- **Tests.** `self_import_namespace_is_live_during_the_body` reproduces the
+  rspack shape (self-import, read an export recorded after the import line,
+  assert no `Object.prototype` leak) and
+  `error_origin_names_the_defining_module_when_it_differs` pins the two-file
+  log format. Suite 748 default / 752 `engine-b + woff2`.
+- **Limits.** Namespace reads are live but writes still land in `props` (a
+  namespace is read-only in the spec; nothing in the wild assigns to one).
+  Module bindings imported *by name* remain copies taken at link time — only
+  the namespace object tracks later exports — so a cycle that reassigns a
+  named `export let` is still not observed. Dynamic `import()` in a cycle keeps
+  returning the still-empty map rather than waiting for evaluation.
 
 ### Wave 35 findings
 
@@ -2218,7 +2255,9 @@ curve matters more than the baseline (near-flat as tabs grow).
   **no script errors at all**.
 - **Known gaps after wave 22**: MDN's client bundle still throws `Cannot read
   property 'length' of undefined` (reported column lands inside a CSS string, so
-  the position mapping, not the read, is suspect); SVG `<text>`/`textPath` are
+  the position mapping, not the read, is suspect — **fixed in wave 36**: the
+  read was the rspack runtime's `executeModules.length` over the empty
+  namespace of a self-importing entry chunk, and namespaces are now live); SVG `<text>`/`textPath` are
   not painted (MDN's mandala); Chrome-side geometry shows the Vector 2022 menu
   landmark is 20px wide while its 44px button overflows it — ours reserves 44,
   so the logo sits 24px further right; no clip/mask/filter/pattern/`use`; no real
@@ -2270,7 +2309,9 @@ curve matters more than the baseline (near-flat as tabs grow).
   reference layout (505px copy in an 872px header; reference 533/877) and put
   the featured-article cards in two columns.
 - **Known gaps after wave 21**: MDN's client bundle still throws `Cannot read
-  property 'length' of undefined` (index.js col 19277); Wikipedia still throws
+  property 'length' of undefined` (index.js col 19277 — **fixed in wave 36**:
+  the throw was `executeModules.length` in the rspack runtime, reading the
+  empty namespace of a self-importing entry chunk); Wikipedia still throws
   inline `match` of undefined + `load.php` `undefined is not a function`; Next.js
   client routing stops on `parsePath` of undefined (caught, logged bare); SVG
   `<text>`/`textPath` are not painted (MDN's mandala); the Vector 2022 header

@@ -804,6 +804,26 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                 ObjKind::Regex(_) | ObjKind::Generator(_) | ObjKind::Style(_) => {
                     out.push_str("{}");
                 }
+                // a namespace serializes as an object of its exports
+                ObjKind::ModuleNs(xs) => {
+                    out.push('{');
+                    let entries: Vec<(Rc<str>, Val)> = xs
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (i, (k, v)) in entries.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        json_str(k, out);
+                        out.push(':');
+                        if !json_write(e, v, depth + 1, out)? {
+                            out.push_str("null");
+                        }
+                    }
+                    out.push('}');
+                }
                 ObjKind::Iterator(_) | ObjKind::ArrayBuffer(_) => {
                     out.push_str("{}");
                 }
@@ -1182,6 +1202,11 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                         ObjKind::Array(items) => (0..items.len())
                             .map(|i| (Rc::from(i.to_string().as_str()), items[i].clone()))
                             .collect(),
+                        ObjKind::ModuleNs(xs) => xs
+                            .borrow()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                         _ => b.props.clone(),
                     }
                 }
@@ -1420,6 +1445,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
                 ObjKind::Regex(_) => "[object RegExp]",
                 ObjKind::Generator(_) => "[object Generator]",
                 ObjKind::Style(_) => "[object CSSStyleDeclaration]",
+                ObjKind::ModuleNs(_) => "[object Module]",
                 ObjKind::Iterator(_) => "[object Iterator]",
                 ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]",
                 ObjKind::TypedArray(ta) => match ta.kind {

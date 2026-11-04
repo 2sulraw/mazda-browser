@@ -802,6 +802,7 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
                 ObjKind::Array(items) => (0..items.len())
                     .map(|i| Rc::from(i.to_string()))
                     .collect(),
+                ObjKind::ModuleNs(xs) => xs.borrow().keys().cloned().collect(),
                 _ => b.props.iter().map(|(k, _)| k.clone()).collect(),
             }
         }

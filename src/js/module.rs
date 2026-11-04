@@ -138,7 +138,19 @@ impl ModuleLoader {
         // A runtime throw carries its own `(line, col)` from `finish_error`;
         // the module URL is all this frame adds.
         let named = |e: &mut JsEngine, err: JsError| -> String {
-            format!("{url}: {}", e.finish_error(err, src))
+            // the `(line, col)` suffix resolves against the source of the
+            // function that threw, which for a bundle chunk is NOT this
+            // module — name that origin too when it differs
+            let origin = if matches!(err, JsError::Throw(_)) {
+                e.module_url_for(e.throw_src)
+            } else {
+                None
+            };
+            let located = e.finish_error(err, src);
+            match origin {
+                Some(o) if o.as_ref() != url => format!("{url} (throw in {o}): {located}"),
+                _ => format!("{url}: {located}"),
+            }
         };
 
         // 1) resolve every import first (document order, depth first)
@@ -257,19 +269,16 @@ impl ModuleLoader {
 }
 
 /// The object handed to `import * as ns` (and to `import()`'s `.then`).
+/// Live: the object reads the module's export map at access time, so a
+/// namespace imported during a cycle sees exports the body records later
+/// (an entry chunk importing itself calls the runtime with its own
+/// namespace — rspack/webpack emit that shape).
 pub(crate) fn namespace_value(xs: &Exports) -> Val {
-    let o = Val::new_object();
-    if let Val::Obj(obj) = &o {
-        let entries: Vec<(Rc<str>, Val)> = xs
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in entries {
-            super::obj_set_own(obj, &k, v);
-        }
-    }
-    o
+    Val::Obj(Rc::new(RefCell::new(super::Obj {
+        kind: super::ObjKind::ModuleNs(xs.clone()),
+        props: Vec::new(),
+        proto: None,
+    })))
 }
 
 /// Absolute specifiers are used as-is; everything else joins the importing
@@ -522,6 +531,58 @@ mod tests {
         let f = get(&xs, "where");
         let v = e.call_function(&f, Val::Undefined, &[]).expect("call");
         assert_eq!(v.to_string(), "https://mazda.test/dir/main.js");
+    }
+
+    #[test]
+    fn self_import_namespace_is_live_during_the_body() {
+        // rspack/webpack entry chunks import THEMSELVES and hand that
+        // namespace to the runtime at the tail of the body (MDN's client
+        // bundle). Imports resolve before the body runs, so a snapshot taken
+        // then would be empty; the namespace must read the export map live.
+        let mut e = JsEngine::new();
+        let mut l = ModuleLoader::new();
+        let xs = l
+            .load_source(
+                &mut e,
+                "https://mazda.test/entry.js",
+                "export const ids = [8410];
+                 import * as self_ns from './entry.js';
+                 globalThis.seen = self_ns.ids.length;
+                 globalThis.has_toString = 'toString' in self_ns;
+                 export const ok = self_ns.ids[0] === 8410;",
+            )
+            .expect("module runs");
+        assert_eq!(e.get_global("seen").to_string(), "1");
+        assert!(matches!(get(&xs, "ok"), Val::Bool(true)));
+        // a namespace has no prototype chain (no Object.prototype leak)
+        assert!(matches!(e.get_global("has_toString"), Val::Bool(false)));
+    }
+
+    #[test]
+    fn error_origin_names_the_defining_module_when_it_differs() {
+        // a bundle chunk's function can throw while the ENTRY module is
+        // evaluating; the log must name both, or the reported line/col looks
+        // like it belongs to the wrong file
+        let mut e = JsEngine::new();
+        let mut l = ModuleLoader::new();
+        l.load_source(
+            &mut e,
+            "https://mazda.test/dep.js",
+            "export function boom(x) { return x.length; }",
+        )
+        .expect("dep runs");
+        let err = l
+            .load_source(
+                &mut e,
+                "https://mazda.test/main.js",
+                "import { boom } from './dep.js'; boom(undefined);",
+            )
+            .expect_err("main throws");
+        assert!(
+            err.contains("throw in https://mazda.test/dep.js"),
+            "origin named: {err}"
+        );
+        assert!(err.contains("line 1"), "location from dep: {err}");
     }
 
     #[test]
