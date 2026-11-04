@@ -794,10 +794,10 @@ curve matters more than the baseline (near-flat as tabs grow).
   cells spans them) and `grid-area: <name>` now place an item into its cell
   rect; a name with no matching cell falls back to auto placement, and a grid
   with no explicit columns gets one content-sized `auto` track per area
-  column. Row-spanning items paint from their start row but do not stretch the
-  rows they cover (shortcut: no span-aware row distribution — a tall spanning
-  sidebar can overhang its last row); numeric/`span` `grid-area` forms and
-  named *lines* beyond `grid-column: <name>` are still not modeled.
+  column. Row-spanning items paint from their start row and their height is
+  guaranteed by growing the last covered row (wave 34; before that a tall
+  spanning sidebar could overhang its last row); numeric/`span` `grid-area`
+  forms and named *lines* beyond `grid-column: <name>` are still not modeled.
   Tests: default **536**, `engine-b + woff2` **540**. Live: wiki Rust article
   **105.0 MB** (14973 runs, 315 images); MDN `/Web/CSS/list-style-type`
   **88.8 MB** (4687 runs) — the sidebar + article + "In this article" TOC now
@@ -1695,6 +1695,47 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 31 (form submission fidelity) | local `form31.html` probe (scripted `form.submit()`, no input synthesized) | `[js] form.submit() -> GET https://example.com/s?q=hi&lang=fr&region=Europe+wide` - the disabled input and the disabled `<fieldset>`'s control are gone, both `<select>`s submit (`selected` option value, label text with collapsed whitespace), suite **740** default / **744** `engine-b + woff2` |
 | 2026-11-03 | wave 32 (label activation + implicit submission) | local `form31.html` probe with a label + checked box | `[js] form.submit() -> GET ...?agree=1&q=hi&lang=fr&region=Europe+wide` (still no submitter pair for a scripted submit - regression-free); label->control resolution covered by an in-crate test over `collect_elements`; suite **741** default / **745** `engine-b + woff2` |
 | 2026-11-04 | wave 33 (grid span sizing + intrinsic whitespace) | MDN homepage, same build pair back-to-back (`MAZDA_DUMP_RUNS=2`) | the "Latest news" date moved from x=121 (on top of the source link) to x=398 in a card ending at 463 - right-aligned like the reference; the `max-content` column is the 58px date again instead of the 615px summary, `1fr` takes the rest; card/did-you-know grid re-wraps unchanged otherwise (2542px total both builds, 615 runs); Wikipedia `/wiki/JavaScript` 24365 -> 24454px because intrinsic text widths no longer count source indentation (a paragraph beside the infobox wraps one line earlier); suite **744** default / **748** `engine-b + woff2` |
+| 2026-11-04 | wave 34 (grid row spans) | MDN homepage + Wikipedia `/wiki/JavaScript`, same build pair | a spanning grid item's height now stretches the rows it covers instead of overhanging them: MDN's hero grid grew 338 -> 420px because `div.homepage-header__mandala` (351x420) spans both header rows, so "Featured articles" moves down 132px (page 2542 -> 2675px, 615 runs); Wikipedia unchanged at 24454px (10943 runs) because no grid there has a row span; suite **745** default / **749** `engine-b + woff2` |
+
+### Wave 34 findings
+
+- **A row-spanning item sizes its rows, not just its own box.** `grid()`
+  painted a spanning item from its start row and let the rows it covered size
+  themselves from single-row content only, so a tall span (MDN's hero
+  `div.homepage-header__mandala`, 351x420, `grid-area: mandala`, spanning the
+  copy/search rows) overhung the grid and everything after it moved up under
+  the overflowing box. The fix records the item's margin-box height
+  (`span_h`) while it is laid out in its **start** row — its height does not
+  depend on where it sits vertically, so there is no second layout pass — and
+  when the loop reaches the row where the span ends, compares that height with
+  the rows already committed (`row_hs[r0..r] + row_h + gaps`) and adds the
+  shortfall to the **last covered row** (`shortcut:` CSS distributes the
+  extra equally across the covered rows; growing the already-painted ones
+  would need a second pass, so the last row takes it all — the span's bottom
+  edge is exact, intermediate row boundaries can differ). Spans ending on the
+  same row are handled narrowest-first, so a 3-row span sees the row heights
+  a 2-row span just produced. `grid_row_span_stretches_its_last_row` pins all
+  of it: 2 rows (30px + 10px gap + 40px) plus a 120px span → row 1 still
+  starts at 40px, the grid is 120px tall, and the span's bottom edge equals
+  the grid's.
+- **Live effect.** MDN's hero grows 288 → 420px (the mandala's height, which
+  used to overflow into the "Featured articles" heading), "Featured articles"
+  moves from y=368 to y=500 and the page from 2542 to 2675px — 615 runs and
+  RAM unchanged (~99 MB). Wikipedia `/wiki/JavaScript` is byte-identical at
+  24454px / 10943 runs: none of its grids has a multi-row item.
+- **Relayout-storm check (not reproduced).** One wave-34 run showed 8 layouts /
+  25 job generations with `skipped N superseded relayout(s)` in bursts. It
+  did not reproduce: four later runs (three of the wave-34 binary, one of the
+  wave-33 build), launched the same way with the pointer untouched, each did
+  exactly one layout (`applied #1`) with no superseded relayouts. An
+  instrumented debug build logged zero `[hover]` dispatches in the clean
+  runs. The hover branch is the only relayout source that can fire repeatedly
+  without a load or a resize (it is gated on pointer motion), so the bursts
+  are consistent with the pointer being moved across the page while the 3s
+  layouts were in flight — each new hit node queues a job and the worker
+  coalesces the queue. Load time is not a wave-34 cost either: MDN worker
+  finishes were 3.0–4.1s for both builds that evening (an earlier 1.8s
+  sample was a warm outlier), and `span_h` adds one f32 per grid item.
 
 ### Wave 33 findings
 

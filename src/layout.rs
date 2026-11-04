@@ -5776,8 +5776,10 @@ fn flex_col(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
 }
 
 /// Grid: cells over resolved tracks; row height = tallest cell, row-gap
-/// between rows. Items with `grid-column: <name>` place into the
-/// [name-start]…[name-end] column span (stacking in successive rows);
+/// between rows. A row-spanning item's height is guaranteed by growing the
+/// LAST row it covers (its height is recorded while it is laid out in its
+/// start row, so no second pass). Items with `grid-column: <name>` place into
+/// the [name-start]…[name-end] column span (stacking in successive rows);
 /// auto items flow row-major. shortcut: named and auto items can share a
 /// row index (overlap) — real grids resolve full placement sparsely.
 fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<PositionedRun>, uls: &mut Vec<UR>) {
@@ -5928,6 +5930,11 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         (x, w)
     };
     let nrows = spots.iter().map(|s| s.1).max().unwrap_or(1);
+    // height of each row-spanning item, recorded when it is laid out in its
+    // START row; the row it ends in then absorbs the shortfall (see below).
+    // No extra pass: a spanning item's height does not depend on where it
+    // sits vertically.
+    let mut span_h: Vec<f32> = vec![0.0; items.len()];
     // percent row tracks need a definite grid height; a declared px height is
     // a border-box height by default (subtract the vertical padding+border
     // that place() adds back), content-box under `box-sizing: content-box`
@@ -5935,6 +5942,7 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         Some(Len::Px(h)) => as_content_h(h, n.bx.content_box, vertical_extra(&n.bx, n.w)),
         _ => 0.0,
     };
+    let mut row_hs: Vec<f32> = vec![0.0; nrows];
     let mut y = n.y;
     let mut last_open = false;
     for r in 0..nrows {
@@ -5969,18 +5977,35 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             };
             marks.push((rs, us, ih));
             cell_ios.push(io);
-            // a row-spanning item paints from its start row; it does not
-            // stretch the rows it covers (they're sized by single-row items),
-            // so a tall spanning sidebar can overhang its last row. shortcut:
-            // no span-aware row distribution.
             if r_end == r + 1 {
                 row_h = row_h.max(ih);
+            } else {
+                span_h[idx] = ih; // remember it for the row it ends in
             }
         }
         // a declared row track is a height floor (the tallest cell still wins)
         if let Some(t) = n.bx.rows.get(r) {
             row_h = row_h.max(row_track_floor(t, row_avail_h));
         }
+        // Row-spanning items laid out above (in their start row): whatever the
+        // covered rows already hold from single-row content, the shortfall
+        // goes into the LAST covered row - equal CSS distribution would have
+        // to grow rows that are already painted. Narrowest spans first, so a
+        // 3-row item sees the result of the 2-row items that end here too.
+        let mut ending: Vec<usize> = (0..items.len())
+            .filter(|&i| spots[i].1 == r + 1 && spots[i].1 > spots[i].0 + 1)
+            .collect();
+        ending.sort_by_key(|&i| spots[i].1 - spots[i].0);
+        for i in ending {
+            let r0 = spots[i].0;
+            let have = row_hs[r0..r].iter().sum::<f32>()
+                + row_h
+                + n.bx.gap_row * (r - r0) as f32;
+            if span_h[i] > have {
+                row_h += span_h[i] - have;
+            }
+        }
+        row_hs[r] = row_h;
         // cross-axis align within the row (ranges are safe: the next row
         // hasn't been laid yet)
         for (ci, &(rs, us, h)) in marks.iter().enumerate() {
@@ -7895,6 +7920,53 @@ mod tests {
         assert!(p.children.iter().all(|c| c.is_text));
         let text: String = p.children.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(text, "abcde");
+    }
+
+    #[test]
+    fn grid_row_span_stretches_its_last_row() {
+        let boxed = |area: &str, h: f32| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    min_height: Some(Len::Px(h)),
+                    grid_area: Some(area.to_string()),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf("x")];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Px(50.0), Track::Px(60.0)],
+                areas: vec![
+                    vec![Some("side".into()), Some("top".into())],
+                    vec![Some("side".into()), Some("bottom".into())],
+                ],
+                gap_row: 10.0,
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![
+            boxed("top", 30.0),
+            boxed("bottom", 40.0),
+            boxed("side", 120.0),
+        ];
+        layout_tree(&mut n, 400.0, &m4);
+        let (top, bottom, side) = (&n.children[0], &n.children[1], &n.children[2]);
+        assert_eq!(top.y, 0.0);
+        assert_eq!(bottom.y, 40.0, "row 1 = the 30px row + the 10px gap");
+        assert_eq!(side.y, 0.0);
+        assert_eq!(side.h, 120.0);
+        assert_eq!(n.h, 120.0, "the grid contains its spanning item");
+        assert_eq!(
+            side.y + side.h,
+            n.h,
+            "the 120px sidebar no longer overhangs the grid"
+        );
     }
 
     #[test]
