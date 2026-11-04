@@ -1694,6 +1694,48 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-03 | wave 30 (tab store) | live restart probe | 2-tab `session` file -> two pills (second active) and the active tab taken from its DOM snapshot (`[dom] restored snapshot ... (no fetch)`); an explicit URL argument starts a fresh one-tab session; 14 s of idle frames left the file's mtime unchanged; suite **737** default / **741** `engine-b + woff2` |
 | 2026-11-03 | wave 31 (form submission fidelity) | local `form31.html` probe (scripted `form.submit()`, no input synthesized) | `[js] form.submit() -> GET https://example.com/s?q=hi&lang=fr&region=Europe+wide` - the disabled input and the disabled `<fieldset>`'s control are gone, both `<select>`s submit (`selected` option value, label text with collapsed whitespace), suite **740** default / **744** `engine-b + woff2` |
 | 2026-11-03 | wave 32 (label activation + implicit submission) | local `form31.html` probe with a label + checked box | `[js] form.submit() -> GET ...?agree=1&q=hi&lang=fr&region=Europe+wide` (still no submitter pair for a scripted submit - regression-free); label->control resolution covered by an in-crate test over `collect_elements`; suite **741** default / **745** `engine-b + woff2` |
+| 2026-11-04 | wave 33 (grid span sizing + intrinsic whitespace) | MDN homepage, same build pair back-to-back (`MAZDA_DUMP_RUNS=2`) | the "Latest news" date moved from x=121 (on top of the source link) to x=398 in a card ending at 463 - right-aligned like the reference; the `max-content` column is the 58px date again instead of the 615px summary, `1fr` takes the rest; card/did-you-know grid re-wraps unchanged otherwise (2542px total both builds, 615 runs); Wikipedia `/wiki/JavaScript` 24365 -> 24454px because intrinsic text widths no longer count source indentation (a paragraph beside the infobox wraps one line earlier); suite **744** default / **748** `engine-b + woff2` |
+
+### Wave 33 findings
+
+- **A spanning item contributes its shortfall, not its width.** `grid()`
+  measured every item and `max()`ed its min/max-content into every column it
+  covered, so an item spanning `1fr max-content` sized BOTH columns from its
+  own one-line width: MDN's news summary (615px) turned the `max-content` date
+  column into 615px and left the `1fr` column 0px, painting the date on top of
+  the source link. The new `span_contribution` (called per column measurement,
+  single-column items first, then spans narrowest-first) computes the shortfall
+  over the covered columns plus the gutters between them and hands it out by
+  the CSS rule: a span crossing a flexible track feeds only those flexible
+  tracks (the intrinsic ones are subtracted from the contribution first, since
+  CSS sizes flexible spans after the intrinsic tracks); otherwise the covered
+  intrinsic tracks share it equally; if none is intrinsic, every covered
+  column does. Verified by `span_contribution_splits_the_shortfall` and the
+  end-to-end `grid_span_does_not_widen_intrinsic_columns` (the card shape with
+  a 100-char summary word: date column 16px, `1fr` 584px, summary spans 600px).
+- **Intrinsic widths were measuring the HTML source, not the text.** The second
+  half of the same card bug: even with spans fixed, the `max-content` column
+  stayed 251px wide for a 58px date. A text leaf keeps the newlines and
+  indentation written between tags, and `natural_w_inner` measured that raw
+  string (`"\n                5 months ago\n              "`). `collapsed_w`
+  now folds collapsible whitespace exactly like line layout (a run = one space,
+  edges disappear, whitespace-only leaves stay one separator so inline
+  siblings keep their space - `Ws::preserve()` leaves are measured raw).
+  `intrinsic_width_collapses_formatting_whitespace` guards it. Live effect:
+  the date lands at x=398 instead of 121.
+- **Cost/limits.** No extra allocation in the layout hot path (`collapsed_w`
+  sums word and single-space measurements), no new wire fields, no new state.
+  The MDN dump is byte-identical except the news rows (2542px, 615 runs); RAM
+  is unchanged within run noise (89.1 vs 100.9 MB across builds is frame/GPU
+  noise, the layout delta itself allocates nothing). Wikipedia's page grows
+  89px because a couple of shrink-to-fit boxes are now their true content
+  width rather than content + source indentation; that is the correct
+  direction, and the capture's section heights stay within one wrapped line
+  per box. Known remaining gap in this area: shares are equal rather than
+  water-filled up to each track's growth limit, a span over several flexible
+  tracks splits by flex factor, and grid `justify-content` is still a no-op
+  (the MDN card's `space-between` lands right only because its `1fr` column
+  absorbs the slack).
 
 ### Wave 32 findings
 
@@ -1848,17 +1890,18 @@ curve matters more than the baseline (near-flat as tabs grow).
   `1<<24` element cap still applies. Guards:
   `bigint_pow_does_not_spin_on_huge_exponents`,
   `typed_array_length_ctor_zero_fills_without_a_value_vector`.
-- **Known gap, visible on the reference capture**: MDN's "Latest news" date now
-  paints (`<time>` only appeared once this wave's DOM/date path worked), and it
-  lands on top of the source link. The template and `grid-area` both parse —
-  a standalone repro with MDN's rule set places the card correctly — so this is
-  a grid *track sizing* bug, not a missing feature: a multi-column-spanning item
-  (the summary `<p>`) contributes its full max-content width to every column it
-  covers (`grid()`'s documented span shortcut), so the `max-content` column
-  inflates to the paragraph's one-line width and the `1fr` column collapses.
-  Fixing it is a track-distribution change (divide a spanning item's
-  contribution across its tracks, then fit to the container), outside these six
-  waves; recorded here so the capture difference is not mistaken for a JS bug.
+- **Fixed in wave 33**: MDN's "Latest news" date used to paint on top of the
+  source link - a grid track-sizing bug, not a missing feature. A multi-column
+  span contributed its full width to every covered column, so the summary
+  `<p>`'s one-line max-content width inflated the `max-content` date column and
+  collapsed the `1fr` column. `span_contribution` now adds only the shortfall
+  over the covered columns, narrowest span first, and a span that crosses a
+  flexible track feeds only that track (CSS sizes such items after the
+  intrinsic ones). A second, smaller inflater shared the blame: intrinsic text
+  measurement folded the page's source indentation into the leaf width (the
+  date leaf `"\n   5 months ago\n  "` measured 251 px for a 58 px string);
+  `collapsed_w` folds it like line layout does. On the live homepage the date
+  now starts at x=398 (card ends at 463) instead of x=121 over the source.
 - **Wave numbering note**: waves 27 (SVG paint pass) and 28 (TLS/media) landed
   first; this JS wave is 29.
 

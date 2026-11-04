@@ -4099,6 +4099,32 @@ fn as_content_h(h: f32, content_box: bool, v_extra: f32) -> f32 {
     }
 }
 
+/// Max-content width of a text leaf whose whitespace collapses: each run of
+/// whitespace (the newlines and indentation written between tags included)
+/// counts as one space, and leading/trailing whitespace disappears - the
+/// folding line layout applies. Measuring the raw leaf folded the page's
+/// source formatting into intrinsic widths: the "Latest news" date leaf
+/// (`"\n   5 months ago\n  "`) measured 251px for a 58px string and widened
+/// the card's `max-content` column.
+fn collapsed_w(text: &str, style: &Style, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
+    let space = || measure(" ", style) + spacing_extra(" ", style);
+    let mut w = 0.0f32;
+    let mut word = false;
+    for tok in text.split_whitespace() {
+        if word {
+            w += space();
+        }
+        w += measure(tok, style) + spacing_extra(tok, style);
+        word = true;
+    }
+    if !word {
+        // a whitespace-only leaf BETWEEN inline boxes is a real word
+        // separator (see `formatting_whitespace_between_boxes_is_not_content`)
+        return space();
+    }
+    w
+}
+
 /// max-content (unwrapped) width of a node, including horizontal padding.
 fn natural_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> f32 {
     let content = natural_w_inner(n, avail, measure);
@@ -4128,10 +4154,12 @@ fn natural_w_inner(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f3
     if n.is_text {
         return if n.hard_break {
             0.0
-        } else {
+        } else if n.style.ws.preserve() {
             // + tracking: shrink-to-fit widths count letter/word spacing
             // (same spacing_extra rule as line layout and draw_text)
             measure(&n.text, &n.style) + spacing_extra(&n.text, &n.style)
+        } else {
+            collapsed_w(&n.text, &n.style, measure)
         };
     }
     if let Some(l) = n.bx.width {
@@ -4630,6 +4658,85 @@ fn track_intrinsic(t: &Track) -> bool {
     }
 }
 
+/// The `fr` factor of a track (0 for non-flexible ones).
+fn track_flex(t: &Track) -> f32 {
+    match *t {
+        Track::Fr(f) => f,
+        Track::MinMax(_, TrackBreadth::Fr(f)) => f,
+        _ => 0.0,
+    }
+}
+
+/// Add one spanning item's intrinsic width to the columns it covers.
+///
+/// `sizes` is the per-column content measurement (min-content for one call,
+/// max-content for the other) and `want` is the item's own contribution,
+/// gutters between the covered columns included. Only the SHORTFALL over
+/// what the columns already hold is distributed, and only to columns that
+/// can absorb it:
+///
+/// - a span that crosses a flexible track contributes to those flexible
+///   tracks alone (CSS sizes such items after the intrinsic tracks), so a
+///   `1fr max-content` card's long summary cannot widen the `max-content`
+///   column and starve the `1fr` one;
+/// - otherwise the covered tracks with an intrinsic sizing function share
+///   the shortfall, and if none is intrinsic every covered column does.
+///
+/// shortcut: shares are equal (not water-filled up to each track's growth
+/// limit) and a bare `fr` track keeps its automatic minimum of 0.
+fn span_contribution(
+    sizes: &mut [f32],
+    tracks: &[Track],
+    c0: usize,
+    c1: usize,
+    gap: f32,
+    want: f32,
+) {
+    let c1 = c1.min(sizes.len());
+    if c1 <= c0 {
+        return;
+    }
+    let gutters = gap * (c1 - c0 - 1) as f32;
+    let flex: Vec<usize> = (c0..c1)
+        .filter(|&c| tracks.get(c).is_some_and(|t| track_flex(t) > 0.0))
+        .collect();
+    let recipients: Vec<usize> = if !flex.is_empty() {
+        // the flexible tracks take what the non-flexible ones leave over
+        let fixed: f32 = (c0..c1)
+            .filter(|c| !flex.contains(c))
+            .map(|c| sizes[c])
+            .sum();
+        let extra = want - fixed - gutters;
+        if extra <= 0.0 {
+            return;
+        }
+        let fsum: f32 = flex.iter().map(|&c| track_flex(&tracks[c])).sum();
+        for &c in &flex {
+            let share = extra * track_flex(&tracks[c]) / fsum;
+            sizes[c] = sizes[c].max(share);
+        }
+        return;
+    } else {
+        let intrinsic: Vec<usize> = (c0..c1)
+            .filter(|&c| tracks.get(c).is_some_and(track_intrinsic))
+            .collect();
+        if intrinsic.is_empty() {
+            (c0..c1).collect()
+        } else {
+            intrinsic
+        }
+    };
+    let held: f32 = (c0..c1).map(|c| sizes[c]).sum::<f32>() + gutters;
+    let extra = want - held;
+    if extra <= 0.0 {
+        return;
+    }
+    let share = extra / recipients.len() as f32;
+    for c in recipients {
+        sizes[c] += share;
+    }
+}
+
 /// Minimum height of a `grid-template-rows` track. A definite length (or the
 /// definite side of `minmax`) is a floor; intrinsic tracks let the tallest
 /// cell decide.
@@ -4669,8 +4776,9 @@ fn row_track_floor(t: &Track, avail_h: f32) -> f32 {
 /// shortcut: leftover space after all tracks reach their maximum is not
 /// distributed back to non-flex tracks (no `justify-content` stretch); when
 /// several non-flex tracks compete for too little space their growth is
-/// granted left-to-right rather than in equal shares; and spanning items
-/// contribute their full width to every covered column.
+/// granted left-to-right rather than in equal shares; and a spanning item's
+/// contribution is spread by [`span_contribution`] (shortfall only, over the
+/// columns that can absorb it) rather than into every covered column.
 fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f32]) -> Vec<f32> {
     let n = cols.len();
     if n == 0 {
@@ -5778,19 +5886,31 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     };
     // Per-column measured widths for `auto`/`min-content`/`max-content`/
     // `minmax(…)`: min-content = widest unbreakable word, max-content = the
-    // item on one line, both outer (padding/border/margins). shortcut: a
-    // multi-column span contributes its full width to every covered column.
+    // item on one line, both outer (padding/border/margins). Single-column
+    // items contribute straight to their column; spanning items are settled
+    // narrowest-span-first and only contribute their shortfall over the
+    // covered columns (see [`span_contribution`]), so a card whose summary
+    // spans `1fr max-content` cannot widen the `max-content` date column.
     let (col_min, col_max): (Vec<f32>, Vec<f32>) = if tracks.iter().any(track_intrinsic) {
         let mut lo = vec![0.0f32; nc];
         let mut hi = vec![0.0f32; nc];
+        let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
         for (i, it) in items.iter().enumerate() {
             let (_, _, c0, c1) = spots[i];
+            let (c0, c1) = (c0.min(nc), c1.min(nc));
             let wmin = item_min_content(n, it, n.w, measure);
             let wmax = item_max_content(n, it, n.w, measure);
-            for col in c0..c1.min(nc) {
-                lo[col] = lo[col].max(wmin);
-                hi[col] = hi[col].max(wmax);
+            if c1 - c0 <= 1 {
+                lo[c0] = lo[c0].max(wmin);
+                hi[c0] = hi[c0].max(wmax);
+            } else {
+                spans.push((c0, c1, wmin, wmax));
             }
+        }
+        spans.sort_by_key(|&(c0, c1, ..)| c1 - c0);
+        for (c0, c1, wmin, wmax) in spans {
+            span_contribution(&mut lo, &tracks, c0, c1, n.bx.gap_col, wmin);
+            span_contribution(&mut hi, &tracks, c0, c1, n.bx.gap_col, wmax);
         }
         (lo, hi)
     } else {
@@ -7432,6 +7552,93 @@ mod tests {
         assert_eq!(capped.children[0].w, 100.0);
     }
 
+    /// A spanning item adds only the shortfall over the columns it covers,
+    /// and only to the columns that can absorb it: flexible tracks for a span
+    /// that crosses one, otherwise the covered intrinsic ones. Before this,
+    /// the item's full width landed in every covered column.
+    #[test]
+    fn span_contribution_splits_the_shortfall() {
+        // two `auto` columns: the 40px shortfall (70 - 10 - 20) is split
+        // equally, not handed to each column whole
+        let mut sizes = vec![10.0, 20.0];
+        span_contribution(&mut sizes, &[Track::Auto, Track::Auto], 0, 2, 0.0, 70.0);
+        assert_eq!(sizes, vec![30.0, 40.0]);
+        // gutters count toward what the item must fit in
+        let mut sizes = vec![10.0, 20.0];
+        span_contribution(&mut sizes, &[Track::Auto, Track::Auto], 0, 2, 10.0, 70.0);
+        assert_eq!(sizes, vec![25.0, 35.0], "60px of columns + a 10px gutter");
+        // a span crossing a flexible track leaves the intrinsic columns
+        // alone: the 1fr takes the remainder after the max-content date
+        let mut sizes = vec![0.0, 16.0];
+        span_contribution(
+            &mut sizes,
+            &[Track::Fr(1.0), Track::MaxContent],
+            0,
+            2,
+            0.0,
+            400.0,
+        );
+        assert_eq!(sizes, vec![384.0, 16.0]);
+        // nothing to do when the columns already hold enough
+        let mut sizes = vec![300.0, 200.0];
+        span_contribution(&mut sizes, &[Track::Auto, Track::Auto], 0, 2, 0.0, 100.0);
+        assert_eq!(sizes, vec![300.0, 200.0]);
+        // no intrinsic track in the span: every covered column shares
+        let mut sizes = vec![0.0, 0.0];
+        span_contribution(&mut sizes, &[Track::Px(50.0), Track::Px(50.0)], 0, 2, 0.0, 60.0);
+        assert_eq!(sizes, vec![30.0, 30.0]);
+    }
+
+    /// The "Latest news" card shape: `grid-template-columns: 1fr max-content`
+    /// with a title and a summary that both span the two columns. The summary
+    /// is the widest item; if its max-content width lands in the `max-content`
+    /// date column the `1fr` collapses to nothing and the date paints over the
+    /// source link. The spanning items must only feed the flexible column.
+    #[test]
+    fn grid_span_does_not_widen_intrinsic_columns() {
+        let boxed = |area: &str, t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    grid_area: Some(area.to_string()),
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Fr(1.0), Track::MaxContent],
+                areas: vec![
+                    vec![Some("source".into()), Some("date".into())],
+                    vec![Some("title".into()), Some("title".into())],
+                    vec![Some("summary".into()), Some("summary".into())],
+                ],
+                ..BoxStyle::default()
+            },
+        );
+        let long: String = "m".repeat(100); // 400px one-line max-content
+        n.children = vec![
+            boxed("source", "s"),
+            boxed("date", "date"),
+            boxed("title", "TITLE"),
+            boxed("summary", &long),
+        ];
+        layout_tree(&mut n, 600.0, &m4);
+        assert_eq!(n.children[1].w, 16.0, "the date column stays content-sized");
+        assert_eq!(n.children[0].w, 584.0, "the 1fr takes the rest");
+        assert_eq!(n.children[1].x, 584.0);
+        assert!(
+            n.children[1].x >= n.children[0].x + n.children[0].w,
+            "date must not overlap the source"
+        );
+        assert_eq!(n.children[3].w, 600.0, "the summary spans both columns");
+    }
+
     #[test]
     fn grid_auto_measurements_include_padding_border_and_margins() {
         let mut padded = BoxNode::group(
@@ -8263,6 +8470,21 @@ mod tests {
         layout_in(&mut root, 600.0, 100.0, &m4);
         let h = &root.children[0];
         assert!((h.w - 12.0).abs() < 0.01, "inline space kept: w={}", h.w);
+    }
+
+    /// Max-content measurement folds collapsible whitespace the way line
+    /// layout does: the indentation/newlines the HTML source carries between
+    /// tags count as one space (or nothing at the edges), not as their raw
+    /// width. A grid item's `max-content` column used to be sized from the
+    /// leaf's source formatting.
+    #[test]
+    fn intrinsic_width_collapses_formatting_whitespace() {
+        let s = Style::new();
+        assert_eq!(collapsed_w("  aa   bb  ", &s, &m4), 20.0, "aa bb");
+        assert_eq!(collapsed_w("aa\n\tbb", &s, &m4), 20.0, "newline+tab = space");
+        assert_eq!(collapsed_w("\n   ", &s, &m4), 4.0, "one separator space");
+        let (n, _) = grid_case(vec![Track::MaxContent], &["\n   aa\n   "], 400.0, 0.0);
+        assert_eq!(n.children[0].w, 8.0, "track hugs the word, not the markup");
     }
 
     #[test]
