@@ -1637,6 +1637,69 @@ impl JsEngine {
             .map(|(_, v)| v.clone())
     }
 
+    /// Effective [[Prototype]] of `o` without attaching it: the explicit
+    /// `proto` when set, else the shared prototype its kind inherits from
+    /// (`get_member` attaches that one lazily on first access). `None` means
+    /// a genuinely null prototype: module namespaces, and `Object.prototype`
+    /// itself. `Object.getPrototypeOf` and `instanceof` both report this
+    /// chain, so fresh built-ins never look prototype-less (core-js read
+    /// `u.next` off a `null` iterator prototype and threw).
+    pub(crate) fn proto_of(&self, o: &Rc<RefCell<Obj>>) -> Option<Rc<RefCell<Obj>>> {
+        let b = o.borrow();
+        if let Some(p) = &b.proto {
+            return Some(p.clone());
+        }
+        let p = match &b.kind {
+            // the export map IS the namespace object's storage; it has no
+            // prototype to walk
+            ObjKind::ModuleNs(_) => return None,
+            ObjKind::Array(_) => self.array_proto.clone(),
+            ObjKind::Promise(_) => self.promise_proto.clone(),
+            ObjKind::TypedArray(_) => self.typed_proto.clone(),
+            ObjKind::Error { .. } => self.error_proto.clone(),
+            _ => self.object_proto.clone(),
+        };
+        // a prototype object is never its own prototype
+        match p {
+            Some(p) if !Rc::ptr_eq(&p, o) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// `key in o` over the same lazy chain `get_member` walks: a fresh array
+    /// or iterator has not attached its prototype yet, but `length` /
+    /// `Symbol.iterator` must still answer.
+    pub(crate) fn chain_has(&self, o: &Rc<RefCell<Obj>>, key: &str) -> bool {
+        let mut cur = Some(o.clone());
+        for _ in 0..PROTO_WALK_CAP {
+            let c = match cur {
+                None => break,
+                Some(c) => c,
+            };
+            {
+                let b = c.borrow();
+                if let ObjKind::ModuleNs(xs) = &b.kind {
+                    return xs.borrow().contains_key(key);
+                }
+                if let ObjKind::Array(items) = &b.kind {
+                    if key == "length" {
+                        return true;
+                    }
+                    if let Ok(i) = key.parse::<usize>() {
+                        if i < items.len() {
+                            return true;
+                        }
+                    }
+                }
+                if b.props.iter().any(|(k, _)| k.as_ref() == key) {
+                    return true;
+                }
+            }
+            cur = self.proto_of(&c);
+        }
+        false
+    }
+
     pub(crate) fn random_f64(&mut self) -> f64 {
         let mut x = self.rng_state;
         x ^= x << 13;
@@ -2738,7 +2801,7 @@ fn chain_get(
                     .iter()
                     .find(|(k, _)| k.as_ref() == key)
                     .map(|(_, v)| v.clone()),
-                b.proto.clone(),
+                e.proto_of(&c),
             )
         };
         cur = next;
@@ -2834,7 +2897,7 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
                             .iter()
                             .find(|(k, _)| k.as_ref() == key)
                             .map(|(_, x)| x.clone()),
-                        b.proto.clone(),
+                        e.proto_of(&c),
                     )
                 };
                 cur = next;

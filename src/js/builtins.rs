@@ -1352,8 +1352,20 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
         O_GET_PROTO => {
             let target = args.first().cloned().unwrap_or(Val::Undefined);
             Ok(match &target {
-                Val::Obj(o) => o.borrow().proto.clone().map(Val::Obj).unwrap_or(Val::Null),
-                Val::Func(f) => f.proto.borrow().clone().unwrap_or(Val::Null),
+                // report the lazy chain too: a fresh array/iterator has no
+                // explicit `proto` until first member access
+                Val::Obj(o) => e.proto_of(o).map(Val::Obj).unwrap_or(Val::Null),
+                // class `extends` stores a function as the [[Prototype]];
+                // otherwise it is Function.prototype
+                Val::Func(f) => f
+                    .proto
+                    .borrow()
+                    .clone()
+                    .or_else(|| e.function_proto.clone().map(Val::Obj))
+                    .unwrap_or(Val::Null),
+                Val::Native(_) | Val::Method(_) | Val::Acc(_) => {
+                    e.function_proto.clone().map(Val::Obj).unwrap_or(Val::Null)
+                }
                 _ => Val::Null,
             })
         }
@@ -1582,7 +1594,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
             if Rc::ptr_eq(&start, &want) {
                 return Ok(Val::Bool(false));
             }
-            let mut cur = start.borrow().proto.clone();
+            let mut cur = e.proto_of(&start);
             for _ in 0..PROTO_WALK_CAP {
                 let c = match cur {
                     None => break,
@@ -1591,14 +1603,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
                 if Rc::ptr_eq(&c, &want) {
                     return Ok(Val::Bool(true));
                 }
-                cur = c.borrow().proto.clone();
-            }
-            // plain objects attach Object.prototype lazily; a chain that ends
-            // without one still stands for `Object.prototype`
-            if let Some(op) = &e.object_proto {
-                if Rc::ptr_eq(op, &want) {
-                    return Ok(Val::Bool(true));
-                }
+                cur = e.proto_of(&c);
             }
             Ok(Val::Bool(false))
         }

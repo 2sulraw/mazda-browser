@@ -459,6 +459,31 @@ fn functions_as_objects_prototype_pattern() {
 }
 
 #[test]
+fn get_prototype_of_reports_lazy_prototypes() {
+    // every object kind inherits from a shared prototype, but the link is
+    // attached lazily on first member access. `Object.getPrototypeOf` must
+    // report it anyway: core-js's iterator helper reads `.next` off the
+    // result and threw on `null`.
+    assert!(boolean("Object.getPrototypeOf({}) === Object.prototype"));
+    assert!(boolean("Object.getPrototypeOf([]) === Array.prototype"));
+    assert!(boolean("Object.getPrototypeOf(Object.prototype) === null"));
+    assert!(boolean("Object.getPrototypeOf(Array.prototype) === Object.prototype"));
+    assert!(boolean("typeof Object.getPrototypeOf(new Set([1]).values()) === 'object'"));
+    // shortcut: built-in iterators have no own prototype object, so they
+    // report the same lazy default as any other engine object
+    assert!(boolean("Object.getPrototypeOf(new Set([1]).values()) === Object.prototype"));
+    assert!(boolean("Object.getPrototypeOf(function(){}) === Function.prototype"));
+    assert!(boolean("Object.getPrototypeOf(new Error('x')) === Error.prototype"));
+    // instanceof follows the same lazy chain
+    assert!(boolean("({}) instanceof Object"));
+    assert!(boolean("[] instanceof Object"));
+    assert!(boolean("new Set([1]).values() instanceof Object"));
+    assert!(boolean("function A(){} new A() instanceof Object"));
+    // and instances reach Object.prototype through a user prototype object
+    assert!(boolean("function A(){} new A().hasOwnProperty('x') === false"));
+}
+
+#[test]
 fn classes_desugar() {
     let src = "class Point { constructor(x, y) { this.x = x; this.y = y } len() { return this.x + this.y } }
                let p = new Point(2, 3); p.len() + ':' + (p instanceof Point)";

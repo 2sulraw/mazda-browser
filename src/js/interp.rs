@@ -1890,7 +1890,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
         In => {
             let key = l.to_string();
             match r {
-                Val::Obj(o) => Val::Bool(obj_has(o, &key)),
+                Val::Obj(o) => Val::Bool(e.chain_has(o, &key)),
                 // functions are objects: `"name" in f`, `"prototype" in f`
                 Val::Func(c) => {
                     // `name`/`length` are synthesized by get_member (no own
@@ -1904,11 +1904,11 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                         for _ in 0..100 {
                             match cur {
                                 Some(Val::Obj(o)) => {
-                                    if obj_has(&o, &key) {
+                                    if e.chain_has(&o, &key) {
                                         found = true;
                                         break;
                                     }
-                                    cur = o.borrow().proto.clone().map(Val::Obj);
+                                    cur = e.proto_of(&o).map(Val::Obj);
                                 }
                                 _ => break,
                             }
@@ -1936,7 +1936,10 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                 let p = ensure_prototype(c);
                 let yes = match l {
                     Val::Obj(o) => {
-                        let mut cur = o.borrow().proto.clone();
+                        // start from the lazy chain: arrays/iterators have no
+                        // explicit proto until first member access, and
+                        // `[].values() instanceof Object` must still hold
+                        let mut cur = e.proto_of(o);
                         let mut found = false;
                         for _ in 0..100 {
                             let c = match cur {
@@ -1947,7 +1950,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                                 found = true;
                                 break;
                             }
-                            cur = c.borrow().proto.clone();
+                            cur = e.proto_of(&c);
                         }
                         found
                     }
@@ -1964,7 +1967,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                     // matched against the value's chain like a real constructor
                     let registered = match e.native_prop(*id, "prototype") {
                         Some(Val::Obj(p)) => {
-                            let mut cur = o.borrow().proto.clone();
+                            let mut cur = e.proto_of(o);
                             let mut found = false;
                             for _ in 0..100 {
                                 match cur {
@@ -1974,7 +1977,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                                             found = true;
                                             break;
                                         }
-                                        cur = c.borrow().proto.clone();
+                                        cur = e.proto_of(&c);
                                     }
                                 }
                             }
@@ -1988,7 +1991,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                             .array_proto
                             .as_ref()
                             .map_or(false, |ap| {
-                                let mut cur = o.borrow().proto.clone();
+                                let mut cur = e.proto_of(o);
                                 let mut found = false;
                                 for _ in 0..100 {
                                     match cur {
@@ -1998,7 +2001,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                                                 found = true;
                                                 break;
                                             }
-                                            cur = c.borrow().proto.clone();
+                                            cur = e.proto_of(&c);
                                         }
                                     }
                                 }
@@ -2039,7 +2042,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                         if is_arr {
                             true
                         } else {
-                            let mut cur = lhs.borrow().proto.clone();
+                            let mut cur = e.proto_of(lhs);
                             let mut found = false;
                             for _ in 0..100 {
                                 match cur {
@@ -2049,7 +2052,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
                                             found = true;
                                             break;
                                         }
-                                        cur = c.borrow().proto.clone();
+                                        cur = e.proto_of(&c);
                                     }
                                 }
                             }

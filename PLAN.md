@@ -1705,6 +1705,44 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 40 (JS syntax compatibility) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | three lexer/parser gaps that rejected shipped framework code: regex `u`/`v`/`d` flags (the flag was lexed as an identifier), non-ASCII identifiers (lodash's deburr table uses accented keys), and computed keys in destructuring (`let {[key]: v, ...rest} = obj`). nextjs.org's script errors drop 11 -> 7 (all four syntax errors gone) with geometry unchanged at 7032px / 502 runs / 145.8 MB; MDN 2675px / 615 runs / 99.9 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 734 runs / 77.9 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **757** default / **761** `engine-b + woff2` |
 | 2026-11-05 | wave 41 (`performance` clock + rAF timestamp) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `performance` was an absent global, so nextjs's streaming bootstrap (`$RT=performance.now()`) and every timing bundle threw. Added a monotonic `performance.now()` / `timeOrigin` plus no-op `mark`/`measure`/`getEntries*`, and rAF callbacks now receive the frame timestamp on the same clock. nextjs.org's remaining rAF error disappears (7 -> 6 script errors) with geometry unchanged at 7032px / 502 runs / 145.3 MB; MDN 2675px / 615 runs / 98.7 MB, Wikipedia 24454px / 10943 runs / 100.9 MB, HN 1695px / 734 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB, all error-free; suite **759** default / **763** `engine-b + woff2` |
 | 2026-11-05 | wave 42 (DOM comments + node navigation) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | React's streaming bootstrap (`$RX`/`$RC`/`$RV`) parks boundary markers in comments and walks/rewrites them, but the HTML parser dropped comments and wrappers had no sibling navigation. Comments are now real arena nodes (`nodeType` 8, no box); wrappers gained live `data`, `nodeType`, `parentNode`, `previousSibling`/`nextSibling`, `firstChild`, `removeChild`, `insertBefore` and a `dataset` object, and text nodes get the same wrapper. nextjs.org's five inline `.data` errors disappear (6 -> 1 script error) and the streamed boundary content now actually swaps in (7032px / 502 runs -> 7578px / 569 runs, 148.7 MB); Wikipedia 24454px / 10943 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.9 MB stay error-free; MDN moves to 2922px / 641 runs / 88.6 MB only because bumping the snapshot format forced a fresh fetch of a newer page (the old cached DOM was stale); suite **761** default / **765** `engine-b + woff2` |
+| 2026-11-05 | wave 43 (lazy prototypes in `getPrototypeOf`/`instanceof`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Prototype links are attached lazily on first member access, but `Object.getPrototypeOf` read the raw slot and returned `null` for any fresh array/iterator/error. core-js's iterator helper then did `null.next` and threw. Added `JsEngine::proto_of` (explicit slot, else the shared prototype for the kind; module namespaces and `Object.prototype` itself are genuinely null) and routed `getPrototypeOf`, `instanceof`, `in`, `isPrototypeOf`, `chain_get` and setter lookup through it. nextjs.org's last script error disappears (1 -> 0) at unchanged 7578px / 569 runs; RAM settles ~162 MB because the app now boots fully and its router prefetches re-render repeatedly (first paint ~155 MB, bounded). MDN 2922px / 641 runs / 87.4 MB, Wikipedia 24454px / 10943 runs / 102.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **762** default / **766** `engine-b + woff2` |
+
+### Wave 43 findings
+
+- **`Object.getPrototypeOf` read only the explicit slot.** Prototypes are
+  attached lazily on first member access (`get_member`), so a just-created
+  array, promise, iterator or error had `proto: None` and `getPrototypeOf`
+  reported `null`. core-js's `defineIterator` helper evaluates
+  `Qr(y.call(new t)).next` on a fresh `Set` iterator; `Qr` saw `null` and
+  threw `Cannot read property 'next' of object`. `JsEngine::proto_of` now
+  answers the effective link without mutating the object: the explicit
+  `proto` when set, else Array → `Array.prototype`, Promise/TypedArray/Error
+  → their shared prototype, module namespaces → null, everything else →
+  `Object.prototype` (with a self-prototype guard so `Object.prototype`
+  itself reports null).
+- **Every chain walk now hops lazily.** `chain_get`, the setter's accessor
+  lookup, `instanceof` (four branches), the `in` operator and
+  `Object.prototype.isPrototypeOf` used to follow only explicit `proto`
+  links, so a user prototype object created by `function A(){}` never reached
+  `Object.prototype`. They now use `proto_of` per hop: `new A() instanceof
+  Object`, `'x' in a`, `new A().hasOwnProperty(...)` and
+  `hasOwnProperty` after `new` all answer correctly, and
+  `Object.prototype.isPrototypeOf(moduleNamespace)` stays false.
+- **Live effect.** nextjs.org drops its final script error (1 → 0). Geometry
+  is unchanged at 7578px / 569 runs; first paint is ~155 MB (was 148.7 MB)
+  and, now that the app fully boots, its own router prefetches drive a
+  handful of re-renders that settle around 162 MB without further growth.
+  The rendered page matches the reference.
+- **Other pages are byte-stable.** Wikipedia 24454px / 10943 runs / 102.1 MB,
+  MDN 2922px / 641 runs / 87.4 MB, Hacker News 1695px / 728 runs / 78.1 MB,
+  rust-lang 5800px / 483 runs / 84.8 MB; zero script errors on all four.
+- **Limits.** Built-in iterators have no own iterator-prototype object, so
+  `Object.getPrototypeOf(new Set().values())` is `Object.prototype` (the
+  identity core-js's check short-circuits on) rather than an
+  `Iterator.prototype` chain. `Object.getPrototypeOf(primitive)` still returns
+  `null` instead of the wrapper prototype, and `Object.create(null)` remains
+  indistinguishable from "not attached yet", so it also reports
+  `Object.prototype`.
 
 ### Wave 42 findings
 
