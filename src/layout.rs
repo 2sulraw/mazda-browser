@@ -2474,6 +2474,89 @@ fn ellipsize_runs(
     }
 }
 
+/// `line-clamp: N` for one block's subtree: keep the first N text line
+/// boxes, clear every run below the cut, end the last kept line with "…",
+/// and drop underlines below the cut. Returns the cut's bottom (doc y) so
+/// `place()` can shrink the box, or None when the content already fits.
+///
+/// Lines are the distinct run `y` tops in [range) (runs are pushed in flow
+/// order). shortcut: nested block content participates in the count (the
+/// CSS line-clamp target is the element's own line boxes), a mixed-height
+/// line takes the next line's top as its bottom, and non-text children
+/// below the cut are left in place for `overflow` to clip.
+fn clamp_lines(
+    runs: &mut [PositionedRun],
+    uls: &mut [UR],
+    range: (u32, u32),
+    ul_range: (u32, u32),
+    max_lines: u32,
+    right: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> Option<f32> {
+    let (a, b) = (range.0 as usize, range.1 as usize);
+    let mut tops: Vec<f32> = Vec::new();
+    for r in &runs[a..b] {
+        if r.text.is_empty() {
+            continue;
+        }
+        if !tops.iter().any(|t| (r.y - *t).abs() <= 0.01) {
+            tops.push(r.y);
+        }
+    }
+    if tops.len() <= max_lines as usize {
+        return None;
+    }
+    tops.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+    let cut = tops[max_lines as usize - 1];
+    let next = tops[max_lines as usize];
+    // everything after the kept line disappears (runs stay in place so
+    // other boxes' stored ranges keep indexing them)
+    for r in &mut runs[a..b] {
+        if r.y > cut + 0.01 {
+            r.text.clear();
+            r.width = 0.0;
+        }
+    }
+    // "…" on the kept line: trim its last run so the marker fits inside the
+    // content edge (same fit rule as text-overflow). Runs after it on that
+    // line are already the line's tail.
+    let (ua, ub) = (ul_range.0 as usize, ul_range.1 as usize);
+    let mut last: Option<usize> = None;
+    for i in a..b {
+        let r = &runs[i];
+        if r.text.is_empty() || (r.y - cut).abs() > 0.01 {
+            continue;
+        }
+        if last.map_or(true, |j| runs[j].x + runs[j].width <= r.x + r.width) {
+            last = Some(i);
+        }
+    }
+    if let Some(i) = last {
+        let r = &mut runs[i];
+        let ew = measure("\u{2026}", &r.style) + spacing_extra("\u{2026}", &r.style);
+        let avail = (right - r.x).max(0.0);
+        let keep = if avail > ew + 0.01 {
+            fit_prefix(&r.text, &r.style, avail - ew, measure)
+        } else {
+            0
+        };
+        let mut t = String::with_capacity(keep + 4);
+        t.push_str(&r.text[..keep]);
+        t.push('\u{2026}');
+        r.width = measure(&t, &r.style) + spacing_extra(&t, &r.style);
+        r.text = t;
+    }
+    // the kept line's underline sits ABOVE the next line's top; later ones
+    // (at or below it) belong to removed lines
+    for u in &mut uls[ua..ub] {
+        if u.1 >= next - 0.01 {
+            u.2 = 0.0;
+            u.3 = 0.0;
+        }
+    }
+    Some(next)
+}
+
 /// Post-layout walk: every box with a background-color emits a filled rect;
 /// every decoded `<img>` emits its pixels (parent-first, so children paint
 /// over their parent's fill). A REPEATING background placeholder emits one
@@ -3906,6 +3989,29 @@ fn place(
                 None if n.bx.content_box => n.w / r,
                 None => (w / r - v_extra).max(0.0),
             };
+        }
+    }
+    // line-clamp: keep only the first N text line boxes of this flow, end
+    // the last kept line with "…", and shrink the content height to the cut
+    // so following siblings move up (flex/grid containers keep their own
+    // sizing rules and ignore the clamp). The subtree's runs were just
+    // appended to [run0, runs.len()) in flow order.
+    if let Some(max_lines) = n.bx.line_clamp {
+        if !matches!(n.bx.display, Display::Flex | Display::Grid) {
+            let run_end = runs.len() as u32;
+            let ul_end = uls.len() as u32;
+            if let Some(cut_bottom) = clamp_lines(
+                runs,
+                uls,
+                (run0 as u32, run_end),
+                (ul0 as u32, ul_end),
+                max_lines,
+                n.x + n.w,
+                measure,
+            ) {
+                n.h = (cut_bottom - n.y).max(0.0);
+                n.open = false;
+            }
         }
     }
     // max-height: cap the used height. Content is already placed, so a
@@ -7263,6 +7369,44 @@ mod tests {
             l.runs[1].y
         );
         assert!((n.h - line * 2.0).abs() < 0.01, "h={} = two lines", n.h);
+    }
+
+    #[test]
+    fn line_clamp_keeps_n_lines_and_ellipsizes_the_last() {
+        // 40px wide at 4px/char: each line holds two 3-char words, so the
+        // text wraps to three lines; clamp to two keeps the first two.
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                width: Some(Len::Px(40.0)),
+                line_clamp: Some(2),
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("aaa bbb ccc ddd eee")];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        let line = 15.0 * 1.35;
+        assert!(
+            (n.h - line * 2.0).abs() < 0.01,
+            "h={} = two lines, not three",
+            n.h
+        );
+        let lines: std::collections::HashSet<i32> = l
+            .runs
+            .iter()
+            .filter(|r| !r.text.is_empty())
+            .map(|r| r.y as i32)
+            .collect();
+        assert_eq!(lines.len(), 2, "only two text lines remain");
+        assert!(
+            l.runs.iter().any(|r| r.text.ends_with('\u{2026}')),
+            "the last kept line ends with an ellipsis"
+        );
+        assert!(
+            l.runs.iter().all(|r| !r.text.contains("eee")),
+            "content past the cut is hidden"
+        );
     }
 
     #[test]

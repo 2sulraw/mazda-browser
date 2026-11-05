@@ -261,6 +261,11 @@ relevant only when transitions and animations exist.
 - `%` `min-height` / `max-height` resolve against width, not container
   height; an auto block still ignores a plain `height` (only `min-height`,
   `max-height`, `aspect-ratio` and replaced boxes pin it).
+- `line-clamp` keeps the first N text line boxes, adds a trailing marker and
+  shrinks the box; it still lays out as block flow (a vendor-prefixed
+  `display: box` is an unknown display value), counts nested
+  block text, and truncates text only (child boxes/images below the cut rely
+  on `overflow` clipping).
 - `outline` paints a solid ring only (styles collapse, `auto` is off);
   `clip-path` is `inset()` only.
 - Interaction pseudo-classes (`:focus`, `:focus-visible`, `:checked`,
@@ -398,7 +403,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 816 self-authored unit tests (820 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 818 self-authored unit tests (822 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -478,8 +483,8 @@ flex-wrap, float, font-family, font-size
 font-style, font-weight, gap, grid-area
 grid-column, grid-column-end, grid-column-start, grid-template-areas
 grid-template-columns, grid-template-rows, height, inset
-justify-content, justify-items, justify-self, left, letter-spacing, line-height
-list-style, list-style-position, list-style-type, margin
+justify-content, justify-items, justify-self, left, letter-spacing, line-clamp
+line-height, list-style, list-style-position, list-style-type, margin
 margin-block, margin-block-end, margin-block-start, margin-bottom
 margin-inline, margin-inline-end, margin-inline-start, margin-left
 margin-right, margin-top, mask, mask-image
@@ -519,7 +524,7 @@ Box, border, outline:
   box-decoration-break
 
 Text and typography:
-  hyphens, text-shadow, text-emphasis, line-clamp, tab-size, quotes,
+  hyphens, text-shadow, text-emphasis, tab-size, quotes,
   direction, unicode-bidi, writing-mode, text-orientation,
   white-space-collapse, text-wrap, font, font-stretch, font-variant,
   font-feature-settings, font-kerning, font-size-adjust, font-optical-sizing

@@ -429,6 +429,18 @@ pub struct BoxStyle {
     /// → None. Shortcut: `%` resolves against the containing block width,
     /// like `min-height`, not its height.
     pub max_height: Option<Len>,
+    /// `line-clamp: N` (every vendor-prefixed spelling unprefixes to this
+    /// name) - show at most the first N line boxes of this box's flow and
+    /// end the last kept line with "…" (layout's clamp in `place()`).
+    /// `none`/garbage clear it; values below 1 are ignored.
+    /// shortcut: the box still lays out as block flow, because a
+    /// vendor-prefixed `display: box` spelling is an unknown display value
+    /// here and is ignored; the line count comes from the subtree's text-run
+    /// tops, so
+    /// mixed line-heights and nested blocks follow those tops; only TEXT is
+    /// truncated - child boxes/images below the cut keep their geometry and
+    /// rely on `overflow` clipping, and underlines below the cut are dropped.
+    pub line_clamp: Option<u32>,
     pub margin_x_auto: bool,
     /// `flex-grow` — share of a flex ROW's free space this item absorbs
     /// (0 = fixed). Wikipedia's page title bar relies on `flex-grow: 1` on
@@ -694,6 +706,7 @@ impl Default for BoxStyle {
             height: None,
             min_height: None,
             max_height: None,
+            line_clamp: None,
             margin_x_auto: false,
             grow: 0.0,
             shrink: 1.0,
@@ -1304,6 +1317,7 @@ const KNOWN: &[&str] = &[
     "height",
     "min-height",
     "max-height",
+    "line-clamp",
     "transform-origin",
     "outline",
     "outline-width",
@@ -2919,6 +2933,16 @@ fn apply_decl(
                 None
             } else {
                 parse_len(&d.1, vp)
+            }
+        }
+        // `line-clamp: N` - a positive line count; `none` and garbage clear
+        // it (a vendor-prefixed spelling unprefixed to this name above).
+        // `0` is ignored: a clamp must keep at least one line.
+        "line-clamp" => {
+            bx.line_clamp = if d.1 == "none" {
+                None
+            } else {
+                d.1.parse::<u32>().ok().filter(|n| *n > 0)
             }
         }
         "max-width" => {
@@ -6614,6 +6638,31 @@ mod tests {
         assert_eq!(st("d").bx.max_height, Some(Len::Px(0.0)));
         // `auto` is not a valid max-height; it clears like an invalid value
         assert_eq!(st("e").bx.max_height, None);
+    }
+
+    #[test]
+    fn line_clamp_parses_a_positive_count_and_clears_on_none() {
+        let sheet = parse(
+            ".a { line-clamp: 2 } .b { -x-line-clamp: 3 } \
+             .c { line-clamp: none } .d { line-clamp: 0 } \
+             .e { line-clamp: 2; -x-line-clamp: 4 } \
+             .f { line-clamp: nope }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let st = |cls: &str| {
+            let node = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, node, Style::new(), None)
+        };
+        assert_eq!(st("a").bx.line_clamp, Some(2));
+        // a vendor-prefixed spelling unprefixes to the same property
+        assert_eq!(st("b").bx.line_clamp, Some(3));
+        assert_eq!(st("c").bx.line_clamp, None, "none clears");
+        assert_eq!(st("d").bx.line_clamp, None, "0 is not a line count");
+        assert_eq!(st("e").bx.line_clamp, Some(4), "later declaration wins");
+        assert_eq!(st("f").bx.line_clamp, None, "garbage clears");
     }
 
     #[test]

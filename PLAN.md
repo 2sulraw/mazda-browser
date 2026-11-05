@@ -1728,6 +1728,39 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 60 (`linear-gradient` backgrounds) | a local gradient page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Backgrounds can now use `linear-gradient(...)` in both `background` and `background-image`. The value parser accepts `to <side>`/corner directions and `deg`/`grad`/`rad`/`turn` angles, percentage stop positions, hard stops, named/hex/`rgb()`/`hsl()` colors and `rgba()`/`transparent` alpha; missing positions stay at 0%/100% or are distributed between neighbours. The gradient is stored as an `Arc<Gradient>` on `BoxStyle` and rides the existing rect channel through a parallel `rect_grad` slot, so stacking order, transforms, overflow clipping and sticky pinning are shared with solid backgrounds. Paint inverse-maps each pixel to the gradient line (through the box centre, length = the box's extent along the direction) and blends stops source-over, so `transparent` fades reveal the background colour; rounded corners reuse the rect culling rule. A local page shows three-stop, angled, corner, hard-stop, `to top`/`0.25turn`, alpha-fade and transformed cases. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.3 MB, MDN 2773px / 641 runs / 87.5 MB, Wikipedia 24575px / 10950 runs / 103.2 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.1 MB; suite **816** default / **820** `engine-b + woff2` |
 
+| 2026-11-05 | wave 61 (`line-clamp`) | a local clamped-card page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | A box can now cap how many text lines it shows. `line-clamp: N` (any single-dash vendor spelling unprefixes to it) parses into an optional positive count on `BoxStyle`; `none`, garbage and `0` clear it. After the box's flow is laid out, `place()` groups the subtree's runs by their line top; when more than N lines exist it clears every run below the cut, trims the kept line's last run with `fit_prefix` so a trailing marker fits inside the content edge, zeros underlines below the cut, and shrinks the content height to the cut so following siblings move up. `display: flex/grid` containers ignore the clamp. A local page shows a two-line card, a three-line card, an unclamped sibling and a short paragraph that already fits. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.5 MB, MDN 2773px / 641 runs / 87.9 MB, Wikipedia 24575px / 10950 runs / 102.8 MB, HN 1695px / 728 runs / 78.3 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **818** default / **822** `engine-b + woff2` |
+
+### Wave 61 findings
+
+- **Lines are run tops, not objects.** The engine has no line-box structure:
+  `block()` emits each line's runs at a shared `y`, so the clamp collects the
+  distinct non-empty run tops. That costs one scan of the subtree's new runs
+  and keeps all existing stored `run_range`s valid (nothing is removed from the
+  vector; hidden runs simply carry empty text and zero width).
+- **Shrink at the cut, not at the last run's bottom.** The first removed line's
+  top is exactly the kept line's bottom, including any extra leading from a
+  taller inline box, so `n.h = next_top - content_top` needs no line-height
+  bookkeeping and mixed font sizes still stack correctly. The box remains a
+  normal block, so the next sibling moves up by the removed height.
+- **The marker shares the overflow path.** The last kept run is trimmed with
+  the same `fit_prefix` + spacing rule as `text-overflow: ellipsis`, measured
+  against the box's content edge, so the marker never paints outside the box.
+  Underlines at or below the next line's top are zero-sized rather than
+  removed, for the same index-stability reason.
+- **Shortcuts.** The classic author recipe sets a vendor-prefixed
+  `display: box`; this engine treats that spelling as an unknown `display`
+  value and keeps block flow, which is enough for the common utility classes and leaves normal block
+  layout intact. Nested block text participates in the line count, mixed
+  line-heights follow their run tops, only text is truncated (child
+  boxes/images below the cut keep their geometry and rely on `overflow`), and
+  flex/grid containers skip the clamp entirely.
+- **Geometry is untouched.** None of the five references changes height, run
+  count or error output; the extra field is one `Option<u32>` per box.
+- **Test coverage.** One parser test (plain and prefixed spellings, `none`,
+  `0` and garbage clearing, later-declaration wins) and one layout test (three
+  wrapped lines clamped to two: height, surviving line count, trailing marker,
+  hidden tail).
+
 ### Wave 60 findings
 
 - **No new paint channel.** A gradient is just a rect with a sentinel colour plus
