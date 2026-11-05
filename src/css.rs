@@ -346,6 +346,11 @@ pub struct BoxStyle {
     pub inline_box: bool,
     pub dir: Dir,
     pub justify: Justify,
+    /// `align-content` — distribution of grid rows / wrapped flex lines in
+    /// the spare block space. Reuses [`Justify`] (the keyword sets match,
+    /// with `stretch` folded into [`Justify::Normal`] — see layout's
+    /// `grid_content_offsets`).
+    pub align_content: Justify,
     pub align: Align,
     /// `flex-wrap: wrap` — items that don't fit start a new line (nowrap =
     /// shrink-to-fit, the old behavior)
@@ -626,6 +631,7 @@ impl Default for BoxStyle {
             inline_box: false,
             dir: Dir::Row,
             justify: Justify::Normal,
+            align_content: Justify::Normal,
             align: Align::Stretch,
             wrap: false,
             gap_row: 0.0,
@@ -1221,6 +1227,8 @@ const KNOWN: &[&str] = &[
     "flex-direction",
     "flex-flow",
     "justify-content",
+    "align-content",
+    "place-content",
     "align-items",
     "align-self",
     "flex-wrap",
@@ -2640,14 +2648,26 @@ fn apply_decl(
             }
         }
         "justify-content" => {
-            bx.justify = match d.1.as_str() {
-                "center" => Justify::Center,
-                "flex-end" | "end" | "right" => Justify::End,
-                "space-between" => Justify::SpaceBetween,
-                "space-around" => Justify::SpaceAround,
-                "space-evenly" => Justify::SpaceEvenly,
-                "normal" | "stretch" => Justify::Normal,
-                _ => Justify::Start, // flex-start/start/left
+            bx.justify = parse_content_pos(&d.1).unwrap_or(Justify::Start);
+        }
+        // `align-content` distributes grid rows / wrapped flex lines in the
+        // spare block space. `stretch` (and `normal`) pack at the start —
+        // this engine never stretches an auto row or flex line (documented
+        // in `grid_content_offsets`).
+        "align-content" => {
+            bx.align_content = parse_content_pos(&d.1).unwrap_or(Justify::Start);
+        }
+        // `place-content: <align-content> <justify-content>?`; with one value
+        // both axes take it (the spec's single-value rule).
+        "place-content" => {
+            let toks = joined_tokens(&d.1);
+            let first = toks.first().map(String::as_str).unwrap_or("normal");
+            if let Some(a) = parse_content_pos(first) {
+                bx.align_content = a;
+                bx.justify = toks
+                    .get(1)
+                    .and_then(|s| parse_content_pos(s))
+                    .unwrap_or(a);
             }
         }
         "align-items" => {
@@ -3668,6 +3688,22 @@ fn parse_origin(v: &str, vp: (f32, f32)) -> Option<(Len, Len)> {
         }
     };
     Some((x, y))
+}
+
+/// Shared keyword parser for `justify-content` and `align-content` (their
+/// value sets are identical apart from `stretch`, which only `align-content`
+/// has — both mean "pack at the start" here).
+fn parse_content_pos(v: &str) -> Option<Justify> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "start" | "flex-start" | "left" => Some(Justify::Start),
+        "center" => Some(Justify::Center),
+        "end" | "flex-end" | "right" => Some(Justify::End),
+        "space-between" => Some(Justify::SpaceBetween),
+        "space-around" => Some(Justify::SpaceAround),
+        "space-evenly" => Some(Justify::SpaceEvenly),
+        "normal" | "stretch" => Some(Justify::Normal),
+        _ => None,
+    }
 }
 
 /// `text-decoration-style` keyword → pattern. `none` is not a valid style
@@ -8210,6 +8246,34 @@ mod tests {
         let sheet0 = parse(".a { flex: 0 }");
         let z = sheet0.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).bx;
         assert_eq!((z.grow, z.basis), (0.0, None), "flex: 0 = grow 0, basis auto");
+    }
+
+    #[test]
+    fn align_content_and_place_content_parse() {
+        let sheet = parse(
+            ".a { align-content: center } .b { align-content: space-between } \
+             .c { align-content: stretch } .d { place-content: center } \
+             .e { place-content: space-between end } .f { align-content: bogus }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("a").align_content, Justify::Center);
+        assert_eq!(bx("b").align_content, Justify::SpaceBetween);
+        // `stretch` has no separate variant: it packs at the start, like
+        // `normal` (no auto-row/line stretching in this engine)
+        assert_eq!(bx("c").align_content, Justify::Normal);
+        // one `place-content` value sets both axes
+        assert_eq!((bx("d").align_content, bx("d").justify), (Justify::Center, Justify::Center));
+        assert_eq!(
+            (bx("e").align_content, bx("e").justify),
+            (Justify::SpaceBetween, Justify::End),
+            "place-content align then justify"
+        );
+        // an unknown keyword falls back to start rather than leaking garbage
+        assert_eq!(bx("f").align_content, Justify::Start);
     }
 
     #[test]

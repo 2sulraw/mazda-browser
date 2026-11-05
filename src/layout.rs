@@ -4303,6 +4303,21 @@ fn as_content_h(h: f32, content_box: bool, v_extra: f32) -> f32 {
     }
 }
 
+/// The definite CONTENT height a container declares through `height` or
+/// `min-height`, or 0 when neither pins one. `place()` normally applies these
+/// after the inner layout, but `align-content` needs the spare space while it
+/// still owns the row/line positions. `%` resolves against the box's own
+/// content width here (the same shortcut `min-height` already documents);
+/// px values — what the web actually uses — are exact.
+fn definite_content_h(bx: &BoxStyle, basis: f32) -> f32 {
+    let v_extra = vertical_extra(bx, basis);
+    let mut h = 0.0f32;
+    for l in [bx.height, bx.min_height].into_iter().flatten() {
+        h = h.max(as_content_h(resolve_len(l, basis), bx.content_box, v_extra));
+    }
+    h
+}
+
 /// Max-content width of a text leaf whose whitespace collapses: each run of
 /// whitespace (the newlines and indentation written between tags included)
 /// counts as one space, and leading/trailing whitespace disappears - the
@@ -5232,9 +5247,10 @@ fn resolve_tracks(
     w
 }
 
-/// `justify-content` distribution for grid columns: the leading offset and
-/// the extra space added to every inter-track gap. `Normal`/`Start` pack the
-/// tracks at the start edge.
+/// `align-content` / `justify-content` distribution over one axis: the
+/// leading offset and the extra space added to every gap between `tracks`.
+/// `Normal`/`Start` pack the tracks at the start edge (`Normal` also covers
+/// `stretch`, which this engine does not implement as track growth).
 fn grid_content_offsets(justify: Justify, slack: f32, tracks: usize) -> (f32, f32) {
     if slack <= 0.0 || tracks == 0 {
         return (0.0, 0.0);
@@ -5841,15 +5857,51 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         let wpx = as_content_decl(content, &c.bx, widths[idx]);
         c.bx.width = Some(Len::Px(wpx));
     }
+    let line_n = lines.len();
+    let mut line_runs: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(line_n);
     for (li, line) in lines.iter().enumerate() {
         if li > 0 {
             y += n.bx.gap_row; // row-gap between wrapped lines
         }
+        let rs = runs.len();
+        let us = uls.len();
         let lh = flex_line(n, &items, &widths, line.clone(), y, gap, measure, runs, uls, &mut last_open);
+        line_runs.push((rs, runs.len(), us, uls.len()));
         y += lh;
         total_h += lh + if li > 0 { n.bx.gap_row } else { 0.0 };
     }
     n.h = total_h;
+    // `align-content` distributes the wrapped lines in the container's spare
+    // block space. Only a wrapping container has lines to distribute; a
+    // nowrap row's single line is handled by `align-items`/`justify-content`.
+    // The spare space comes from a declared `height`/`min-height`, which
+    // `place()` would otherwise only add below the content without moving it.
+    if n.bx.wrap && line_n > 0 {
+        let definite = definite_content_h(&n.bx, n.w);
+        let slack = (definite - total_h).max(0.0);
+        let (off, extra) = grid_content_offsets(n.bx.align_content, slack, line_n);
+        if off > 0.0 || extra > 0.0 {
+            for (li, &(rs, re, us, ue)) in line_runs.iter().enumerate() {
+                let dy = off + extra * li as f32;
+                if dy == 0.0 {
+                    continue;
+                }
+                for r in &mut runs[rs..re] {
+                    r.y += dy;
+                }
+                for u in &mut uls[us..ue] {
+                    u.1 += dy;
+                }
+                for idx in lines[li].clone() {
+                    if let Item::Grp(i) = items[idx] {
+                        shift_tree(&mut n.children[i], 0.0, dy);
+                    }
+                }
+            }
+            // the box must cover the last shifted line / the declared height
+            n.h = total_h.max(definite);
+        }
+    }
     n.open = last_open;
 }
 
@@ -6320,10 +6372,15 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         _ => 0.0,
     };
     let mut row_hs: Vec<f32> = vec![0.0; nrows];
+    // per-row paint/subtree ranges for the post-pass `align-content` shift
+    let mut row_runs: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(nrows);
+    let mut row_owner: Vec<Vec<usize>> = Vec::with_capacity(nrows);
     let mut y = n.y;
     let mut last_open = false;
     for r in 0..nrows {
         let mut row_h = 0.0f32;
+        let rs0 = runs.len();
+        let us0 = uls.len();
         let mut marks: Vec<(usize, usize, f32)> = Vec::with_capacity(nc); // run_start, ul_start, h
         let mut row_items: Vec<usize> = (0..items.len()).filter(|&i| spots[i].0 == r).collect();
         row_items.sort_by_key(|&i| spots[i].2);
@@ -6407,12 +6464,44 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
             }
         }
         last_open = cell_ios.last().copied().unwrap_or(false);
+        row_runs.push((rs0, runs.len(), us0, uls.len()));
+        row_owner.push(row_items.clone());
         y += row_h;
         if r + 1 < nrows {
             y += n.bx.gap_row;
         }
     }
     n.h = y - n.y;
+    // `align-content`: after every row is laid out we know both the natural
+    // stack height and the definite height, so the spare space can go before
+    // the first row (offset) and/or into every inter-row gap. Rows are
+    // already painted, so this is a pure shift of each row's runs, underline
+    // rects and item subtrees — no re-layout. A single row cannot spread, so
+    // `space-between` stays put, matching the spec.
+    let used_h = row_hs.iter().sum::<f32>() + n.bx.gap_row * (nrows.saturating_sub(1)) as f32;
+    let definite = definite_content_h(&n.bx, n.w);
+    let (ac_off, ac_extra) = grid_content_offsets(n.bx.align_content, (definite - used_h).max(0.0), nrows);
+    if ac_off > 0.0 || ac_extra > 0.0 {
+        for (r, &(rs, re, us, ue)) in row_runs.iter().enumerate() {
+            let dy = ac_off + ac_extra * r as f32;
+            if dy == 0.0 {
+                continue;
+            }
+            for run in &mut runs[rs..re] {
+                run.y += dy;
+            }
+            for u in &mut uls[us..ue] {
+                u.1 += dy;
+            }
+            for &idx in &row_owner[r] {
+                if let Item::Grp(i) = items[idx] {
+                    shift_tree(&mut n.children[i], 0.0, dy);
+                }
+            }
+        }
+        // the container covers the shifted rows / its declared height
+        n.h = used_h.max(definite);
+    }
     n.open = last_open;
 }
 pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> f32) -> Layout {
@@ -8556,6 +8645,88 @@ mod tests {
         layout_tree(&mut n, 300.0, &m4);
         assert_eq!(n.children[0].y, 0.0);
         assert_eq!(n.children[1].y, 100.0, "second row starts after 100px");
+    }
+
+    #[test]
+    fn align_content_distributes_grid_rows() {
+        let build = |ac: Justify| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Grid,
+                    cols: vec![Track::Fr(1.0)],
+                    height: Some(Len::Px(300.0)),
+                    align_content: ac,
+                    ..BoxStyle::default()
+                },
+            );
+            for _ in 0..2 {
+                n.children.push(BoxNode::group(
+                    Style::new(),
+                    BoxStyle {
+                        min_height: Some(Len::Px(20.0)),
+                        ..BoxStyle::default()
+                    },
+                ));
+            }
+            layout_tree(&mut n, 300.0, &m4);
+            (n.children[0].y, n.children[1].y, n.h)
+        };
+        let (y0, y1, h) = build(Justify::Normal);
+        assert_eq!((y0, y1), (0.0, 20.0), "normal packs at the start");
+        assert_eq!(h, 40.0, "start does not grow the box past its content");
+        let (y0, y1, h) = build(Justify::Center);
+        assert_eq!((y0, y1), (130.0, 150.0), "centre: (300-40)/2");
+        assert_eq!(h, 300.0, "centre honours the declared height");
+        let (y0, y1, _) = build(Justify::End);
+        assert_eq!((y0, y1), (260.0, 280.0), "end");
+        let (y0, y1, _) = build(Justify::SpaceBetween);
+        assert_eq!((y0, y1), (0.0, 280.0), "between: one 260px gap");
+        let (y0, y1, _) = build(Justify::SpaceEvenly);
+        assert!((y0 - 260.0 / 3.0).abs() < 0.01, "evenly leading {}", y0);
+        assert!((y1 - (260.0 / 3.0 + 20.0 + 260.0 / 3.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn align_content_distributes_wrapped_flex_lines() {
+        let build = |ac: Justify, floor: bool| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Flex,
+                    dir: Dir::Row,
+                    wrap: true,
+                    min_height: if floor { Some(Len::Px(200.0)) } else { None },
+                    align_content: ac,
+                    ..BoxStyle::default()
+                },
+            );
+            for _ in 0..3 {
+                n.children.push(BoxNode::group(
+                    Style::new(),
+                    BoxStyle {
+                        width: Some(Len::Px(60.0)),
+                        min_height: Some(Len::Px(20.0)),
+                        ..BoxStyle::default()
+                    },
+                ));
+            }
+            layout_tree(&mut n, 120.0, &m4);
+            (n.children[0].y, n.children[2].y, n.h)
+        };
+        // 3 x 60px wraps into two lines (2 + 1); without spare space nothing
+        // moves even when `align-content` is authored
+        let (a0, a2, h) = build(Justify::Center, false);
+        assert_eq!((a0, a2), (0.0, 20.0), "no definite height: no free space");
+        assert_eq!(h, 40.0);
+        // min-height 200 -> 160px spare, single-line gap stays fixed
+        let (a0, a2, h) = build(Justify::Center, true);
+        assert_eq!((a0, a2), (80.0, 100.0), "centre each wrapped line");
+        assert_eq!(h, 200.0);
+        let (a0, a2, _) = build(Justify::End, true);
+        assert_eq!((a0, a2), (160.0, 180.0), "end");
+        let (a0, a2, _) = build(Justify::SpaceBetween, true);
+        assert_eq!((a0, a2), (0.0, 180.0), "between: both lines at the edges");
     }
 
     #[test]

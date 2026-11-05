@@ -1720,6 +1720,40 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 54 (SVG intrinsic-size scaling) | a local three-size SVG page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Fixed a vector-rasterization bug: an SVG that declares `width`/`height` but no `viewBox` was rendered as if its user-space viewport were the requested raster size. Rendering the 144-unit rust-lang logo at 80px therefore mapped only user units 0–80 and clipped the gear to a corner fragment (144px happened to match, 200px showed it unscaled). `root_space` and `render` now derive the fallback viewport from the root `width`/`height` attributes (then the requested size), so the intrinsic 144-unit coordinate system is scaled to any display size; percentage lengths resolve against the same viewport. A local page embeds the same logo at 144px, 80px and 200px and now shows the full gear at all three. All five references stay geometry-identical and error-free: nextjs 7578px / 569 runs / 155.3 MB, MDN 2690px / 641 runs / 87.9 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 78.4 MB, rust-lang 5800px / 483 runs / 84.7 MB — with the rust logo now whole in its capture; suite **799** default / **803** `engine-b + woff2` |
 
 | 2026-11-05 | wave 55 (`text-decoration` paint controls) | a local decoration page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Underlines, strikethroughs and overlines can now be painted with their authored colour, pattern, thickness and offset. `text-decoration-color`, `text-decoration-style` (`solid`/`double`/`dotted`/`dashed`/`wavy`), `text-decoration-thickness` and `text-underline-offset` parse into four compact `Style` fields; the `text-decoration` shorthand also picks a style/colour/thickness token from its list, while `text-decoration-line` keeps changing only the line flags. Paint expands `double` into two rules inside the declared thickness, `dotted`/`dashed` into short solid segments (the wire channel is solid rects only), and moves only the underline by `text-underline-offset`; the run's own colour is the default. A local page shows a plain link, a red underline, a 4px red underline shifted 6px down, dotted and dashed 4px rules, a double rule, and wavy documented as solid. All five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.4 MB, MDN 2690px / 641 runs / 88.1 MB, Wikipedia 24575px / 10950 runs / 103.2 MB, HN 1695px / 728 runs / 78.3 MB, rust-lang 5800px / 483 runs / 85.2 MB — MDN's link decoration now carries its authored colour and offset; suite **801** default / **805** `engine-b + woff2` |
+| 2026-11-05 | wave 56 (`align-content` / `place-content`) | a local five-grid + two-flex distribution page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Grid rows and wrapped flex lines can now be distributed in the container's spare block space. `align-content` and the `place-content` shorthand parse into one compact `Justify` field on `BoxStyle`; the layout keeps its existing single-pass paint, then shifts each row's/line's runs, underline rects and item subtrees by the leading offset plus the extra gap. `start`/`normal`/`stretch` pack at the start (no auto-track growth), `center`/`end`/`space-between`/`space-around`/`space-evenly` work in both grids and wrapping flex rows; `place()` already floors the box, so a wrapped flex container with `min-height` now places its lines inside that floor instead of leaving them at the top. A local page shows five 180px grids (start/center/end/between/evenly) and two wrapped flex columns (center/between). All five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.6 MB, MDN 2690px / 641 runs / 88.5 MB, Wikipedia 24575px / 10950 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.3 MB; suite **804** default / **808** `engine-b + woff2` |
+
+### Wave 56 findings
+
+- **Distribution is a post-pass shift, not a re-layout.** Grid and flex line
+  positions are decided exactly as before; once the natural stack height and
+  the definite height are both known, each row/line's already-painted runs,
+  underline rects and subtrees move by one offset. That keeps the memory cost
+  at two small per-row/per-line range vectors and touches nothing in the
+  measuring path.
+- **`stretch` has no growth model.** `align-content: normal` and `stretch`
+  both pack at the start, because auto grid rows and flex lines are never
+  re-measured to fill the spare space. The property therefore distributes
+  existing rows/lines but cannot enlarge them; this is the same honest
+  shortcut used for wavy decorations in wave 55.
+- **The spare space is the definite height.** `height` and `min-height` are
+  read through one helper (`definite_content_h`), resolved in the same
+  border-box/content-box terms `place()` uses. `%` values still resolve
+  against the box's content width, matching the pre-existing percent-height
+  shortcut.
+- **Only a declared box can distribute.** With no `height`/`min-height`
+  there is no spare space, so the pass is a no-op. Conversely, when
+  distribution does move rows, the container's used height becomes the
+  definite height so its background/border covers the shifted content; with
+  `start` the old content-derived height is kept (this engine still ignores a
+  bare `height` on non-grid boxes).
+- **Wrapping gates the flex case.** A nowrap flex row has a single line and
+  gets nothing from `align-content`; `align-items`/`justify-content` remain
+  the properties that move it. Column flex has no wrapping model, so the
+  lines case there is untouched.
+- **The reference pages never use it.** No cached reference sheet declares
+  `align-content`, so every reference height and run count is unchanged; the
+  feature is a conformance win for authored pages, verified on a local page
+  and by six unit assertions.
 
 ### Wave 55 findings
 
