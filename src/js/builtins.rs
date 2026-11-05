@@ -661,6 +661,107 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("SharedArrayBuffer", Val::Native(ab_ctor));
     e.arraybuffer_proto = Some(own(&ab_proto).clone());
 
+    // -- DataView -----------------------------------------------------------
+    // One shared prototype holds every accessor; an instance carries
+    // `__dv_buf` (ArrayBuffer), `__dv_off` and `__dv_len` (byte window).
+    let dv_proto = Val::new_object();
+    for (idx, name) in [
+        (DV_GET_I8, "getInt8"),
+        (DV_GET_U8, "getUint8"),
+        (DV_GET_I16, "getInt16"),
+        (DV_GET_U16, "getUint16"),
+        (DV_GET_I32, "getInt32"),
+        (DV_GET_U32, "getUint32"),
+        (DV_GET_F32, "getFloat32"),
+        (DV_GET_F64, "getFloat64"),
+        (DV_GET_BIGI64, "getBigInt64"),
+        (DV_GET_BIGU64, "getBigUint64"),
+        (DV_SET_I8, "setInt8"),
+        (DV_SET_U8, "setUint8"),
+        (DV_SET_I16, "setInt16"),
+        (DV_SET_U16, "setUint16"),
+        (DV_SET_I32, "setInt32"),
+        (DV_SET_U32, "setUint32"),
+        (DV_SET_F32, "setFloat32"),
+        (DV_SET_F64, "setFloat64"),
+        (DV_SET_BIGI64, "setBigInt64"),
+        (DV_SET_BIGU64, "setBigUint64"),
+    ] {
+        let id = e.register_native(name, n_data_view, idx);
+        obj_set_own(own(&dv_proto), name, Val::Native(id));
+    }
+    for (idx, name) in [
+        (DV_GET_BYTE_LENGTH, "byteLength"),
+        (DV_GET_BYTE_OFFSET, "byteOffset"),
+        (DV_GET_BUFFER, "buffer"),
+    ] {
+        let id = e.register_native(name, n_data_view, idx);
+        obj_set_own(
+            own(&dv_proto),
+            name,
+            Val::Acc(Rc::new(AccEntry {
+                getter: Some(Val::Native(id)),
+                setter: None,
+            })),
+        );
+    }
+    let dv_ctor = e.register_native("DataView", n_data_view, DV_CTOR);
+    e.set_native_prop(dv_ctor, "prototype", dv_proto.clone());
+    e.data_view_proto = Some(own(&dv_proto).clone());
+    e.set_global("DataView", Val::Native(dv_ctor));
+
+    // -- AbortController / AbortSignal --------------------------------------
+    let sig_proto = Val::new_object();
+    let sig_add = e.register_native("AbortSignal.prototype.addEventListener", n_abort, A_ADD);
+    let sig_rm = e.register_native("AbortSignal.prototype.removeEventListener", n_abort, A_REMOVE);
+    let sig_throw = e.register_native("AbortSignal.prototype.throwIfAborted", n_abort, A_THROW);
+    for (id, name) in [
+        (sig_add, "addEventListener"),
+        (sig_rm, "removeEventListener"),
+        (sig_throw, "throwIfAborted"),
+    ] {
+        obj_set_own(own(&sig_proto), name, Val::Native(id));
+    }
+    for (idx, name) in [
+        (A_GET_ABORTED, "aborted"),
+        (A_GET_REASON, "reason"),
+    ] {
+        let id = e.register_native(name, n_abort, idx);
+        obj_set_own(
+            own(&sig_proto),
+            name,
+            Val::Acc(Rc::new(AccEntry {
+                getter: Some(Val::Native(id)),
+                setter: None,
+            })),
+        );
+    }
+    let on_get = e.register_native("get AbortSignal.prototype.onabort", n_abort, A_GET_ON);
+    let on_set = e.register_native("set AbortSignal.prototype.onabort", n_abort, A_SET_ON);
+    obj_set_own(
+        own(&sig_proto),
+        "onabort",
+        Val::Acc(Rc::new(AccEntry {
+            getter: Some(Val::Native(on_get)),
+            setter: Some(Val::Native(on_set)),
+        })),
+    );
+    let sig_ctor = e.register_native("AbortSignal", n_abort, A_SIGNAL_CTOR);
+    e.set_native_prop(sig_ctor, "prototype", sig_proto.clone());
+    let sig_static = e.register_native("AbortSignal.abort", n_abort, A_STATIC_ABORT);
+    e.set_native_prop(sig_ctor, "abort", Val::Native(sig_static));
+    e.abort_signal_proto = Some(own(&sig_proto).clone());
+    e.set_global("AbortSignal", Val::Native(sig_ctor));
+
+    let ctrl_proto = Val::new_object();
+    let ctrl_abort = e.register_native("AbortController.prototype.abort", n_abort, A_ABORT);
+    obj_set_own(own(&ctrl_proto), "abort", Val::Native(ctrl_abort));
+    let ctrl_ctor = e.register_native("AbortController", n_abort, A_CTOR);
+    e.set_native_prop(ctrl_ctor, "prototype", ctrl_proto.clone());
+    e.abort_controller_proto = Some(own(&ctrl_proto).clone());
+    e.set_global("AbortController", Val::Native(ctrl_ctor));
+
+
 
     // -- global aliases ----------------------------------------------------
     let g = Val::Obj(e.global_obj.clone());
@@ -3590,10 +3691,17 @@ fn n_ab(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, Js
             };
             Ok(Val::Num(n as f64))
         }
-        2 => Ok(Val::Bool(matches!(
-            args.first(),
-            Some(Val::Obj(o)) if matches!(o.borrow().kind, ObjKind::TypedArray(_))
-        ))),
+        2 => {
+            let is_view = match args.first() {
+                Some(Val::Obj(o)) => {
+                    let b = o.borrow();
+                    matches!(b.kind, ObjKind::TypedArray(_))
+                        || b.props.iter().any(|(k, _)| k.as_ref() == "__dv_len")
+                }
+                _ => false,
+            };
+            Ok(Val::Bool(is_view))
+        }
         3 => {
             // slice(begin, end) copies the requested byte range
             let src = match this {
@@ -3617,8 +3725,392 @@ fn n_ab(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, Js
     }
 }
 
-fn n_bigint(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
-    let arg = args.first().cloned().unwrap_or(Val::Undefined);
+// ---- DataView -------------------------------------------------------------
+// Dispatch indices are shared by `register_native` calls in `install`.
+const DV_CTOR: u16 = 0;
+const DV_GET_I8: u16 = 1;
+const DV_GET_U8: u16 = 2;
+const DV_GET_I16: u16 = 3;
+const DV_GET_U16: u16 = 4;
+const DV_GET_I32: u16 = 5;
+const DV_GET_U32: u16 = 6;
+const DV_GET_F32: u16 = 7;
+const DV_GET_F64: u16 = 8;
+const DV_GET_BIGI64: u16 = 9;
+const DV_GET_BIGU64: u16 = 10;
+const DV_SET_I8: u16 = 11;
+const DV_SET_U8: u16 = 12;
+const DV_SET_I16: u16 = 13;
+const DV_SET_U16: u16 = 14;
+const DV_SET_I32: u16 = 15;
+const DV_SET_U32: u16 = 16;
+const DV_SET_F32: u16 = 17;
+const DV_SET_F64: u16 = 18;
+const DV_SET_BIGI64: u16 = 19;
+const DV_SET_BIGU64: u16 = 20;
+const DV_GET_BYTE_LENGTH: u16 = 21;
+const DV_GET_BYTE_OFFSET: u16 = 22;
+const DV_GET_BUFFER: u16 = 23;
+
+/// The ArrayBuffer behind a DataView instance (`__dv_buf`).
+fn dv_bytes(buf: &Val) -> Result<Rc<RefCell<Vec<u8>>>, JsError> {
+    if let Val::Obj(o) = buf {
+        let b = o.borrow();
+        if let ObjKind::ArrayBuffer(bytes) = &b.kind {
+            return Ok(bytes.clone());
+        }
+    }
+    Err(JsError::throw(
+        "TypeError: DataView buffer is not an ArrayBuffer",
+    ))
+}
+
+/// Read `size` bytes at `at` as an unsigned integer (endianness applied).
+fn dv_load(buf: &Val, at: usize, size: usize, little: bool) -> Result<u64, JsError> {
+    let bytes = dv_bytes(buf)?;
+    let b = bytes.borrow();
+    let mut n = 0u64;
+    for k in 0..size {
+        n = if little {
+            n | ((b[at + k] as u64) << (8 * k))
+        } else {
+            (n << 8) | b[at + k] as u64
+        };
+    }
+    Ok(n)
+}
+
+/// Write the low `size` bytes of `n` at `at` (endianness applied).
+fn dv_store(buf: &Val, at: usize, size: usize, n: u64, little: bool) -> Result<(), JsError> {
+    let bytes = dv_bytes(buf)?;
+    let mut b = bytes.borrow_mut();
+    for k in 0..size {
+        let shift = if little { 8 * k } else { 8 * (size - 1 - k) };
+        b[at + k] = (n >> shift) as u8;
+    }
+    Ok(())
+}
+
+/// ToIndex for a DataView offset/length (NaN -> 0, negative -> RangeError).
+fn dv_index(v: Option<&Val>, default: usize) -> Result<usize, JsError> {
+    match v {
+        None | Some(Val::Undefined) => Ok(default),
+        Some(v) => {
+            let n = v.to_number();
+            if n.is_nan() {
+                return Ok(0);
+            }
+            if !n.is_finite() || n < 0.0 {
+                return Err(JsError::throw("RangeError: invalid DataView offset"));
+            }
+            Ok(n as usize)
+        }
+    }
+}
+
+/// Element width for a DataView setter index.
+fn dv_size(idx: u16) -> usize {
+    match idx {
+        DV_GET_I8 | DV_GET_U8 | DV_SET_I8 | DV_SET_U8 => 1,
+        DV_GET_I16 | DV_GET_U16 | DV_SET_I16 | DV_SET_U16 => 2,
+        DV_GET_I32 | DV_GET_U32 | DV_GET_F32 | DV_SET_I32 | DV_SET_U32 | DV_SET_F32 => 4,
+        _ => 8,
+    }
+}
+
+fn n_data_view(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == DV_CTOR {
+        let Some(buf) = args.first() else {
+            return Err(JsError::throw(
+                "TypeError: DataView: 1 argument required",
+            ));
+        };
+        let blen = match buf {
+            Val::Obj(o) => {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::ArrayBuffer(bytes) => bytes.borrow().len(),
+                    _ => {
+                        return Err(JsError::throw(
+                            "TypeError: DataView: first argument is not an ArrayBuffer",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(JsError::throw(
+                    "TypeError: DataView: first argument is not an ArrayBuffer",
+                ))
+            }
+        };
+        let off = dv_index(args.get(1), 0)?;
+        if off > blen {
+            return Err(JsError::throw("RangeError: DataView offset is out of bounds"));
+        }
+        let len = match args.get(2) {
+            Some(Val::Undefined) | None => blen - off,
+            v => dv_index(v, 0)?,
+        };
+        if off.checked_add(len).map_or(true, |end| end > blen) {
+            return Err(JsError::throw(
+                "RangeError: DataView length is out of bounds",
+            ));
+        }
+        let obj = proto_instance(e.data_view_proto.clone());
+        obj.set("__dv_buf", buf.clone());
+        obj.set("__dv_off", Val::Num(off as f64));
+        obj.set("__dv_len", Val::Num(len as f64));
+        return Ok(obj);
+    }
+
+    let (buf, off, len) = match this {
+        Val::Obj(o) => (
+            obj_get_own(o, "__dv_buf"),
+            obj_get_own(o, "__dv_off").to_number() as usize,
+            obj_get_own(o, "__dv_len").to_number() as usize,
+        ),
+        _ => return Err(JsError::throw("TypeError: DataView method on non-DataView")),
+    };
+    match idx {
+        DV_GET_BYTE_LENGTH => return Ok(Val::Num(len as f64)),
+        DV_GET_BYTE_OFFSET => return Ok(Val::Num(off as f64)),
+        DV_GET_BUFFER => return Ok(buf),
+        _ => {}
+    }
+    let size = dv_size(idx);
+    let i = dv_index(args.first(), 0)?;
+    if i.checked_add(size).map_or(true, |end| end > len) {
+        return Err(JsError::throw("RangeError: DataView offset is out of bounds"));
+    }
+    let at = off + i;
+    if idx >= DV_SET_I8 && idx <= DV_SET_BIGU64 {
+        let v = args.get(1).cloned().unwrap_or(Val::Undefined);
+        let raw = match idx {
+            DV_SET_I8 | DV_SET_U8 => v.to_number() as i64 as u8 as u64,
+            DV_SET_I16 | DV_SET_U16 => v.to_number() as i64 as u16 as u64,
+            DV_SET_I32 | DV_SET_U32 => v.to_number() as i64 as u32 as u64,
+            DV_SET_F32 => (v.to_number() as f32).to_bits() as u64,
+            DV_SET_F64 => v.to_number().to_bits(),
+            _ => match v {
+                Val::BigInt(n) => {
+                    if idx == DV_SET_BIGI64 {
+                        *n as i64 as u64
+                    } else {
+                        *n as u64
+                    }
+                }
+                _ => {
+                    return Err(JsError::throw(
+                        "TypeError: DataView BigInt setter requires a BigInt",
+                    ))
+                }
+            },
+        };
+        let little = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+        dv_store(&buf, at, size, raw, little)?;
+        return Ok(Val::Undefined);
+    }
+    let little = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+    let n = dv_load(&buf, at, size, little)?;
+    Ok(match idx {
+        DV_GET_I8 => Val::Num(n as u8 as i8 as f64),
+        DV_GET_U8 => Val::Num(n as u8 as f64),
+        DV_GET_I16 => Val::Num(n as u16 as i16 as f64),
+        DV_GET_U16 => Val::Num(n as u16 as f64),
+        DV_GET_I32 => Val::Num(n as u32 as i32 as f64),
+        DV_GET_U32 => Val::Num(n as u32 as f64),
+        DV_GET_F32 => Val::Num(f32::from_bits(n as u32) as f64),
+        DV_GET_F64 => Val::Num(f64::from_bits(n)),
+        DV_GET_BIGI64 => Val::BigInt(Rc::new(n as i64 as i128)),
+        DV_GET_BIGU64 => Val::BigInt(Rc::new(n as i128)),
+        _ => return Err(JsError::throw("TypeError: unknown DataView method")),
+    })
+}
+
+// ---- AbortController / AbortSignal ----------------------------------------
+const A_CTOR: u16 = 0;
+const A_ABORT: u16 = 1;
+const A_ADD: u16 = 2;
+const A_REMOVE: u16 = 3;
+const A_THROW: u16 = 4;
+const A_GET_ABORTED: u16 = 5;
+const A_GET_REASON: u16 = 6;
+const A_GET_ON: u16 = 7;
+const A_SET_ON: u16 = 8;
+const A_STATIC_ABORT: u16 = 9;
+const A_SIGNAL_CTOR: u16 = 10;
+
+fn abort_error(e: &JsEngine) -> Val {
+    Val::Obj(Rc::new(RefCell::new(Obj {
+        kind: ObjKind::Error {
+            name: Rc::from("AbortError"),
+            msg: Rc::from("This operation was aborted"),
+        },
+        props: Vec::new(),
+        proto: e.error_proto.clone(),
+    })))
+}
+
+fn make_signal(e: &JsEngine, aborted: bool, reason: Val) -> Val {
+    let sig = proto_instance(e.abort_signal_proto.clone());
+    sig.set("__abort_cbs", Val::new_array(Vec::new()));
+    sig.set("__aborted", Val::Bool(aborted));
+    sig.set("__reason", reason);
+    sig
+}
+
+fn abort_event(sig: &Val) -> Val {
+    let evt = Val::new_object();
+    evt.set("type", Val::Str(Rc::from("abort")));
+    evt.set("target", sig.clone());
+    evt.set("currentTarget", sig.clone());
+    evt.set("bubbles", Val::Bool(false));
+    evt.set("cancelable", Val::Bool(false));
+    evt.set("defaultPrevented", Val::Bool(false));
+    evt
+}
+
+/// Mark `sig` aborted and run its listeners (FIFO). Callback exceptions are
+/// reported like ordinary listener errors and never escape `abort()`.
+fn abort_signal(e: &mut JsEngine, sig: &Val, reason: Val) {
+    let Val::Obj(o) = sig else { return };
+    if matches!(obj_get_own(o, "__aborted"), Val::Bool(true)) {
+        return;
+    }
+    obj_set_own(o, "__aborted", Val::Bool(true));
+    obj_set_own(o, "__reason", reason);
+    let evt = abort_event(sig);
+    let cbs = match obj_get_own(o, "__abort_cbs") {
+        Val::Obj(a) => match &a.borrow().kind {
+            ObjKind::Array(items) => items.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for cb in cbs {
+        if is_callable(&cb) {
+            if let Err(err) = e.call(cb, sig.clone(), vec![evt.clone()]) {
+                eprintln!("[js] abort listener error: {err}");
+            }
+        }
+    }
+    let on = obj_get_own(o, "__onabort");
+    if is_callable(&on) {
+        if let Err(err) = e.call(on, sig.clone(), vec![evt]) {
+            eprintln!("[js] abort listener error: {err}");
+        }
+    }
+}
+
+fn n_abort(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        A_CTOR => {
+            if !is_ctor_call(e, this) {
+                return Err(JsError::throw(
+                    "TypeError: AbortController is not a constructor function",
+                ));
+            }
+            let sig = make_signal(e, false, Val::Undefined);
+            let ctrl = proto_instance(e.abort_controller_proto.clone());
+            ctrl.set("signal", sig);
+            Ok(ctrl)
+        }
+        A_SIGNAL_CTOR => Err(JsError::throw("TypeError: Illegal constructor")),
+        A_ABORT => {
+            let Val::Obj(c) = this else {
+                return Err(JsError::throw("TypeError: abort called on non-controller"));
+            };
+            let sig = obj_get_own(c, "signal");
+            if !matches!(sig, Val::Obj(_)) {
+                return Err(JsError::throw(
+                    "TypeError: AbortController has no signal",
+                ));
+            }
+            let reason = match args.first() {
+                None | Some(Val::Undefined) => abort_error(e),
+                Some(v) => v.clone(),
+            };
+            abort_signal(e, &sig, reason);
+            Ok(Val::Undefined)
+        }
+        A_STATIC_ABORT => {
+            let reason = match args.first() {
+                None | Some(Val::Undefined) => abort_error(e),
+                Some(v) => v.clone(),
+            };
+            Ok(make_signal(e, true, reason))
+        }
+        A_ADD => {
+            let Val::Obj(o) = this else {
+                return Err(JsError::throw("TypeError: signal method on non-signal"));
+            };
+            let kind = args.first().map(|v| v.to_string()).unwrap_or_default();
+            let cb = args.get(1).cloned().unwrap_or(Val::Undefined);
+            if kind == "abort" {
+                if matches!(obj_get_own(o, "__aborted"), Val::Bool(true)) {
+                    // shortcut: an already-aborted signal calls the listener
+                    // synchronously, not from a queued microtask
+                    if is_callable(&cb) {
+                        e.call(cb, this.clone(), vec![abort_event(this)])?;
+                    }
+                } else if is_callable(&cb) {
+                    let list = obj_get_own(o, "__abort_cbs");
+                    if let Val::Obj(a) = list {
+                        if let ObjKind::Array(items) = &mut a.borrow_mut().kind {
+                            if !items.iter().any(|it| strict_eq(it, &cb)) {
+                                items.push(cb);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Val::Undefined)
+        }
+        A_REMOVE => {
+            let Val::Obj(o) = this else {
+                return Err(JsError::throw("TypeError: signal method on non-signal"));
+            };
+            let cb = args.get(1).cloned().unwrap_or(Val::Undefined);
+            let list = obj_get_own(o, "__abort_cbs");
+            if let Val::Obj(a) = list {
+                if let ObjKind::Array(items) = &mut a.borrow_mut().kind {
+                    items.retain(|it| !strict_eq(it, &cb));
+                }
+            }
+            Ok(Val::Undefined)
+        }
+        A_THROW => {
+            let Val::Obj(o) = this else {
+                return Err(JsError::throw("TypeError: signal method on non-signal"));
+            };
+            if matches!(obj_get_own(o, "__aborted"), Val::Bool(true)) {
+                return Err(JsError::Throw(obj_get_own(o, "__reason")));
+            }
+            Ok(Val::Undefined)
+        }
+        A_GET_ABORTED => match this {
+            Val::Obj(o) => Ok(obj_get_own(o, "__aborted")),
+            _ => Ok(Val::Bool(false)),
+        },
+        A_GET_REASON => match this {
+            Val::Obj(o) => Ok(obj_get_own(o, "__reason")),
+            _ => Ok(Val::Undefined),
+        },
+        A_GET_ON => match this {
+            Val::Obj(o) => Ok(obj_get_own(o, "__onabort")),
+            _ => Ok(Val::Undefined),
+        },
+        A_SET_ON => {
+            if let Val::Obj(o) = this {
+                obj_set_own(o, "__onabort", args.first().cloned().unwrap_or(Val::Undefined));
+            }
+            Ok(Val::Undefined)
+        }
+        _ => Err(JsError::throw("TypeError: unknown AbortSignal method")),
+    }
+}
+
+fn n_bigint(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {    let arg = args.first().cloned().unwrap_or(Val::Undefined);
     match idx {
         1 | 2 => {
             let bits = arg.to_number().max(0.0) as u64;

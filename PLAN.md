@@ -1708,6 +1708,33 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 43 (lazy prototypes in `getPrototypeOf`/`instanceof`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Prototype links are attached lazily on first member access, but `Object.getPrototypeOf` read the raw slot and returned `null` for any fresh array/iterator/error. core-js's iterator helper then did `null.next` and threw. Added `JsEngine::proto_of` (explicit slot, else the shared prototype for the kind; module namespaces and `Object.prototype` itself are genuinely null) and routed `getPrototypeOf`, `instanceof`, `in`, `isPrototypeOf`, `chain_get` and setter lookup through it. nextjs.org's last script error disappears (1 -> 0) at unchanged 7578px / 569 runs; RAM settles ~162 MB because the app now boots fully and its router prefetches re-render repeatedly (first paint ~155 MB, bounded). MDN 2922px / 641 runs / 87.4 MB, Wikipedia 24454px / 10943 runs / 102.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **762** default / **766** `engine-b + woff2` |
 | 2026-11-05 | wave 44 (property-name interning) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Every property insert allocated its own `Rc<str>` copy of the key, so a React render paid one string per slot for a handful of repeated names. A thread-local intern table (`KEY_INTERN`, cap 4096, cleared per `JsEngine::new`) now hands out one shared `Rc` per name; used by `obj_set_own`, `set_member`'s function-property insert and `Object.defineProperty`'s function path. Deterministic 150k-object x 8-key workload: 108.0 MB -> 71.7 MB, **36.3 MB (~34%) saved**. Live pages geometry-stable and error-free: nextjs 7578px / 569 runs / first layout ~152 MB, MDN 2922px / 641 runs / 87.3 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **763** default / **767** `engine-b + woff2` |
 | 2026-11-05 | wave 45 (document/Node surface + `queueMicrotask`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 document/Node members: `queueMicrotask` (a `Job::Call` in the existing FIFO microtask queue, non-callables throw), `document.forms` and `getElementsByName`, `createTextNode` / `createComment` (real text/comment arena nodes), and `Node.childNodes` / `Element.children` (document-order snapshots). No layout change; all five references are geometry- and error-identical: nextjs 7578px / 569 runs / first layout 150.2 MB (settles 153-158 MB as its router re-renders), MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.5 MB; suite **768** default / **772** `engine-b + woff2` |
+| 2026-11-05 | wave 46 (`DataView` + `AbortController` / `AbortSignal`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the two remaining self-contained P1 constructors. `DataView` is a byte window over an `ArrayBuffer` with big-endian default, per-call little-endian flag, all 10 numeric accessor pairs (including BigInt), and RangeError/TypeError bounds checks. `AbortController` / `AbortSignal` expose `signal`, `aborted`, `reason`, `onabort`, `addEventListener` / `removeEventListener` for `abort`, `throwIfAborted`, and `AbortSignal.abort()`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.2 MB, MDN 2922px / 641 runs / 87.6 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.4 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **773** default / **777** `engine-b + woff2` |
+
+### Wave 46 findings
+
+- **DataView is a window, not a copy.** The instance stores the backing
+  `ArrayBuffer`, its byte offset, and its byte length in three hidden own
+  properties; reads and writes go straight through to the shared bytes, so
+  a `Uint8Array` over the same buffer sees them immediately. The default
+  endianness is big-endian and the optional `littleEndian` argument is
+  honoured per call (typed arrays are little-endian by comparison).
+- **Bounds are checked per access.** An offset outside the view, a length
+  that overruns the buffer, or a non-ArrayBuffer first argument throws
+  `RangeError` / `TypeError` instead of silently reading elsewhere. The
+  BigInt setters require a BigInt and throw `TypeError` for numbers.
+- **AbortSignal listeners fire synchronously from `abort()`.** Listener
+  exceptions are logged and do not escape, matching event dispatch. The
+  controller only carries `signal`; `abort()` is on the shared prototype.
+  Duplicate `(type, callback)` registrations are ignored and
+  `removeEventListener` removes them by identity.
+- **Abort shortcuts, documented here.** An already-aborted signal calls a
+  newly added listener synchronously rather than from a queued microtask;
+  `AbortSignal.timeout` / `any` and signal `dispatchEvent` are absent;
+  `fetch` still ignores a signal; the default reason is an `Error`-kind
+  object named `AbortError` (no `DOMException` type), so `reason.name`
+  works while `reason instanceof DOMException` cannot.
+- **No geometry change, as intended.** All five reference pages kept their
+  exact height and run count.
 
 ### Wave 45 findings
 

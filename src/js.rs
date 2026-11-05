@@ -1133,6 +1133,11 @@ pub struct JsEngine {
     pub(crate) typed_slice: usize,
     /// typed-array prototype (`Uint8Array.prototype`, `%TypedArray%.prototype`)
     pub(crate) typed_proto: Option<Rc<RefCell<Obj>>>,
+    /// shared `DataView.prototype`; instances carry a byte offset/length
+    pub(crate) data_view_proto: Option<Rc<RefCell<Obj>>>,
+    /// shared `AbortSignal.prototype` / `AbortController.prototype`
+    pub(crate) abort_signal_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) abort_controller_proto: Option<Rc<RefCell<Obj>>>,
     /// `Function.prototype` — the fallback prototype for function values
     pub(crate) function_proto: Option<Rc<RefCell<Obj>>>,
     /// `Error.prototype` — parent of every error instance, so `extends
@@ -1304,6 +1309,9 @@ impl JsEngine {
             typed_subarray: 0,
             typed_slice: 0,
             typed_proto: None,
+            data_view_proto: None,
+            abort_signal_proto: None,
+            abort_controller_proto: None,
             function_proto: None,
         error_proto: None,
             regex_cache: HashMap::new(),

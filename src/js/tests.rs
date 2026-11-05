@@ -2665,3 +2665,176 @@ fn queue_microtask_rejects_non_callables() {
         "err: {err}"
     );
 }
+
+#[test]
+fn data_view_reads_and_writes_with_endianness() {
+    // default endianness is big-endian; the littleEndian flag is per call
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(16); var dv = new DataView(b);\n\
+             dv.setUint16(0, 0x1234); dv.getUint16(0)"
+        ),
+        0x1234 as f64
+    );
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(16); var dv = new DataView(b);\n\
+             dv.setUint16(0, 0x1234); dv.getUint16(0, true)"
+        ),
+        0x3412 as f64
+    );
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(16); var dv = new DataView(b);\n\
+             dv.setInt32(2, -2); dv.getInt32(2)"
+        ),
+        -2.0
+    );
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(16); var dv = new DataView(b);\n\
+             dv.setFloat64(4, 1.5); dv.getFloat64(4)"
+        ),
+        1.5
+    );
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(16); var dv = new DataView(b);\n\
+             dv.setFloat32(8, 1.5); dv.getFloat32(8)"
+        ),
+        1.5
+    );
+    // byte order is visible through a typed-array view of the same buffer
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(4); var dv = new DataView(b);\n\
+             dv.setUint16(0, 0x1234); new Uint8Array(b)[0]"
+        ),
+        0x12 as f64
+    );
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(4); var dv = new DataView(b);\n\
+             dv.setUint16(0, 0x1234, true); new Uint8Array(b)[0]"
+        ),
+        0x34 as f64
+    );
+}
+
+#[test]
+fn data_view_window_and_bounds_are_checked() {
+    assert_eq!(
+        num(
+            "var b = new ArrayBuffer(8); var dv = new DataView(b, 4, 2);\n\
+             dv.byteOffset + dv.byteLength"
+        ),
+        6.0
+    );
+    assert_eq!(
+        num(
+            "var dv = new DataView(new ArrayBuffer(8), 4, 2);\n\
+             dv.setUint8(1, 7); dv.getUint8(1)"
+        ),
+        7.0
+    );
+    // the view window is enforced, not the backing buffer
+    assert!(err("var dv = new DataView(new ArrayBuffer(8), 4, 2); dv.getUint16(1)")
+        .to_string()
+        .contains("RangeError"));
+    assert!(err("new DataView(new ArrayBuffer(8), 9)")
+        .to_string()
+        .contains("RangeError"));
+    assert!(err("new DataView({})").to_string().contains("TypeError"));
+    // DataView is an ArrayBuffer view
+    assert!(boolean("ArrayBuffer.isView(new DataView(new ArrayBuffer(4)))"));
+}
+
+#[test]
+fn data_view_bigint_accessors() {
+    assert!(boolean(
+        "var dv = new DataView(new ArrayBuffer(8));\n\
+         dv.setBigUint64(0, 18446744073709551615n);\n\
+         dv.getBigInt64(0) === -1n"
+    ));
+    assert!(boolean(
+        "var dv = new DataView(new ArrayBuffer(8));\n\
+         dv.setBigInt64(0, -2n); dv.getBigUint64(0) === 18446744073709551614n"
+    ));
+    assert!(err("var dv = new DataView(new ArrayBuffer(8)); dv.setBigInt64(0, 1)")
+        .to_string()
+        .contains("TypeError"));
+}
+
+#[test]
+fn abort_controller_fires_listeners_with_reason() {
+    assert_eq!(
+        string(
+            "var c = new AbortController(); var hits = [];\n\
+             var before = c.signal.aborted;\n\
+             c.signal.addEventListener('abort', function (e) { hits.push('l:' + e.type); });\n\
+             c.signal.onabort = function (e) { hits.push('on:' + e.type); };\n\
+             c.abort();\n\
+             before + '|' + c.signal.aborted + '|' + hits.join(',') + '|' + c.signal.reason.name"
+        ),
+        "false|true|l:abort,on:abort|AbortError"
+    );
+    assert_eq!(
+        string(
+            "var c = new AbortController(); var why = { code: 7 };\n\
+             c.abort(why); c.signal.reason.code"
+        ),
+        "7"
+    );
+    assert_eq!(
+        string("var c = new AbortController(); typeof c.signal.throwIfAborted"),
+        "function"
+    );
+    assert_eq!(
+        string(
+            "var c = new AbortController(); c.abort(1);\n\
+             var out = 'none';\n\
+             try { c.signal.throwIfAborted(); } catch (e) { out = 'caught:' + e; }\n\
+             out"
+        ),
+        "caught:1"
+    );
+    assert_eq!(
+        string(
+            "var c = new AbortController(); var why = { code: 7 };\n\
+             c.abort(why);\n\
+             var out = 'none';\n\
+             try { c.signal.throwIfAborted(); } catch (e) { out = e.code; }\n\
+             out"
+        ),
+        "7"
+    );
+    // abort is idempotent: listeners fire once
+    assert_eq!(
+        num(
+            "var c = new AbortController(); var n = 0;\n\
+             c.signal.addEventListener('abort', function () { n++; });\n\
+             c.abort(); c.abort(1); n"
+        ),
+        1.0
+    );
+}
+
+#[test]
+fn abort_signal_static_and_listener_removal() {
+    assert!(boolean("AbortSignal.abort().aborted"));
+    assert_eq!(string("AbortSignal.abort().reason.name"), "AbortError");
+    assert_eq!(
+        num(
+            "var c = new AbortController(); var n = 0;\n\
+             function f() { n++; }\n\
+             c.signal.addEventListener('abort', f);\n\
+             c.signal.removeEventListener('abort', f);\n\
+             c.abort(); n"
+        ),
+        0.0
+    );
+    assert!(err("new AbortSignal()").to_string().contains("TypeError"));
+    // instanceof works through the registered prototypes
+    assert!(boolean("new AbortController() instanceof AbortController"));
+    assert!(boolean("new AbortController().signal instanceof AbortSignal"));
+}
