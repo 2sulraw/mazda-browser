@@ -1206,6 +1206,41 @@ pub struct JsEngine {
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
 
+/// Canonical `Rc<str>` for property names. Every object property insert used
+/// to allocate its own copy of the key: a React render creates the same
+/// handful of names across thousands of objects, so a heavy page paid one
+/// string allocation per property slot. Interning makes each distinct name a
+/// single allocation shared by every object that uses it.
+///
+/// shortcut: one table per worker thread, capped at [`KEY_INTERN_MAX`]
+/// distinct names. Past the cap a fresh `Rc` is made (correct, just not
+/// shared), and `JsEngine::new` clears the table so a later page does not
+/// keep the previous page's names.
+thread_local! {
+    static KEY_INTERN: std::cell::RefCell<HashMap<Box<str>, Rc<str>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+pub(crate) const KEY_INTERN_MAX: usize = 4096;
+
+/// Intern a property name, returning a shared `Rc<str>` when possible.
+pub(crate) fn intern_key(key: &str) -> Rc<str> {
+    KEY_INTERN.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(k) = m.get(key) {
+            return k.clone();
+        }
+        let k: Rc<str> = Rc::from(key);
+        if m.len() < KEY_INTERN_MAX {
+            m.insert(k.as_ref().into(), k.clone());
+        }
+        k
+    })
+}
+
+fn clear_key_intern() {
+    KEY_INTERN.with(|m| m.borrow_mut().clear());
+}
+
 /// Retained runtime-error sources per engine and their total byte budget.
 /// Diagnostics are worth a few MB, never an unbounded amount: a page with
 /// more/larger scripts than this simply reports errors without line/col.
@@ -1228,6 +1263,9 @@ impl JsEngine {
     /// (console, Math, JSON, Object, Array, Date, Error family, parseInt,
     /// timers stubs, ...).
     pub fn new() -> JsEngine {
+        // one page's property names are not the next page's; drop the old
+        // table so a long session keeps interning the CURRENT page's keys
+        clear_key_intern();
         let mut e = JsEngine {
             global_env: Env::root(),
             global_obj: Rc::new(RefCell::new(Obj {
@@ -2376,7 +2414,7 @@ pub fn obj_set_own(o: &Rc<RefCell<Obj>>, key: &str, v: Val) {
                 *slot = v;
             }
         }
-        None => b.props.push((Rc::from(key), v)),
+        None => b.props.push((intern_key(key), v)),
     }
 }
 
@@ -2948,7 +2986,7 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
             let mut ps = c.props.borrow_mut();
             match ps.iter_mut().find(|(k, _)| k.as_ref() == key) {
                 Some((_, slot)) => *slot = v,
-                None => ps.push((Rc::from(key), v)),
+                None => ps.push((intern_key(key), v)),
             }
             Ok(())
         }

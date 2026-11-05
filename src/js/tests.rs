@@ -2603,3 +2603,34 @@ fn function_constructor_syntax_error_is_throwable() {
         caught.to_string()
     );
 }
+
+#[test]
+fn property_keys_are_interned() {
+    // `a.shared` and `b.shared` must point at ONE key allocation: a React
+    // render inserts the same handful of names into thousands of objects.
+    fn key_of(e: &mut JsEngine, src: &str) -> std::rc::Rc<str> {
+        match e.exec(src) {
+            Ok(Val::Obj(o)) => o
+                .borrow()
+                .props
+                .iter()
+                .find(|(k, _)| k.as_ref() == "shared")
+                .map(|(k, _)| k.clone())
+                .unwrap_or_else(|| panic!("{src} has no shared prop")),
+            other => panic!("{src}: {other:?}"),
+        }
+    }
+    let mut e = JsEngine::new();
+    e.exec("var a = {}; var b = {}; a.shared = 1; b.shared = 2;")
+        .expect("setup");
+    let ka = key_of(&mut e, "a");
+    let kb = key_of(&mut e, "b");
+    assert!(
+        std::rc::Rc::ptr_eq(&ka, &kb),
+        "property names should share one Rc"
+    );
+    match e.exec("a.shared + b.shared") {
+        Ok(v) => assert_eq!(v.to_string(), "3"),
+        other => panic!("sum: {other:?}"),
+    }
+}

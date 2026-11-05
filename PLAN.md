@@ -1706,6 +1706,36 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 41 (`performance` clock + rAF timestamp) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `performance` was an absent global, so nextjs's streaming bootstrap (`$RT=performance.now()`) and every timing bundle threw. Added a monotonic `performance.now()` / `timeOrigin` plus no-op `mark`/`measure`/`getEntries*`, and rAF callbacks now receive the frame timestamp on the same clock. nextjs.org's remaining rAF error disappears (7 -> 6 script errors) with geometry unchanged at 7032px / 502 runs / 145.3 MB; MDN 2675px / 615 runs / 98.7 MB, Wikipedia 24454px / 10943 runs / 100.9 MB, HN 1695px / 734 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB, all error-free; suite **759** default / **763** `engine-b + woff2` |
 | 2026-11-05 | wave 42 (DOM comments + node navigation) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | React's streaming bootstrap (`$RX`/`$RC`/`$RV`) parks boundary markers in comments and walks/rewrites them, but the HTML parser dropped comments and wrappers had no sibling navigation. Comments are now real arena nodes (`nodeType` 8, no box); wrappers gained live `data`, `nodeType`, `parentNode`, `previousSibling`/`nextSibling`, `firstChild`, `removeChild`, `insertBefore` and a `dataset` object, and text nodes get the same wrapper. nextjs.org's five inline `.data` errors disappear (6 -> 1 script error) and the streamed boundary content now actually swaps in (7032px / 502 runs -> 7578px / 569 runs, 148.7 MB); Wikipedia 24454px / 10943 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.9 MB stay error-free; MDN moves to 2922px / 641 runs / 88.6 MB only because bumping the snapshot format forced a fresh fetch of a newer page (the old cached DOM was stale); suite **761** default / **765** `engine-b + woff2` |
 | 2026-11-05 | wave 43 (lazy prototypes in `getPrototypeOf`/`instanceof`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Prototype links are attached lazily on first member access, but `Object.getPrototypeOf` read the raw slot and returned `null` for any fresh array/iterator/error. core-js's iterator helper then did `null.next` and threw. Added `JsEngine::proto_of` (explicit slot, else the shared prototype for the kind; module namespaces and `Object.prototype` itself are genuinely null) and routed `getPrototypeOf`, `instanceof`, `in`, `isPrototypeOf`, `chain_get` and setter lookup through it. nextjs.org's last script error disappears (1 -> 0) at unchanged 7578px / 569 runs; RAM settles ~162 MB because the app now boots fully and its router prefetches re-render repeatedly (first paint ~155 MB, bounded). MDN 2922px / 641 runs / 87.4 MB, Wikipedia 24454px / 10943 runs / 102.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **762** default / **766** `engine-b + woff2` |
+| 2026-11-05 | wave 44 (property-name interning) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Every property insert allocated its own `Rc<str>` copy of the key, so a React render paid one string per slot for a handful of repeated names. A thread-local intern table (`KEY_INTERN`, cap 4096, cleared per `JsEngine::new`) now hands out one shared `Rc` per name; used by `obj_set_own`, `set_member`'s function-property insert and `Object.defineProperty`'s function path. Deterministic 150k-object x 8-key workload: 108.0 MB -> 71.7 MB, **36.3 MB (~34%) saved**. Live pages geometry-stable and error-free: nextjs 7578px / 569 runs / first layout ~152 MB, MDN 2922px / 641 runs / 87.3 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **763** default / **767** `engine-b + woff2` |
+
+### Wave 44 findings
+
+- **Every property insert copied its key.** `Obj.props` is a
+  `Vec<(Rc<str>, Val)>`, and the insert path did `Rc::from(key)` on every
+  miss: one allocation plus one copy per property slot. A React-style
+  render writes the same handful of names (`type`, `props`, `children`,
+  `key`, ...) into thousands of objects, so the heap held thousands of
+  identical strings.
+- **Interning.** A thread-local `KEY_INTERN` maps each distinct name to one
+  shared `Rc<str>` (`intern_key`), capped at `KEY_INTERN_MAX = 4096`;
+  `JsEngine::new` clears it so a navigation cannot pin the previous page's
+  names. The three paths that create property keys use it: `obj_set_own`,
+  `set_member`'s function-property insert, and `Object.defineProperty`'s
+  function-property insert.
+- **Measured.** Deterministic workload (150k objects x 8 properties, same
+  process, working-set delta): **108.0 MB without interning, 71.7 MB with
+  it - 36.3 MB (~34%) of that workload's heap**. Live RSS is too noisy
+  (+/-6 MB) to read the same number off a reference page, so the synthetic
+  number is the honest measure.
+- **Live pages unchanged.** nextjs.org 7578px / 569 runs, first layout
+  ~152 MB, 0 script errors; MDN 2922px / 641 runs / 87.3 MB; Wikipedia
+  24454px / 10943 runs / 101.1 MB; Hacker News 1695px / 728 runs / 78.1 MB;
+  rust-lang 5800px / 483 runs / 84.7 MB; all error-free.
+- **Limits.** Past 4096 distinct names per thread a new key is allocated
+  normally (correct, just unshared); the table is only cleared when a new
+  engine is built, so a very long-lived page can hold up to the cap. Keys
+  stored outside these three paths (module export maps, literal string
+  values) are still allocated per site.
 
 ### Wave 43 findings
 

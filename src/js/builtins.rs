@@ -1232,7 +1232,7 @@ fn define_prop(
         Val::Func(f) => {
             let mut props = f.props.borrow_mut();
             props.retain(|(k, _)| k.as_ref() != key);
-            props.push((Rc::from(key), v));
+            props.push((intern_key(key), v));
         }
         // built-in constructors keep their own props in the native side
         // table; polyfills legitimately patch them (`Object.defineProperty(
