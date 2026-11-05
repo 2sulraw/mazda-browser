@@ -1738,6 +1738,57 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 65 (partial `opacity`) | a local opacity page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Boxes can now paint at a partial `opacity` instead of the old all-or-nothing rule. The cascade stores a clamped 0..1 value on `BoxStyle` (still turning `0` into `display:none`), and one post-build pass composes it down the box tree into `BoxNode.eff`. Every primitive the box emits multiplies that effective alpha in: background/border/outline/caret colours ride the previously unused high byte of the existing `0x00RRGGBB` words, gradients and shadows scale their own alpha, images scale per-pixel alpha, and text runs carry an alpha byte that scales glyph coverage (decorations are alpha-packed too). Fully opaque primitives keep their old unpacked bytes, so paint output for pages without `opacity` is unchanged. A local page shows 50% red over white = 255,127,127, 25% black = 191,191,191, nested 50% over green = 128,127,0 and 50% text ink. References keep their exact geometry: nextjs 7578px / 569 runs / 148.8 MB, MDN 2773px / 641 runs / 89.2 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **823** default / **827** `engine-b + woff2` |
 
+| 2026-11-06 | wave 66 (observed CSS misses + border longhands) | a local border-longhand page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The engine can now report what it drops: `MAZDA_MISS=1` counts every property name rejected by the `KNOWN` gate and every at-rule the parser does not implement, then prints a frequency-sorted table after each load. The first reference run ranked 111 distinct dropped properties on nextjs.org, 38 on Wikipedia, 23 on rust-lang.org, 20 on MDN and 4 on Hacker News; transitions/animations, the individual `translate`/`rotate`/`scale` properties, `user-select`/`pointer-events`, the `font` shorthand and `filter` led the list. The cheapest visual win in it was borders: the model already stores per-side widths, but the per-side width/colour longhands and all four corner-radius longhands were missing from `KNOWN` (the handler had an unreachable top-left arm), so reset/Tailwind styles like `border-top-width: 1px` drew nothing. All eight per-side width/colour longhands and all four corner-radius longhands now parse into the existing per-side-width / one-colour / one-radius model (style words remain collapsed to solid). A local page verifies a 6px top border, a 10px left border, a per-side red colour and 12/20px corner clipping. Distinct dropped-property counts fall to 94 on nextjs.org and 10 on rust-lang.org; all five references keep identical geometry: nextjs 7578px / 569 runs / 148.8 MB, MDN 2773 / 641 / 86.9 MB, Wikipedia 24575 / 10950 / 102.6 MB, HN 1695 / 728 / 78.2 MB, rust-lang 5800 / 483 / 84.7 MB; suite **825** default / **829** `engine-b + woff2` |
+
+### Wave 66 findings
+
+- **Instrument the gate, not the renderer.** Every stylesheet rule and inline
+  style already passes through one `KNOWN` check, so one counter there sees
+  every property the engine silently drops. The switch is a `OnceLock` env
+  read; when `MAZDA_MISS` is unset each declaration pays one atomic load and
+  allocates nothing. When set, a mutex-guarded `HashMap` counts names and
+  `dump_misses()` prints them sorted by frequency, then name, after each worker
+  load (cumulative, so the last table before exit is the session total).
+- **At-rules are counted in the same table.** `handle_at_rule` already knows
+  which names it implements (`media`, `supports`, `layer`) and which it skips
+  by documented shortcut (`import`, `font-face`, `keyframes`); every other name
+  is a genuine miss. The references report `@property` (98 occurrences on
+  nextjs.org, 21 on MDN), `@container` (21) and `@starting-style` (1), plus
+  Wikipedia's 3 `@counter-style` blocks.
+- **The ranking changes the work queue.** Ignoring behavioural properties
+  (`user-select`, `pointer-events`, `touch-action`) and the deliberate
+  no-animation shortcut, the visual misses were individual transforms
+  (`translate` 59, `rotate` 15, `scale` 12 on nextjs.org), `filter` /
+  `backdrop-filter` (11+10), `text-shadow` (6), `background-clip` (6) and the
+  `font` shorthand (8 on MDN, 6 on rust-lang.org). Grid shorthand
+  `place-items`/`place-self` appear on MDN (4+1) and nextjs.org (1+0).
+- **Borders were the cheapest real win.** `BoxStyle.border` is already
+  `[Len; 4]`, so per-side widths needed parse entries, not layout work. The
+  `KNOWN` table had `border-width` but not `border-top-width`, and
+  `border-radius` but none of the four corner longhands (the handler had a
+  top-left arm, unreachable through the gate). Adding the four widths, four
+  colours and four corner radii makes resets and utility classes that split
+  the shorthand draw their borders.
+  A per-side colour still collapses to the model's single `bcolor` (last one
+  wins), and every corner longhand sets the single `radius`; both are the
+  pre-existing single-value shortcuts, now documented at the parse site.
+- **Style longhands are accepted no-ops.** `border-style` and its four
+  longhands now survive the gate but change nothing, exactly like the style
+  words inside `border`/`border-top` have always been ignored (every border
+  paints solid). That keeps a style-only declaration from looking like a
+  missing parse entry without inventing dashed-border paint.
+- **Measured.** Local page: 6px top / 10px left ring at the expected pixels,
+  10px border inner edge at x=10, radius-12 corners leave the outer corner
+  white and radius-20 clips the second box; `MAZDA_MISS` reports zero dropped
+  names for the page. References keep identical height and run counts (see the
+  measurement row) and RAM stays in the usual bands. Distinct drops fall from
+  111 to 94 (nextjs.org) and 23 to 10 (rust-lang.org). Suite **825** default /
+  **829** `engine-b + woff2`.
+- **Next in the queue.** Individual `translate`/`rotate`/`scale` (they fit the
+  existing transform-composite path), the `font` shorthand, `place-items` /
+  `place-self`, `filter`/`backdrop-filter`, `text-shadow`, `background-clip`,
+  then `@container`/`@property` if a reference starts depending on them.
+
 ### Wave 65 findings
 
 - **Per-primitive alpha, not a group composite.** A real `opacity` renders the

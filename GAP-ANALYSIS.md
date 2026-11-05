@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 142 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
+| CSS property names | 159 in `KNOWN` + 1 alias | 752 non-vendor | ~21% | dataset includes drafts; ~24-26% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,17 +151,16 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 141 |
-| Additional accepted alias | 1 (`border-top-left-radius`) |
-| Raw missing (non-vendor) | ~630 |
-| Coverage (non-vendor) | ~16% |
-| Coverage against names shipping in two mainstream engines | ~20-22% |
+| Names in the engine's `KNOWN` table | 159 |
+| Additional accepted alias | 1 (`word-wrap` = `overflow-wrap`) |
+| Raw missing (non-vendor) | ~593 |
+| Coverage (non-vendor) | ~21% |
+| Coverage against names shipping in two mainstream engines | ~24-26% |
 
 The `KNOWN` table is the source of truth for this count. A name in the table can
 still be only partially implemented; a name outside it can still work through a
-shorthand. For example, `border-radius` is handled and `border-top-left-radius`
-is accepted as an alias, but the other three corner longhands are genuinely
-ignored.
+shorthand. For example, `border-radius` and all four corner longhands are
+handled, but the paint model still applies one radius to every corner.
 
 ### Coverage by category (raw dataset diff)
 
@@ -257,8 +256,10 @@ relevant only when transitions and animations exist.
   `justify-self` align grid items inside their area; `align-content`
   distributes rows, but `stretch` packs at the start (auto rows never grow).
 - Flex: `wrap-reverse` does not reverse the cross axis.
-- Borders: one colour for all sides; dashed/dotted approximated; inner shadows
-  dropped; only the top-left corner longhand is aliased.
+- Borders: per-side width and colour longhands parse into the existing model,
+  which still keeps one colour for all sides and one radius for all corners
+  (the last declaration wins); style words collapse to a solid border;
+  dashed/dotted text decorations are approximated; inner shadows are dropped.
 - `%` `min-height` / `max-height` resolve against width, not container
   height; an auto block still ignores a plain `height` (only `min-height`,
   `max-height`, `aspect-ratio` and replaced boxes pin it).
@@ -408,7 +409,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 823 self-authored unit tests (827 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 825 self-authored unit tests (829 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -429,12 +430,15 @@ implementing drafts. Use one of these instead:
 The best signal is neither: instrument the engine to log unresolved property
 names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
+Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
+individual transforms, `font`, `filter`, `place-items`) now orders the CSS
+queue. The DOM/JS half is still open.
 
 ### 8.2 Priority by reference impact and RAM cost
 
 | Priority | Work | Why | Reference impact | RAM cost | Effort |
 |---|---|---|---|---|---|
-| P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
+| P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands | all six | negligible (dev-only) | CSS done, JS next |
 | P0 (done) | Shrink JS AST/env/object types (waves 63-64: `Obj` 88 to 64 B, `Param` 144 to 40 B, `Stmt` 192 to 72 B, `Closure` 112 to 96 B) | directly serves the success metric; wave 44 saved 36 MB on one workload and waves 63-64 cut ~5 MB off nextjs.org | all | negative (saves) | done |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
@@ -471,14 +475,19 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (142 + 1 alias)
+## Appendix A - CSS property names accepted (159 + 1 alias)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
 background, background-color, background-image, background-position, background-repeat
-background-size, border, border-bottom, border-collapse
-border-color, border-left, border-radius, border-right
-border-spacing, border-top, border-width, bottom
+background-size, border, border-bottom, border-bottom-color
+border-bottom-left-radius, border-bottom-right-radius, border-bottom-style
+border-bottom-width, border-collapse, border-color, border-left
+border-left-color, border-left-style, border-left-width, border-radius
+border-right, border-right-color, border-right-style, border-right-width
+border-spacing, border-style, border-top, border-top-color
+border-top-left-radius, border-top-right-radius, border-top-style
+border-top-width, border-width, bottom
 box-shadow, box-sizing, caption-side, clear, clip
 clip-path, color, color-scheme, column-gap
 content, cursor, display, fill

@@ -1393,13 +1393,30 @@ const KNOWN: &[&str] = &[
     "padding-block-start",
     "padding-block-end",
     "border-radius",
+    "border-top-left-radius",
+    "border-top-right-radius",
+    "border-bottom-right-radius",
+    "border-bottom-left-radius",
     "border",
     "border-width",
     "border-color",
+    "border-style",
     "border-top",
     "border-right",
     "border-bottom",
     "border-left",
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "border-top-style",
+    "border-right-style",
+    "border-bottom-style",
+    "border-left-style",
     "border-collapse",
     "border-spacing",
     "table-layout",
@@ -1442,6 +1459,77 @@ const KNOWN: &[&str] = &[
     "stroke-linejoin",
     "stroke-linecap",
 ];
+
+/// Observed CSS misses (`MAZDA_MISS=1`, dev-only): property names dropped by
+/// the [`KNOWN`] gate and at-rule names this parser does not implement, each
+/// with a count. Off by default - every recording call is one `OnceLock` load
+/// and returns; nothing is allocated.
+struct Misses {
+    props: std::collections::HashMap<String, u32>,
+    at: std::collections::HashMap<String, u32>,
+}
+
+fn miss_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAZDA_MISS").is_some())
+}
+
+fn misses() -> &'static std::sync::Mutex<Misses> {
+    static MISSES: std::sync::OnceLock<std::sync::Mutex<Misses>> = std::sync::OnceLock::new();
+    MISSES.get_or_init(|| {
+        std::sync::Mutex::new(Misses {
+            props: std::collections::HashMap::new(),
+            at: std::collections::HashMap::new(),
+        })
+    })
+}
+
+fn note_unknown_prop(name: &str) {
+    if !miss_enabled() {
+        return;
+    }
+    if let Ok(mut m) = misses().lock() {
+        *m.props.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
+fn note_unknown_at_rule(name: &str) {
+    if !miss_enabled() {
+        return;
+    }
+    if let Ok(mut m) = misses().lock() {
+        *m.at.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Counts sorted by frequency, then name (deterministic output).
+fn ranked(counts: &std::collections::HashMap<String, u32>) -> Vec<(&str, u32)> {
+    let mut v: Vec<(&str, u32)> = counts.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    v
+}
+
+/// Print the cumulative observed-miss table (no-op unless `MAZDA_MISS` is set).
+pub fn dump_misses() {
+    if !miss_enabled() {
+        return;
+    }
+    let Ok(m) = misses().lock() else { return };
+    let props = ranked(&m.props);
+    if !props.is_empty() {
+        eprintln!("[css-miss] {} distinct dropped properties", props.len());
+        for (name, n) in props {
+            eprintln!("[css-miss] prop {n} {name}");
+        }
+    }
+    let at = ranked(&m.at);
+    if !at.is_empty() {
+        eprintln!("[css-miss] {} distinct unimplemented at-rules", at.len());
+        for (name, n) in at {
+            eprintln!("[css-miss] at {n} @{name}");
+        }
+    }
+}
 
 /// The OS color-scheme preference this build renders for (`true` = the system
 /// prefers dark, as on this machine). shortcut: no live OS listener — one
@@ -1662,6 +1750,15 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
         "layer" => true,
         _ => false,
     };
+    // observed-miss instrumentation: only names this parser never implements
+    // (media/supports/layer are handled above; import/font-face/keyframes are
+    // skipped on purpose by documented shortcuts)
+    if !matches!(
+        name,
+        "media" | "supports" | "layer" | "import" | "font-face" | "keyframes"
+    ) {
+        note_unknown_at_rule(name);
+    }
     if transparent {
         pe + 1 // parse inside; the closing '}' is consumed as a stray
     } else {
@@ -2378,6 +2475,7 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         let p = unprefix(&p).to_string();
         // custom properties (--x) always survive: var() resolution needs them
         if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
+            note_unknown_prop(&p);
             continue;
         }
         // image URLs are case-sensitive on real servers — a value carrying
@@ -3203,8 +3301,13 @@ fn apply_decl(
             bx.pad[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             bx.declared |= decl::PAD;
         }
-        // first value only (per-corner radii: shortcut)
-        "border-radius" | "border-top-left-radius" => {
+        // one radius for all corners (shortcut: per-corner radii and the
+        // elliptical `h v` form collapse to the first value)
+        "border-radius"
+        | "border-top-left-radius"
+        | "border-top-right-radius"
+        | "border-bottom-right-radius"
+        | "border-bottom-left-radius" => {
             if let Some(v) = joined_tokens(&d.1).first().and_then(|t| parse_len(t, vp)) {
                 bx.radius = v;
                 bx.declared |= decl::RADIUS;
@@ -3228,6 +3331,38 @@ fn apply_decl(
             bx.border = parse_sides(&d.1, vp);
             bx.declared |= decl::BORDER;
         }
+        // per-side width longhands (the width model is already per-side;
+        // only the parse entries were missing, so Tailwind-style
+        // `border-top-width: 1px` rules drew nothing)
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
+            let side = match d.0.as_str() {
+                "border-top-width" => 0,
+                "border-right-width" => 1,
+                "border-bottom-width" => 2,
+                _ => 3,
+            };
+            if let Some(w) = parse_len(&d.1, vp) {
+                bx.border[side] = w;
+            }
+            bx.declared |= decl::BORDER;
+        }
+        // per-side colour longhands; shortcut: the paint model keeps ONE
+        // colour for all sides, so the last declaration wins (same limitation
+        // as the `border`/`border-<side>` shorthands)
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
+                bx.bcolor = Some(c);
+                bx.declared |= decl::BCOLOR;
+            }
+        }
+        // style words are ignored (every border renders solid) - accepted as
+        // no-ops so the longhands behave exactly like the shorthands, which
+        // have always collapsed styles this way
+        "border-style"
+        | "border-top-style"
+        | "border-right-style"
+        | "border-bottom-style"
+        | "border-left-style" => {}
         "border-color" => {
             if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 bx.bcolor = Some(c);
@@ -6686,6 +6821,15 @@ mod tests {
     use super::*;
     use crate::html;
 
+    #[test]
+    fn miss_ranking_is_frequency_then_name() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("b".to_string(), 2);
+        m.insert("a".to_string(), 2);
+        m.insert("c".to_string(), 7);
+        assert_eq!(ranked(&m), vec![("c", 7), ("a", 2), ("b", 2)]);
+    }
+
     /// Default viewport for direct parse_len/parse_tracks calls — the fixed
     /// window (main.rs `with_inner_size([1000, 700])`) that parse assumes.
     const VP: (f32, f32) = (1000.0, 700.0);
@@ -8929,6 +9073,36 @@ mod tests {
         assert_eq!(c.bx.bg, Some(0xff0000), "rgba alpha>0 renders opaque");
         let t = sheet.resolve(&dom, by_attr(&dom, "class", "t"), Style::new(), None);
         assert_eq!(t.bx.bg, None, "rgba(…,0) = transparent = no fill");
+    }
+
+    #[test]
+    fn border_longhands_set_width_color_and_radius() {
+        let sheet = parse(
+            ".a { border-top-width: 3px; border-left-width: 5%; \
+                  border-right-color: #ff0000; border-bottom-right-radius: 7px }\n\
+             .b { border-top-width: 2px; border-left: 4px solid #00ff00 }\n\
+             .c { border-style: dashed; border-top-style: solid; border-bottom-color: red }",
+        );
+        let dom = dom_of(r#"<div class=a></div><div class=b></div><div class=c></div>"#);
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let a = get("a");
+        assert_eq!(
+            a.bx.border,
+            [Len::Px(3.0), Len::Px(0.0), Len::Px(0.0), Len::Pct(5.0)],
+            "per-side width longhands"
+        );
+        assert_eq!(a.bx.bcolor, Some(0xff0000), "per-side colour longhand");
+        assert_eq!(a.bx.radius, Len::Px(7.0), "corner radius longhand");
+        // a longhand and a shorthand compose in cascade order
+        let b = get("b");
+        assert_eq!(
+            b.bx.border,
+            [Len::Px(2.0), Len::Px(0.0), Len::Px(0.0), Len::Px(4.0)]
+        );
+        assert_eq!(b.bx.bcolor, Some(0x00ff00));
+        // style longhands are accepted no-ops (all borders render solid)
+        let c = get("c");
+        assert_eq!(c.bx.bcolor, Some(0xff0000));
     }
 
     #[test]
