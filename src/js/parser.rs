@@ -516,8 +516,11 @@ pub struct Param {
     pub name: Rc<str>,
     /// `Some` when written `{a, b}` / `[x, y]`; the value is destructured
     /// after the param env is built. `rest` params bind remaining args.
-    pub pat: Option<Pat>,
-    pub default: Option<Expr>,
+    /// Boxed: `Pat`/`Expr` are much larger than the common no-default,
+    /// no-pattern parameter, and params are cloned into every function
+    /// definition.
+    pub pat: Option<Box<Pat>>,
+    pub default: Option<Box<Expr>>,
     pub rest: bool,
 }
 
@@ -1773,7 +1776,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     // param env is built
                     let hidden = Rc::from(format!("#{}", *hidden_idx));
                     *hidden_idx += 1;
-                    (hidden, Some(pat))
+                    (hidden, Some(Box::new(pat)))
                 }
                 _ => {
                     return self.err("expected parameter name");
@@ -1782,7 +1785,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             let default = if rest {
                 None // rest params take no default
             } else if self.eat_op(Op::Assign) {
-                Some(self.assign_expr()?)
+                Some(Box::new(self.assign_expr()?))
             } else {
                 None
             };

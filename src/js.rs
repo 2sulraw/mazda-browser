@@ -161,11 +161,20 @@ pub enum Meth {
 #[derive(Debug)]
 pub struct Obj {
     pub kind: ObjKind,
-    /// Own properties in insertion order. shortcut: linear scan on lookup —
+    /// Own properties in insertion order. shortcut: linear scan on lookup -
     /// O(n) per access; fine for typical script objects (tens of props), to
     /// be revisited with a real shape/map if profiles ever demand it.
     pub props: Vec<(Rc<str>, Val)>,
     pub proto: Option<Rc<RefCell<Obj>>>,
+}
+
+/// `name`/`message` of an error object, shared behind one [`std::rc::Rc`] so
+/// [`ObjKind::Error`] costs a single pointer instead of two fat string
+/// pointers. Errors are immutable after construction, so sharing is safe.
+#[derive(Debug)]
+pub struct ErrorData {
+    pub name: Rc<str>,
+    pub msg: Rc<str>,
 }
 
 #[derive(Debug)]
@@ -174,13 +183,15 @@ pub enum ObjKind {
     /// array exotic: dense element storage; `length` and integer keys map
     /// onto it, everything else goes through `props`.
     Array(Vec<Val>),
-    Error {
-        name: Rc<str>,
-        msg: Rc<str>,
-    },
+    /// error data behind one `Rc`: packed so the enum (and therefore every
+    /// [`Obj`]) stays small. `Rc<ErrorData>` is one pointer instead of two
+    /// fat `Rc<str>` pointers.
+    Error(Rc<ErrorData>),
     /// milliseconds since epoch (NaN = invalid date)
     Date(f64),
-    Promise(PromiseState),
+    /// Boxed: `PromiseState` is 56 B and promises are far rarer than plain
+    /// objects, so keeping it out of line shrinks `ObjKind` for every object.
+    Promise(Box<PromiseState>),
     /// regex instance: one `Rc<Regex>` per (pattern, flags) is shared via the
     /// compile cache; only `lastIndex` (for `g`/`y`) is per-instance, stored
     /// as a Cell so exec can update it without cloning the compiled program.
@@ -202,11 +213,14 @@ pub enum ObjKind {
     /// `Symbol.iterator` result is a plain object with `next`; this is the
     /// built-in fast path). `next()` reads the CURRENT source by index, so
     /// mutation during iteration follows the spec's live-view behavior.
-    Iterator(IterState),
+    /// Boxed: `IterState` is 40 B and iterators are far rarer than plain
+    /// objects, so it stays out of the `ObjKind` size budget.
+    Iterator(Box<IterState>),
     /// real byte buffer shared by every view over it
     ArrayBuffer(Rc<RefCell<Vec<u8>>>),
-    /// fixed-width view into an ArrayBuffer
-    TypedArray(TypedArray),
+    /// fixed-width view into an ArrayBuffer. Boxed for the same reason as
+    /// [`ObjKind::Iterator`] / [`ObjKind::Promise`].
+    TypedArray(Box<TypedArray>),
     /// live host-backed collection (`getElementsBy*`, `document.forms`,
     /// `form.elements`): index/`length`/named reads re-query the host at
     /// access time through `JsEngine::live_get`, so DOM mutations that
@@ -663,7 +677,7 @@ impl Val {
                         })
                         .collect::<Vec<_>>()
                         .join(","),
-                    ObjKind::Error { name, msg } => format!("{}: {}", name, msg),
+                    ObjKind::Error(ed) => format!("{}: {}", ed.name, ed.msg),
                     ObjKind::Date(ms) => format!("Date({}ms)", ms),
                     ObjKind::Regex(ri) => format!("/{}/{}", ri.re.src, ri.re.flags),
                     ObjKind::Promise(_) => "[object Promise]".into(),
@@ -717,7 +731,7 @@ impl Val {
                         })
                         .collect::<Vec<_>>()
                         .join(","),
-                    ObjKind::Error { name, msg } => format!("{}: {}", name, msg),
+                    ObjKind::Error(ed) => format!("{}: {}", ed.name, ed.msg),
                     ObjKind::Date(ms) => format!("Date({}ms)", ms),
                     ObjKind::Promise(st) => match &st.settled {
                         None => "Promise { <pending> }".into(),
@@ -1736,7 +1750,7 @@ impl JsEngine {
             ObjKind::Array(_) => self.array_proto.clone(),
             ObjKind::Promise(_) => self.promise_proto.clone(),
             ObjKind::TypedArray(_) => self.typed_proto.clone(),
-            ObjKind::Error { .. } => self.error_proto.clone(),
+            ObjKind::Error(_) => self.error_proto.clone(),
             _ => self.object_proto.clone(),
         };
         // a prototype object is never its own prototype
@@ -1989,7 +2003,7 @@ const PROTO_WALK_CAP: usize = 100; // prototype cycle guard
 /// fresh pending promise object
 pub(crate) fn new_promise_obj() -> Rc<RefCell<Obj>> {
     Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Promise(PromiseState::default()),
+        kind: ObjKind::Promise(Box::new(PromiseState::default())),
         props: Vec::new(),
         proto: None,
     }))
@@ -2781,15 +2795,15 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             }
             {
                 let b = o.borrow();
-                if let ObjKind::Error { name, msg } = &b.kind {
+                if let ObjKind::Error(ed) = &b.kind {
                     // error objects expose .name/.message as own props
                     match key {
-                        "name" => return Ok(Val::Str(name.clone())),
-                        "message" => return Ok(Val::Str(msg.clone())),
-                        // shortcut: no captured frames — the "stack" is just
+                        "name" => return Ok(Val::Str(ed.name.clone())),
+                        "message" => return Ok(Val::Str(ed.msg.clone())),
+                        // shortcut: no captured frames - the "stack" is just
                         // the head line a log/overlay would print
                         "stack" => {
-                            return Ok(Val::Str(Rc::from(format!("{name}: {msg}").as_str())))
+                            return Ok(Val::Str(Rc::from(format!("{}: {}", ed.name, ed.msg).as_str())))
                         }
                         _ => {}
                     }

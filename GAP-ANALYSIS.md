@@ -404,7 +404,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 820 self-authored unit tests (824 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 821 self-authored unit tests (825 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -431,7 +431,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 | Priority | Work | Why | Reference impact | RAM cost | Effort |
 |---|---|---|---|---|---|
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
-| P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
+| P0 | Shrink JS AST/env/object types (`Stmt` 192 B and `Closure` 112 B remain; wave 63 cut `Param` from 144 to 40 B and `Obj` from 88 to 64 B) | directly serves the success metric; wave 44 saved 36 MB on one workload and wave 63 cut ~2.5 MB off nextjs.org | all | negative (saves) | medium |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |

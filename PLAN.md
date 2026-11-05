@@ -1732,6 +1732,39 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 62 (`radial-gradient`) | a local radial page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Backgrounds can now use `radial-gradient(...)` in `background` and `background-image` alongside the linear form. The parser accepts `circle`/`ellipse`, the `closest-side`/`farthest-side`/`closest-corner`/`farthest-corner` extents (plus the `contain`/`cover` synonyms), one or two explicit radii, and `at <position>` using the `background-position` grammar; a lone length implies a circle and a headless gradient defaults to a centred ellipse at farthest-corner. The extra geometry is one optional `Radial` field on the existing `Gradient`, so linear parsing, storage and the paint channel are unchanged. Paint resolves the centre and radii against the painted border box and maps each pixel through the normalized distance `sqrt(((x-cx)/rx)^2 + ((y-cy)/ry)^2)`, so `t` is 0 at the centre and 1 on the ending shape; rounded corners, stacking, transforms and sticky pinning reuse the solid-background path. A local page shows an off-centre circle, the default ellipse, explicit `20px 40px` radii, `closest-side`, positioned stops, a rounded-corner clip and a headless gradient. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.7 MB, MDN 2773px / 641 runs / 89.8 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **820** default / **824** `engine-b + woff2` |
 
+| 2026-11-05 | wave 63 (JS allocation units) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The two hottest JS allocation units got smaller without changing behavior. `ObjKind`'s rare large payloads (`PromiseState` 56 B, `IterState` 40 B, `TypedArray` 32 B and an error's two fat name/message strings) now live behind one pointer each, so `ObjKind` falls from 56 to 32 bytes and `Obj` from 88 to 64 (−24 B for every object, including plain objects and arrays). Error name/message share one `Rc<ErrorData>`. `Param`'s optional destructuring pattern and default expression are boxed, so `Param` falls from 144 to 40 bytes (−104 B per parameter); the boxes allocate only when a function actually uses a default or pattern. A new size-guard test pins these ceilings. All 820 behavior tests still pass. References keep their exact geometry: nextjs 7578px / 569 runs / 153.2 MB, MDN 2773px / 641 runs / 87.3 MB, Wikipedia 24575px / 10950 runs / 102.5 MB, HN 1695px / 728 runs / 77.5 MB (67-83 MB across reloads), rust-lang 5800px / 483 runs / 84.9 MB; suite **821** default / **825** `engine-b + woff2` |
+
+### Wave 63 findings
+
+- **Box the rare payloads, keep the common ones inline.** `ObjKind` is
+  embedded in every `Obj`, so its largest variant set the size of all objects.
+  `PromiseState`, `IterState` and `TypedArray` are far rarer than plain objects
+  and arrays, so moving each behind a `Box` removed their bytes from every
+  object. `Array(Vec<Val>)` stays inline because arrays are common and the
+  `Vec` header is already only 24 B.
+- **One pointer for error text.** An error previously carried two fat
+  `Rc<str>` pointers (16 B each) inside the enum. `ErrorData { name, msg }`
+  behind one `Rc` turns that into 8 B; the payload is immutable after
+  construction, so sharing is safe.
+- **Parameters pay only when they use the feature.** `Param` was 144 B because
+  it inlined an 80 B `Expr` default and a 32 B `Pat` even though most
+  parameters have neither. Boxing both fields makes the common parameter
+  40 B; the extra allocation happens only for a function that actually
+  declares `= default` or a destructuring pattern.
+- **Measured.** `ObjKind` 56 -> 32 B, `Obj` 88 -> 64 B (-27%), `Param`
+  144 -> 40 B (-72%); `Val` stays 24 B. Live working set fell on the
+  script-heavy references (nextjs 155.7 -> 153.2 MB, MDN 89.8 -> 87.3 MB)
+  while geometry and run counts stayed identical. Hacker News ranges
+  67-83 MB across reloads, so only its stable 1695px / 728-run geometry is
+  meaningful. Wave 44 showed that single-process RSS is noisy; the exact
+  per-unit sizes are the deterministic measure.
+- **Tradeoff.** Errors, promises, iterators, typed arrays and parameters with
+  defaults/patterns gain one indirection on access. Ordinary object and
+  parameter creation gets cheaper and more cache-friendly, which is the path
+  React-style code exercises most.
+- **Still ahead.** `Stmt` (192 B) and `Closure` (112 B) are untouched; a later
+  wave can box their large variants the same way.
+
 ### Wave 62 findings
 
 - **Geometry resolves at paint time.** The centre is stored as the same

@@ -822,12 +822,12 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
 /// results; anything else throws a clear TypeError.
 pub(crate) fn make_iterator(source: Val, kind: IterKind) -> Val {
     Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Iterator(IterState {
+        kind: ObjKind::Iterator(Box::new(IterState {
             source,
             kind,
             index: 0,
             done: false,
-        }),
+        })),
         props: Vec::new(),
         proto: None,
     })))

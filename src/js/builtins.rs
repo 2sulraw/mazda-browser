@@ -967,7 +967,7 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                     Some(s) => json_str(&Rc::from(s.as_str()), out),
                     None => out.push_str("null"),
                 },
-                ObjKind::Error { .. } | ObjKind::Promise(_) => {
+                ObjKind::Error(_) | ObjKind::Promise(_) => {
                     // shortcut: no toJSON support; these serialize empty
                     out.push_str("{}");
                 }
@@ -1626,7 +1626,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
             Val::Obj(o) => match &o.borrow().kind {
                 ObjKind::Plain => "[object Object]",
                 ObjKind::Array(_) => "[object Array]",
-                ObjKind::Error { .. } => "[object Error]",
+                ObjKind::Error(_) => "[object Error]",
                 ObjKind::Date(_) => "[object Date]",
                 ObjKind::Promise(_) => "[object Promise]",
                 ObjKind::Regex(_) => "[object RegExp]",
@@ -2263,11 +2263,11 @@ fn n_error_ctor(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<
     if is_ctor_call(e, this) {
         if let Val::Obj(o) = this {
             let mut b = o.borrow_mut();
-            if !matches!(b.kind, ObjKind::Error { .. }) {
-                b.kind = ObjKind::Error {
+            if !matches!(b.kind, ObjKind::Error(_)) {
+                b.kind = ObjKind::Error(Rc::new(ErrorData {
                     name: name.clone(),
                     msg: msg.clone(),
-                };
+                }));
                 if b.proto.is_none() {
                     b.proto = proto.clone();
                 }
@@ -2276,7 +2276,7 @@ fn n_error_ctor(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<
         }
     }
     Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Error { name, msg },
+        kind: ObjKind::Error(Rc::new(ErrorData { name, msg })),
         props: Vec::new(),
         proto,
     }))))
@@ -3429,12 +3429,12 @@ fn make_view(
     len: usize,
 ) -> Val {
     Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::TypedArray(TypedArray {
+        kind: ObjKind::TypedArray(Box::new(TypedArray {
             kind,
             buf,
             offset,
             len,
-        }),
+        })),
         props: Vec::new(),
         proto: e.typed_proto.clone(),
     })))
@@ -3965,10 +3965,10 @@ const A_SIGNAL_CTOR: u16 = 10;
 
 fn abort_error(e: &JsEngine) -> Val {
     Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Error {
+        kind: ObjKind::Error(Rc::new(ErrorData {
             name: Rc::from("AbortError"),
             msg: Rc::from("This operation was aborted"),
-        },
+        })),
         props: Vec::new(),
         proto: e.error_proto.clone(),
     })))

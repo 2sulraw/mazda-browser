@@ -2838,3 +2838,26 @@ fn abort_signal_static_and_listener_removal() {
     assert!(boolean("new AbortController() instanceof AbortController"));
     assert!(boolean("new AbortController().signal instanceof AbortSignal"));
 }
+
+#[test]
+fn js_allocation_units_stay_compact() {
+    // RAM guards for wave 63: the rare `ObjKind` payloads live behind one
+    // pointer and `Param`'s optional pattern/default are boxed, so ordinary
+    // objects and parameters stay small. Raise these ceilings only with a
+    // measured reason.
+    assert!(
+        std::mem::size_of::<ObjKind>() <= 32,
+        "ObjKind grew to {} bytes",
+        std::mem::size_of::<ObjKind>()
+    );
+    assert!(
+        std::mem::size_of::<Obj>() <= 64,
+        "Obj grew to {} bytes",
+        std::mem::size_of::<Obj>()
+    );
+    assert!(
+        std::mem::size_of::<parser::Param>() <= 40,
+        "Param grew to {} bytes",
+        std::mem::size_of::<parser::Param>()
+    );
+}
