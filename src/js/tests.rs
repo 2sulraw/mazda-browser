@@ -2494,3 +2494,37 @@ fn module_body_error_locations_stay_per_statement() {
         .expect_err("module must throw");
     assert!(err.contains("line 2"), "expected line 2, got: {err}");
 }
+
+#[test]
+fn function_constructor_compiles_its_body() {
+    assert!(matches!(
+        run("new Function('return true;')()"),
+        Val::Bool(true)
+    ));
+    assert_eq!(num("Function('a', 'b', 'return a + b;')(2, 3)"), 5.0);
+    // every argument but the last is a parameter
+    assert_eq!(num("new Function('x', 'return x * 2')(21)"), 42.0);
+    // spec: the compiled function closes over the GLOBAL scope only
+    assert_eq!(
+        run("(function () { let hidden = 1; return new Function('return typeof hidden')(); })()")
+            .to_string(),
+        "undefined"
+    );
+    // ... and a plain call gets the global object as `this`
+    assert!(matches!(run("Function('return this')()"), Val::Obj(_)));
+    // the spec name for a constructor-built function
+    assert_eq!(run("new Function('return 1').name").to_string(), "anonymous");
+}
+
+#[test]
+fn function_constructor_syntax_error_is_throwable() {
+    let caught = run(
+        "(function () { try { new Function('return )'); return false } \
+         catch (e) { return String(e).startsWith('SyntaxError:') } })()",
+    );
+    assert!(
+        matches!(caught, Val::Bool(true)),
+        "caught: {caught:?} / {}",
+        caught.to_string()
+    );
+}

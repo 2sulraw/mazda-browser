@@ -287,10 +287,8 @@ pub(crate) fn install(e: &mut JsEngine) {
         };
         e.function_proto = Some(o.clone());
     }
-    let fn_body = e.register_native("Function(...) body", n_fn_body, 0);
     let fn_ctor = e.register_native("Function", n_fn_ctor, 0);
     e.set_native_prop(fn_ctor, "prototype", fn_proto);
-    e.fn_body_native = fn_body;
     e.set_global("Function", Val::Native(fn_ctor));
 
     e.set_global("NaN", Val::Num(f64::NAN));
@@ -2201,15 +2199,41 @@ fn n_fn_proto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
     super::interp::call_method(e, FN_METHODS[idx as usize], this, args)
 }
 
-/// shortcut: the `Function` constructor does not compile source. The callable
-/// it returns ignores its body and yields the global object — enough for the
-/// widespread `Function("return this")()` global probe.
-fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
-    Ok(Val::Native(e.fn_body_native))
-}
-
-fn n_fn_body(e: &mut JsEngine, _idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
-    Ok(Val::Obj(e.global_obj.clone()))
+/// The `Function` constructor compiles real source: `new Function("a", "return a + 1")`
+/// builds a sloppy-mode function whose scope is the global one (no closure
+/// over the caller). The wrapper's parameter list is parsed by the ordinary
+/// parser, so destructuring/rest/default parameters work; the body stays
+/// unexecuted until the function is called.
+fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    use super::parser::{self, StmtKind};
+    let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+    let (params, body) = match parts.split_last() {
+        Some((body, params)) => (params.join(", "), body.clone()),
+        None => (String::new(), String::new()),
+    };
+    let src = format!("function anonymous({params}\n) {{\n{body}\n}}");
+    let src_id = e.register_source(&src);
+    let prog = parser::parse(&src, src_id).map_err(|err| match err {
+        // the reported position is inside our wrapper; the message is what
+        // matters (real engines expose body-relative positions)
+        JsError::Syntax { msg, .. } => JsError::throw(&format!("SyntaxError: {msg}")),
+        other => other,
+    })?;
+    let def = prog
+        .into_iter()
+        .find_map(|st| match st.kind {
+            StmtKind::FuncDecl(f) => Some(f),
+            _ => None,
+        })
+        .ok_or_else(|| JsError::throw("SyntaxError: invalid function body"))?;
+    Ok(Val::Func(Rc::new(Closure {
+        def,
+        env: e.global_env.clone(),
+        this: Val::Undefined,
+        is_arrow: false,
+        props: RefCell::new(Vec::new()),
+        proto: RefCell::new(None),
+    })))
 }
 
 fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {

@@ -1699,6 +1699,44 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-04 | wave 34 (grid row spans) | MDN homepage + Wikipedia `/wiki/JavaScript`, same build pair | a spanning grid item's height now stretches the rows it covers instead of overhanging them: MDN's hero grid grew 288 -> 420px because `div.homepage-header__mandala` (351x420) spans both header rows, so "Featured articles" moves down 132px (page 2542 -> 2675px, 615 runs); Wikipedia unchanged at 24454px (10943 runs) because no grid there has a row span; suite **745** default / **749** `engine-b + woff2` |
 | 2026-11-05 | wave 35 (page CSS inside inline SVG) | MDN homepage + a local page with the real mandala markup and the page's rules | the mandala now paints (5 concentric rings of slashes, was blank): the page's `.mandala svg>text` and `.mandala textPath[href="#circleN"]` rules reach the rasterizer through a mini-cascade over the SVG's ancestor chain, and `font-size: 1.5rem` resolves in svg.rs; page height 2675px, 615 runs and ~100 MB unchanged, Wikipedia unchanged at 24454px; suite **746** default / **750** `engine-b + woff2` |
 | 2026-11-05 | wave 36 (live ES-module namespaces) | MDN homepage + Wikipedia `/wiki/JavaScript` + nextjs.org | MDN's client bundle now runs to completion - the `Cannot read property 'length' of undefined` at `index.08e…js` col 19277 is gone and the page logs no `[js]` errors (page 2675px / 615 runs / 100.5 MB, one layout); Wikipedia unchanged at 24454px / 10943 runs / 101.6 MB; nextjs.org 7032px / 502 runs / 141.4 MB (fresh 256 KB page, unchanged by this wave); suite **748** default / **752** `engine-b + woff2` |
+| 2026-11-05 | wave 37 (Function constructor compiles source) | Wikipedia `/wiki/JavaScript` + MDN homepage + nextjs.org + rust-lang.org + Hacker News | Wikipedia's 20 `Exception in resolve` / `Skipped unavailable module` pairs are gone (ResourceLoader evaluates each module's `skip` condition with `new Function(...)()`, which returned a plain object and threw) and the page logs no script errors; layout unchanged at 24454px / 10943 runs / 102.2 MB and the worker finished in 12.4s (wave 36: 18.2s); MDN 2675px / 615 runs / 99.7 MB, nextjs 7032 / 502 / 140.5 MB (same 11 pre-existing errors), rust-lang 483 runs, HN 734 runs (its `getElementsByClassName` gap is unrelated); suite **750** default / **754** `engine-b + woff2` |
+
+### Wave 37 findings
+
+- **`new Function` was returning a plain object, not a function.** The
+  constructor's stub handed back a native that ignored its body and returned
+  the global object; that only worked for `Function("return this")()` — called
+  *without* `new`. The `new` operator keeps a constructor's result only when it
+  is an object, and a `Val::Native` was not in that set, so `new Function(...)`
+  evaluated to the discarded fresh object. Calling that (`new Function(...)()`)
+  threw `TypeError: object is not a function`.
+- **That broke MediaWiki's module loader.** ResourceLoader evaluates every
+  module's `skip` condition as a source string:
+  `var skip = (new Function(registry[module].skip)())`. Each evaluation threw,
+  `sortDependencies` aborted, and the module was dropped as
+  `Skipped unavailable module …` plus `Exception in resolve` — 20 times on
+  `/wiki/JavaScript`.
+- **The constructor now compiles its body.** Arguments are stringified (last is
+  the body, the rest are the parameter list), wrapped as
+  `function anonymous(params\n) { body }`, parsed by the common parser and
+  closed over the **global** environment (not the caller's). Destructuring,
+  default and rest parameters therefore work; a syntax error becomes a
+  throwable `SyntaxError`; the function's name is `anonymous`, as specified.
+  `new` now honours any object-like constructor result (function values
+  included), which is what lets `new Function(...)` return the compiled
+  function.
+- **Live effect.** Wikipedia's loader resolves cleanly: `Exception in resolve`
+  0, `Skipped unavailable module` 0, zero script errors, identical geometry
+  (24454 px / 10943 runs / 102.2 MB) — with the worker finishing in 12.4 s
+  against 18.2 s in the wave-36 run. MDN homepage (2675 px / 615 runs /
+  99.7 MB), nextjs.org (7032 / 502 / 140.5 MB, same 11 pre-existing errors) and
+  rust-lang.org (483 runs) are unchanged; Hacker News keeps its one
+  `getElementsByClassName` gap, which is an element-API issue, not this path.
+- **Limits.** A generated function's syntax-error position is reported inside
+  the wrapper, not body-relative; `eval` is still absent; and the compiled body
+  runs under the interpreter's existing strictness rules (a leading
+  `"use strict"` is parsed in the body but strict-only semantics are not
+  separately enforced).
 
 ### Wave 36 findings
 

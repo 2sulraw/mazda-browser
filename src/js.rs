@@ -1134,8 +1134,6 @@ pub struct JsEngine {
     /// `Error.prototype` — parent of every error instance, so `extends
     /// Error` and borrowed `Error.prototype.toString` both work
     pub(crate) error_proto: Option<Rc<RefCell<Obj>>>,
-    /// native returned by `Function(...)` (its body is not compiled)
-    pub(crate) fn_body_native: usize,
     /// compiled-once regex literal cache, keyed by (pattern, flags). Regex
     /// literals are program text, so this cache is bounded by the number of
     /// distinct (pattern, flags) literals the page can create; still capped
@@ -1266,7 +1264,6 @@ impl JsEngine {
             typed_proto: None,
             function_proto: None,
         error_proto: None,
-            fn_body_native: 0,
             regex_cache: HashMap::new(),
             next_timer_id: 1.0,
             steps: 0,

@@ -1300,8 +1300,17 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             // generically: natives get the fresh object as `this`
             e.pending_construct = Some(f.clone());
             let res = e.call(f, fresh.clone(), argvals)?;
-            // constructor returning an object overrides `this`
-            Ok(if matches!(res, Val::Obj(_)) { res } else { fresh })
+            // a constructor returning an OBJECT overrides `this`. Functions
+            // are objects too (this is how `new Function(...)` hands back the
+            // compiled function instead of the discarded fresh object).
+            Ok(if matches!(
+                res,
+                Val::Obj(_) | Val::Func(_) | Val::Native(_) | Val::Method(_)
+            ) {
+                res
+            } else {
+                fresh
+            })
         }
         ExprKind::Member { base, key } => {
             let b = eval_expr(e, env, base)?;
