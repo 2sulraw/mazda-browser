@@ -816,9 +816,10 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
     }
 }
 
-/// shortcut: no iterator protocol — arrays and strings only; anything else
-/// throws a clear TypeError (custom iterables, Maps, Sets are later waves).
-/// Build a built-in iterator object over `source`.
+/// Build a built-in iterator object over `source`. `get_iterator` wraps
+/// arrays/typed arrays/strings, live host collections (as a one-query
+/// snapshot), Sets/Maps (hidden payload props) and user `@@iterator`
+/// results; anything else throws a clear TypeError.
 pub(crate) fn make_iterator(source: Val, kind: IterKind) -> Val {
     Val::Obj(Rc::new(RefCell::new(Obj {
         kind: ObjKind::Iterator(IterState {
@@ -966,6 +967,19 @@ pub(crate) fn get_iterator(e: &mut JsEngine, v: &Val) -> Result<Val, JsError> {
     match v {
         Val::Str(_) => return Ok(make_iterator(v.clone(), IterKind::Values)),
         Val::Obj(o) => {
+            // live host collection: snapshot once through the embedder hook
+            // (per-index reads would re-query the DOM for every element)
+            let live = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Live(s) => Some(s.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(spec) = live {
+                let items = e.live_values.map(|f| f(&spec)).unwrap_or_default();
+                return Ok(make_iterator(Val::new_array(items), IterKind::Values));
+            }
             let builtin = {
                 let b = o.borrow();
                 match &b.kind {

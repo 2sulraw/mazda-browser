@@ -1724,6 +1724,42 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 57 (`justify-items` / `justify-self`) | a local five-grid alignment page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Grid items can now be aligned along the inline axis inside their grid area. `justify-items` parses into an `Align` on `BoxStyle` and `justify-self` into a per-item override (`auto` inherits, `normal` is `stretch`). `stretch` keeps the old full-area placement, so every existing page is byte-identical; `start`/`center`/`end` size the item to fit-content (declared px/% against the area, auto widths from max-content) and shift its margin box inside the area. Text items wrap at that fit-content width instead of the whole cell. A local page shows four grids (start/center/end/stretch) plus per-item overrides; suite **807** default / **811** `engine-b + woff2`. References: nextjs 7578px / 569 runs / 155.7 MB, MDN 2773px / 641 runs / 88.1 MB (the MDN homepage itself changed between waves: 2690px with the same binary when the feature is disabled, so this is content drift, not layout), Wikipedia 24575px / 10950 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.2 MB |
 | 2026-11-05 | wave 58 (`caption-side`) | a local three-caption table page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Table captions can now sit below the grid. `caption-side` parses `top`/`bottom` (plus `block-start`/`block-end`) into an optional value on `BoxStyle`; layout resolves a caption's own declaration first, then inherits the table's (the initial value stays `top`), and places bottom captions after the last row and its bottom border-spacing. Multiple captions keep document order within each side. A local page shows the default top caption, a table-level `caption-side: bottom`, and a caption-level `top` overriding a bottom table. All references stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.5 MB, MDN 2773px / 641 runs / 88.2 MB, Wikipedia 24575px / 10950 runs / 103.4 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.0 MB; suite **809** default / **813** `engine-b + woff2` |
 
+| 2026-11-05 | wave 59 (live collections / named form access) | a local collections/form page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `getElementsByTagName`, `getElementsByClassName`, `getElementsByName`, `document.forms` and `form.elements` now return LIVE `HTMLCollection`-shaped objects: `length`, index reads, `item()`, `namedItem()` and named property reads re-query the DOM, so nodes appended after the collection was returned appear without re-querying. `document.forms.login` and `form.elements.email` work by name/id; `form.elements` is a getter backed by the form's `button/fieldset/input/object/output/select/textarea` descendants. `for..of`, spread and `Array.from` snapshot through one query; generic `Array.prototype.*.call(collection, ...)` (MDN's header-anchor code) still works. `querySelectorAll` stays a static NodeList. Fixing collection indices also exposed an old document-order bug in element-scoped subtree walks, now corrected. A local page shows live length growth, named form/control access, iteration and a generic array method. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.1 MB, MDN 2773px / 641 runs / 87.7 MB, Wikipedia 24575px / 10950 runs / 102.9 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **812** default / **816** `engine-b + woff2` |
+
+### Wave 59 findings
+
+- **Live means re-query, not caching.** A collection stores only its query
+  (family + scope + argument) in a new `ObjKind::Live`; every `length`,
+  index, `item`, `namedItem` or named read re-runs it against the current
+  arena. That is O(nodes) per read, but collections are read a handful of
+  times in practice and the alternative (a cache plus a mutation counter)
+  would be a second source of truth.
+- **The engine still knows nothing about the DOM.** `js.rs` defines the
+  opaque `LiveSpec` and two embedder hooks (`live_get` for member reads,
+  `live_values` for iteration). The family numbers and tag lists live in
+  `script.rs`. Shorthand: `live_values` snapshots the collection, so
+  `for..of`/spread are one query rather than one per index.
+- **Array interop is kept on purpose.** Real `HTMLCollection` has no array
+  methods, but real pages call generic ones: MDN's anchor code does
+  `Array.prototype.filter.call(document.getElementsByClassName(...), fn)`.
+  `need_array` now turns a live collection into a one-shot array for those
+  methods; writes land in that snapshot, not the DOM. Direct `forEach`/`map`
+  on a collection stay absent (browsers do not have them either).
+- **`form.elements` is a getter, not a method.** Installing it as a native
+  value made `form.elements.length` read the function's arity (undefined) -
+  the wrapper now installs an accessor pair, like `parentElement`. Named
+  shorthand on the form itself (`form.email`) is still not attached; use
+  `form.elements`.
+- **The wave found a real ordering bug.** Element-scoped subtree walks
+  (`getElementsBy*` on an element, element `querySelectorAll`) popped the
+  initial children from the back of a stack without reversing them, so
+  siblings came out in reverse document order. Whole-document queries used
+  arena order and were fine. Both helpers now push the initial children
+  reversed; a new assertion pins `form.elements.item(1)` to the second
+  control in document order.
+- **`querySelectorAll` stayed static.** Only `getElementsBy*`, `forms` and
+  `form.elements` became live, matching the NodeList/HTMLCollection split.
+
 ### Wave 58 findings
 
 - **Captions are placed, not re-gridded.** `table_layout` already painted

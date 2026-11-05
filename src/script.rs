@@ -48,10 +48,17 @@
 //! - `createElement` interns any tag name (the table grows on demand, so
 //!   custom elements and `link`/`meta` work); created nodes are inert until
 //!   appended (no fetch, no stylesheet application for a created `<link>`).
-//!   `getElementsByTagName(name)` returns a document-order snapshot array
-//!   (`"*"` = every element), not a live collection. `getElementsByClassName`
-//!   matches elements carrying all the whitespace-separated names (document
-//!   order; empty = nothing; on an element, descendants only).
+//!   `getElementsByTagName`/`getElementsByClassName`/`getElementsByName`,
+//!   `document.forms` and `form.elements` return LIVE collections (`length`,
+//!   index, `item()`, `namedItem()` and named property reads re-query the
+//!   DOM, so later mutations are visible); `querySelectorAll` stays a
+//!   document-order static array, as a NodeList is. `getElementsByTagName`
+//!   (`"*"` = every element) and `getElementsByClassName` (elements carrying
+//!   all the whitespace-separated names) match in document order on the whole
+//!   document; on an element, descendants only. `form.elements` lists the
+//!   form's `button/fieldset/input/object/output/select/textarea`
+//!   descendants. `form.controlName` shorthand is not attached to the form
+//!   wrapper itself (use `form.elements`).
 //! - reflected attribute props (`id`, `className`, `href`, `src`, `rel`,
 //!   `as`, `crossOrigin`, `nonce`, `name`, `title`, `alt`, `target`, `media`,
 //!   `integrity`, `referrerPolicy`) are live accessors on every element
@@ -215,6 +222,17 @@ fn wrap_element(node: u32) -> Val {
     let p = runtime::host(|h| h.snapshot(node));
     if let Some(p) = p {
         o.set("tagName", str_val(&p.tag));
+        // `form.elements`: live collection of the form's listed controls.
+        // A getter (not a method), like the real property.
+        if p.tag.eq_ignore_ascii_case("form") {
+            o.set(
+                "elements",
+                js::Val::Acc(Rc::new(js::AccEntry {
+                    getter: Some(js::Val::Native(n.el_form_elements)),
+                    setter: None,
+                })),
+            );
+        }
         // value-like props snapshot: input/textarea current value
         if let Some(v) = p.value {
             o.set("value", str_val(&v));
@@ -442,6 +460,11 @@ struct Nids {
     node_child_nodes: usize,
     node_children: usize,
     node_dataset: usize,
+    /// `form.elements` (a live controls collection)
+    el_form_elements: usize,
+    /// shared `item`/`namedItem` native for live collections
+    coll_item: usize,
+    coll_named: usize,
     cls_add: usize,
     cls_remove: usize,
     cls_toggle: usize,
@@ -524,10 +547,12 @@ pub(crate) fn all_elements_dom(dom: &Dom) -> Vec<u32> {
 /// order). Text and the `#document` sentinel are skipped.
 pub(crate) fn subtree_elements_dom(dom: &Dom, root: u32) -> Vec<u32> {
     let mut out = Vec::new();
+    // the stack pops from the back, so both the initial children and each
+    // visited node's children are pushed reversed to yield document order
     let mut stack: Vec<u32> = dom
         .nodes
         .get(root as usize)
-        .map(|n| n.children.clone())
+        .map(|n| n.children.iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(n) = stack.pop() {
         if dom.is_element(n) {
@@ -706,6 +731,11 @@ const N_DATASET: u16 = 9;
 /// snapshots built from the arena's child list
 const N_CHILD_NODES: u16 = 10;
 const N_CHILDREN: u16 = 11;
+/// live-collection group idxs (one native for `item`/`namedItem`)
+const C_ITEM: u16 = 0;
+const C_NAMED: u16 = 1;
+/// `form.elements` (element group; distinct from every E_* above)
+const E_FORM_ELEMENTS: u16 = 48;
 
 // Scheduler budgets (MAX_PENDING_TIMERS / MAX_PENDING_FRAMES /
 // FRAME_EPOCH) live ONCE in runtime.rs — single source for both engines.
@@ -757,26 +787,12 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             let Some(tag) = sel else { return Ok(Val::Null) };
             create_element(&tag)
         }
-        D_GET_ELEMENTS_BY_TAG => {
-            let name = sel.unwrap_or_default();
-            Ok(runtime::host(|h| {
-                js::Val::new_array(h.by_tag(&name).into_iter().map(wrap_element).collect())
-            }))
-        }
-        D_GET_ELEMENTS_BY_CLASS => {
-            let names = sel.unwrap_or_default();
-            Ok(runtime::host(|h| {
-                js::Val::new_array(h.by_class(&names).into_iter().map(wrap_element).collect())
-            }))
-        }
-        D_FORMS => Ok(runtime::host(|h| {
-            js::Val::new_array(h.by_tag("form").into_iter().map(wrap_element).collect())
-        })),
+        D_GET_ELEMENTS_BY_TAG => Ok(wrap_coll(LIVE_TAG, 0, &sel.unwrap_or_default())),
+        D_GET_ELEMENTS_BY_CLASS => Ok(wrap_coll(LIVE_CLASS, 0, &sel.unwrap_or_default())),
+        D_FORMS => Ok(wrap_coll(LIVE_FORMS, 0, "")),
         D_GET_ELEMENTS_BY_NAME => {
             let name = args.first().map(|v| v.to_string()).unwrap_or_default();
-            Ok(runtime::host(|h| {
-                js::Val::new_array(h.by_name(&name).into_iter().map(wrap_element).collect())
-            }))
+            Ok(wrap_coll(LIVE_NAME, 0, &name))
         }
         D_CREATE_TEXT => {
             let text = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -854,28 +870,9 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
                 js::Val::new_array(h.subtree_all(node, &sel).into_iter().map(wrap_element).collect())
             }))
         }
-        E_GET_ELEMENTS_BY_CLASS => {
-            let names = a0.to_string();
-            Ok(runtime::host(|h| {
-                js::Val::new_array(
-                    h.subtree_class(node, &names)
-                        .into_iter()
-                        .map(wrap_element)
-                        .collect(),
-                )
-            }))
-        }
-        E_GET_ELEMENTS_BY_TAG => {
-            let name = a0.to_string();
-            Ok(runtime::host(|h| {
-                js::Val::new_array(
-                    h.subtree_tag(node, &name)
-                        .into_iter()
-                        .map(wrap_element)
-                        .collect(),
-                )
-            }))
-        }
+        E_GET_ELEMENTS_BY_CLASS => Ok(wrap_coll(LIVE_CLASS, node, &a0.to_string())),
+        E_GET_ELEMENTS_BY_TAG => Ok(wrap_coll(LIVE_TAG, node, &a0.to_string())),
+        E_FORM_ELEMENTS => Ok(wrap_coll(LIVE_FORM_CONTROLS, node, "")),
         E_APPEND_CHILD => {
             let child = this_node(&a0)?;
             // dirty flag bookkeeping lives inside the host write (as
@@ -2037,6 +2034,140 @@ fn style_set_hook(node: u32, key: &str, val: &str) {
     runtime::host_mut_opt(|h| h.style_set(node, key, val));
 }
 
+// ---------------------------------------------------------------------------
+// Live collections (`getElementsBy*`, `document.forms`, `form.elements`)
+// ---------------------------------------------------------------------------
+//
+// A live collection stores only the QUERY (family + root + argument); every
+// index/`length`/named read re-runs it against the current arena, so DOM
+// mutations after the collection was returned are visible. `for..of`,
+// spread and `Array.from` use `live_values` (one query, not one per index).
+// The engine keeps `LiveSpec` opaque - these family numbers are ours.
+
+const LIVE_TAG: u8 = 0;
+const LIVE_CLASS: u8 = 1;
+const LIVE_NAME: u8 = 2;
+const LIVE_FORMS: u8 = 3;
+const LIVE_FORM_CONTROLS: u8 = 4;
+
+/// `HTMLFormElement.elements` lists exactly these tags.
+const LISTED_TAGS: [&str; 7] = [
+    "button", "fieldset", "input", "object", "output", "select", "textarea",
+];
+
+/// Nodes a live collection currently contains (document order). The
+/// `root` of a tag/class collection scopes it to one element's subtree;
+/// `0` means the whole document.
+fn live_nodes(spec: &js::LiveSpec) -> Vec<u32> {
+    runtime::host_opt(|h| {
+        let dom = h.dom();
+        match spec.family {
+            LIVE_TAG => {
+                if spec.root == 0 {
+                    h.by_tag(&spec.arg)
+                } else {
+                    h.subtree_tag(spec.root, &spec.arg)
+                }
+            }
+            LIVE_CLASS => {
+                if spec.root == 0 {
+                    h.by_class(&spec.arg)
+                } else {
+                    h.subtree_class(spec.root, &spec.arg)
+                }
+            }
+            LIVE_NAME => h.by_name(&spec.arg),
+            LIVE_FORMS => h.by_tag("form"),
+            LIVE_FORM_CONTROLS => subtree_elements_dom(dom, spec.root)
+                .into_iter()
+                .filter(|&i| {
+                    let t = dom.tag(i);
+                    LISTED_TAGS.iter().any(|l| t.eq_ignore_ascii_case(l))
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    })
+    .unwrap_or_default()
+}
+
+/// The `name` or `id` a collection's named lookup matches.
+fn live_named(spec: &js::LiveSpec, name: &str) -> Option<u32> {
+    runtime::host_opt(|h| {
+        live_nodes(spec).into_iter().find(|&i| {
+            h.attr(i, "id").as_deref() == Some(name)
+                || h.attr(i, "name").as_deref() == Some(name)
+        })
+    })
+    .flatten()
+}
+
+/// `live_get` hook: answer a property read on a collection.
+fn live_get_hook(spec: &js::LiveSpec, key: &str) -> Option<Val> {
+    if key == "length" {
+        return Some(Val::Num(live_nodes(spec).len() as f64));
+    }
+    if let Ok(i) = key.parse::<usize>() {
+        return live_nodes(spec).get(i).map(|&n| wrap_element(n));
+    }
+    live_named(spec, key).map(wrap_element)
+}
+
+/// `live_values` hook: snapshot for iteration / `Array.from` / spread.
+fn live_values_hook(spec: &js::LiveSpec) -> Vec<Val> {
+    live_nodes(spec).into_iter().map(wrap_element).collect()
+}
+
+/// The spec behind a collection value, if it is one.
+fn live_spec_of(v: &Val) -> Option<js::LiveSpec> {
+    match v {
+        Val::Obj(o) => match &o.borrow().kind {
+            js::ObjKind::Live(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Build a live collection value: `item`/`namedItem` natives + the opaque
+/// query in `ObjKind::Live`.
+fn wrap_coll(family: u8, root: u32, arg: &str) -> Val {
+    let o = Val::new_object();
+    let n = nids();
+    o.set("item", Val::Native(n.coll_item));
+    o.set("namedItem", Val::Native(n.coll_named));
+    if let Val::Obj(rc) = &o {
+        rc.borrow_mut().kind = js::ObjKind::Live(js::LiveSpec {
+            family,
+            root,
+            arg: Rc::from(arg),
+        });
+    }
+    o
+}
+
+/// `HTMLCollection.prototype.item(i)` / `.namedItem(name)` (shared native).
+fn coll_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let Some(spec) = live_spec_of(this) else {
+        return Ok(Val::Null);
+    };
+    if idx == C_ITEM {
+        let i = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+        return Ok(if i.is_finite() && i >= 0.0 {
+            live_nodes(&spec)
+                .get(i as usize)
+                .map(|&n| wrap_element(n))
+                .unwrap_or(Val::Null)
+        } else {
+            Val::Null
+        });
+    }
+    let name = args.first().map(|v| v.to_string()).unwrap_or_default();
+    Ok(live_named(&spec, &name)
+        .map(wrap_element)
+        .unwrap_or(Val::Null))
+}
+
 fn remove_attr(node: u32, name: &str) {
     runtime::host_mut(|h| h.remove_attribute(node, name));
 }
@@ -2051,10 +2182,12 @@ fn set_text_content(node: u32, text: &str) {
 /// `pub(crate)`: the shared DomHost delegates to this canonical copy.
 pub(crate) fn subtree_query_dom(dom: &Dom, root: u32, sel: &str) -> Vec<u32> {
     let mut out = Vec::new();
+    // stack pops from the back: push the initial children reversed so the
+    // FIRST child is visited first (document order)
     let mut stack: Vec<u32> = dom
         .nodes
         .get(root as usize)
-        .map(|n| n.children.clone())
+        .map(|n| n.children.iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(n) = stack.pop() {
         if matches_simple(dom, n, sel) {
@@ -2150,6 +2283,9 @@ impl PageScripts {
             el_submit: engine.register_native("Element.submit", el_native, E_SUBMIT),
             el_parent: engine.register_native("Element.parentElement", el_native, E_PARENT),
             el_remove: engine.register_native("Element.remove", el_native, E_REMOVE),
+            el_form_elements: engine.register_native("HTMLFormElement.elements", el_native, E_FORM_ELEMENTS),
+            coll_item: engine.register_native("HTMLCollection.prototype.item", coll_native, C_ITEM),
+            coll_named: engine.register_native("HTMLCollection.prototype.namedItem", coll_native, C_NAMED),
             node_data_get: engine.register_native("Node.data", n_node, N_DATA_GET),
             node_data_set: engine.register_native("Node.data", n_node, N_DATA_SET),
             node_type: engine.register_native("Node.nodeType", n_node, N_NODE_TYPE),
@@ -2207,6 +2343,9 @@ impl PageScripts {
         // the shared host (js.rs itself stays DOM-free)
         engine.style_get = Some(style_get_hook);
         engine.style_set = Some(style_set_hook);
+        // live collections re-query the arena through these hooks
+        engine.live_get = Some(live_get_hook);
+        engine.live_values = Some(live_values_hook);
         // dynamic import(): global native; the module registry itself lives
         // on the engine (engine.module_loader), and the page URL is the
         // fallback base for specifiers called outside a module body
@@ -2969,6 +3108,95 @@ mod tests {
     }
 
     #[test]
+    fn live_collections_track_dom_mutations() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><ul id="list">
+                <li class="row">a</li><li class="row">b</li>
+            </ul><script>
+                window.c = document.getElementsByClassName("row");
+                window.n0 = window.c.length;
+                window.first = window.c[0].textContent;
+                window.byItem = window.c.item(1).textContent;
+                window.missing = window.c.namedItem("nope") === null;
+                // querySelectorAll is a static NodeList
+                window.q = document.querySelectorAll(".row");
+                window.q0 = window.q.length;
+                var li = document.createElement("li");
+                li.setClassName("row");
+                li.setTextContent("c");
+                document.getElementById("list").appendChild(li);
+                window.n1 = window.c.length;
+                window.third = window.c[2].textContent;
+                window.q1 = window.q.length;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "n0"), "2", "initial length");
+        assert_eq!(get_global_str(&mut ps, "first"), "a", "index read");
+        assert_eq!(get_global_str(&mut ps, "byItem"), "b", "item()");
+        assert_eq!(get_global_str(&mut ps, "missing"), "true", "namedItem miss = null");
+        assert_eq!(get_global_str(&mut ps, "n1"), "3", "length after appendChild");
+        assert_eq!(get_global_str(&mut ps, "third"), "c", "new node is visible");
+        assert_eq!(get_global_str(&mut ps, "q0"), "2", "static NodeList length");
+        assert_eq!(get_global_str(&mut ps, "q1"), "2", "NodeList does not grow");
+    }
+
+    #[test]
+    fn document_forms_and_form_elements_allow_named_access() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body>
+                <form id="f" name="login"><input name="email" value="e@x">
+                <input id="pw" name="pass"></form>
+                <script>
+                    window.formsLen = document.forms.length;
+                    window.formName = document.forms.login.name;
+                    var f = document.forms.login;
+                    window.ctrlLen = f.elements.length;
+                    window.emailName = f.elements.email.name;
+                    window.pwId = f.elements.item(1).id;
+                    window.byNamedItem = f.elements.namedItem("pass").id;
+                    window.byIndex = document.forms[0].id;
+                </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "formsLen"), "1");
+        assert_eq!(get_global_str(&mut ps, "formName"), "login", "named form access");
+        assert_eq!(get_global_str(&mut ps, "ctrlLen"), "2", "form.elements length");
+        assert_eq!(get_global_str(&mut ps, "emailName"), "email");
+        assert_eq!(get_global_str(&mut ps, "pwId"), "pw", "item(1) in document order");
+        assert_eq!(get_global_str(&mut ps, "byNamedItem"), "pw", "namedItem");
+        assert_eq!(get_global_str(&mut ps, "byIndex"), "f");
+    }
+
+    #[test]
+    fn live_collections_iterate_and_accept_generic_array_methods() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body>
+                <div class="x">1</div><div class="x">2</div>
+                <script>
+                    var c = document.getElementsByClassName("x");
+                    window.spread = [...c].length;
+                    var a = Array.from(c);
+                    window.fromLen = a.length;
+                    window.fromFirst = a[0].textContent;
+                    // MDN's header-anchor code does exactly this: a generic
+                    // Array.prototype method called on a collection
+                    window.filtered =
+                        Array.prototype.filter.call(c, function () { return true; }).length;
+                    var n = 0;
+                    for (var el of c) { if (el.textContent) n++; }
+                    window.loop = n;
+                </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "spread"), "2");
+        assert_eq!(get_global_str(&mut ps, "fromLen"), "2");
+        assert_eq!(get_global_str(&mut ps, "fromFirst"), "1");
+        assert_eq!(get_global_str(&mut ps, "filtered"), "2", "Array.prototype.filter.call");
+        assert_eq!(get_global_str(&mut ps, "loop"), "2", "for..of");
+    }
+
+    #[test]
     fn document_cookie_reads_as_a_string() {
         // Wikipedia's client-preference bootstrap does
         // `document.cookie.match(...)`; an undefined cookie killed the whole
@@ -3680,8 +3908,9 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "dgst"), "d1");
     }
 
-    /// `document.forms` and `getElementsByName` are document-order snapshots
-    /// built from the arena (no live collection behind them).
+    /// `document.forms` and `getElementsByName` are live document-order
+    /// collections; a newly appended matching node shows up without a
+    /// re-query.
     #[test]
     fn document_forms_and_get_elements_by_name() {
         let (mut dom, mut ps) = page(

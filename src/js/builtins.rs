@@ -972,7 +972,11 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                     out.push_str("{}");
                 }
                 // regex/generator instances: no own enumerable props -> {}
-                ObjKind::Regex(_) | ObjKind::Generator(_) | ObjKind::Style(_) => {
+                ObjKind::Regex(_)
+                | ObjKind::Generator(_)
+                | ObjKind::Style(_)
+                | ObjKind::Live(_) => {
+                    // live collections have no enumerable own data props
                     out.push_str("{}");
                 }
                 // a namespace serializes as an object of its exports
@@ -1628,6 +1632,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
                 ObjKind::Regex(_) => "[object RegExp]",
                 ObjKind::Generator(_) => "[object Generator]",
                 ObjKind::Style(_) => "[object CSSStyleDeclaration]",
+                ObjKind::Live(_) => "[object HTMLCollection]",
                 ObjKind::ModuleNs(_) => "[object Module]",
                 ObjKind::Iterator(_) => "[object Iterator]",
                 ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]",
@@ -1820,13 +1825,31 @@ fn fn_desc(f: &Rc<Closure>, key: &str) -> Option<Val> {
     }
 }
 
-fn need_array(this: &Val) -> Result<Rc<RefCell<Obj>>, JsError> {    match this {
+fn need_array(e: &mut JsEngine, this: &Val) -> Result<Rc<RefCell<Obj>>, JsError> {
+    match this {
         Val::Obj(o) => {
             if matches!(o.borrow().kind, ObjKind::Array(_)) {
-                Ok(o.clone())
-            } else {
-                Err(JsError::throw("TypeError: array method on non-array"))
+                return Ok(o.clone());
             }
+            // generic `Array.prototype.*.call(collection, ...)`: a live host
+            // collection behaves as an array-like, so hand the method a
+            // one-shot snapshot (writes land in the snapshot, not the DOM)
+            let live = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Live(s) => Some(s.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(spec) = live {
+                let items = e.live_values.map(|f| f(&spec)).unwrap_or_default();
+                return Ok(Rc::new(RefCell::new(Obj {
+                    kind: ObjKind::Array(items),
+                    props: Vec::new(),
+                    proto: None,
+                })));
+            }
+            Err(JsError::throw("TypeError: array method on non-array"))
         }
         _ => Err(JsError::throw("TypeError: array method on non-array")),
     }
@@ -1891,7 +1914,7 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
             _ => false,
         }));
     }
-    let o = need_array(this)?;
+    let o = need_array(e, this)?;
     Ok(match idx {
         A_SPLICE => {
             let len = match &o.borrow().kind {

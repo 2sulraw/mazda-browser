@@ -324,8 +324,13 @@ dataset writes (reads work, writes do not update the attribute)
 `Node.childNodes` / `Element.children`, `queueMicrotask`, `DataView`,
 `AbortController` / `AbortSignal`, the `Event` / `CustomEvent`
 constructors with synchronous `dispatchEvent`, and `MutationObserver` now
-exist; the collection APIs are document-order snapshots, not live
-collections. Console-created (`new`) events bubble through elements,
+exist. `getElementsByTagName` / `getElementsByClassName` /
+`getElementsByName`, `document.forms` and `form.elements` are LIVE
+collections (`length`, index, `item()`, `namedItem()`, named property
+reads and iteration re-query the DOM); `querySelectorAll` is a static
+NodeList, as in a browser. `form.controlName` shorthand on the form
+wrapper itself is still absent (use `form.elements`). Console-created
+(`new`) events bubble through elements,
 document and window and honour both stop flags; shell-created events still
 lack `stopPropagation`. Mutation records cover `childList`, `attributes`
 and `characterData` (with `subtree`, old-value flags and
@@ -390,7 +395,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 809 self-authored unit tests (813 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 812 self-authored unit tests (816 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -418,7 +423,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 |---|---|---|---|---|---|
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
-| P1 | live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 1-2 waves |
+| P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |

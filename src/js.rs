@@ -207,6 +207,26 @@ pub enum ObjKind {
     ArrayBuffer(Rc<RefCell<Vec<u8>>>),
     /// fixed-width view into an ArrayBuffer
     TypedArray(TypedArray),
+    /// live host-backed collection (`getElementsBy*`, `document.forms`,
+    /// `form.elements`): index/`length`/named reads re-query the host at
+    /// access time through `JsEngine::live_get`, so DOM mutations that
+    /// happened after the collection was returned are visible. Own props
+    /// carry `item`/`namedItem`; `JsEngine::live_values` snapshots it for
+    /// iteration. This module stays DOM-free - the spec only names the
+    /// query, the embedder owns its meaning.
+    Live(LiveSpec),
+}
+
+/// Query behind an [`ObjKind::Live`] collection. `family`/`root`/`arg` are
+/// opaque to the engine and interpreted by the embedder hook.
+#[derive(Debug, Clone)]
+pub struct LiveSpec {
+    /// embedder-defined collection kind (tag / class / name / forms / ...)
+    pub family: u8,
+    /// scope node id; 0 = whole document
+    pub root: u32,
+    /// query argument (tag name, class list, name, ...)
+    pub arg: Rc<str>,
 }
 
 /// Which built-in iterator this is (keys/values/entries).
@@ -649,6 +669,7 @@ impl Val {
                     ObjKind::Promise(_) => "[object Promise]".into(),
                     ObjKind::Generator(_) => "[object Generator]".into(),
                     ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::Live(_) => "[object HTMLCollection]".into(),
                     ObjKind::ModuleNs(_) => "[object Module]".into(),
                     ObjKind::Iterator(_) => "[object Iterator]".into(),
                     ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
@@ -724,6 +745,7 @@ impl Val {
                     ObjKind::Regex(ri) => format!("/{}/{}", ri.re.src, ri.re.flags),
                     ObjKind::Generator(_) => "[object Generator]".into(),
                     ObjKind::Style(_) => "[object CSSStyleDeclaration]".into(),
+                    ObjKind::Live(_) => "[object HTMLCollection]".into(),
                     ObjKind::ModuleNs(_) => "[object Module]".into(),
                     ObjKind::Iterator(_) => "[object Iterator]".into(),
                     ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
@@ -1199,6 +1221,13 @@ pub struct JsEngine {
     /// `undefined`, writes are no-ops.
     pub(crate) style_get: Option<fn(u32, &str) -> String>,
     pub(crate) style_set: Option<fn(u32, &str, &str)>,
+    /// live-collection bridge installed by the embedder: a member read that
+    /// is not an own prop (`length`, an index, a named item) forwards here.
+    /// `None` = no DOM attached: such reads are `undefined`.
+    pub(crate) live_get: Option<fn(&LiveSpec, &str) -> Option<Val>>,
+    /// live-collection snapshot for `for..of`, spread and `Array.from`
+    /// (one host query, not one per index).
+    pub(crate) live_values: Option<fn(&LiveSpec) -> Vec<Val>>,
     /// Page URL used as the fallback base for dynamic `import()` outside a
     /// module body (module bodies use the module's own URL). Set by the
     /// embedder; `None` in pure-engine tests.
@@ -1331,6 +1360,8 @@ impl JsEngine {
             err_decorated: false,
             style_get: None,
             style_set: None,
+            live_get: None,
+            live_values: None,
             import_base: None,
             import_native: None,
             module_urls: HashMap::new(),
@@ -2721,6 +2752,33 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                     None => Val::Undefined,
                 });
             }
+            // Live host collection: own props (`item`/`namedItem`) win, then
+            // every other key (`length`, an index, a named item) is answered
+            // by the embedder against the CURRENT DOM. A miss falls through
+            // to the prototype chain so `toString` still works.
+            let live = o
+                .try_borrow()
+                .ok()
+                .and_then(|b| match &b.kind {
+                    ObjKind::Live(s) => Some(s.clone()),
+                    _ => None,
+                });
+            if let Some(spec) = live {
+                let own = o
+                    .borrow()
+                    .props
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == key)
+                    .map(|(_, v)| v.clone());
+                if let Some(v) = own {
+                    return Ok(v);
+                }
+                if let Some(f) = e.live_get {
+                    if let Some(v) = f(&spec, key) {
+                        return Ok(v);
+                    }
+                }
+            }
             {
                 let b = o.borrow();
                 if let ObjKind::Error { name, msg } = &b.kind {
@@ -2914,6 +2972,15 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
                 if let Some(f) = e.style_set {
                     f(node, key, &v.to_string());
                 }
+                return Ok(());
+            }
+            // Live host collections are read-only views: `length`/indices
+            // have no setter (sloppy mode silently ignores the write), and
+            // an own property must not shadow the live lookup.
+            if o.try_borrow()
+                .map(|b| matches!(b.kind, ObjKind::Live(_)))
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
             // regex instances: `lastIndex` writes to the per-instance Cell
