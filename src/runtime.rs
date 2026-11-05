@@ -724,6 +724,144 @@ impl DomHost {
         (p != 0 && p != node).then_some(p)
     }
 
+    /// DOM `nodeType`: 1 element, 3 text, 8 comment. None on a bad id.
+    pub fn node_type(&self, node: u32) -> Option<u8> {
+        match &self.dom_ref().nodes.get(node as usize)?.kind {
+            NodeKind::Element(..) => Some(1),
+            NodeKind::Text(_) => Some(3),
+            NodeKind::Comment(_) => Some(8),
+        }
+    }
+
+    /// Text/comment body (`Node.data`); None on an element.
+    pub fn node_data(&self, node: u32) -> Option<String> {
+        match &self.dom_ref().nodes.get(node as usize)?.kind {
+            NodeKind::Text(s) | NodeKind::Comment(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Write `Node.data` on a text/comment node; true (and dirty) only when
+    /// the value changed. Elements have no data (returns false).
+    pub fn set_node_data(&mut self, node: u32, text: &str) -> bool {
+        let dom = unsafe { &mut *self.dom };
+        let Some(n) = dom.nodes.get_mut(node as usize) else {
+            return false;
+        };
+        match &mut n.kind {
+            NodeKind::Text(s) | NodeKind::Comment(s) => {
+                if s == text {
+                    return false;
+                }
+                *s = text.to_string();
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Parent node INCLUDING the document root (`Node.parentNode`), unlike
+    /// [`DomHost::parent_element`] which stops at `<html>`.
+    pub fn parent_node(&self, node: u32) -> Option<u32> {
+        let p = self.dom_ref().nodes.get(node as usize)?.parent;
+        (p != node).then_some(p)
+    }
+
+    /// Adjacent sibling node (text and comments included), or None.
+    pub fn sibling_node(&self, node: u32, next: bool) -> Option<u32> {
+        let dom = self.dom_ref();
+        let p = dom.nodes.get(node as usize)?.parent;
+        if p == node {
+            return None;
+        }
+        let kids = &dom.nodes.get(p as usize)?.children;
+        let i = kids.iter().position(|&c| c == node)?;
+        if next {
+            kids.get(i + 1).copied()
+        } else {
+            i.checked_sub(1).and_then(|j| kids.get(j).copied())
+        }
+    }
+
+    /// First child node (any kind), or None.
+    pub fn first_child(&self, node: u32) -> Option<u32> {
+        self.dom_ref()
+            .nodes
+            .get(node as usize)?
+            .children
+            .first()
+            .copied()
+    }
+
+    /// `parent.insertBefore(new, before)`: detach `new` from its old parent
+    /// first, then insert at `before`'s slot (or append when `before` is
+    /// None / not a child). False on a bad id or a cycle.
+    pub fn insert_before(&mut self, parent: u32, new: u32, before: Option<u32>) -> bool {
+        let dom = unsafe { &mut *self.dom };
+        if parent as usize >= dom.nodes.len() || new as usize >= dom.nodes.len() {
+            return false;
+        }
+        if parent == new {
+            return false;
+        }
+        let old = dom.nodes[new as usize].parent;
+        if old != new && (old as usize) < dom.nodes.len() {
+            if let Some(pos) = dom.nodes[old as usize].children.iter().position(|&c| c == new) {
+                dom.nodes[old as usize].children.remove(pos);
+            }
+        }
+        let len = dom.nodes[parent as usize].children.len();
+        let pos = match before {
+            Some(b) => dom.nodes[parent as usize]
+                .children
+                .iter()
+                .position(|&c| c == b)
+                .unwrap_or(len),
+            None => len,
+        };
+        dom.nodes[parent as usize].children.insert(pos, new);
+        dom.nodes[new as usize].parent = parent;
+        self.dirty = true;
+        true
+    }
+
+    /// True when `child` is a direct child of `parent` (removeChild check).
+    pub fn is_child_of(&self, parent: u32, child: u32) -> bool {
+        self.dom_ref()
+            .nodes
+            .get(parent as usize)
+            .is_some_and(|p| p.children.contains(&child))
+    }
+
+    /// `node.data-*` attribute names, for the `dataset` accessor.
+    pub fn data_attrs(&self, node: u32) -> Vec<(String, String)> {
+        let dom = self.dom_ref();
+        let NodeKind::Element(_, attrs) = &dom.nodes[node as usize].kind else {
+            return Vec::new();
+        };
+        attrs
+            .iter()
+            .filter_map(|(k, v)| {
+                let rest = k.strip_prefix("data-")?;
+                // dataset camelCase: `data-foo-bar` -> `fooBar`
+                let mut key = String::with_capacity(rest.len());
+                let mut upper = false;
+                for ch in rest.chars() {
+                    if ch == '-' {
+                        upper = true;
+                    } else if upper {
+                        key.extend(ch.to_uppercase());
+                        upper = false;
+                    } else {
+                        key.push(ch);
+                    }
+                }
+                Some((key, v.clone()))
+            })
+            .collect()
+    }
+
     /// `element.remove()`: detach from the parent's child list.
     pub fn remove_node(&mut self, node: u32) -> bool {
         let dom = unsafe { &mut *self.dom };

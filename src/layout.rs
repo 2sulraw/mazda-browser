@@ -382,6 +382,7 @@ fn contained_text(dom: &Dom, node: u32) -> String {
     for &c in &dom.nodes[node as usize].children {
         match &dom.nodes[c as usize].kind {
             NodeKind::Text(t) => s.push_str(t),
+            NodeKind::Comment(_) => {}
             NodeKind::Element(..) => {
                 let tag = dom.tag(c);
                 if tag != "option" && !is_hidden_payload(&tag) {
@@ -996,6 +997,7 @@ fn build_into(
     };
     for &child in &dom.nodes[node as usize].children {
         match &dom.nodes[child as usize].kind {
+            NodeKind::Comment(_) => {}
             NodeKind::Text(t) => {
                 let t = t.trim_matches('\u{a0}');
                 if !t.is_empty() {

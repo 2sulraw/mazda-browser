@@ -4,6 +4,9 @@
 
 pub enum Token {
     Text(String),
+    /// `<!-- ... -->` body kept verbatim: React's streaming bootstrap parks
+    /// its boundary markers in comments and rewrites their `data`.
+    Comment(String),
     StartTag {
         name: String,
         attrs: Vec<(String, String)>,
@@ -30,6 +33,10 @@ pub struct TagId(u16);
 pub enum NodeKind {
     Element(TagId, Box<[(String, String)]>),
     Text(String),
+    /// Comment body without the `<!--` / `-->` delimiters. Layout skips
+    /// these (no box, no text), but scripts see them as `nodeType === 8`
+    /// with a writable `data`, and sibling navigation counts them.
+    Comment(String),
 }
 
 pub struct Node {
@@ -93,6 +100,16 @@ impl Dom {
         match &self.nodes[idx as usize].kind {
             NodeKind::Element(t, _) => &self.tags[t.0 as usize],
             NodeKind::Text(_) => "#text",
+            NodeKind::Comment(_) => "#comment",
+        }
+    }
+
+    /// True for real elements: skips text, comments and the `#document`
+    /// sentinel at index 0.
+    pub fn is_element(&self, idx: u32) -> bool {
+        match &self.nodes[idx as usize].kind {
+            NodeKind::Element(t, _) => self.tags[t.0 as usize].as_ref() != "#document",
+            _ => false,
         }
     }
 
@@ -103,7 +120,7 @@ impl Dom {
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str()),
-            NodeKind::Text(_) => None,
+            _ => None,
         }
     }
 
@@ -132,6 +149,10 @@ pub fn parse(html: &str) -> Dom {
                     let parent = *stack.last().unwrap();
                     dom.add(parent, NodeKind::Text(decode_entities(&t)));
                 }
+            }
+            Token::Comment(t) => {
+                let parent = *stack.last().unwrap();
+                dom.add(parent, NodeKind::Comment(t));
             }
             Token::StartTag {
                 name,
@@ -317,6 +338,8 @@ pub fn tokenize(s: &str) -> Vec<Token> {
         if s[i..].starts_with("<!--") {
             match s[i + 4..].find("-->") {
                 Some(e) => {
+                    // keep the body: scripts read and rewrite marker comments
+                    out.push(Token::Comment(s[i + 4..i + 4 + e].to_string()));
                     i = i + 4 + e + 3;
                 }
                 None => break,
@@ -563,7 +586,7 @@ fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// On-disk snapshot version. Bump whenever the byte layout changes: a stale
 /// file then fails the version check and is treated as a miss, never as a
 /// mis-parse.
-pub const SNAP_VERSION: u16 = 1;
+pub const SNAP_VERSION: u16 = 2;
 const SNAP_MAGIC: &[u8; 4] = b"MDOM";
 /// Refuse absurd node counts before allocating (corrupt/hostile file).
 const SNAP_MAX_NODES: usize = 4_000_000;
@@ -652,6 +675,10 @@ impl Dom {
                     out.push(1);
                     put_str(&mut out, s);
                 }
+                NodeKind::Comment(s) => {
+                    out.push(2);
+                    put_str(&mut out, s);
+                }
             }
         }
         let h = snap_hash(&out);
@@ -725,6 +752,7 @@ impl Dom {
                     NodeKind::Element(TagId(t), attrs.into_boxed_slice())
                 }
                 1 => NodeKind::Text(r.str()?),
+                2 => NodeKind::Comment(r.str()?),
                 _ => return None,
             };
             nodes.push(Node { parent, children, kind });
@@ -841,6 +869,44 @@ mod tests {
             toks.iter().any(|t| matches!(t, Token::StartTag { name, .. } if name == "p")),
             "document continues after the outer </svg>"
         );
+    }
+
+    #[test]
+    fn comments_are_nodes_and_survive_snapshot_round_trip() {
+        let dom = parse("<body><!--$?--><template id='B:0'></template><!--/$--><p>x</p></body>");
+        let comments: Vec<&str> = dom
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Comment(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(comments, vec!["$?", "/$"]);
+        // the boundary template's previous sibling in the parent's child list
+        // is the `$?` marker, and it must not be reported as an element
+        let tmpl = (0..dom.nodes.len() as u32)
+            .find(|&i| dom.attr(i, "id") == Some("B:0"))
+            .expect("template");
+        let siblings = &dom.nodes[dom.nodes[tmpl as usize].parent as usize].children;
+        let pos = siblings.iter().position(|&c| c == tmpl).unwrap();
+        assert_eq!(
+            dom.tag(siblings[pos - 1]),
+            "#comment",
+            "marker precedes the template"
+        );
+        assert!(!dom.is_element(siblings[pos - 1]));
+        // text/comment bytes survive the DOM snapshot cache
+        let back = Dom::from_bytes(&dom.to_bytes()).expect("snapshot round trip");
+        let back_comments: Vec<&str> = back
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Comment(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(back_comments, vec!["$?", "/$"]);
     }
 
     #[test]

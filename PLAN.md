@@ -1704,6 +1704,43 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 39 (grid `justify-content`) | MDN homepage + nextjs.org + Wikipedia `/wiki/JavaScript` + Hacker News | grid columns now honour `justify-content` (`start`/`center`/`end`/`space-between`/`space-around`/`space-evenly`) and only `normal`/`stretch` grows `auto` tracks; flex no longer collapses `space-around`/`space-evenly` into `space-between`. No reference page changes: MDN 2675px / 615 runs / 100.0 MB, nextjs 7032px / 502 runs / 140.8 MB (same 11 errors), Wikipedia 24454px / 10943 runs / 103.2 MB, HN 1695px / 734 runs / 78.3 MB; suite **754** default / **758** `engine-b + woff2` |
 | 2026-11-05 | wave 40 (JS syntax compatibility) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | three lexer/parser gaps that rejected shipped framework code: regex `u`/`v`/`d` flags (the flag was lexed as an identifier), non-ASCII identifiers (lodash's deburr table uses accented keys), and computed keys in destructuring (`let {[key]: v, ...rest} = obj`). nextjs.org's script errors drop 11 -> 7 (all four syntax errors gone) with geometry unchanged at 7032px / 502 runs / 145.8 MB; MDN 2675px / 615 runs / 99.9 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 734 runs / 77.9 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **757** default / **761** `engine-b + woff2` |
 | 2026-11-05 | wave 41 (`performance` clock + rAF timestamp) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `performance` was an absent global, so nextjs's streaming bootstrap (`$RT=performance.now()`) and every timing bundle threw. Added a monotonic `performance.now()` / `timeOrigin` plus no-op `mark`/`measure`/`getEntries*`, and rAF callbacks now receive the frame timestamp on the same clock. nextjs.org's remaining rAF error disappears (7 -> 6 script errors) with geometry unchanged at 7032px / 502 runs / 145.3 MB; MDN 2675px / 615 runs / 98.7 MB, Wikipedia 24454px / 10943 runs / 100.9 MB, HN 1695px / 734 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB, all error-free; suite **759** default / **763** `engine-b + woff2` |
+| 2026-11-05 | wave 42 (DOM comments + node navigation) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | React's streaming bootstrap (`$RX`/`$RC`/`$RV`) parks boundary markers in comments and walks/rewrites them, but the HTML parser dropped comments and wrappers had no sibling navigation. Comments are now real arena nodes (`nodeType` 8, no box); wrappers gained live `data`, `nodeType`, `parentNode`, `previousSibling`/`nextSibling`, `firstChild`, `removeChild`, `insertBefore` and a `dataset` object, and text nodes get the same wrapper. nextjs.org's five inline `.data` errors disappear (6 -> 1 script error) and the streamed boundary content now actually swaps in (7032px / 502 runs -> 7578px / 569 runs, 148.7 MB); Wikipedia 24454px / 10943 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.9 MB stay error-free; MDN moves to 2922px / 641 runs / 88.6 MB only because bumping the snapshot format forced a fresh fetch of a newer page (the old cached DOM was stale); suite **761** default / **765** `engine-b + woff2` |
+
+### Wave 42 findings
+
+- **Comments were thrown away.** `tokenize` skipped `<!-- … -->` entirely.
+  React's Flight bootstrap depends on them: the boundary marker before
+  `<template id="B:n">` is a comment whose `data` flips `$?`/`$!`/`$~`/`$`,
+  and `$RV` walks and rewrites those markers. Comments are now
+  `NodeKind::Comment(String)` nodes, skipped by layout/text extraction and
+  excluded from element queries (`Dom::is_element`), but visible to scripts.
+- **Wrappers had no tree navigation.** Elements exposed only `parentElement`
+  and `appendChild`. They now also expose `nodeType`, `parentNode`,
+  `previousSibling`/`nextSibling`, `firstChild`, `removeChild` and
+  `insertBefore`; text and comment nodes get a small `CharacterData` wrapper
+  whose `data`/`textContent` read and write the arena string. `insertBefore`
+  detaches the moved node from its old parent first, which is what `$RV`
+  relies on when it hoists streamed children out of a hidden `<div>`.
+- **`dataset` is a cached snapshot.** `el.dataset` builds a camelCase view of
+  `data-*` attributes and caches it on the wrapper, so `$RX`'s
+  `a.dataset.dgst = …` writes read back on the same wrapper. The writes do
+  not become attributes and a fresh wrapper rebuilds from the arena — an
+  honest shortcut, enough for error markers.
+- **Snapshot format bumped to v2.** Comment nodes are serialized, so the DOM
+  cache needed a new version; old snapshots miss once and refetch. That is why
+  MDN's numbers moved (2675 -> 2922 px): the previous snapshot was stale and
+  the fresh page carries more content (and more comments). The rendered top
+  matches the reference and the page stays error-free.
+- **Live effect.** nextjs.org drops 6 -> 1 script error (only the core-js
+  iterator-helper `.next` on a null receiver remains). With `$RV` finally
+  running, the streamed footer boundary is swapped into place: layout goes
+  7032px / 502 runs -> 7578px / 569 runs and RAM 145.2 -> 148.7 MB. The five
+  other pages are visually unchanged; Wikipedia and rust-lang are byte-stable
+  in geometry.
+- **Limits.** Engine B (compile-gated) still wraps only the wave-17 element
+  surface. Comments are not exposed as `childNodes`/`children` collections,
+  `document.createComment` is absent, and `dataset` writes never reach the
+  `data-*` attributes.
 
 ### Wave 41 findings
 

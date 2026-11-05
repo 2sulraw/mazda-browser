@@ -237,6 +237,16 @@ fn wrap_element(node: u32) -> Val {
             setter: None,
         })),
     );
+    // node-level navigation: comments and text are real arena nodes, so
+    // React's streaming bootstrap can walk/rewrite its boundary markers
+    o.set("nodeType", js::Val::Num(1.0));
+    o.set("parentNode", lazy_native_attr(n.node_parent));
+    o.set("previousSibling", lazy_native_attr(n.node_prev));
+    o.set("nextSibling", lazy_native_attr(n.node_next));
+    o.set("firstChild", lazy_native_attr(n.node_first));
+    o.set("dataset", lazy_native_attr(n.node_dataset));
+    o.set("removeChild", js::Val::Native(n.node_remove_child));
+    o.set("insertBefore", js::Val::Native(n.node_insert_before));
     // layout reads: scripts run before layout in this pipeline, so these are
     // 0 — documented shortcut (no synchronous layout to measure against).
     o.set("offsetWidth", js::Val::Num(0.0));
@@ -303,6 +313,14 @@ fn wrap_class_list(node: u32) -> Val {
 
 fn str_val(s: &str) -> Val {
     Val::Str(Rc::from(s))
+}
+
+/// A read-only accessor backed by one native id (lazy, like `parentElement`).
+fn lazy_native_attr(id: usize) -> Val {
+    Val::Acc(Rc::new(js::AccEntry {
+        getter: Some(Val::Native(id)),
+        setter: None,
+    }))
 }
 
 /// The full event object handed to listeners: `type`, `target` (element
@@ -389,6 +407,18 @@ struct Nids {
     el_submit: usize,
     el_parent: usize,
     el_remove: usize,
+    /// node-level navigation (`Node.data`, `nodeType`, siblings, parent,
+    /// firstChild, removeChild, insertBefore) — text and comment nodes too
+    node_data_get: usize,
+    node_data_set: usize,
+    node_type: usize,
+    node_parent: usize,
+    node_prev: usize,
+    node_next: usize,
+    node_first: usize,
+    node_remove_child: usize,
+    node_insert_before: usize,
+    node_dataset: usize,
     cls_add: usize,
     cls_remove: usize,
     cls_toggle: usize,
@@ -455,7 +485,7 @@ fn matches_simple(dom: &Dom, node: u32, sel: &str) -> bool {
 /// `pub(crate)`: the shared DomHost delegates to this canonical copy.
 pub(crate) fn all_elements_dom(dom: &Dom) -> Vec<u32> {
     (1..dom.nodes.len() as u32)
-        .filter(|&i| dom.tag(i) != "#text" && dom.tag(i) != "#document")
+        .filter(|&i| dom.is_element(i))
         .collect()
 }
 
@@ -469,8 +499,7 @@ pub(crate) fn subtree_elements_dom(dom: &Dom, root: u32) -> Vec<u32> {
         .map(|n| n.children.clone())
         .unwrap_or_default();
     while let Some(n) = stack.pop() {
-        let tag = dom.tag(n);
-        if tag != "#text" && tag != "#document" {
+        if dom.is_element(n) {
             out.push(n);
         }
         if let Some(node) = dom.nodes.get(n as usize) {
@@ -524,6 +553,7 @@ pub(crate) fn child_text(dom: &Dom, node: u32) -> String {
     fn walk(dom: &Dom, node: u32, out: &mut String) {
         match &dom.nodes[node as usize].kind {
             NodeKind::Text(t) => out.push_str(t),
+            NodeKind::Comment(_) => {}
             NodeKind::Element(_, _) => {
                 for &c in &dom.nodes[node as usize].children {
                     walk(dom, c, out);
@@ -610,6 +640,19 @@ const S_SET: u16 = 41;
 const S_REMOVE: u16 = 42;
 const S_LENGTH: u16 = 43;
 const S_CLEAR: u16 = 44;
+/// node-navigation group idxs (`data`, `nodeType`, sibling/parent/firstChild,
+/// removeChild, insertBefore, dataset) — shared by element, text and comment
+/// wrappers.
+const N_DATA_GET: u16 = 0;
+const N_DATA_SET: u16 = 1;
+const N_NODE_TYPE: u16 = 2;
+const N_PARENT: u16 = 3;
+const N_PREV: u16 = 4;
+const N_NEXT: u16 = 5;
+const N_FIRST_CHILD: u16 = 6;
+const N_REMOVE_CHILD: u16 = 7;
+const N_INSERT_BEFORE: u16 = 8;
+const N_DATASET: u16 = 9;
 
 // Scheduler budgets (MAX_PENDING_TIMERS / MAX_PENDING_FRAMES /
 // FRAME_EPOCH) live ONCE in runtime.rs — single source for both engines.
@@ -909,6 +952,128 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
         E_MEDIA_NOOP => Ok(Val::Undefined),
         _ => Err(JsError::throw("TypeError: bad element native")),
     }
+}
+
+/// Wrap any arena node: elements get the full element surface, while text and
+/// comment nodes get the small `CharacterData` one (`data`, `textContent`,
+/// sibling/parent navigation).
+fn wrap_any(node: u32) -> Val {
+    match runtime::host_opt(|h| h.node_type(node)).flatten() {
+        Some(3) | Some(8) => wrap_char_data(node),
+        _ => wrap_element(node),
+    }
+}
+
+/// Text/comment node wrapper (`nodeType` 3 or 8). `data` is live through the
+/// host, so React's marker rewrites (`c.data = "$!"`) land in the arena.
+fn wrap_char_data(node: u32) -> Val {
+    let o = Val::new_object();
+    o.set("__node", Val::Num(node as f64));
+    let n = nids();
+    let ty = runtime::host_opt(|h| h.node_type(node))
+        .flatten()
+        .unwrap_or(3);
+    o.set("nodeType", Val::Num(ty as f64));
+    let data = Val::Acc(Rc::new(js::AccEntry {
+        getter: Some(Val::Native(n.node_data_get)),
+        setter: Some(Val::Native(n.node_data_set)),
+    }));
+    o.set("data", data.clone());
+    o.set("textContent", data);
+    o.set(
+        "parentNode",
+        Val::Acc(Rc::new(js::AccEntry {
+            getter: Some(Val::Native(n.node_parent)),
+            setter: None,
+        })),
+    );
+    o.set(
+        "previousSibling",
+        Val::Acc(Rc::new(js::AccEntry {
+            getter: Some(Val::Native(n.node_prev)),
+            setter: None,
+        })),
+    );
+    o.set(
+        "nextSibling",
+        Val::Acc(Rc::new(js::AccEntry {
+            getter: Some(Val::Native(n.node_next)),
+            setter: None,
+        })),
+    );
+    o
+}
+
+/// Node-level natives: `Node.data` / `nodeType` / `parentNode` /
+/// `previousSibling` / `nextSibling` / `firstChild` / `removeChild` /
+/// `insertBefore`, plus `dataset` on element wrappers.
+fn n_node(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let node = this_node(this)?;
+    Ok(match idx {
+        N_DATA_GET => runtime::host(|h| h.node_data(node))
+            .map(|s| str_val(&s))
+            .unwrap_or(Val::Null),
+        N_DATA_SET => {
+            let v = args.first().map(|v| v.to_string()).unwrap_or_default();
+            runtime::host_mut(|h| h.set_node_data(node, &v));
+            Val::Undefined
+        }
+        N_NODE_TYPE => {
+            Val::Num(runtime::host(|h| h.node_type(node)).unwrap_or(1) as f64)
+        }
+        N_PARENT => match runtime::host(|h| h.parent_node(node)) {
+            Some(p) => wrap_any(p),
+            None => Val::Null,
+        },
+        N_PREV => match runtime::host(|h| h.sibling_node(node, false)) {
+            Some(s) => wrap_any(s),
+            None => Val::Null,
+        },
+        N_NEXT => match runtime::host(|h| h.sibling_node(node, true)) {
+            Some(s) => wrap_any(s),
+            None => Val::Null,
+        },
+        N_FIRST_CHILD => match runtime::host(|h| h.first_child(node)) {
+            Some(c) => wrap_any(c),
+            None => Val::Null,
+        },
+        N_REMOVE_CHILD => {
+            let child = this_node(&args.first().cloned().unwrap_or(Val::Undefined))?;
+            if runtime::host(|h| h.is_child_of(node, child)) {
+                runtime::host_mut(|h| h.remove_node(child));
+            }
+            args.first().cloned().unwrap_or(Val::Null)
+        }
+        N_INSERT_BEFORE => {
+            let new = this_node(&args.first().cloned().unwrap_or(Val::Undefined))?;
+            let before = match args.get(1) {
+                Some(v) if !matches!(v, Val::Undefined | Val::Null) => Some(this_node(v)?),
+                _ => None,
+            };
+            runtime::host_mut(|h| h.insert_before(node, new, before));
+            args.first().cloned().unwrap_or(Val::Null)
+        }
+        // shortcut: a snapshot object cached on the wrapper, so writes made
+        // through one `el.dataset` read back on the next read of the SAME
+        // wrapper. They do not become `data-*` attributes and a fresh
+        // wrapper rebuilds from attributes - enough for error markers.
+        N_DATASET => {
+            if let Val::Obj(w) = this {
+                if let Val::Obj(d) = js::obj_get_own(w, "__dataset") {
+                    return Ok(Val::Obj(d));
+                }
+            }
+            let o = Val::new_object();
+            for (k, v) in runtime::host(|h| h.data_attrs(node)) {
+                o.set(&k, str_val(&v));
+            }
+            if let Val::Obj(w) = this {
+                js::obj_set_own(w, "__dataset", o.clone());
+            }
+            o
+        }
+        _ => return Err(JsError::throw("TypeError: bad node native")),
+    })
 }
 
 fn loc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
@@ -1321,6 +1486,16 @@ impl PageScripts {
             el_submit: engine.register_native("Element.submit", el_native, E_SUBMIT),
             el_parent: engine.register_native("Element.parentElement", el_native, E_PARENT),
             el_remove: engine.register_native("Element.remove", el_native, E_REMOVE),
+            node_data_get: engine.register_native("Node.data", n_node, N_DATA_GET),
+            node_data_set: engine.register_native("Node.data", n_node, N_DATA_SET),
+            node_type: engine.register_native("Node.nodeType", n_node, N_NODE_TYPE),
+            node_parent: engine.register_native("Node.parentNode", n_node, N_PARENT),
+            node_prev: engine.register_native("Node.previousSibling", n_node, N_PREV),
+            node_next: engine.register_native("Node.nextSibling", n_node, N_NEXT),
+            node_first: engine.register_native("Node.firstChild", n_node, N_FIRST_CHILD),
+            node_remove_child: engine.register_native("Node.removeChild", n_node, N_REMOVE_CHILD),
+            node_insert_before: engine.register_native("Node.insertBefore", n_node, N_INSERT_BEFORE),
+            node_dataset: engine.register_native("HTMLElement.dataset", n_node, N_DATASET),
             cls_add: engine.register_native("Element.classList.add", el_native, E_CLASS_ADD),
             cls_remove: engine.register_native("Element.classList.remove", el_native, E_CLASS_REMOVE),
             cls_toggle: engine.register_native("Element.classList.toggle", el_native, E_CLASS_TOGGLE),
@@ -2067,6 +2242,7 @@ pub(crate) fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
                 }
             }
             NodeKind::Text(_) => {}
+            NodeKind::Comment(_) => {}
         }
     }
     out
@@ -2775,6 +2951,42 @@ mod tests {
         );
         // and a delayed one lands on the wake queue for the worker loop
         let _ = ps.run_due_timers(&mut dom);
+    }
+
+    /// React's streaming bootstrap walks boundary comments: comments are real
+    /// nodes with a writable `data`, and text children can be moved/removed.
+    #[test]
+    fn comment_and_sibling_navigation() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><!--$?--><template id="B:0"></template><!--/$--><div id="S:0">streamed</div><script>
+                var a = document.getElementById("B:0");
+                var c = a.previousSibling;
+                window.marker = c.nodeType + ":" + c.data;
+                c.data = "$!";
+                window.afterWrite = a.previousSibling.data;
+                window.parentTag = a.parentNode.tagName;
+                var s = document.getElementById("S:0");
+                var p = s.parentNode;
+                var moved = s.firstChild;
+                p.insertBefore(moved, s);
+                window.movedType = s.previousSibling.nodeType;
+                window.movedNext = s.previousSibling.nextSibling.getAttribute("id");
+                window.movedText = s.previousSibling.data;
+                p.removeChild(s.previousSibling);
+                window.afterRemove = s.previousSibling.nodeType;
+                a.dataset.dgst = "d1";
+                window.dgst = a.dataset.dgst;
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "marker"), "8:$?");
+        assert_eq!(get_global_str(&mut ps, "afterWrite"), "$!");
+        assert_eq!(get_global_str(&mut ps, "parentTag"), "BODY");
+        assert_eq!(get_global_str(&mut ps, "movedType"), "3");
+        assert_eq!(get_global_str(&mut ps, "movedNext"), "S:0");
+        assert_eq!(get_global_str(&mut ps, "movedText"), "streamed");
+        assert_eq!(get_global_str(&mut ps, "afterRemove"), "8");
+        assert_eq!(get_global_str(&mut ps, "dgst"), "d1");
     }
 
     /// rAF coalescing: two callbacks queued in one epoch fire in ONE pass
