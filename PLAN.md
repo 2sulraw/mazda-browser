@@ -1726,6 +1726,41 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 59 (live collections / named form access) | a local collections/form page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `getElementsByTagName`, `getElementsByClassName`, `getElementsByName`, `document.forms` and `form.elements` now return LIVE `HTMLCollection`-shaped objects: `length`, index reads, `item()`, `namedItem()` and named property reads re-query the DOM, so nodes appended after the collection was returned appear without re-querying. `document.forms.login` and `form.elements.email` work by name/id; `form.elements` is a getter backed by the form's `button/fieldset/input/object/output/select/textarea` descendants. `for..of`, spread and `Array.from` snapshot through one query; generic `Array.prototype.*.call(collection, ...)` (MDN's header-anchor code) still works. `querySelectorAll` stays a static NodeList. Fixing collection indices also exposed an old document-order bug in element-scoped subtree walks, now corrected. A local page shows live length growth, named form/control access, iteration and a generic array method. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.1 MB, MDN 2773px / 641 runs / 87.7 MB, Wikipedia 24575px / 10950 runs / 102.9 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **812** default / **816** `engine-b + woff2` |
 
+| 2026-11-05 | wave 60 (`linear-gradient` backgrounds) | a local gradient page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Backgrounds can now use `linear-gradient(...)` in both `background` and `background-image`. The value parser accepts `to <side>`/corner directions and `deg`/`grad`/`rad`/`turn` angles, percentage stop positions, hard stops, named/hex/`rgb()`/`hsl()` colors and `rgba()`/`transparent` alpha; missing positions stay at 0%/100% or are distributed between neighbours. The gradient is stored as an `Arc<Gradient>` on `BoxStyle` and rides the existing rect channel through a parallel `rect_grad` slot, so stacking order, transforms, overflow clipping and sticky pinning are shared with solid backgrounds. Paint inverse-maps each pixel to the gradient line (through the box centre, length = the box's extent along the direction) and blends stops source-over, so `transparent` fades reveal the background colour; rounded corners reuse the rect culling rule. A local page shows three-stop, angled, corner, hard-stop, `to top`/`0.25turn`, alpha-fade and transformed cases. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.3 MB, MDN 2773px / 641 runs / 87.5 MB, Wikipedia 24575px / 10950 runs / 103.2 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.1 MB; suite **816** default / **820** `engine-b + woff2` |
+
+### Wave 60 findings
+
+- **No new paint channel.** A gradient is just a rect with a sentinel colour plus
+  one parallel `Layout::rect_grad` slot. The z-sort reorders the slots with the
+  same stable keys, and `StickyGroup.rects` already spans the shared vector, so
+  sticky pinning, transforms, overflow clips and parent-before-child order all
+  work without new bookkeeping. The alternative (a separate `gradients`
+  vector) would have needed its own sort, sticky spans and paint interleaving.
+- **Parse at declaration time, keep the value small.** A `Gradient` is a unit
+  direction plus `GradStop { pos, color, alpha }`; colors reuse
+  `parse_color_alpha`, so `transparent` and `rgba()` keep their real alpha.
+  Stops are made non-decreasing, the first/last default to 0/1 and interior
+  gaps are distributed evenly. Function-name matching is a substring search, so
+  prefixed spellings land in the same parser without writing a prefix.
+- **The box background stays underneath.** Alpha gradients blend per pixel over
+  whatever is already painted, which is why the existing background-color rect
+  is pushed first; a gradient with no base colour therefore shows the parent's
+  paint through its transparent stops.
+- **Directions are screen-space.** `0deg` = up, `90deg` = right, so
+  `to bottom`/`180deg` is `(0, 1)`. Corner keywords normalise the corner vector;
+  the real spec's aspect-ratio-dependent corner angle is a documented shortcut.
+  `repeating-*` currently draws one pass, and only the first layer of a
+  multi-layer background participates.
+- **Geometry is untouched.** Gradients are paint-only; all five reference
+  heights and run counts are identical to wave 59. The sub-megabyte RAM change
+  is the `Arc`'d stop arrays and the gradient slots.
+- **Test coverage.** One parser test (directions, angles, stops, alpha,
+  `none`/`url` clearing), one layout test (gradient slot rides the rect channel,
+  sentinel colour, width), and two paint tests (linear interpolation/clamping
+  and left-to-right / top-to-bottom rasterisation). The empty-`height` local
+  page pitfall is already documented: a plain block's `height` is ignored unless
+  it has content, `min-height` or a replaced/aspect/grid box.
+
 ### Wave 59 findings
 
 - **Live means re-query, not caching.** A collection stores only its query

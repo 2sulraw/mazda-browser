@@ -674,6 +674,7 @@ impl App {
                 height: 0.0,
                 underline_rects: Vec::new(),
                 rects: Vec::new(),
+                rect_grad: Vec::new(),
                 images: Vec::new(),
                 shadows: Vec::new(),
                 open_line: false,
@@ -2751,6 +2752,8 @@ struct PageWire {
     underline_rects: Vec<(f32, f32, f32, f32, u32, bool)>,
     /// x, y, w, h, color, radius, fixed
     rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    /// parallel to `rects`: Some = paint that rect as a gradient
+    rect_grad: Vec<Option<std::sync::Arc<css::Gradient>>>,
     /// x, y, w, h, pixels (owned), fixed
     images: Vec<(f32, f32, f32, f32, image::ImageData, bool)>,
     shadows: Vec<layout::ShadowRect>,
@@ -2841,6 +2844,7 @@ fn page_to_wire(
             .collect(),
         underline_rects: p.laid.underline_rects,
         rects: p.laid.rects,
+        rect_grad: p.laid.rect_grad,
         images: p
             .laid
             .images
@@ -2894,6 +2898,7 @@ fn wire_to_page(w: PageWire) -> Page {
             height: w.height,
             underline_rects: w.underline_rects,
             rects: w.rects,
+            rect_grad: w.rect_grad,
             images: w
                 .images
                 .into_iter()
@@ -5986,6 +5991,12 @@ fn render(
             }
             let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + top + y).max(0.0));
             let r = rad.min(w * 0.5).min(h * 0.5);
+            // a gradient slot paints the rect per-pixel (same geometry,
+            // radius, sticky shift and transform as the solid fill)
+            if let Some(g) = laid.rect_grad.get(i).and_then(|g| g.as_deref()) {
+                paint_gradient(buf, width, height, sx, sy, w, h, r, g);
+                continue;
+            }
             let (sxi, syi) = (sx.max(0.0) as usize, sy as usize);
             // square corners: one row fill per line instead of per-pixel math
             if r <= 0.5 {
@@ -6217,6 +6228,104 @@ fn blend(dst: &mut u32, src: u32, alpha: u8) {
     let g = (sg * a + dg * (255 - a)) / 255;
     let b = (sb * a + db * (255 - a)) / 255;
     *dst = (r << 16) | (g << 8) | b;
+}
+
+/// Interpolate a gradient's color at `t` (0..1) and return `(rgb, alpha)`.
+fn grad_at(g: &css::Gradient, t: f32) -> (u32, u8) {
+    let s = &g.stops;
+    if s.is_empty() {
+        return (0, 0);
+    }
+    if t <= s[0].pos {
+        return (s[0].color, s[0].alpha);
+    }
+    let last = &s[s.len() - 1];
+    if t >= last.pos {
+        return (last.color, last.alpha);
+    }
+    for w in s.windows(2) {
+        if t <= w[1].pos {
+            let d = w[1].pos - w[0].pos;
+            let f = if d > 1e-6 { (t - w[0].pos) / d } else { 1.0 };
+            // premultiplied interpolation (CSS Color 4): a fade to
+            // `transparent` keeps its hue instead of darkening toward black
+            let a0 = w[0].alpha as f32 / 255.0;
+            let a1 = w[1].alpha as f32 / 255.0;
+            let a = a0 + (a1 - a0) * f;
+            let pm = |c0: u32, c1: u32| -> u32 {
+                if a <= 1e-6 {
+                    0
+                } else {
+                    (((c0 as f32 * a0) * (1.0 - f) + (c1 as f32 * a1) * f) / a) as u32
+                }
+            };
+            let r = pm((w[0].color >> 16) & 0xff, (w[1].color >> 16) & 0xff);
+            let gch = pm((w[0].color >> 8) & 0xff, (w[1].color >> 8) & 0xff);
+            let b = pm(w[0].color & 0xff, w[1].color & 0xff);
+            return (r << 16 | gch << 8 | b, (a * 255.0).round() as u8);
+        }
+    }
+    (last.color, last.alpha)
+}
+
+/// Paint one `linear-gradient` into a rect of the page buffer. The
+/// gradient line crosses the rect centre along `g.dir`; its length is the
+/// rect's extent along that direction (the CSS rule for a linear gradient),
+/// so `t` is 0 at the entry edge and 1 at the exit edge.
+fn paint_gradient(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    sx: f32,
+    sy: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    g: &css::Gradient,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let len = (w * g.dir.0).abs() + (h * g.dir.1).abs();
+    let len = if len > 1e-6 { len } else { 1.0 };
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let (ox, oy) = (sx as i32, sy as i32);
+    for dy in 0..h.max(0.0) as usize {
+        let py = oy + dy as i32;
+        if py < 0 {
+            continue;
+        }
+        if py >= height as i32 {
+            break;
+        }
+        let ly = dy as f32;
+        for dx in 0..w.max(0.0) as usize {
+            let px = ox + dx as i32;
+            if px < 0 {
+                continue;
+            }
+            if px >= width as i32 {
+                break;
+            }
+            if r > 0.5 {
+                let lx = dx as f32;
+                let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
+                let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
+                let (ex, ey) = (lx - cx, ly - cy);
+                if ex * ex + ey * ey > r * r {
+                    continue;
+                }
+            }
+            let t = 0.5 + ((dx as f32 - hw) * g.dir.0 + (ly - hh) * g.dir.1) / len;
+            let (c, a) = grad_at(g, t.clamp(0.0, 1.0));
+            let idx = py as usize * width + px as usize;
+            if a == 255 {
+                buf[idx] = c;
+            } else if a > 0 {
+                blend(&mut buf[idx], c, a);
+            }
+        }
+    }
 }
 
 /// Fill a vertical pill (rounded top and bottom, square sides) into the
@@ -6806,6 +6915,7 @@ mod tests {
             height: 123.0,
             underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
             rects: vec![(1.0, 2.0, 3.0, 4.0, 0x00ff00, 2.0, true)],
+            rect_grad: vec![None],
             images: vec![(
                 5.0,
                 6.0,
@@ -8076,6 +8186,56 @@ mod tests {
         assert_eq!((probed, skipped), (1, 0), "bg data: URL probed");
         assert_eq!(dims, Some((2, 3)));
         assert!(drawn.is_some(), "bg data: URL decoded");
+    }
+
+    #[test]
+    fn gradient_stop_interpolation_is_linear_and_clamped() {
+        let g = css::Gradient {
+            dir: (1.0, 0.0),
+            stops: vec![
+                css::GradStop { pos: 0.2, color: 0xff0000, alpha: 255 },
+                css::GradStop { pos: 0.6, color: 0x0000ff, alpha: 0 },
+            ],
+        };
+        assert_eq!(grad_at(&g, 0.1), (0xff0000, 255), "before first stop clamps");
+        let (c, a) = grad_at(&g, 0.4);
+        assert_eq!(c, 0xff0000, "premultiplied midpoint keeps the opaque hue");
+        assert!((a as i32 - 127).abs() <= 1, "midpoint alpha: {a}");
+        assert_eq!(grad_at(&g, 0.9), (0x0000ff, 0), "after last stop clamps");
+        // two opaque stops still interpolate both RGB channels linearly
+        let solid = css::Gradient {
+            dir: (1.0, 0.0),
+            stops: vec![
+                css::GradStop { pos: 0.0, color: 0xff0000, alpha: 255 },
+                css::GradStop { pos: 1.0, color: 0x0000ff, alpha: 255 },
+            ],
+        };
+        assert_eq!(grad_at(&solid, 0.5), (0x7f007f, 255));
+    }
+
+    #[test]
+    fn linear_gradient_paints_along_its_direction() {
+        let g = css::Gradient {
+            dir: (1.0, 0.0), // to right
+            stops: vec![
+                css::GradStop { pos: 0.0, color: 0xff0000, alpha: 255 },
+                css::GradStop { pos: 1.0, color: 0x0000ff, alpha: 255 },
+            ],
+        };
+        let mut buf = vec![0u32; 100];
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 1.0, 0.0, &g);
+        assert_eq!(buf[0], 0xff0000, "left edge = first stop");
+        let (r0, _, b0) = ((buf[0] >> 16) & 0xff, (buf[0] >> 8) & 0xff, buf[0] & 0xff);
+        let (r9, _, b9) = ((buf[9] >> 16) & 0xff, (buf[9] >> 8) & 0xff, buf[9] & 0xff);
+        assert_eq!((r0, b0), (255, 0));
+        assert!(b9 > 200 && r9 < 55, "right edge near the last stop: {r9}/{b9}");
+
+        // a vertical direction changes only the y axis: every row differs
+        let v = css::Gradient { dir: (0.0, 1.0), ..g };
+        let mut buf = vec![0u32; 100];
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 1.0, 10.0, 0.0, &v);
+        assert_eq!(buf[0], 0xff0000);
+        assert!(buf[9 * 10] & 0xff > 200, "bottom row near blue");
     }
 
     #[test]

@@ -5,8 +5,8 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide, Clear,
-    Cursor, Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track,
-    TrackBreadth, VAlign, VarScope,
+    Cursor, Dir, Display, Float, Gradient, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole,
+    Track, TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -1807,8 +1807,12 @@ pub struct Layout {
     pub height: f32,
     /// x, y, w, h, color (matches the run's text color), fixed
     pub underline_rects: Vec<(f32, f32, f32, f32, u32, bool)>,
-    /// filled box backgrounds (x, y, w, h, color, radius, fixed) — drawn under text
+    /// filled box backgrounds (x, y, w, h, color, radius, fixed) - drawn under text
     pub rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    /// parallel to [`Layout::rects`]: `Some(g)` = fill that rect with the
+    /// gradient instead of its (sentinel) color. Sharing the rect channel
+    /// keeps z-order, sticky spans and transforms exact for free.
+    pub rect_grad: Vec<Option<std::sync::Arc<Gradient>>>,
     /// decoded `<img>` boxes (x, y, w, h, pixels, fixed) — drawn under text
     pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
     /// box-shadows (under backgrounds), paint order = list order
@@ -2005,6 +2009,7 @@ pub fn layout_in_forms(
         &mut hover_targets,
     );
     let mut rects = Vec::new();
+    let mut rect_grad = Vec::new();
     let mut rect_z = Vec::new();
     let mut images = Vec::new();
     let mut img_z = Vec::new();
@@ -2020,6 +2025,7 @@ pub fn layout_in_forms(
         // against the initial containing block (its height)
         (0.0, viewport_h),
         &mut rects,
+        &mut rect_grad,
         &mut rect_z,
         &mut images,
         &mut img_z,
@@ -2031,6 +2037,11 @@ pub fn layout_in_forms(
     // sticky spans were recorded in paint-walk order, so they follow their
     // entries through a permutation (exact while the subtree kept one level)
     let rm = zsort(&mut rects, &rect_z);
+    // the gradient slots follow the same stable sort (same keys => same
+    // permutation), so slot `i` still describes `rects[i]`
+    if rm.is_some() {
+        let _ = zsort(&mut rect_grad, &rect_z);
+    }
     let im = zsort(&mut images, &img_z);
     // text channel: move runs/underlines through their boxes' transforms
     // (layout coords never move — transforms are visual-only), stamp their
@@ -2060,6 +2071,7 @@ pub fn layout_in_forms(
         height: root.h,
         underline_rects: uls,
         rects,
+        rect_grad,
         images,
         shadows,
         open_line: root.open,
@@ -2507,6 +2519,7 @@ fn collect_paint(
     // containing block; the root's parent is the viewport)
     container: (f32, f32),
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    out_g: &mut Vec<Option<std::sync::Arc<Gradient>>>,
     out_z: &mut Vec<i32>,
     imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
     img_z: &mut Vec<i32>,
@@ -2640,8 +2653,23 @@ fn collect_paint(
                 let (x, y, w, h) = m.map_rect((x, y, w, h));
                 if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
                     out.push((x, y, w, h, color, rad * m.sx.abs(), fixed));
+                    out_g.push(None);
                     out_z.push(z);
                 }
+            }
+        }
+        // the gradient layer paints directly above this box's background
+        // color (and below its children). It rides the rect channel with a
+        // sentinel color so z-order / sticky / transforms stay shared.
+        // shortcut: painted over the border box (no background-origin or
+        // background-clip), one layer only, and a rounded border ring is
+        // covered by the gradient.
+        if let Some(g) = n.bx.bg_gradient.clone().filter(|_| !masked) {
+            let (x, y, w, h) = m.map_rect((n.x, n.y, n.w, n.h));
+            if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
+                out.push((x, y, w, h, u32::MAX, r * m.sx.abs(), fixed));
+                out_g.push(Some(g));
+                out_z.push(z);
             }
         }
         if has_b && !ring {
@@ -2660,6 +2688,7 @@ fn collect_paint(
                 let q = m.map_rect(q);
                 if let Some(q) = cull_rect(q, clip) {
                     out.push((q.0, q.1, q.2, q.3, bc, 0.0, fixed));
+                    out_g.push(None);
                     out_z.push(z);
                 }
             }
@@ -2687,6 +2716,7 @@ fn collect_paint(
                     let q = m.map_rect(q);
                     if let Some(q) = cull_rect(q, clip) {
                         out.push((q.0, q.1, q.2, q.3, oc, 0.0, fixed));
+                        out_g.push(None);
                         out_z.push(z);
                     }
                 }
@@ -2785,6 +2815,7 @@ fn collect_paint(
                 content_clip,
                 (n.y, n.y + n.h),
                 out,
+                out_g,
                 out_z,
                 imgs,
                 img_z,
@@ -7022,6 +7053,7 @@ fn layout_from(
             height: y,
             underline_rects,
             rects: Vec::new(),
+            rect_grad: Vec::new(),
             images: Vec::new(),
             shadows: Vec::new(),
             open_line: x > line_x0,
@@ -9981,6 +10013,27 @@ mod tests {
         assert!((n.children[1].y - expect).abs() < 0.01, "b2.y={} expect={}", n.children[1].y, expect);
         assert_eq!(l.runs.len(), 2);
         assert!((l.runs[1].y - expect).abs() < 0.01, "second run y={}", l.runs[1].y);
+    }
+
+    #[test]
+    fn linear_gradient_background_rides_the_rect_channel() {
+        let dom = crate::html::parse(r#"<div id=g>x</div>"#);
+        let sheet = crate::css::parse(
+            "#g{width:100px;height:40px;background:linear-gradient(90deg, red, blue)}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        assert_eq!(l.rect_grad.len(), l.rects.len(), "parallel channels");
+        let (i, g) = l
+            .rect_grad
+            .iter()
+            .enumerate()
+            .find(|(_, g)| g.is_some())
+            .expect("gradient rect pushed");
+        assert_eq!(l.rects[i].4, u32::MAX, "sentinel color");
+        assert_eq!(l.rects[i].2, 100.0, "border-box width");
+        assert_eq!(g.as_ref().unwrap().stops.len(), 2);
+        assert!((g.as_ref().unwrap().dir.0 - 1.0).abs() < 1e-6);
     }
 
     #[test]

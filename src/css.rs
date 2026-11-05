@@ -290,6 +290,29 @@ pub enum BgRepeat {
     NoRepeat,
 }
 
+/// One color stop of a [`Gradient`]. `pos` is 0..1 along the gradient line
+/// (positions may sit outside the box's 0..1 span, exactly like CSS).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GradStop {
+    pub pos: f32,
+    pub color: u32,
+    pub alpha: u8,
+}
+
+/// A parsed `linear-gradient(...)`. `dir` is a unit vector in SCREEN space
+/// (y grows downward), so `to bottom` = `(0, 1)` and `90deg` = `(1, 0)`.
+/// Stops are stored in declaration order with positions made non-decreasing
+/// and the first/last defaults pinned to 0.0/1.0; the paint code clamps.
+/// shortcut: one layer only (the first gradient in the value), no
+/// `background-origin`/`background-clip` (painted over the border box),
+/// corner directions ignore the box's aspect ratio, and `repeating-*`
+/// paints one non-repeating pass.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Gradient {
+    pub dir: (f32, f32),
+    pub stops: Vec<GradStop>,
+}
+
 /// Resolved `transform`: a translate + scale composite that layout applies
 /// at PAINT time only (CSS transforms are visual — layout flow size and
 /// sibling positions never change). `tx`/`ty` stay symbolic [`Len`]s:
@@ -465,6 +488,11 @@ pub struct BoxStyle {
     /// `background-repeat` — None = undeclared (single draw, see
     /// [`BgRepeat`]); Some(...) tiles on the named axis/axes at paint
     pub bg_repeat: Option<BgRepeat>,
+    /// `background: linear-gradient(...)` / `background-image:
+    /// linear-gradient(...)` — parsed once per declaration and painted
+    /// per-pixel over the box's border box (see [`Gradient`] for the
+    /// shortcuts). Painted above the background-color and below children.
+    pub bg_gradient: Option<std::sync::Arc<Gradient>>,
     /// `object-fit` — how a replaced element's content fills its box (see
     /// [`ObjFit`]); initial `fill` = the engine's old exact stretch
     pub obj_fit: ObjFit,
@@ -685,6 +713,7 @@ impl Default for BoxStyle {
             bg_size: BgSize::Auto,
             bg_pos: [BgPos::Pct(0.0); 2], // top-left
             bg_repeat: None,
+            bg_gradient: None,
             obj_fit: ObjFit::Fill,
             obj_pos: [BgPos::Pct(50.0); 2], // centered
             aspect_ratio: None,
@@ -2360,6 +2389,7 @@ fn apply_decl(
             // later color-only `background:` clears an earlier url.
             if d.0 == "background" {
                 bx.bg_image = parse_bg_url(&d.1);
+                bx.bg_gradient = parse_linear_gradient(&d.1, dark);
                 // the shorthand resets the geometry longhands, then parses
                 // any repeat / position / size tokens it carries (spec
                 // cascade: a shorthand wins over earlier longhands)
@@ -2370,8 +2400,12 @@ fn apply_decl(
             } else if d.0 == "background-image" {
                 if d.1.trim() == "none" {
                     bx.bg_image = None;
-                } else if let Some(u) = parse_bg_url(&d.1) {
-                    bx.bg_image = Some(u);
+                    bx.bg_gradient = None;
+                } else {
+                    if let Some(u) = parse_bg_url(&d.1) {
+                        bx.bg_image = Some(u);
+                    }
+                    bx.bg_gradient = parse_linear_gradient(&d.1, dark);
                 }
             }
         }
@@ -3879,6 +3913,189 @@ fn parse_bg_url(v: &str) -> Option<std::rc::Rc<str>> {
     };
     let target = target.trim();
     (!target.is_empty()).then(|| std::rc::Rc::from(target))
+}
+
+/// Split a value on top-level commas (`rgb(1, 2, 3)` keeps its own).
+fn split_top_level_commas(v: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in v.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&v[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&v[start..]);
+    parts
+}
+
+/// Parse the FIRST `linear-gradient(...)` in a `background` /
+/// `background-image` value. The match is a plain substring, so prefixed
+/// spellings land in the same parser (and `repeating-*` draws one pass —
+/// see [`Gradient`]). `None` = no gradient or an unparseable one.
+fn parse_linear_gradient(v: &str, dark: bool) -> Option<std::sync::Arc<Gradient>> {
+    const FN: &str = "linear-gradient(";
+    let lower = v.to_ascii_lowercase();
+    let at = lower.find(FN)? + FN.len();
+    // closing paren, counting nested color functions (rgba(), light-dark())
+    let mut depth = 1usize;
+    let mut end = None;
+    for (i, c) in v[at..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(at + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &v[at..end?];
+    let parts = split_top_level_commas(body);
+    // CSS initial direction: to bottom. `to <side>` / `<angle>` is only a
+    // direction when it is the FIRST component.
+    let mut dir = (0.0f32, 1.0f32);
+    let mut first_stop = 0usize;
+    if let Some(head) = parts.first() {
+        let head = head.trim();
+        let low = head.to_ascii_lowercase();
+        if let Some(rest) = low.strip_prefix("to ") {
+            let (mut x, mut y) = (0.0f32, 0.0f32);
+            for side in rest.split_whitespace() {
+                match side {
+                    "top" => y -= 1.0,
+                    "bottom" => y += 1.0,
+                    "left" => x -= 1.0,
+                    "right" => x += 1.0,
+                    _ => {}
+                }
+            }
+            if x != 0.0 || y != 0.0 {
+                let l = (x * x + y * y).sqrt();
+                // shortcut: a corner direction ignores the box aspect ratio
+                dir = (x / l, y / l);
+            }
+            first_stop = 1;
+        } else if let Some(theta) = parse_grad_angle(&low) {
+            // 0deg = to top, 90deg = to right; screen y grows downward
+            dir = (theta.sin(), -theta.cos());
+            first_stop = 1;
+        }
+    }
+    let mut stops: Vec<GradStop> = Vec::new();
+    for part in &parts[first_stop..] {
+        let toks = joined_tokens(part);
+        // a trailing percentage is the stop position; px positions are
+        // dropped but still stripped from the color text (shortcut: no
+        // length resolution at parse time)
+        let mut pos: Option<f32> = None;
+        let mut used = toks.len();
+        if let Some(last) = toks.last() {
+            if let Some(p) = parse_stop_pos(last) {
+                pos = p;
+                used -= 1;
+            }
+        }
+        if used == 0 {
+            continue; // bare position token, not a stop
+        }
+        let raw = toks[..used].join(" ");
+        let picked = pick_light_dark(&raw, dark);
+        let low = picked.trim().to_ascii_lowercase();
+        let (color, alpha) = if low == "transparent" {
+            (0u32, 0u8)
+        } else {
+            parse_color_alpha(&low)?
+        };
+        stops.push(GradStop {
+            pos: pos.unwrap_or(f32::NAN),
+            color,
+            alpha,
+        });
+    }
+    if stops.is_empty() {
+        return None;
+    }
+    if stops.len() == 1 {
+        stops.push(stops[0]); // one color = a solid fill
+    }
+    let n = stops.len();
+    if stops[0].pos.is_nan() {
+        stops[0].pos = 0.0;
+    }
+    if stops[n - 1].pos.is_nan() {
+        stops[n - 1].pos = 1.0;
+    }
+    // CSS clamps positions to be non-decreasing, then evenly distributes
+    // stops that gave no position between their nearest known neighbours
+    let mut prev = stops[0].pos;
+    for s in stops.iter_mut() {
+        if !s.pos.is_nan() {
+            if s.pos < prev {
+                s.pos = prev;
+            }
+            prev = s.pos;
+        }
+    }
+    let mut i = 1;
+    while i < n - 1 {
+        if stops[i].pos.is_nan() {
+            let start = i;
+            while i < n - 1 && stops[i].pos.is_nan() {
+                i += 1;
+            }
+            let (a, b) = (stops[start - 1].pos, stops[i].pos);
+            let count = i - start;
+            for (k, s) in stops[start..i].iter_mut().enumerate() {
+                s.pos = a + (b - a) * (k as f32 + 1.0) / (count as f32 + 1.0);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Some(std::sync::Arc::new(Gradient { dir, stops }))
+}
+
+/// `<angle>` for gradient directions: `deg`, `grad`, `rad`, `turn`.
+/// Unitless values (other than the caller's CSS rules) are rejected.
+fn parse_grad_angle(v: &str) -> Option<f32> {
+    let cut = v.find(|c: char| c.is_ascii_alphabetic())?;
+    let n: f32 = v[..cut].trim().parse().ok()?;
+    match v[cut..].trim() {
+        "deg" => Some(n.to_radians()),
+        "grad" => Some(n * std::f32::consts::PI / 200.0),
+        "rad" => Some(n),
+        "turn" => Some(n * std::f32::consts::TAU),
+        _ => None,
+    }
+}
+
+/// One optional color-stop position. Outer `Some` = this token IS a
+/// position (strip it from the color text); inner `Some` = a usable
+/// fraction of the gradient line. `px` positions strip but carry no
+/// fraction (shortcut: only percentages resolve).
+fn parse_stop_pos(t: &str) -> Option<Option<f32>> {
+    let t = t.trim().to_ascii_lowercase();
+    if let Some(p) = t.strip_suffix('%') {
+        let v: f32 = p.trim().parse().ok()?;
+        return v.is_finite().then_some(Some(v / 100.0));
+    }
+    if let Some(p) = t.strip_suffix("px") {
+        return p.trim().parse::<f32>().ok().map(|_| None);
+    }
+    if t == "0" {
+        return Some(Some(0.0));
+    }
+    None
 }
 
 /// `background-repeat` → [`BgRepeat`]; anything else (incl. layered
@@ -9111,7 +9328,7 @@ mod tests {
         let sheet = parse(
             ".a { background: url(x.png) no-repeat } \
              .b { background: #abc url(y.png) center/cover } \
-             .c { background: linear-gradient(#a, #b) 50% 25%/30px 40px repeat-x } \
+             .c { background: linear-gradient(#abc, #def) 50% 25%/30px 40px repeat-x } \
              .d { background: red }",
         );
         let dom = dom_of(
@@ -9130,9 +9347,10 @@ mod tests {
         assert_eq!(b.bg_size, BgSize::Cover, "…/cover");
         assert_eq!(b.bg_repeat, None, "no repeat token");
         let c = bx("c");
-        // the gradient is not an image we support (no url), but its tokens
-        // must not derail the position/size/repeat parse around it
+        // the gradient is parsed as the background layer (no url), and its
+        // tokens must not derail the position/size/repeat parse around it
         assert_eq!(c.bg_image, None);
+        assert!(c.bg_gradient.is_some(), "gradient layer parsed");
         assert_eq!(c.bg_pos, [BgPos::Pct(50.0), BgPos::Pct(25.0)]);
         assert_eq!(c.bg_size, BgSize::Wh(Some(Len::Px(30.0)), Some(Len::Px(40.0))));
         assert_eq!(c.bg_repeat, Some(BgRepeat::RepeatX));
@@ -9141,6 +9359,59 @@ mod tests {
         assert_eq!(d.bg_repeat, None);
         assert_eq!(d.bg_pos, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
         assert_eq!(d.bg_size, BgSize::Auto);
+    }
+
+    #[test]
+    fn linear_gradient_parses_direction_stops_and_transparency() {
+        let sheet = parse(
+            ".a { background-image: linear-gradient(#000, #fff) } \
+             .b { background: linear-gradient(to right, rgba(255,0,0,.5) 10%, blue 80%) } \
+             .c { background-image: linear-gradient(90deg, red, transparent) } \
+             .d { background-image: linear-gradient(0.5turn, #000 20%, #fff) } \
+             .e { background-image: linear-gradient(to bottom right, red, blue, lime) } \
+             .f { background-image: none } \
+             .g { background: url(x.png) } \
+             .h { background-image: linear-gradient(red 40%, lime 20%) }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>\
+             <div class=e></div><div class=f></div><div class=g></div><div class=h></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        let a = bx("a").bg_gradient.unwrap();
+        assert_eq!(a.dir, (0.0, 1.0), "initial direction = to bottom");
+        assert_eq!(a.stops.len(), 2);
+        assert!((a.stops[0].pos - 0.0).abs() < 1e-6);
+        assert!((a.stops[1].pos - 1.0).abs() < 1e-6);
+        assert_eq!((a.stops[0].color, a.stops[0].alpha), (0x000000, 255));
+
+        let b = bx("b").bg_gradient.unwrap();
+        assert!((b.dir.0 - 1.0).abs() < 1e-6 && b.dir.1.abs() < 1e-6, "to right");
+        assert_eq!((b.stops[0].color, b.stops[0].alpha), (0xff0000, 128));
+        assert!((b.stops[0].pos - 0.1).abs() < 1e-6);
+        assert!((b.stops[1].pos - 0.8).abs() < 1e-6);
+
+        let c = bx("c").bg_gradient.unwrap();
+        assert!((c.dir.0 - 1.0).abs() < 1e-6 && c.dir.1.abs() < 1e-6, "90deg = right");
+        assert_eq!(c.stops[1].alpha, 0, "transparent stop keeps alpha 0");
+
+        let d = bx("d").bg_gradient.unwrap();
+        assert!(d.dir.0.abs() < 1e-6 && (d.dir.1 - 1.0).abs() < 1e-6, "0.5turn = down");
+        assert!((d.stops[0].pos - 0.2).abs() < 1e-6);
+        assert!((d.stops[1].pos - 1.0).abs() < 1e-6);
+
+        let e = bx("e").bg_gradient.unwrap();
+        let l = 0.5f32.sqrt();
+        assert!((e.dir.0 - l).abs() < 1e-3 && (e.dir.1 - l).abs() < 1e-3);
+        assert_eq!(e.stops.len(), 3);
+        assert!((e.stops[1].pos - 0.5).abs() < 1e-6, "missing position = midpoint");
+
+        assert!(bx("f").bg_gradient.is_none(), "none clears");
+        assert!(bx("g").bg_gradient.is_none(), "url has no gradient");
+        // non-decreasing: a later 20% clamps up to the previous 40%
+        let h = bx("h").bg_gradient.unwrap();
+        assert!((h.stops[0].pos - 0.4).abs() < 1e-6);
+        assert!((h.stops[1].pos - 0.4).abs() < 1e-6);
     }
 
     // ---- object-fit / object-position / aspect-ratio ----
