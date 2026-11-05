@@ -46,9 +46,7 @@ pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<ImageData> {
         w2: w as usize * SS,
         h2: h as usize * SS,
     };
-    let vb = get_attr(root_attrs, "viewBox")
-        .and_then(nums4)
-        .unwrap_or([0.0, 0.0, w as f64, h as f64]);
+    let vb = root_vb(root_attrs, w, h);
     let m = match get_attr(root_attrs, "transform") {
         Some(t) => base * parse_transform(t),
         None => base,
@@ -426,12 +424,29 @@ fn root_content(txt: &str) -> Option<(&str, usize, usize)> {
     Some((t.attrs, i, ce))
 }
 
+/// Root user-space viewport: the `viewBox` when present, else the declared
+/// intrinsic `width`/`height` (an SVG without a viewBox still has a fixed
+/// 1:1 user coordinate system — its intrinsic size), else the requested
+/// raster size. Using the requested size as the fallback would map only the
+/// top-left `w×h` user units and clip the rest when rendering below the
+/// intrinsic size.
+fn root_vb(root_attrs: &str, w: u32, h: u32) -> [f64; 4] {
+    if let Some(v) = get_attr(root_attrs, "viewBox").and_then(nums4) {
+        return v;
+    }
+    let iw = get_attr(root_attrs, "width")
+        .and_then(parse_px)
+        .unwrap_or(w as f64);
+    let ih = get_attr(root_attrs, "height")
+        .and_then(parse_px)
+        .unwrap_or(h as f64);
+    [0.0, 0.0, iw.max(1e-6), ih.max(1e-6)]
+}
+
 /// Root user space → supersampled image pixels (`viewBox` fit, xMidYMid meet).
 fn root_space(txt: &str, w: u32, h: u32) -> Option<M> {
     let (_, root_attrs) = root_tag(txt)?;
-    let vb = get_attr(root_attrs, "viewBox")
-        .and_then(nums4)
-        .unwrap_or([0.0, 0.0, w as f64, h as f64]);
+    let vb = root_vb(root_attrs, w, h);
     let (vw, vh) = (vb[2].max(1e-6), vb[3].max(1e-6));
     let scale = (w as f64 / vw).min(h as f64 / vh);
     let k = SS as f64;
@@ -2735,6 +2750,23 @@ mod tests {
         let at = |x: usize, y: usize| img.px[y * 10 + x];
         assert_eq!(at(5, 5), 0xffff_0000); // red center
         assert_eq!(at(0, 0), 0); // untouched corner
+    }
+
+    #[test]
+    fn intrinsic_size_scales_when_no_viewbox() {
+        // An SVG with width/height but no viewBox has a fixed user coordinate
+        // system of that intrinsic size. Rendering at a smaller or larger
+        // raster size must scale the whole drawing, not map only the top-left
+        // w×h user units (which clipped the logo at 80px).
+        let s = br#"<svg width="100" height="100"><rect width="100" height="100" fill="black"/></svg>"#;
+        for &n in &[50u32, 100, 200] {
+            let img = render(s, n, n).expect("renders");
+            assert_eq!((img.w, img.h), (n, n));
+            assert!(
+                img.px.iter().all(|&p| p == 0xff00_0000),
+                "full-bleed rect must cover {n}x{n}"
+            );
+        }
     }
 
     #[test]

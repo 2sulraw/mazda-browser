@@ -1717,6 +1717,28 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 52 (`outline`) | a local outline page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | A box can now paint an outline: a ring outside the border box that layout never sees. `outline` and its `outline-width`/`-style`/`-color`/`-offset` longhands parse into a compact `BoxStyle.outline` (on, width, optional colour, offset); every non-`none` style paints solid, `auto` counts as off, an unset colour is currentcolor, and the width defaults to the CSS `medium` 3px. Paint emits four strips around the border box shifted outward by `outline-offset`, mapped through the box transform and culled by the inherited clip like the border strips. A local page shows all five cases: a 4px red ring hugging the border box, the same ring pushed 6px out by `outline-offset`, a `none` box with no ring, `thick dashed #06c` drawn as a 5px solid blue ring, and `1px solid transparent` keeping its geometry but painting nothing. All five references are geometry-identical and error-free: nextjs 7578px / 569 runs / 155.4 MB, MDN 2690px / 641 runs / 88.0 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 79.3 MB, rust-lang 5800px / 483 runs / 85.8 MB; suite **796** default / **800** `engine-b + woff2` |
 | 2026-11-05 | wave 53 (`transform-origin`) | a local five-origin page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The 2D transform composite can now scale about a declared point instead of always the box centre. `transform-origin` parses one or two values — `left`/`center`/`right`, `top`/`center`/`bottom`, lengths and percentages — into symbolic `Len`s on `BoxStyle.origin`; `%` resolves against the box's own border-box w/h at paint time, a lone vertical keyword claims the Y axis, keyword pairs may be written in either order, and `initial`/`unset`/`revert`/garbage fall back to `50% 50%`. `box_xf` now uses `p·s + (o(1−s) + d)` with `o` the resolved origin, so `scale()` pins the declared point and paint-only behavior is unchanged. A local page isolates it: five `scale(0.5)` boxes stay pinned at the centre, `0 0`, `100% 0`, `bottom right`, and `top left` respectively. All five references are geometry-identical and error-free: nextjs 7578px / 569 runs / 155.5 MB, MDN 2690px / 641 runs / 88.0 MB, Wikipedia 24575px / 10950 runs / 102.2 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 85.3 MB; suite **798** default / **802** `engine-b + woff2` |
 
+| 2026-11-05 | wave 54 (SVG intrinsic-size scaling) | a local three-size SVG page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Fixed a vector-rasterization bug: an SVG that declares `width`/`height` but no `viewBox` was rendered as if its user-space viewport were the requested raster size. Rendering the 144-unit rust-lang logo at 80px therefore mapped only user units 0–80 and clipped the gear to a corner fragment (144px happened to match, 200px showed it unscaled). `root_space` and `render` now derive the fallback viewport from the root `width`/`height` attributes (then the requested size), so the intrinsic 144-unit coordinate system is scaled to any display size; percentage lengths resolve against the same viewport. A local page embeds the same logo at 144px, 80px and 200px and now shows the full gear at all three. All five references stay geometry-identical and error-free: nextjs 7578px / 569 runs / 155.3 MB, MDN 2690px / 641 runs / 87.9 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 78.4 MB, rust-lang 5800px / 483 runs / 84.7 MB — with the rust logo now whole in its capture; suite **799** default / **803** `engine-b + woff2` |
+
+### Wave 54 findings
+
+- **No `viewBox` does not mean "use the output size".** An SVG without a
+  `viewBox` still has a fixed user coordinate system: the root `width`/`height`
+  (the intrinsic size). The old fallback substituted the requested raster size,
+  which made the user-space origin track the display size and cropped anything
+  larger than it. The logo only looked right at its native 144px and appeared
+  merely small at 200px because the untransformed 144-unit drawing still fit.
+- **One fallback for both geometry and percentages.** `root_space` and
+  `render` now share `root_vb`: `viewBox` if present, else intrinsic
+  `width`/`height`, else the requested size. `state.vp` takes the same values,
+  so `%` lengths inside a no-viewBox SVG resolve against the intrinsic box too.
+- **Uniform fit preserved.** The existing `xMidYMid meet` rule (min scale +
+  centring) still applies to both cases; a no-`viewBox` image whose display
+  aspect differs from its intrinsic aspect letterboxes rather than stretching.
+  That is the documented rasterizer shortcut, unchanged by this wave.
+- **Layout is untouched.** The bug was entirely inside `svg::render`; probe
+  already reported the intrinsic size correctly, so box geometry, run counts
+  and page heights are identical. Only the pixels inside image boxes change.
+
 ### Wave 53 findings
 
 - **Origin is a paint anchor, not geometry.** `box_xf` already folded the
