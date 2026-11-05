@@ -425,6 +425,12 @@ pub struct BoxStyle {
     /// `align-self` — this item's cross-axis alignment, overriding the
     /// container's `align-items`. None = inherit it.
     pub align_self: Option<Align>,
+    /// `justify-items` — grid items' inline-axis alignment inside their area.
+    /// Reuses [`Align`]; `Stretch`/`Normal` keep the old full-area placement.
+    pub justify_items: Align,
+    /// `justify-self` — one grid item's override of `justify-items`.
+    /// `auto` = None (inherit the container's value).
+    pub justify_self: Option<Align>,
     /// per-slot auto margins (`margin-left/right: auto`) — CSS: both auto →
     /// center, left-auto-only → push right, right-auto-only → hug left.
     /// `margin_x_auto` stays the shorthand "both auto" centering flag (the
@@ -656,6 +662,8 @@ impl Default for BoxStyle {
             min_width: None,
             order: 0,
             align_self: None,
+            justify_items: Align::Stretch,
+            justify_self: None,
             margin_l_auto: false,
             margin_r_auto: false,
             pad: [Len::Px(0.0); 4],
@@ -1231,6 +1239,8 @@ const KNOWN: &[&str] = &[
     "place-content",
     "align-items",
     "align-self",
+    "justify-items",
+    "justify-self",
     "flex-wrap",
     "flex-shrink",
     "flex-basis",
@@ -2647,6 +2657,23 @@ fn apply_decl(
                 _ => None,
             }
         }
+        // grid items' inline-axis alignment inside their area; `normal`
+        // behaves as `stretch` (the initial value), like CSS Grid
+        "justify-items" => {
+            if let Some(a) = parse_inline_align(&d.1) {
+                bx.justify_items = a;
+            }
+        }
+        // `justify-self: auto` inherits `justify-items`; every other keyword
+        // overrides it for this item only
+        "justify-self" => {
+            let t = d.1.trim();
+            bx.justify_self = if t.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                parse_inline_align(t)
+            };
+        }
         "justify-content" => {
             bx.justify = parse_content_pos(&d.1).unwrap_or(Justify::Start);
         }
@@ -3702,6 +3729,19 @@ fn parse_content_pos(v: &str) -> Option<Justify> {
         "space-around" => Some(Justify::SpaceAround),
         "space-evenly" => Some(Justify::SpaceEvenly),
         "normal" | "stretch" => Some(Justify::Normal),
+        _ => None,
+    }
+}
+
+/// `justify-items` / `justify-self` keyword → inline-axis alignment.
+/// `normal` maps to `stretch` (CSS Grid's initial behaviour); `legacy` and
+/// unknown keywords are dropped so the declaration keeps the earlier value.
+fn parse_inline_align(v: &str) -> Option<Align> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "start" | "flex-start" | "left" | "self-start" => Some(Align::Start),
+        "center" => Some(Align::Center),
+        "end" | "flex-end" | "right" | "self-end" => Some(Align::End),
+        "stretch" | "normal" => Some(Align::Stretch),
         _ => None,
     }
 }
@@ -8246,6 +8286,30 @@ mod tests {
         let sheet0 = parse(".a { flex: 0 }");
         let z = sheet0.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).bx;
         assert_eq!((z.grow, z.basis), (0.0, None), "flex: 0 = grow 0, basis auto");
+    }
+
+    #[test]
+    fn justify_items_and_justify_self_parse() {
+        let sheet = parse(
+            ".a { justify-items: center } .b { justify-items: normal } \
+             .c { justify-self: end } .d { justify-self: auto } \
+             .e { justify-items: start } .f { justify-self: stretch }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("a").justify_items, Align::Center);
+        // `normal` behaves as `stretch` in grid layout
+        assert_eq!(bx("b").justify_items, Align::Stretch);
+        assert_eq!(bx("c").justify_self, Some(Align::End));
+        assert_eq!(bx("d").justify_self, None, "auto = inherit justify-items");
+        assert_eq!(bx("e").justify_items, Align::Start);
+        assert_eq!(bx("f").justify_self, Some(Align::Stretch));
+        // the initial value keeps the old full-area placement
+        assert_eq!(BoxStyle::default().justify_items, Align::Stretch);
+        assert_eq!(BoxStyle::default().justify_self, None);
     }
 
     #[test]

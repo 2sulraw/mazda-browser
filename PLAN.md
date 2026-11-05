@@ -1721,6 +1721,36 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 55 (`text-decoration` paint controls) | a local decoration page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Underlines, strikethroughs and overlines can now be painted with their authored colour, pattern, thickness and offset. `text-decoration-color`, `text-decoration-style` (`solid`/`double`/`dotted`/`dashed`/`wavy`), `text-decoration-thickness` and `text-underline-offset` parse into four compact `Style` fields; the `text-decoration` shorthand also picks a style/colour/thickness token from its list, while `text-decoration-line` keeps changing only the line flags. Paint expands `double` into two rules inside the declared thickness, `dotted`/`dashed` into short solid segments (the wire channel is solid rects only), and moves only the underline by `text-underline-offset`; the run's own colour is the default. A local page shows a plain link, a red underline, a 4px red underline shifted 6px down, dotted and dashed 4px rules, a double rule, and wavy documented as solid. All five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.4 MB, MDN 2690px / 641 runs / 88.1 MB, Wikipedia 24575px / 10950 runs / 103.2 MB, HN 1695px / 728 runs / 78.3 MB, rust-lang 5800px / 483 runs / 85.2 MB — MDN's link decoration now carries its authored colour and offset; suite **801** default / **805** `engine-b + woff2` |
 | 2026-11-05 | wave 56 (`align-content` / `place-content`) | a local five-grid + two-flex distribution page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Grid rows and wrapped flex lines can now be distributed in the container's spare block space. `align-content` and the `place-content` shorthand parse into one compact `Justify` field on `BoxStyle`; the layout keeps its existing single-pass paint, then shifts each row's/line's runs, underline rects and item subtrees by the leading offset plus the extra gap. `start`/`normal`/`stretch` pack at the start (no auto-track growth), `center`/`end`/`space-between`/`space-around`/`space-evenly` work in both grids and wrapping flex rows; `place()` already floors the box, so a wrapped flex container with `min-height` now places its lines inside that floor instead of leaving them at the top. A local page shows five 180px grids (start/center/end/between/evenly) and two wrapped flex columns (center/between). All five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.6 MB, MDN 2690px / 641 runs / 88.5 MB, Wikipedia 24575px / 10950 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.3 MB; suite **804** default / **808** `engine-b + woff2` |
+| 2026-11-05 | wave 57 (`justify-items` / `justify-self`) | a local five-grid alignment page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Grid items can now be aligned along the inline axis inside their grid area. `justify-items` parses into an `Align` on `BoxStyle` and `justify-self` into a per-item override (`auto` inherits, `normal` is `stretch`). `stretch` keeps the old full-area placement, so every existing page is byte-identical; `start`/`center`/`end` size the item to fit-content (declared px/% against the area, auto widths from max-content) and shift its margin box inside the area. Text items wrap at that fit-content width instead of the whole cell. A local page shows four grids (start/center/end/stretch) plus per-item overrides; suite **807** default / **811** `engine-b + woff2`. References: nextjs 7578px / 569 runs / 155.7 MB, MDN 2773px / 641 runs / 88.1 MB (the MDN homepage itself changed between waves: 2690px with the same binary when the feature is disabled, so this is content drift, not layout), Wikipedia 24575px / 10950 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 85.2 MB |
+
+### Wave 57 findings
+
+- **Grid-only, and off by default.** `justify-items`/`justify-self` act in
+  the grid row loop; flex containers ignore them, as CSS does. The initial
+  value is `stretch`, which is exactly the old "pass the whole area" path, so
+  no reference page changes unless it authors the property.
+- **Non-stretch is fit-content, not re-flow.** The item's outer width becomes
+  its max-content width (or its declared width) capped by the grid area, then
+  the margin box shifts by the leftover space. A text item is laid out at
+  that narrower width, so it wraps like a shrink-to-fit box; a block item
+  keeps its internal layout and just moves.
+- **Percentages resolve against the area.** A `%` width on a grid item must
+  use the grid area, not the whole grid, so alignment has its own
+  `grid_item_outer_w` measurement instead of reusing `item_max_content`
+  (which sizes `%` widths intrinsically). `min-width`/`max-width` clamp the
+  aligned size, matching `place()`.
+- **`normal` and `auto` mean different things.** `justify-items: normal` (and
+  `justify-self: normal`) is `stretch`; `justify-self: auto` inherits the
+  container's value. Unknown keywords (including `legacy`) are dropped and
+  keep the previous value.
+- **Two bytes, no new pass.** `justify_items: Align` plus
+  `justify_self: Option<Align>` fits in existing padding; the slot and shift
+  are computed where the item is already placed, so column sizing, row
+  heights, spans and the wave-56 `align-content` pass are untouched.
+- **MDN moved, this wave didn't.** The MDN homepage measured 2773px this
+  wave versus 2690px in wave 56. Running the same binary with `justify-self`
+  parsing disabled still gives 2773px, so the difference is the live page
+  (contributor-spotlight/footer content), not this feature.
 
 ### Wave 56 findings
 

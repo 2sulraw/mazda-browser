@@ -4564,6 +4564,49 @@ fn item_min_content(
     }
 }
 
+/// Outer (margin-box) width a grid item uses when `justify-items` /
+/// `justify-self` is not `stretch`: shrink-to-fit content, a declared width,
+/// or a percentage resolved against the item's grid AREA. The caller clamps
+/// it to the area. (`item_max_content` cannot be reused here: it resolves a
+/// `%` width intrinsically and ignores `min-width`/`max-width`.)
+fn grid_item_outer_w(
+    parent: &BoxNode,
+    it: &Item,
+    area_w: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) -> f32 {
+    match it {
+        Item::Text(a, b) => parent.children[*a..*b]
+            .iter()
+            .map(|c| natural_w(c, area_w, measure))
+            .sum(),
+        Item::Grp(i) => {
+            let c = &parent.children[*i];
+            let mut w = match c.bx.width {
+                Some(l) => resolve_len(l, area_w),
+                None => cell_max_content(c, area_w, measure),
+            };
+            if let Some(m) = c.bx.max_width {
+                w = w.min(resolve_len(m, area_w));
+            }
+            if let Some(m) = c.bx.min_width {
+                w = w.max(resolve_len(m, area_w));
+            }
+            let ml = if c.bx.margin_l_auto {
+                0.0
+            } else {
+                resolve_len(c.bx.margin[3], area_w)
+            };
+            let mr = if c.bx.margin_r_auto {
+                0.0
+            } else {
+                resolve_len(c.bx.margin[1], area_w)
+            };
+            (w + ml + mr).max(0.0)
+        }
+    }
+}
+
 /// Max-content OUTER width of one grid item: all inline content on one line
 /// (see [`cell_max_content`]), plus horizontal margins. A declared px width
 /// wins (the box does not grow past it).
@@ -6387,8 +6430,32 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         let mut cell_ios: Vec<bool> = Vec::with_capacity(nc);
         for &idx in &row_items {
             let (_, r_end, c0, c1) = spots[idx];
-            let (dx, w) = span_xw(c0, c1);
-            let x = n.x + dx;
+            let (dx, area_w) = span_xw(c0, c1);
+            let area_x = n.x + dx;
+            // `justify-items` / `justify-self`: non-stretch sizes the item to
+            // fit-content and aligns that margin box inside the grid area.
+            // `stretch` (and `normal`) keep the full-area placement.
+            let align = match items[idx] {
+                Item::Grp(i) => n
+                    .children[i]
+                    .bx
+                    .justify_self
+                    .unwrap_or(n.bx.justify_items),
+                Item::Text(..) => n.bx.justify_items,
+            };
+            let (w, x) = if align == Align::Stretch {
+                (area_w, area_x)
+            } else {
+                let outer = grid_item_outer_w(n, &items[idx], area_w, measure)
+                    .min(area_w)
+                    .max(0.0);
+                let shift = match align {
+                    Align::Center => (area_w - outer) * 0.5,
+                    Align::End => area_w - outer,
+                    _ => 0.0, // Start
+                };
+                (outer, area_x + shift)
+            };
             let rs = runs.len();
             let us = uls.len();
             let (ih, io) = match items[idx] {
@@ -8685,6 +8752,73 @@ mod tests {
         let (y0, y1, _) = build(Justify::SpaceEvenly);
         assert!((y0 - 260.0 / 3.0).abs() < 0.01, "evenly leading {}", y0);
         assert!((y1 - (260.0 / 3.0 + 20.0 + 260.0 / 3.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn justify_items_aligns_grid_items_in_their_area() {
+        let build = |ji: Align| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Grid,
+                    cols: vec![Track::Px(100.0), Track::Px(100.0)],
+                    justify_items: ji,
+                    ..BoxStyle::default()
+                },
+            );
+            n.children.push(BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    width: Some(Len::Px(40.0)),
+                    min_height: Some(Len::Px(10.0)),
+                    ..BoxStyle::default()
+                },
+            ));
+            // auto-width item: max-content is 4 chars x 4px
+            let mut t = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    min_height: Some(Len::Px(10.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            t.children.push(leaf("abcd"));
+            n.children.push(t);
+            layout_tree(&mut n, 200.0, &m4);
+            (n.children[0].x, n.children[1].x, n.children[1].w)
+        };
+        assert_eq!(build(Align::Start), (0.0, 100.0, 16.0));
+        assert_eq!(build(Align::Center), (30.0, 142.0, 16.0));
+        assert_eq!(build(Align::End), (60.0, 184.0, 16.0));
+        // stretch fills the area; a declared width keeps its size at the start
+        assert_eq!(build(Align::Stretch), (0.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn justify_self_overrides_justify_items() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Px(100.0), Track::Px(100.0)],
+                justify_items: Align::Start,
+                ..BoxStyle::default()
+            },
+        );
+        for self_align in [None, Some(Align::End)] {
+            n.children.push(BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    width: Some(Len::Px(40.0)),
+                    min_height: Some(Len::Px(10.0)),
+                    justify_self: self_align,
+                    ..BoxStyle::default()
+                },
+            ));
+        }
+        layout_tree(&mut n, 200.0, &m4);
+        assert_eq!(n.children[0].x, 0.0, "container start");
+        assert_eq!(n.children[1].x, 160.0, "item end inside its 100px area");
     }
 
     #[test]

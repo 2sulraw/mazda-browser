@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 139 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
+| CSS property names | 141 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,7 +151,7 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 139 |
+| Names in the engine's `KNOWN` table | 141 |
 | Additional accepted alias | 1 (`border-top-left-radius`) |
 | Raw missing (non-vendor) | ~630 |
 | Coverage (non-vendor) | ~16% |
@@ -175,7 +175,7 @@ ignored.
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
 | Fonts | 23 | `font`, `font-variant-*`, `font-kerning` | medium |
-| Grid & alignment | 14 | `justify-items`, `grid-row`, `grid-auto-flow` | high |
+| Grid & alignment | 12 | `grid-row`, `grid-auto-flow`, `place-items` | high |
 | Transforms & motion paths | 14 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
 | Backgrounds | 13 | `background-clip`, `background-origin`, `background-attachment` | medium |
@@ -249,9 +249,9 @@ relevant only when transitions and animations exist.
 - `@media` only understands width, hover, pointer, orientation, and
   `prefers-color-scheme`.
 - Grid: no `auto-fill`/`auto-fit`, no `min-content`/`max-content`, `repeat()`
-  capped at 64; `justify-items`/`justify-self` and `place-items`/`place-self`
-  are absent; `align-content` distributes rows, but `stretch` packs at the
-  start (auto rows never grow).
+  capped at 64; `place-items`/`place-self` are absent; `justify-items` and
+  `justify-self` align grid items inside their area; `align-content`
+  distributes rows, but `stretch` packs at the start (auto rows never grow).
 - Flex: `wrap-reverse` does not reverse the cross axis.
 - Borders: one colour for all sides; dashed/dotted approximated; inner shadows
   dropped; only the top-left corner longhand is aliased.
@@ -390,7 +390,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 804 self-authored unit tests (808 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 807 self-authored unit tests (811 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -419,7 +419,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
 | P1 | live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 1-2 waves |
-| P1 | CSS `justify-items`/`justify-self`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
+| P1 | CSS `caption-side` | frequent declarations with a small parser | some pages | low | 1 wave |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
@@ -454,7 +454,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (139 + 1 alias)
+## Appendix A - CSS property names accepted (141 + 1 alias)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -471,7 +471,7 @@ flex-wrap, float, font-family, font-size
 font-style, font-weight, gap, grid-area
 grid-column, grid-column-end, grid-column-start, grid-template-areas
 grid-template-columns, grid-template-rows, height, inset
-justify-content, left, letter-spacing, line-height
+justify-content, justify-items, justify-self, left, letter-spacing, line-height
 list-style, list-style-position, list-style-type, margin
 margin-block, margin-block-end, margin-block-start, margin-bottom
 margin-inline, margin-inline-end, margin-inline-start, margin-left
@@ -504,8 +504,7 @@ The full list is reproducible with Appendix D.
 
 ```text
 Layout and alignment:
-  justify-items, justify-self, place-items,
-  place-self, grid-auto-columns, grid-auto-rows, grid-auto-flow, grid-row,
+  place-items, place-self, grid-auto-columns, grid-auto-rows, grid-auto-flow, grid-row,
   grid-row-start, grid-row-end, grid-template, grid-gap
 
 Box, border, outline:
@@ -590,7 +589,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 139 names
+# Engine property table: 141 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 
