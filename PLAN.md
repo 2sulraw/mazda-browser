@@ -1711,6 +1711,42 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 46 (`DataView` + `AbortController` / `AbortSignal`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the two remaining self-contained P1 constructors. `DataView` is a byte window over an `ArrayBuffer` with big-endian default, per-call little-endian flag, all 10 numeric accessor pairs (including BigInt), and RangeError/TypeError bounds checks. `AbortController` / `AbortSignal` expose `signal`, `aborted`, `reason`, `onabort`, `addEventListener` / `removeEventListener` for `abort`, `throwIfAborted`, and `AbortSignal.abort()`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.2 MB, MDN 2922px / 641 runs / 87.6 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.4 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **773** default / **777** `engine-b + woff2` |
 | 2026-11-05 | wave 47 (`Event` / `CustomEvent` + `dispatchEvent`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 event surface. `new Event(type, {bubbles, cancelable})` and `new CustomEvent(type, {detail, bubbles, cancelable})` build plain objects on linked prototypes (`CustomEvent` is an `Event`), with `preventDefault`, `stopPropagation` and `stopImmediatePropagation`. `element` / `document` / `window` `dispatchEvent` is synchronous: target, then ancestors, then the shared window/document bucket; `bubbles: false` stays on the target; `stopImmediatePropagation` also skips later listeners at the same stop; the return value is `!defaultPrevented`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 154.9 MB, MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 102.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **778** default / **782** `engine-b + woff2` |
 | 2026-11-05 | wave 48 (`MutationObserver`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `new MutationObserver(callback)` with `observe` / `disconnect` / `takeRecords`. The shared DOM host logs `childList`, `attributes` and `characterData` mutations (plus `subtree`, `attributeOldValue` / `characterDataOldValue`, `attributeFilter`), but only while an observer is registered, so pages that never observe pay nothing. Callbacks run at the end of a script turn with `(records, observer)`; each record carries `type`, `target`, `addedNodes`, `removedNodes`, `attributeName` and `oldValue`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.6 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24454px / 10943 runs / 99.7-102.6 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 85.0 MB; suite **781** default / **785** `engine-b + woff2` |
+| 2026-11-05 | wave 49 (`overflow-wrap` / `word-break`) | a local 120px-box wrapping page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Line layout can now break inside a word. `overflow-wrap: break-word|anywhere`, the legacy `word-wrap` alias and `word-break: break-all|break-word|keep-all` parse into two inherited `Style` switches; when a word still does not fit, the breaker cuts the longest character prefix that fits (`fit_prefix`, a binary search over monotone widths) and continues on the next line. A local page isolates the behavior: a 28-character token in a 120px box stays one 217px overflowing run by default, becomes 117px + 76px with `break-word`, 112px + 97px with `break-all`, and short words on one line are untouched. Four references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.1 MB, MDN 2922px / 641 runs / 87.5 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.6 MB. Wikipedia moves to 24575px / 10950 runs / 100.9 MB because its own `word-break: break-all` / `break-word` rules now take effect (intended fidelity gain, 7 extra run pieces); suite **785** default / **789** `engine-b + woff2` |
+
+### Wave 49 findings
+
+- **Two inherited switches, no new storage per box.** `Style` gained `ow`
+  (`overflow-wrap` / legacy `word-wrap`) and `wb` (`word-break`); both ride
+  the existing copied `Style` down the tree. `breaks_inside_words()` is the
+  one predicate the breaker asks. `word-break: break-word` is parsed onto
+  `overflow-wrap: break-word` as the spec says, and `normal` / unknown
+  keywords restore the initial state.
+- **The breaker only fires when a word still does not fit.** When the word
+  fits, the run is emitted exactly as before, so pages without these
+  declarations stay byte-identical. Once a word overflows a wrappable line,
+  `fit_prefix` binary-searches the longest character prefix that fits
+  (widths are monotone in prefix length) and the remainder continues on the
+  next line. `word-break: break-all` and `overflow-wrap: anywhere` use the
+  same path.
+- **The cut is made at placement time, not by splitting atoms.** Splitting
+  words into character atoms up front would multiply every run, underline
+  rect and hover target; the greedy cut creates only the extra line pieces
+  a real browser would show. Underlines / strike / overline are emitted per
+  piece so decoration follows the visible line.
+- **Progress is guaranteed.** If not even one glyph fits, a non-empty line
+  wraps first; a character wider than the whole line is emitted anyway
+  (the old overflow result). Emitted width always advances `x` or the loop
+  breaks because the remainder is empty.
+- **Shortcuts, documented here.** `anywhere` is treated as `break-word`
+  (the min-content difference is ignored), `keep-all` behaves like `normal`
+  (there is no CJK breaker), continuation lines reuse the current line's
+  usable range instead of re-checking floats, `hyphens` / `line-clamp` are
+  absent, and `text-overflow: ellipsis` is still not painted.
+- **Wikipedia moved, and that is intended.** `/wiki/JavaScript` gains 7 run
+  pieces and 121 px (24454 -> 24575) because its own rules
+  (`.mw-body-content a.external.free { word-break: break-all }`,
+  `h1 { word-break: break-word }`) now take effect; the other four
+  references keep their exact geometry.
 
 ### Wave 48 findings
 

@@ -36,8 +36,9 @@ pub enum Fam {
 /// `<pre>` element's inline descendants with mixed normal siblings (the
 /// UA default on `<pre>` itself is `Ws::Pre`, see `style_for`, so plain
 /// `<pre>` content works; an inline child that redeclares gets its own
-/// mode). `break-word`/`overflow-wrap` are out of scope (this batch only
-/// breaks where the old breaker already broke: whitespace).
+/// mode). In-word breaking (`overflow-wrap` / `word-break`) is a separate
+/// inherited switch on [`Style`], applied by `layout_from` only when a word
+/// still does not fit.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Ws {
     Normal,
@@ -45,6 +46,28 @@ pub enum Ws {
     Pre,
     PreWrap,
     PreLine,
+}
+
+/// `overflow-wrap` (legacy `word-wrap`): may a word that does not fit break
+/// between two of its characters? `anywhere` is the same as `break-word`
+/// here — the min-content difference only matters to sizing, and this
+/// engine already treats the two the same (see [`Style::breaks_inside_words`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Ow {
+    Normal,
+    BreakWord,
+    Anywhere,
+}
+
+/// `word-break`: `break-all` lets any two characters break, `keep-all`
+/// forbids breaks between CJK characters (no CJK-specific breaker here, so
+/// it behaves like `normal`; the shorthand `break-word` is parsed as
+/// `overflow-wrap: break-word`, matching the spec).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Wb {
+    Normal,
+    BreakAll,
+    KeepAll,
 }
 
 impl Ws {
@@ -120,6 +143,10 @@ pub struct Style {
     pub lh: f32,
     /// `white-space` — inherited, see [`Ws`]
     pub ws: Ws,
+    /// `overflow-wrap` / `word-wrap` — inherited, see [`Ow`]
+    pub ow: Ow,
+    /// `word-break` — inherited, see [`Wb`]
+    pub wb: Wb,
     /// `text-transform` — inherited, see [`Tt`]
     pub text_transform: Tt,
     /// `letter-spacing` in px — inherited; extra advance between each pair
@@ -151,6 +178,8 @@ impl Style {
             text_align: 0,
             lh: 0.0,
             ws: Ws::Normal,
+            ow: Ow::Normal,
+            wb: Wb::Normal,
             text_transform: Tt::None,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -168,6 +197,13 @@ impl Style {
         } else {
             self.size * 1.35
         }
+    }
+
+    /// May a single word be split between characters when it overflows the
+    /// line? `overflow-wrap: break-word|anywhere` and `word-break: break-all`
+    /// say yes; everything else keeps the word whole.
+    pub fn breaks_inside_words(&self) -> bool {
+        self.ow != Ow::Normal || self.wb == Wb::BreakAll
     }
 }
 
@@ -6233,6 +6269,36 @@ pub fn layout(atoms: &[Atom], max_width: f32, measure: &dyn Fn(&str, &Style) -> 
 /// centered/right-aligned line beside a float may overlap it (left-aligned
 /// text, the default, is exact).
 #[allow(clippy::too_many_arguments)]
+/// Largest byte length of a prefix of `text` that fits in `avail` px, or 0
+/// when not even one character fits. Widths are monotonic in the prefix
+/// length, so a binary search over character counts is enough.
+fn fit_prefix(text: &str, style: &Style, avail: f32, measure: &dyn Fn(&str, &Style) -> f32) -> usize {
+    let end_of = |k: usize| -> usize {
+        text.char_indices()
+            .nth(k)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len())
+    };
+    let nchars = text.chars().count();
+    if nchars == 0 || avail <= 0.0 {
+        return 0;
+    }
+    let w = |k: usize| measure(&text[..end_of(k)], style) + spacing_extra(&text[..end_of(k)], style);
+    if w(1) > avail + 0.01 {
+        return 0;
+    }
+    let (mut ok, mut bad) = (1usize, nchars + 1);
+    while bad - ok > 1 {
+        let mid = (ok + bad) / 2;
+        if w(mid) <= avail + 0.01 {
+            ok = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    end_of(ok)
+}
+
 fn layout_from(
     atoms: &[Atom],
     x0: f32,
@@ -6450,7 +6516,8 @@ fn layout_from(
         // measured width + tracking in ONE number: spacing_extra is the
         // same rule draw_text replays per glyph (main.rs), so what wraps
         // here is exactly what paints there
-        let ww = measure(&w.text, &w.style) + spacing_extra(&w.text, &w.style);
+        let mut rest = w.text.as_str();
+        let mut ww = measure(rest, &w.style) + spacing_extra(rest, &w.style);
         // a word that EXACTLY fills the line must not wrap: the shrink-to-fit
         // max-content width and this line's per-word sum can differ in the
         // last float digit (a letter-spaced, uppercased pill measured 96.31454
@@ -6483,30 +6550,74 @@ fn layout_from(
             }
         }
         let lh = w.style.line_height();
-        runs.push(PositionedRun {
-            x,
-            y,
-            text: w.text.clone(),
-            style: w.style,
-            width: ww,
-            link: w.link.clone(),
-            fixed: false,
-            clip: None,
-            node: w.node,
-            cursor: w.cursor,
-        });
-        if w.style.underline {
-            underline_rects.push((x, y + lh - 2.0, ww, 1.0, w.style.color, false));
+        // `overflow-wrap: break-word` / `word-break: break-all`: a word that
+        // still does not fit is cut at the last character that fits and the
+        // rest continues on the next line. Continued lines reuse this line's
+        // usable range (no float re-exclusion) — shortcut.
+        loop {
+            let can_cut = x + ww > line_max + 0.01
+                && w.style.ws.wrap()
+                && w.style.breaks_inside_words();
+            let mut cut = if can_cut {
+                fit_prefix(rest, &w.style, line_max - x, measure)
+            } else {
+                0
+            };
+            if can_cut && cut == 0 {
+                if x > line_x0 {
+                    // nothing more fits here: continue on a fresh line
+                    y += line_height;
+                    x = 0.0;
+                    line_x0 = 0.0;
+                    line_height = 0.0;
+                    ww = measure(rest, &w.style) + spacing_extra(rest, &w.style);
+                    continue;
+                }
+                // a single character wider than the line: take it anyway so
+                // the loop always makes progress (the old overflow result)
+                cut = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(rest.len());
+            }
+            let piece = if cut == 0 { rest } else { &rest[..cut] };
+            let pw = if cut == 0 {
+                ww
+            } else {
+                measure(piece, &w.style) + spacing_extra(piece, &w.style)
+            };
+            runs.push(PositionedRun {
+                x,
+                y,
+                text: piece.into(),
+                style: w.style,
+                width: pw,
+                link: w.link.clone(),
+                fixed: false,
+                clip: None,
+                node: w.node,
+                cursor: w.cursor,
+            });
+            if w.style.underline {
+                underline_rects.push((x, y + lh - 2.0, pw, 1.0, w.style.color, false));
+            }
+            if w.style.strike {
+                // mid-x-height: a hair above the vertical middle of the line box
+                underline_rects.push((x, y + lh * 0.5, pw, 1.0, w.style.color, false));
+            }
+            if w.style.overline {
+                underline_rects.push((x, y + 1.0, pw, 1.0, w.style.color, false));
+            }
+            x += pw;
+            line_height = line_height.max(lh);
+            rest = &rest[piece.len()..];
+            if rest.is_empty() {
+                break;
+            }
+            // the remainder moved to the next line
+            y += line_height;
+            x = 0.0;
+            line_x0 = 0.0;
+            line_height = 0.0;
+            ww = measure(rest, &w.style) + spacing_extra(rest, &w.style);
         }
-        if w.style.strike {
-            // mid-x-height: a hair above the vertical middle of the line box
-            underline_rects.push((x, y + lh * 0.5, ww, 1.0, w.style.color, false));
-        }
-        if w.style.overline {
-            underline_rects.push((x, y + 1.0, ww, 1.0, w.style.color, false));
-        }
-        x += ww;
-        line_height = line_height.max(lh);
     }
     y += line_height;
 
@@ -6588,6 +6699,68 @@ mod tests {
         for r in &l.runs {
             assert!(r.x + r.width <= 20.0 + 0.001, "run overflows: {:?}", r.text);
         }
+    }
+
+    /// The same long token with no in-word breaking stays one overflowing
+    /// run; `overflow-wrap: break-word` cuts it into line-sized pieces.
+    #[test]
+    fn break_word_splits_a_token_that_does_not_fit() {
+        let text = "abcdefghij";
+        let plain = vec![mk_atom(text, false)];
+        let l = layout(&plain, 20.0, &|s, _| s.len() as f32 * 4.0);
+        assert_eq!(l.runs.len(), 1, "default keeps the word whole");
+        assert!(l.runs[0].width > 20.0, "and lets it overflow");
+
+        let mut a = mk_atom(text, false);
+        a.style.ow = Ow::BreakWord;
+        let l = layout(&[a], 20.0, &|s, _| s.len() as f32 * 4.0);
+        assert!(l.runs.len() > 1, "break-word splits, got {}", l.runs.len());
+        let joined: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, text, "no characters are lost or duplicated");
+        for r in &l.runs {
+            assert!(
+                r.x + r.width <= 20.0 + 0.001,
+                "piece overflows: {:?} at x={} w={}",
+                r.text,
+                r.x,
+                r.width
+            );
+        }
+        assert!(l.height > l.runs[0].style.line_height());
+    }
+
+    /// `word-break: break-all` enables the same in-word cut; `keep-all` and
+    /// `white-space: nowrap` do not.
+    #[test]
+    fn break_all_breaks_and_nowrap_keeps_the_word_whole() {
+        let mut a = mk_atom("abcdefghij", false);
+        a.style.wb = Wb::BreakAll;
+        let l = layout(&[a], 20.0, &|s, _| s.len() as f32 * 4.0);
+        assert!(l.runs.len() > 1);
+
+        let mut a = mk_atom("abcdefghij", false);
+        a.style.wb = Wb::KeepAll;
+        let l = layout(&[a], 20.0, &|s, _| s.len() as f32 * 4.0);
+        assert_eq!(l.runs.len(), 1);
+
+        let mut a = mk_atom("abcdefghij", false);
+        a.style.ow = Ow::BreakWord;
+        a.style.ws = Ws::Nowrap;
+        let l = layout(&[a], 20.0, &|s, _| s.len() as f32 * 4.0);
+        assert_eq!(l.runs.len(), 1, "nowrap wins over in-word breaking");
+    }
+
+    /// A breakable word that fits is untouched, and the pieces fill each
+    /// line greedily (5 chars per 20px line at 4px/char).
+    #[test]
+    fn break_word_keeps_fitting_words_and_fills_lines() {
+        let mut a = mk_atom("abc defghijkl", false);
+        a.style.ow = Ow::BreakWord;
+        let l = layout(&[a], 20.0, &|s, _| s.len() as f32 * 4.0);
+        let texts: Vec<&str> = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts[0], "abc");
+        assert_eq!(texts[1], "defgh", "the long word fills the second line");
+        assert_eq!(texts[2], "ijkl");
     }
 
     #[test]

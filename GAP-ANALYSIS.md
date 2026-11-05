@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 122 in `KNOWN` + 1 alias | 752 non-vendor | ~16% | dataset includes drafts; ~20-22% against names shipping in two mainstream engines |
+| CSS property names | 125 in `KNOWN` + 1 alias | 752 non-vendor | ~16% | dataset includes drafts; ~20-22% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,7 +151,7 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 122 |
+| Names in the engine's `KNOWN` table | 125 |
 | Additional accepted alias | 1 (`border-top-left-radius`) |
 | Raw missing (non-vendor) | ~630 |
 | Coverage (non-vendor) | ~16% |
@@ -168,7 +168,7 @@ ignored.
 | Category | Missing | Examples | Decision relevance |
 |---|---:|---|---|
 | Other / miscellaneous | 217 | `bookmark-label`, `block-step-align`, `corner-*`, `cue` | ignore: drafts, print, speech |
-| Text & typography | 62 | `text-overflow`, `overflow-wrap`, `word-break`, `hyphens` | high: frequent in real CSS |
+| Text & typography | 62 | `text-overflow`, `hyphens` | high: frequent in real CSS |
 | Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low: low frequency here |
 | Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required |
 | Borders & outlines | 40 | corner longhands, `border-style`, `outline-*` | medium: `outline` is common |
@@ -260,8 +260,10 @@ relevant only when transitions and animations exist.
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
   Focus rings and custom checkbox states are therefore missing.
 - `var()` is a flat page-wide map, not a per-element cascade.
-- `text-overflow`, `overflow-wrap`/`word-break`, `caption-side`,
-  `transform-origin`, `background-clip`, and `filter` are absent.
+- `text-overflow`, `caption-side`, `transform-origin`, `background-clip`,
+  and `filter` are absent. `overflow-wrap` / `word-break` now break inside
+  words during line layout (see the wave 49 notes), but `hyphens` is not
+  modeled.
 - `direction`, `unicode-bidi`, and writing modes are absent.
 
 ---
@@ -382,7 +384,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 781 self-authored unit tests (785 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 785 self-authored unit tests (789 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -411,7 +413,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
 | P1 | live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 1-2 waves |
-| P1 | CSS `text-overflow`, `overflow-wrap`/`word-break`, `outline`, `transform-origin`, `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
+| P1 | CSS `text-overflow`, `outline`, `transform-origin`, `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
@@ -470,16 +472,17 @@ margin-inline, margin-inline-end, margin-inline-start, margin-left
 margin-right, margin-top, mask, mask-image
 mask-position, mask-repeat, mask-size, max-width
 min-height, min-width, object-fit, object-position
-opacity, order, overflow, overflow-x
-overflow-y, padding, padding-block, padding-block-end
-padding-block-start, padding-bottom, padding-inline, padding-inline-end
-padding-inline-start, padding-left, padding-right, padding-top
-position, right, row-gap, stroke
-stroke-linecap, stroke-linejoin, stroke-opacity, stroke-width
-table-layout, text-align, text-decoration, text-decoration-line
-text-indent, text-transform, top, transform
-vertical-align, visibility, white-space, width
-word-spacing, z-index
+opacity, order, overflow, overflow-wrap
+overflow-x, overflow-y, padding, padding-block
+padding-block-end, padding-block-start, padding-bottom, padding-inline
+padding-inline-end, padding-inline-start, padding-left, padding-right
+padding-top, position, right, row-gap
+stroke, stroke-linecap, stroke-linejoin, stroke-opacity
+stroke-width, table-layout, text-align, text-decoration
+text-decoration-line, text-indent, text-transform, top
+transform, vertical-align, visibility, white-space
+width, word-break, word-spacing, word-wrap
+z-index
 ```
 
 `border-top-left-radius` is accepted as an alias of the corner-radius shorthand
@@ -502,7 +505,7 @@ Box, border, outline:
   box-decoration-break
 
 Text and typography:
-  text-overflow, overflow-wrap, word-break, hyphens, text-shadow,
+  text-overflow, hyphens, text-shadow,
   text-decoration-color, text-decoration-style, text-decoration-thickness,
   text-underline-offset, text-emphasis, line-clamp, tab-size, quotes,
   direction, unicode-bidi, writing-mode, text-orientation,

@@ -25,7 +25,7 @@
 //! layout.rs consumes it. Upgrade when the CSS engine grows (Phase 1c+).
 
 use crate::html::{Dom, NodeKind};
-use crate::layout::{Fam, ListPos, ListStyleType, Style, Tt, Ws};
+use crate::layout::{Fam, ListPos, ListStyleType, Ow, Style, Tt, Wb, Ws};
 
 pub type Decl = (String, String);
 
@@ -1190,6 +1190,9 @@ const KNOWN: &[&str] = &[
     "height",
     "min-height",
     "white-space",
+    "overflow-wrap",
+    "word-wrap",
+    "word-break",
     "padding",
     "padding-top",
     "padding-right",
@@ -2435,6 +2438,27 @@ fn apply_decl(
                 _ => Ws::Normal,
             }
         }
+        // the two in-word breaking switches (see layout.rs): unknown values
+        // and `normal` restore the initial no-break mode, and the legacy
+        // `word-wrap` alias is the same property as `overflow-wrap`
+        "overflow-wrap" | "word-wrap" => {
+            style.ow = match d.1.as_str() {
+                "break-word" => Ow::BreakWord,
+                "anywhere" => Ow::Anywhere,
+                _ => Ow::Normal,
+            }
+        }
+        // `word-break: break-word` is specified as `overflow-wrap: break-word`
+        // (plus an ignored `word-break: normal`), so it lands on `ow`
+        "word-break" => match d.1.as_str() {
+            "break-all" => style.wb = Wb::BreakAll,
+            "keep-all" => style.wb = Wb::KeepAll,
+            "break-word" => {
+                style.wb = Wb::Normal;
+                style.ow = Ow::BreakWord;
+            }
+            _ => style.wb = Wb::Normal,
+        },
         // case mapping, applied once when text boxes are built
         // (layout.rs transform_text); `none`/garbage → initial None
         "text-transform" => {
@@ -5884,6 +5908,45 @@ mod tests {
         let st = sheet.resolve(&dom, node, Style::new(), None);
         assert!(st.bx.width.is_none(), "auto clears the width");
         assert_eq!(st.bx.declared & decl::WIDTH, 0, "declared bit cleared too");
+    }
+
+    #[test]
+    fn in_word_breaking_keywords_land_on_the_inherited_style() {
+        let sheet = parse(
+            ".a { overflow-wrap: break-word } \
+             .b { overflow-wrap: anywhere } \
+             .c { word-wrap: break-word } \
+             .d { word-break: break-all } \
+             .e { word-break: break-word } \
+             .f { word-break: keep-all } \
+             .g { overflow-wrap: normal } \
+             .h { overflow-wrap: nope }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div>",
+        );
+        let st = |cls: &str| {
+            let node = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, node, Style::new(), None).style
+        };
+        assert_eq!(st("a").ow, Ow::BreakWord);
+        assert!(st("a").breaks_inside_words());
+        assert_eq!(st("b").ow, Ow::Anywhere);
+        // `word-wrap` is the legacy spelling of the same property
+        assert_eq!(st("c").ow, Ow::BreakWord);
+        assert_eq!(st("d").wb, Wb::BreakAll);
+        assert!(st("d").breaks_inside_words());
+        // the legacy `word-break: break-word` maps onto overflow-wrap
+        assert_eq!(st("e").wb, Wb::Normal);
+        assert_eq!(st("e").ow, Ow::BreakWord);
+        assert_eq!(st("f").wb, Wb::KeepAll);
+        assert!(!st("f").breaks_inside_words());
+        // `normal` and an unknown keyword both restore the initial mode
+        assert_eq!(st("g").ow, Ow::Normal);
+        assert_eq!(st("h").ow, Ow::Normal);
+        assert!(!st("h").breaks_inside_words());
     }
 
     #[test]
