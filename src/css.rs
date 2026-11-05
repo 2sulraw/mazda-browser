@@ -615,6 +615,11 @@ pub struct BoxStyle {
     pub inset: [Option<Len>; 4],
     /// `box-shadow` list, first = topmost (paint order reversed)
     pub shadows: Vec<Shadow>,
+    /// `opacity` 0..1 (initial 1). shortcut: applied per painted primitive,
+    /// not as a true group composite - two overlapping children of a
+    /// semi-transparent box can show through each other. `0` hides the whole
+    /// subtree (the cascade turns it into `display:none`).
+    pub opacity: f32,
     /// CSS `float` — out-of-flow box placed at the current line's edge
     /// (layout.rs `block()`)
     pub float: Float,
@@ -777,6 +782,7 @@ impl Default for BoxStyle {
             pos: Pos::Static,
             inset: [None; 4],
             shadows: Vec::new(),
+            opacity: 1.0,
             float: Float::None,
             clear: Clear::None,
             valign: VAlign::Baseline,
@@ -2662,9 +2668,21 @@ fn apply_decl(
         // shadows carry their own alpha (rgba() is the common case) and may
         // stack — parse the whole list, first shadow paints on top
         "box-shadow" => bx.shadows = parse_box_shadows(&d.1, dark, vp),
-        // fully transparent = invisible; shortcut: partial opacity ignored
-        // (rasterizer has no alpha compositing), so only 0 hides the subtree
-        "opacity" => return d.1.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false),
+        // fully transparent = invisible; partial opacity paints with
+        // per-primitive alpha (see BoxStyle::opacity), so only 0 hides the
+        // subtree outright
+        "opacity" => {
+            let Ok(v) = d.1.parse::<f32>() else {
+                return false;
+            };
+            // non-finite numbers are invalid CSS - ignore the declaration
+            if !v.is_finite() {
+                return false;
+            }
+            let v = v.clamp(0.0, 1.0);
+            bx.opacity = v;
+            return v <= 0.0;
+        }
         // shortcut: hidden/collapse treated as display:none (real CSS keeps
         // the box in flow — usually fine, sites use it on off-screen
         // measurement clones)
@@ -8216,9 +8234,19 @@ mod tests {
         let sheet = parse(".drawer { opacity: 0 } .faded { opacity: .5 } .shown { opacity: 1 }");
         let dom = dom_of("<div class=drawer></div><div class=faded></div><div class=shown></div>");
         assert!(sheet.resolve(&dom, by_attr(&dom, "class", "drawer"), Style::new(), None).display_none);
-        // partial/full opacity keeps rendering (rasterizer has no alpha — documented shortcut)
-        assert!(!sheet.resolve(&dom, by_attr(&dom, "class", "faded"), Style::new(), None).display_none);
-        assert!(!sheet.resolve(&dom, by_attr(&dom, "class", "shown"), Style::new(), None).display_none);
+        // partial/full opacity keeps rendering; the declared value is stored
+        // and composed into each painted primitive (documented shortcut)
+        let faded = sheet.resolve(&dom, by_attr(&dom, "class", "faded"), Style::new(), None);
+        assert!(!faded.display_none);
+        assert!((faded.bx.opacity - 0.5).abs() < 1e-6, "declared opacity stored");
+        let shown = sheet.resolve(&dom, by_attr(&dom, "class", "shown"), Style::new(), None);
+        assert!(!shown.display_none);
+        assert_eq!(shown.bx.opacity, 1.0);
+        // out-of-range values clamp into 0..1
+        let sheet2 = parse(".a { opacity: 2 } .b { opacity: -1 }");
+        let dom2b = dom_of("<div class=a></div><div class=b></div>");
+        assert_eq!(sheet2.resolve(&dom2b, by_attr(&dom2b, "class", "a"), Style::new(), None).bx.opacity, 1.0);
+        assert_eq!(sheet2.resolve(&dom2b, by_attr(&dom2b, "class", "b"), Style::new(), None).bx.opacity, 0.0);
         // inline style too
         let dom2 = dom_of(r#"<div id=x style="opacity:0"></div>"#);
         assert!(sheet.resolve(&dom2, by_attr(&dom2, "id", "x"), Style::new(), Some("opacity:0")).display_none);

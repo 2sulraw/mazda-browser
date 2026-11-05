@@ -269,6 +269,10 @@ relevant only when transitions and animations exist.
   on `overflow` clipping).
 - `outline` paints a solid ring only (styles collapse, `auto` is off);
   `clip-path` is `inset()` only.
+- `opacity` is applied per painted primitive (backgrounds, borders, images,
+  text, decorations), not as a group composite: overlapping translucent
+  children of the same box can show through each other. `opacity: 0` removes
+  the subtree.
 - Interaction pseudo-classes (`:focus`, `:focus-visible`, `:checked`,
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
   Focus rings and custom checkbox states are therefore missing.
@@ -404,7 +408,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 821 self-authored unit tests (825 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 823 self-authored unit tests (827 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 

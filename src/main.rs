@@ -2754,8 +2754,8 @@ struct PageWire {
     rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     /// parallel to `rects`: Some = paint that rect as a gradient
     rect_grad: Vec<Option<std::sync::Arc<css::Gradient>>>,
-    /// x, y, w, h, pixels (owned), fixed
-    images: Vec<(f32, f32, f32, f32, image::ImageData, bool)>,
+    /// x, y, w, h, pixels (owned), fixed, effective opacity
+    images: Vec<(f32, f32, f32, f32, image::ImageData, bool, u8)>,
     shadows: Vec<layout::ShadowRect>,
     /// sticky pinning records — the UI thread applies them per frame in
     /// `render` (indexes into the channels above, so they ride along)
@@ -2791,6 +2791,8 @@ struct RunWire {
     /// clip window (x0, y0, x1, y1, doc coords) from ancestor overflow/clip
     /// boxes — None = unclipped; degenerate (x0 ≥ x1) = draw nothing
     clip: Option<(f32, f32, f32, f32)>,
+    /// effective opacity byte (255 = opaque) for the run's glyphs
+    alpha: u8,
 }
 
 /// Result sent back by the worker: the wire page (None = the pipeline panicked),
@@ -2840,6 +2842,7 @@ fn page_to_wire(
                 link: r.link.as_ref().map(|l| l.to_string()),
                 fixed: r.fixed,
                 clip: r.clip,
+                alpha: r.alpha,
             })
             .collect(),
         underline_rects: p.laid.underline_rects,
@@ -2849,14 +2852,14 @@ fn page_to_wire(
             .laid
             .images
             .into_iter()
-            .map(|(x, y, w, h, img, fixed)| {
+            .map(|(x, y, w, h, img, fixed, alpha)| {
                 // freshly decoded per page: refcount is 1, but be safe
                 let owned = std::rc::Rc::try_unwrap(img).unwrap_or_else(|rc| image::ImageData {
                     w: rc.w,
                     h: rc.h,
                     px: rc.px.clone(),
                 });
-                (x, y, w, h, owned, fixed)
+                (x, y, w, h, owned, fixed, alpha)
             })
             .collect(),
         shadows: p.laid.shadows,
@@ -2893,6 +2896,7 @@ fn wire_to_page(w: PageWire) -> Page {
                     // hover identity rides `hover_targets`, not the runs
                     node: None,
                     cursor: None,
+                    alpha: r.alpha,
                 })
                 .collect(),
             height: w.height,
@@ -2902,7 +2906,7 @@ fn wire_to_page(w: PageWire) -> Page {
             images: w
                 .images
                 .into_iter()
-                .map(|(x, y, w, h, img, fixed)| (x, y, w, h, std::rc::Rc::new(img), fixed))
+                .map(|(x, y, w, h, img, fixed, alpha)| (x, y, w, h, std::rc::Rc::new(img), fixed, alpha))
                 .collect(),
             shadows: w.shadows,
             sticky: w.sticky,
@@ -4878,7 +4882,7 @@ fn decode_images(
             // and nothing retained, so no budget is charged
             if let Some(Some((img, draw))) = slot {
                 *budget -= px;
-                laid.images.push((draw.0, draw.1, draw.2, draw.3, img, fixed));
+                laid.images.push((draw.0, draw.1, draw.2, draw.3, img, fixed, layout::eff_alpha(n.eff)));
                 count += 1;
             }
         }
@@ -5991,10 +5995,17 @@ fn render(
             }
             let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + top + y).max(0.0));
             let r = rad.min(w * 0.5).min(h * 0.5);
+            // high byte = effective opacity (0 = un-packed colour, treat as
+            // opaque so every pre-opacity caller keeps painting solid)
+            let alpha = match (color >> 24) as u8 {
+                0 => 255,
+                a => a,
+            };
+            let rgb = color & 0x00ff_ffff;
             // a gradient slot paints the rect per-pixel (same geometry,
             // radius, sticky shift and transform as the solid fill)
             if let Some(g) = laid.rect_grad.get(i).and_then(|g| g.as_deref()) {
-                paint_gradient(buf, width, height, sx, sy, w, h, r, g);
+                paint_gradient(buf, width, height, sx, sy, w, h, r, g, alpha);
                 continue;
             }
             let (sxi, syi) = (sx.max(0.0) as usize, sy as usize);
@@ -6006,7 +6017,13 @@ fn render(
                     if py >= height || xa >= xb {
                         break;
                     }
-                    buf[py * width + xa..py * width + xb].fill(color);
+                    if alpha == 255 {
+                        buf[py * width + xa..py * width + xb].fill(rgb);
+                    } else {
+                        for idx in &mut buf[py * width + xa..py * width + xb] {
+                            blend(idx, rgb, alpha);
+                        }
+                    }
                 }
                 continue;
             }
@@ -6031,12 +6048,16 @@ fn render(
                             continue;
                         }
                     }
-                    buf[py * width + px] = color;
+                    if alpha == 255 {
+                        buf[py * width + px] = rgb;
+                    } else {
+                        blend(&mut buf[py * width + px], rgb, alpha);
+                    }
                 }
             }
         }
         // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
-        for (i, (x, y, w, h, img, fixed)) in laid.images.iter().enumerate() {
+        for (i, (x, y, w, h, img, fixed, ialpha)) in laid.images.iter().enumerate() {
             if *fixed != want_fixed {
                 continue;
             }
@@ -6059,7 +6080,7 @@ fn render(
                     }
                     let u = (dx as f32 * img.w as f32 / w) as u32;
                     let c = img.px[(v * img.w + u) as usize];
-                    let a = (c >> 24) as u8;
+                    let a = ((c >> 24) as u16 * *ialpha as u16 / 255) as u8;
                     let idx = py as usize * width + px as usize;
                     if a == 255 {
                         buf[idx] = c & 0x00ff_ffff;
@@ -6109,6 +6130,7 @@ fn render(
                 &run.text,
                 fonts,
                 &run.style,
+                run.alpha,
                 clip.map(|(x0, y0, x1, y1)| {
                     (
                         PADDING as f32 + x0,
@@ -6129,12 +6151,22 @@ fn render(
                 continue;
             }
             let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + top + y);
+            let alpha = match (color >> 24) as u8 {
+                0 => 255,
+                a => a,
+            };
+            let rgb = color & 0x00ff_ffff;
             for dy in 0..h.max(1.0) as usize {
                 for dx in 0..w as usize {
                     let px = sx as usize + dx;
                     let py = (sy as usize) + dy;
                     if px < width && py * width + px < buf.len() {
-                        buf[py * width + px] = color;
+                        let idx = py * width + px;
+                        if alpha == 255 {
+                            buf[idx] = rgb;
+                        } else {
+                            blend(&mut buf[idx], rgb, alpha);
+                        }
                     }
                 }
             }
@@ -6151,6 +6183,8 @@ fn draw_text(
     s: &str,
     fonts: &Fonts,
     style: &Style,
+    // effective opacity byte for this run (255 = opaque)
+    alpha: u8,
     // clip window in BUFFER coords (x0, y0, x1, y1); glyphs fully outside
     // are skipped — partial overlap still blends (the buffer has no clip
     // stack; intersection was pre-applied to the run's window in layout)
@@ -6207,7 +6241,10 @@ fn draw_text(
                     }
                     let idx = row + dx as usize;
                     if idx < buf.len() {
-                        blend(&mut buf[idx], style.color, cov);
+                        let cov = ((cov as u16 * alpha as u16) / 255) as u8;
+                        if cov > 0 {
+                            blend(&mut buf[idx], style.color, cov);
+                        }
                     }
                 }
             }
@@ -6360,6 +6397,8 @@ fn paint_gradient(
     h: f32,
     r: f32,
     g: &css::Gradient,
+    // effective opacity byte of the box that owns this gradient
+    opacity: u8,
 ) {
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -6405,6 +6444,7 @@ fn paint_gradient(
                 None => 0.5 + ((lx - hw) * g.dir.0 + (ly - hh) * g.dir.1) / len,
             };
             let (c, a) = grad_at(g, t.clamp(0.0, 1.0));
+            let a = ((a as u16 * opacity as u16) / 255) as u8;
             let idx = py as usize * width + px as usize;
             if a == 255 {
                 buf[idx] = c;
@@ -6592,10 +6632,10 @@ mod tests {
         let style = Style::new();
         let (w, h) = (240, 40);
         let mut warm = vec![0x00ff_ffffu32; w * h];
-        draw_text(&mut warm, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, None);
+        draw_text(&mut warm, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, 255, None);
         fonts.glyphs.borrow_mut().clear(); // cold
         let mut cold = vec![0x00ff_ffffu32; w * h];
-        draw_text(&mut cold, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, None);
+        draw_text(&mut cold, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, 255, None);
         assert_eq!(warm, cold);
         assert!(warm.iter().any(|&p| p != 0x00ff_ffff), "text drew no ink");
     }
@@ -6998,6 +7038,7 @@ mod tests {
                 clip: None,
                 node: None,
                 cursor: None,
+                alpha: 255,
             }],
             height: 123.0,
             underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
@@ -7014,6 +7055,7 @@ mod tests {
                     px: vec![0x80445566],
                 }),
                 false,
+                255,
             )],
             shadows: vec![layout::ShadowRect {
                 x: 9.0,
@@ -8190,8 +8232,8 @@ mod tests {
         let drawn = laid
             .images
             .first()
-            .map(|(_, _, _, _, img, _)| (img.w, img.h, img.px.clone()));
-        let rcs = laid.images.iter().map(|(.., img, _)| img.clone()).collect();
+            .map(|(_, _, _, _, img, _, _)| (img.w, img.h, img.px.clone()));
+        let rcs = laid.images.iter().map(|(.., img, _, _)| img.clone()).collect();
         (probed, skipped, dims, drawn, rcs)
     }
 
@@ -8313,7 +8355,7 @@ mod tests {
             ],
         };
         let mut buf = vec![0u32; 100];
-        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 1.0, 0.0, &g);
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 1.0, 0.0, &g, 255);
         assert_eq!(buf[0], 0xff0000, "left edge = first stop");
         let (r0, _, b0) = ((buf[0] >> 16) & 0xff, (buf[0] >> 8) & 0xff, buf[0] & 0xff);
         let (r9, _, b9) = ((buf[9] >> 16) & 0xff, (buf[9] >> 8) & 0xff, buf[9] & 0xff);
@@ -8323,7 +8365,7 @@ mod tests {
         // a vertical direction changes only the y axis: every row differs
         let v = css::Gradient { dir: (0.0, 1.0), ..g };
         let mut buf = vec![0u32; 100];
-        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 1.0, 10.0, 0.0, &v);
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 1.0, 10.0, 0.0, &v, 255);
         assert_eq!(buf[0], 0xff0000);
         assert!(buf[9 * 10] & 0xff > 200, "bottom row near blue");
     }
@@ -8348,7 +8390,7 @@ mod tests {
             ],
         };
         let mut buf = vec![0u32; 100];
-        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, 0.0, &g);
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, 0.0, &g, 255);
         assert_eq!(buf[5 * 10 + 5], 0xff0000, "center = first stop");
         assert_eq!(buf[0], 0x0000ff, "corner past the radius = last stop");
         assert!(buf[6 * 10 + 6] != 0xff0000, "off-center pixel blended");

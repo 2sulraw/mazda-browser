@@ -314,6 +314,8 @@ pub struct Atom {
     /// the text's effective `cursor` (inherited down the box tree at build
     /// time, see `build_into`); None = no declaration anywhere above
     pub cursor: Option<Cursor>,
+    /// effective `opacity` of the box that owns the text (0..1)
+    pub eff: f32,
 }
 
 /// Apply presentational defaults for an element tag.
@@ -712,6 +714,10 @@ pub struct BoxNode {
     pub run_range: (u32, u32),
     /// same for `underline_rects`
     pub ul_range: (u32, u32),
+    /// effective `opacity` for this box (own value x every ancestor's),
+    /// 0..1. Filled by [`apply_opacity`] after the tree is built; paint and
+    /// text emission read it to alpha the primitive they emit.
+    pub eff: f32,
 }
 
 impl BoxNode {
@@ -742,6 +748,7 @@ impl BoxNode {
             open: false,
             run_range: (0, 0),
             ul_range: (0, 0),
+            eff: 1.0,
         }
     }
 
@@ -772,6 +779,7 @@ impl BoxNode {
             open: false,
             run_range: (0, 0),
             ul_range: (0, 0),
+            eff: 1.0,
         }
     }
 }
@@ -827,7 +835,41 @@ pub fn build_scoped(
     if let Some(a) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::After) {
         root.children.push(a);
     }
+    apply_opacity(&mut root, 1.0);
     root
+}
+
+/// Compose `opacity` down the built box tree: every box carries its own
+/// declared value and inherits the product of its ancestors'. shortcut: the
+/// effective value is applied to each primitive at paint time, not as a true
+/// group composite (an element and its children do not render into one
+/// offscreen layer first), which is cheap and correct for the common
+/// single-child fade but lets overlapping siblings of a translucent parent
+/// show through each other.
+fn apply_opacity(n: &mut BoxNode, parent: f32) {
+    let op = (parent * n.bx.opacity).clamp(0.0, 1.0);
+    n.eff = op;
+    for c in &mut n.children {
+        apply_opacity(c, op);
+    }
+}
+
+/// Alpha byte for an effective opacity value.
+pub(crate) fn eff_alpha(op: f32) -> u8 {
+    (op.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Pack an effective opacity into a colour's unused high byte (the paint
+/// channels carry 0x00RRGGBB today). Fully opaque colours are returned
+/// untouched so existing paint snapshots keep their exact bytes; `opacity: 0`
+/// hides its subtree during the cascade, so a visible primitive never packs 0.
+fn with_alpha(color: u32, op: f32) -> u32 {
+    let a = eff_alpha(op);
+    if a >= 255 {
+        color
+    } else {
+        ((a.max(1) as u32) << 24) | (color & 0x00ff_ffff)
+    }
 }
 
 /// Synthetic child for `background-image` — it rides the existing `<img>`
@@ -1656,6 +1698,8 @@ pub struct PositionedRun {
     /// them, [`Layout::hover_targets`] carries the results upstream)
     pub node: Option<u32>,
     pub cursor: Option<Cursor>,
+    /// effective opacity byte (255 = opaque) for this run's glyphs
+    pub alpha: u8,
 }
 
 /// One hover hit-test rectangle: document-coord rect + the DOM element it
@@ -1814,7 +1858,7 @@ pub struct Layout {
     /// keeps z-order, sticky spans and transforms exact for free.
     pub rect_grad: Vec<Option<std::sync::Arc<Gradient>>>,
     /// decoded `<img>` boxes (x, y, w, h, pixels, fixed) — drawn under text
-    pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
+    pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool, u8)>,
     /// box-shadows (under backgrounds), paint order = list order
     pub shadows: Vec<ShadowRect>,
     /// true if the last line still has content on it (no trailing <br>) —
@@ -2117,7 +2161,9 @@ fn apply_form_state(
             if let Some(leaf) = n.children.iter_mut().find(|c| c.is_text) {
                 leaf.text = display;
             } else if !display.is_empty() {
-                n.children.push(BoxNode::leaf(n.style, display, false, None));
+                let mut l = BoxNode::leaf(n.style, display, false, None);
+                l.eff = n.eff;
+                n.children.push(l);
             }
         }
         // tail-clip text-ish values wider than the box's content area —
@@ -2208,7 +2254,7 @@ fn collect_forms(
                     n.y + bt + pt,
                     1.0,
                     caret_h,
-                    FORM_ACCENT,
+                    with_alpha(FORM_ACCENT, n.eff),
                     fixed,
                 ));
             }
@@ -2604,7 +2650,7 @@ fn collect_paint(
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     out_g: &mut Vec<Option<std::sync::Arc<Gradient>>>,
     out_z: &mut Vec<i32>,
-    imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool)>,
+    imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool, u8)>,
     img_z: &mut Vec<i32>,
     shadows: &mut Vec<ShadowRect>,
     sticky: &mut Vec<StickyGroup>,
@@ -2711,7 +2757,7 @@ fn collect_paint(
                 h: sh,
                 radius: r * m.sx.abs(),
                 blur: s.blur,
-                color: (alpha << 24) | c,
+                color: ((alpha as f32 * n.eff).round().min(255.0) as u32) << 24 | c,
                 fixed,
                 hole: m.map_rect((n.x, n.y, n.w, n.h)),
             });
@@ -2735,7 +2781,7 @@ fn collect_paint(
             for (x, y, w, h, color, rad) in rects {
                 let (x, y, w, h) = m.map_rect((x, y, w, h));
                 if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
-                    out.push((x, y, w, h, color, rad * m.sx.abs(), fixed));
+                    out.push((x, y, w, h, with_alpha(color, n.eff), rad * m.sx.abs(), fixed));
                     out_g.push(None);
                     out_z.push(z);
                 }
@@ -2750,7 +2796,7 @@ fn collect_paint(
         if let Some(g) = n.bx.bg_gradient.clone().filter(|_| !masked) {
             let (x, y, w, h) = m.map_rect((n.x, n.y, n.w, n.h));
             if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
-                out.push((x, y, w, h, u32::MAX, r * m.sx.abs(), fixed));
+                out.push((x, y, w, h, with_alpha(u32::MAX, n.eff), r * m.sx.abs(), fixed));
                 out_g.push(Some(g));
                 out_z.push(z);
             }
@@ -2770,7 +2816,7 @@ fn collect_paint(
                 }
                 let q = m.map_rect(q);
                 if let Some(q) = cull_rect(q, clip) {
-                    out.push((q.0, q.1, q.2, q.3, bc, 0.0, fixed));
+                    out.push((q.0, q.1, q.2, q.3, with_alpha(bc, n.eff), 0.0, fixed));
                     out_g.push(None);
                     out_z.push(z);
                 }
@@ -2798,7 +2844,7 @@ fn collect_paint(
                 for q in strips {
                     let q = m.map_rect(q);
                     if let Some(q) = cull_rect(q, clip) {
-                        out.push((q.0, q.1, q.2, q.3, oc, 0.0, fixed));
+                        out.push((q.0, q.1, q.2, q.3, with_alpha(oc, n.eff), 0.0, fixed));
                         out_g.push(None);
                         out_z.push(z);
                     }
@@ -2859,7 +2905,7 @@ fn collect_paint(
                             for kx in kx0..kx0 + cols {
                                 let t = m.map_rect((n.x + kx as f32 * tw, n.y + ky as f32 * th, tw, th));
                                 if let Some(q) = cull_rect(t, win) {
-                                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed, eff_alpha(n.eff)));
                                     img_z.push(z);
                                 }
                             }
@@ -2877,7 +2923,7 @@ fn collect_paint(
                             (Some(a), None) => Some(a),
                         };
                         if let Some(q) = cull_rect(q, win) {
-                            imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed));
+                            imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed, eff_alpha(n.eff)));
                             img_z.push(z);
                         }
                     }
@@ -3230,6 +3276,7 @@ fn leaf_atom(n: &BoxNode) -> Atom {
         link: n.link.clone(),
         node: n.node,
         cursor: n.bx.cursor,
+        eff: n.eff,
     }
 }
 
@@ -5625,6 +5672,7 @@ fn block(
                 clip: None,
                 node: m.node,
                 cursor: m.bx.cursor,
+                alpha: eff_alpha(m.eff),
             });
             i += 1;
         } else if n.children[i].is_text {
@@ -6797,6 +6845,7 @@ fn layout_from(
         link: &Option<std::rc::Rc<str>>,
         node: Option<u32>,
         cursor: Option<Cursor>,
+        eff: f32,
     ) -> Atom {
         Atom {
             text: text.into(),
@@ -6805,6 +6854,7 @@ fn layout_from(
             link: link.clone(),
             node,
             cursor,
+            eff,
         }
     }
 
@@ -6817,6 +6867,7 @@ fn layout_from(
             link: None,
             node: None,
             cursor: None,
+            eff: 1.0,
         }
     }
 
@@ -6832,6 +6883,7 @@ fn layout_from(
         link: &Option<std::rc::Rc<str>>,
         node: Option<u32>,
         cursor: Option<Cursor>,
+        eff: f32,
         out: &mut Vec<Atom>,
     ) {
         let mut first = true;
@@ -6842,17 +6894,17 @@ fn layout_from(
                 continue;
             }
             if !first || pending_ws {
-                out.push(word(" ", style, link, node, cursor));
+                out.push(word(" ", style, link, node, cursor, eff));
             }
             first = false;
             pending_ws = false;
-            out.push(word(w, style, link, node, cursor));
+            out.push(word(w, style, link, node, cursor, eff));
         }
         // text ends with whitespace → separator before the next atom's text
         // (a space atom at line start is a no-op: the draw loop only
         // advances x when x > line_x0)
         if pending_ws {
-            out.push(word(" ", style, link, node, cursor));
+            out.push(word(" ", style, link, node, cursor, eff));
         }
     }
 
@@ -6865,6 +6917,7 @@ fn layout_from(
         link: &Option<std::rc::Rc<str>>,
         node: Option<u32>,
         cursor: Option<Cursor>,
+        eff: f32,
         out: &mut Vec<Atom>,
     ) {
         let mut it = text.char_indices().peekable();
@@ -6878,7 +6931,7 @@ fn layout_from(
                 e = n + nc.len_utf8();
                 it.next();
             }
-            out.push(word(&text[s..e], style, link, node, cursor));
+            out.push(word(&text[s..e], style, link, node, cursor, eff));
         }
     }
 
@@ -6923,7 +6976,7 @@ fn layout_from(
                     Ws::Pre => {
                         let seg = pre_ws(seg);
                         if !seg.is_empty() {
-                            words.push(word(&seg, a.style, &a.link, a.node, a.cursor));
+                            words.push(word(&seg, a.style, &a.link, a.node, a.cursor, a.eff));
                         }
                     }
                     Ws::PreWrap => push_preserved(
@@ -6932,13 +6985,14 @@ fn layout_from(
                         &a.link,
                         a.node,
                         a.cursor,
+                        a.eff,
                         &mut words,
                     ),
-                    _ => push_words(seg, a.style, &a.link, a.node, a.cursor, &mut words), // pre-line
+                    _ => push_words(seg, a.style, &a.link, a.node, a.cursor, a.eff, &mut words), // pre-line
                 }
             }
         } else {
-            push_words(&a.text, a.style, &a.link, a.node, a.cursor, &mut words);
+            push_words(&a.text, a.style, &a.link, a.node, a.cursor, a.eff, &mut words);
         }
     }
 
@@ -7070,8 +7124,9 @@ fn layout_from(
                 clip: None,
                 node: w.node,
                 cursor: w.cursor,
+                alpha: eff_alpha(w.eff),
             });
-            let deco_color = w.style.deco_color.unwrap_or(w.style.color);
+            let deco_color = with_alpha(w.style.deco_color.unwrap_or(w.style.color), w.eff);
             if w.style.underline {
                 push_deco(
                     &mut underline_rects,
@@ -7187,6 +7242,7 @@ mod tests {
             link: None,
             node: None,
             cursor: None,
+            eff: 1.0,
         }
     }
 
@@ -7207,6 +7263,7 @@ mod tests {
                 clip: None,
                 node: None,
                 cursor: None,
+                alpha: 255,
             }
         }
         let mut runs = vec![
@@ -7480,6 +7537,51 @@ mod tests {
         s.len() as f32 * 4.0
     }
 
+    #[test]
+    fn partial_opacity_alphas_every_painted_primitive() {
+        let mut root = boxes_of(
+            r#"<div style="width:100px;min-height:20px;background:#336699;color:#112233;opacity:.5">hi<span style="opacity:.5;background:#ffffff">x</span></div>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // background rect: 50% in the colour's high byte
+        let bg = l
+            .rects
+            .iter()
+            .find(|r| r.4 & 0x00ff_ffff == 0x336699)
+            .expect("div background");
+        assert_eq!((bg.4 >> 24) as u8, 128, "50% alpha");
+        // nested opacity multiplies: .5 * .5 = 25%. (A full-opacity white
+        // page background also lives in the channel, hence the alpha match.)
+        let sbg = l
+            .rects
+            .iter()
+            .find(|r| r.4 & 0x00ff_ffff == 0xffffff && (r.4 >> 24) as u8 == 64)
+            .expect("span background");
+        assert_eq!((sbg.4 >> 24) as u8, 64, "nested opacity multiplies");
+        // text runs carry the owning box's effective opacity
+        assert_eq!(l.runs.iter().find(|r| r.text == "hi").unwrap().alpha, 128);
+        assert_eq!(l.runs.iter().find(|r| r.text == "x").unwrap().alpha, 64);
+    }
+
+    #[test]
+    fn full_opacity_stays_opaque() {
+        let mut root = boxes_of(
+            r#"<div style="width:10px;background:#123456">x</div>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 100.0, &m4);
+        // an opaque box keeps the old unpacked 0x00RRGGBB bytes (the paint
+        // path reads a 0 high byte as fully opaque)
+        let bg = l
+            .rects
+            .iter()
+            .find(|r| r.4 & 0x00ff_ffff == 0x123456)
+            .expect("div background");
+        assert_eq!((bg.4 >> 24) as u8, 0, "opaque rect stays unpacked");
+        assert!(l.runs.iter().all(|r| r.alpha == 255), "opaque text");
+    }
+
     fn leaf(text: &str) -> BoxNode {
         BoxNode::leaf(Style::new(), text.into(), false, None)
     }
@@ -7544,6 +7646,7 @@ mod tests {
             link: None,
             node: None,
             cursor: None,
+            eff: 1.0,
         };
         // width fits only ~2 chars → would wrap without nowrap
         let l = layout(&[a], 10.0, &|s, st| s.len() as f32 * st.size * 0.5);
@@ -12673,7 +12776,7 @@ line</textarea></div>"#,
         content.img = Some(ImgSlot::Ready(img));
         let l = layout_tree(&mut root, 500.0, &m4);
         assert_eq!(l.images.len(), 2, "bg + content img");
-        let (x, y, w, h, _, _) = l.images[0];
+        let (x, y, w, h, _, _, _) = l.images[0];
         assert_eq!((x, y, w, h), (0.0, 0.0, 2.0, 1.0), "natural size at padding-box origin");
         // z-order: the bg entry precedes the content image; text runs draw
         // after ALL images in render(), so the text sits on top

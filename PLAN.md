@@ -1736,6 +1736,43 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 64 (`Stmt`/`Closure` size) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The AST statement and closure units got smaller. `StmtKind`'s inline expressions are now boxed: `if`/`while`/`do` tests, `for` condition and update, `for-in`/`for-of` sources, `switch` discriminant, `throw`/`return` values and a class accessor owner; `try`'s catch clause is boxed too. That drops `StmtKind` from 176 to 56 bytes and `Stmt` from 192 to 72 (−120 B, −62%) for every statement, with an extra allocation only on statements that actually carry one of those expressions. `Closure.this` is now an optional boxed value: only arrow functions store a captured `this`, so `Closure` falls from 112 to 96 bytes. The size-guard test pins both ceilings. All 820 behavior tests still pass. References keep their exact geometry at the default viewport: nextjs 7578px / 569 runs / 148.2 MB (down from 153.2), MDN 2773px / 641 runs / 86.9 MB, Wikipedia 24575px / 10950 runs / 102.4 MB, HN 1695px / 728 runs / 78.3 MB (within the usual 67-83 MB reload range), rust-lang 5800px / 483 runs / 84.7 MB at 1000x616 (a later window resize to 1920x948 produced the shorter 4979px relayout, so that number is not comparable); suite **821** default / **825** `engine-b + woff2` |
 
+| 2026-11-06 | wave 65 (partial `opacity`) | a local opacity page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Boxes can now paint at a partial `opacity` instead of the old all-or-nothing rule. The cascade stores a clamped 0..1 value on `BoxStyle` (still turning `0` into `display:none`), and one post-build pass composes it down the box tree into `BoxNode.eff`. Every primitive the box emits multiplies that effective alpha in: background/border/outline/caret colours ride the previously unused high byte of the existing `0x00RRGGBB` words, gradients and shadows scale their own alpha, images scale per-pixel alpha, and text runs carry an alpha byte that scales glyph coverage (decorations are alpha-packed too). Fully opaque primitives keep their old unpacked bytes, so paint output for pages without `opacity` is unchanged. A local page shows 50% red over white = 255,127,127, 25% black = 191,191,191, nested 50% over green = 128,127,0 and 50% text ink. References keep their exact geometry: nextjs 7578px / 569 runs / 148.8 MB, MDN 2773px / 641 runs / 89.2 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **823** default / **827** `engine-b + woff2` |
+
+### Wave 65 findings
+
+- **Per-primitive alpha, not a group composite.** A real `opacity` renders the
+  element and its descendants into an offscreen group and composites the group
+  once. This wave instead folds the effective alpha into each primitive the box
+  paints (backgrounds, borders, outlines, shadows, gradients, images, text runs
+  and decorations). A single translucent layer is exact and costs no extra
+  buffer; the documented shortcut is that overlapping siblings inside a
+  translucent parent can show through each other.
+- **Alpha rides the colour word's unused high byte.** Every paint channel
+  already carried `0x00RRGGBB`, so `with_alpha()` packs a 1..255 alpha into the
+  high byte and the paint loop reads 0 as "opaque". That kept the
+  colour-carrying channels (rects, underlines, shadows) byte-compatible and
+  left every fully opaque primitive byte-identical to the pre-wave snapshots.
+- **Compose once at build time.** `apply_opacity()` walks the box tree after
+  `build_into` and stores `eff = parent * own` on each box, so nested fades
+  multiply without per-frame work. `opacity: 0` is still turned into
+  `display:none` during the cascade, which keeps fully transparent subtrees out
+  of layout and paint entirely.
+- **Text needed the value twice.** `layout_from` splits atoms into words, so the
+  effective opacity is threaded as `Atom.eff` through `word`, `push_words` and
+  `push_preserved`; the emitted `PositionedRun` carries it as a `u8` alpha for
+  glyph coverage, while underline/strike/overline colours are alpha-packed at
+  emission (otherwise a faded decoration would stay fully opaque).
+- **Measured.** The local page verifies the blend math: 50% red over white is
+  `255,127,127`, 25% black is `191,191,191`, nested 50% red over green is
+  `128,127,0`, and 50% black ink lands at grey 137. The five references kept
+  their exact geometry at 1000x616 and stayed in their RAM noise bands:
+  nextjs 7578px / 569 runs / 148.8 MB, MDN 2773 / 641 / 89.2 MB, Wikipedia
+  24575 / 10950 / 103.0 MB, Hacker News 1695 / 728 / 78.2 MB, rust-lang
+  5800 / 483 / 84.7 MB.
+- **Cost.** One `f32` per `BoxStyle` (declared value) and per `BoxNode`
+  (effective value), plus one alpha byte on the run/image/wire entries. No new
+  allocation per primitive and no extra per-frame buffer.
+
 ### Wave 64 findings
 
 - **One inline expression set the size of every statement.** `StmtKind` was
