@@ -2634,3 +2634,34 @@ fn property_keys_are_interned() {
         other => panic!("sum: {other:?}"),
     }
 }
+
+#[test]
+fn queue_microtask_is_fifo_with_promise_reactions() {
+    let mut e = JsEngine::new();
+    e.exec(
+        "var order = [];\n\
+         queueMicrotask(function () { order.push('a'); });\n\
+         Promise.resolve().then(function () { order.push('b'); });\n\
+         queueMicrotask(function () { order.push('c'); });",
+    )
+    .expect("queue microtasks");
+    // the turn-end drain runs the queued callbacks and promise reactions in
+    // FIFO order; nested queueing appends behind the existing jobs
+    match e.exec("order.join(',')") {
+        Ok(v) => assert_eq!(v.to_string(), "a,b,c"),
+        other => panic!("order: {other:?}"),
+    }
+}
+
+#[test]
+fn queue_microtask_rejects_non_callables() {
+    let mut e = JsEngine::new();
+    let err = e
+        .exec("queueMicrotask(1)")
+        .err()
+        .expect("non-callable must throw");
+    assert!(
+        err.to_string().contains("queueMicrotask callback is not a function"),
+        "err: {err}"
+    );
+}

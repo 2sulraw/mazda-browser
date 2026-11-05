@@ -1044,6 +1044,9 @@ pub(crate) enum Job {
     /// microtask, so `await import(...)` pumps it and `.then` chains follow
     /// in order. The URL was resolved when `import()` was called.
     Import { url: Rc<str>, promise: Rc<RefCell<Obj>> },
+    /// `queueMicrotask(cb)`: run a plain callback in FIFO order with the
+    /// promise reactions.
+    Call(Val),
 }
 
 /// Shared bookkeeping for `Promise.all/any/race/allSettled`: a board where
@@ -2139,6 +2142,10 @@ fn deliver(e: &mut JsEngine, ret: Option<Rc<RefCell<Obj>>>, out: Result<Val, Val
 /// run one queued reaction (see `Job::Reaction`) or dynamic import
 fn exec_job(e: &mut JsEngine, job: Job) -> Result<(), JsError> {
     let (re, out) = match job {
+        Job::Call(cb) => {
+            e.call(cb, Val::Undefined, Vec::new())?;
+            return Ok(());
+        }
         Job::Reaction(re, out) => (re, out),
         Job::Import { url, promise } => {
             // a module job: fetch/execute (cached after the first time), then

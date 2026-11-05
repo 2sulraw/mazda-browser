@@ -1707,6 +1707,35 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 42 (DOM comments + node navigation) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | React's streaming bootstrap (`$RX`/`$RC`/`$RV`) parks boundary markers in comments and walks/rewrites them, but the HTML parser dropped comments and wrappers had no sibling navigation. Comments are now real arena nodes (`nodeType` 8, no box); wrappers gained live `data`, `nodeType`, `parentNode`, `previousSibling`/`nextSibling`, `firstChild`, `removeChild`, `insertBefore` and a `dataset` object, and text nodes get the same wrapper. nextjs.org's five inline `.data` errors disappear (6 -> 1 script error) and the streamed boundary content now actually swaps in (7032px / 502 runs -> 7578px / 569 runs, 148.7 MB); Wikipedia 24454px / 10943 runs / 102.7 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.9 MB stay error-free; MDN moves to 2922px / 641 runs / 88.6 MB only because bumping the snapshot format forced a fresh fetch of a newer page (the old cached DOM was stale); suite **761** default / **765** `engine-b + woff2` |
 | 2026-11-05 | wave 43 (lazy prototypes in `getPrototypeOf`/`instanceof`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Prototype links are attached lazily on first member access, but `Object.getPrototypeOf` read the raw slot and returned `null` for any fresh array/iterator/error. core-js's iterator helper then did `null.next` and threw. Added `JsEngine::proto_of` (explicit slot, else the shared prototype for the kind; module namespaces and `Object.prototype` itself are genuinely null) and routed `getPrototypeOf`, `instanceof`, `in`, `isPrototypeOf`, `chain_get` and setter lookup through it. nextjs.org's last script error disappears (1 -> 0) at unchanged 7578px / 569 runs; RAM settles ~162 MB because the app now boots fully and its router prefetches re-render repeatedly (first paint ~155 MB, bounded). MDN 2922px / 641 runs / 87.4 MB, Wikipedia 24454px / 10943 runs / 102.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **762** default / **766** `engine-b + woff2` |
 | 2026-11-05 | wave 44 (property-name interning) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Every property insert allocated its own `Rc<str>` copy of the key, so a React render paid one string per slot for a handful of repeated names. A thread-local intern table (`KEY_INTERN`, cap 4096, cleared per `JsEngine::new`) now hands out one shared `Rc` per name; used by `obj_set_own`, `set_member`'s function-property insert and `Object.defineProperty`'s function path. Deterministic 150k-object x 8-key workload: 108.0 MB -> 71.7 MB, **36.3 MB (~34%) saved**. Live pages geometry-stable and error-free: nextjs 7578px / 569 runs / first layout ~152 MB, MDN 2922px / 641 runs / 87.3 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **763** default / **767** `engine-b + woff2` |
+| 2026-11-05 | wave 45 (document/Node surface + `queueMicrotask`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 document/Node members: `queueMicrotask` (a `Job::Call` in the existing FIFO microtask queue, non-callables throw), `document.forms` and `getElementsByName`, `createTextNode` / `createComment` (real text/comment arena nodes), and `Node.childNodes` / `Element.children` (document-order snapshots). No layout change; all five references are geometry- and error-identical: nextjs 7578px / 569 runs / first layout 150.2 MB (settles 153-158 MB as its router re-renders), MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.5 MB; suite **768** default / **772** `engine-b + woff2` |
+
+### Wave 45 findings
+
+- **`queueMicrotask` rides the existing microtask queue.** Added a third
+  `Job` variant, `Job::Call(Val)`, next to promise reactions and dynamic
+  imports. `exec`'s turn-end drain runs it FIFO, so
+  `queueMicrotask(a); Promise.resolve().then(b); queueMicrotask(c)` fires
+  a, b, c in that order. A non-callable argument throws
+  `TypeError: queueMicrotask callback is not a function`; the existing
+  10,000-job drain cap still bounds runaway loops.
+- **The new collections are snapshots, not live.** `document.forms`,
+  `getElementsByName`, `Node.childNodes` and `Element.children` walk the
+  arena and return plain arrays on each read. Writing to `forms` or using
+  named access (`document.forms.login`) is not implemented; callers can
+  index or iterate as with the existing `getElementsBy*` results.
+- **Character-data wrappers are real nodes.** `createTextNode` /
+  `createComment` append orphan arena nodes (`nodeType` 3 / 8, live `data`,
+  `textContent`, parent/sibling navigation) that `appendChild` /
+  `insertBefore` can attach. Element wrappers still snapshot
+  `textContent` at wrap time, so a wrapper obtained before an append does
+  not see the new child; a fresh `getElementById` read does. This is the
+  long-standing snapshot shortcut, not a new regression.
+- **`Element.children` filters by node kind.** It keeps children whose
+  `nodeType` is 1, so text and comment nodes are excluded while
+  `childNodes` keeps all four kinds.
+- **No geometry change, as intended.** All five reference pages kept their
+  exact height and run count, which also confirms the new host methods do
+  not disturb layout.
 
 ### Wave 44 findings
 

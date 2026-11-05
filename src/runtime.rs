@@ -556,6 +556,16 @@ impl DomHost {
         crate::script::class_all_dom(self.dom_ref(), None, names)
     }
 
+    /// `document.getElementsByName`: every element carrying this `name`
+    /// attribute, in document order. Snapshot, like the other collections.
+    pub fn by_name(&self, name: &str) -> Vec<u32> {
+        let dom = self.dom_ref();
+        all_elements_dom(dom)
+            .into_iter()
+            .filter(|&i| dom.attr(i, "name") == Some(name))
+            .collect()
+    }
+
     /// `element.getElementsByClassName`: same match over the subtree of
     /// `root` (the root element itself is excluded, per spec).
     pub fn subtree_class(&self, root: u32, names: &str) -> Vec<u32> {
@@ -794,6 +804,16 @@ impl DomHost {
             .copied()
     }
 
+    /// All child nodes (any kind), document order. Snapshot, not a live
+    /// collection; `Node.childNodes` builds its array from this.
+    pub fn child_nodes(&self, node: u32) -> Vec<u32> {
+        self.dom_ref()
+            .nodes
+            .get(node as usize)
+            .map(|n| n.children.clone())
+            .unwrap_or_default()
+    }
+
     /// `parent.insertBefore(new, before)`: detach `new` from its old parent
     /// first, then insert at `before`'s slot (or append when `before` is
     /// None / not a child). False on a bad id or a cycle.
@@ -947,6 +967,28 @@ impl DomHost {
             parent: 0,
             children: Vec::new(),
             kind: NodeKind::Element(tid, Box::from([])),
+        });
+        self.dirty = true;
+        Some(id)
+    }
+
+    /// `createTextNode(text)` / `createComment(text)`: append an orphan
+    /// character-data node (parent = document root, not in its child list).
+    /// `comment` selects the comment kind, whose `nodeType` is 8.
+    pub fn create_text_node(&mut self, text: &str, comment: bool) -> Option<u32> {
+        let dom = unsafe { &mut *self.dom };
+        if dom.nodes.is_empty() {
+            return None;
+        }
+        let id = dom.nodes.len() as u32;
+        dom.nodes.push(html::Node {
+            parent: 0,
+            children: Vec::new(),
+            kind: if comment {
+                NodeKind::Comment(text.to_string())
+            } else {
+                NodeKind::Text(text.to_string())
+            },
         });
         self.dirty = true;
         Some(id)

@@ -343,6 +343,10 @@ pub(crate) fn install(e: &mut JsEngine) {
     let ci = e.register_native("clearInterval", n_set_timeout, 2);
     e.set_global("clearInterval", Val::Native(ci));
 
+    // queue-only microtask: drains with the promise reactions at turn end
+    let qm = e.register_native("queueMicrotask", n_queue_microtask, 0);
+    e.set_global("queueMicrotask", Val::Native(qm));
+
     // -- Promise (constructor + statics) ------------------------------------
     // `new Promise(executor)` and all five static combinators below; the
     // constructor's resolve/reject twin natives live in `js.rs` (slots).
@@ -2462,6 +2466,22 @@ fn n_uri(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, 
 }
 
 // -- timers -----------------------------------------------------------------
+
+fn n_queue_microtask(
+    e: &mut JsEngine,
+    _idx: u16,
+    _this: &Val,
+    args: &[Val],
+) -> Result<Val, JsError> {
+    let cb = args.first().cloned().unwrap_or(Val::Undefined);
+    if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
+        return Err(JsError::throw(
+            "TypeError: queueMicrotask callback is not a function",
+        ));
+    }
+    e.microtasks.push(Job::Call(cb));
+    Ok(Val::Undefined)
+}
 
 fn n_set_timeout(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     // idx 0 = setTimeout, 1 = setInterval, 2 = clearTimeout/clearInterval.

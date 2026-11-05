@@ -244,6 +244,8 @@ fn wrap_element(node: u32) -> Val {
     o.set("previousSibling", lazy_native_attr(n.node_prev));
     o.set("nextSibling", lazy_native_attr(n.node_next));
     o.set("firstChild", lazy_native_attr(n.node_first));
+    o.set("childNodes", lazy_native_attr(n.node_child_nodes));
+    o.set("children", lazy_native_attr(n.node_children));
     o.set("dataset", lazy_native_attr(n.node_dataset));
     o.set("removeChild", js::Val::Native(n.node_remove_child));
     o.set("insertBefore", js::Val::Native(n.node_insert_before));
@@ -387,6 +389,10 @@ struct Nids {
     doc_cookie_set: usize,
     doc_get_by_tag: usize,
     doc_get_by_class: usize,
+    doc_forms: usize,
+    doc_get_by_name: usize,
+    doc_create_text: usize,
+    doc_create_comment: usize,
     /// one native per `REFLECTED` entry (accessor pair halves)
     reflect: [usize; REFLECTED.len()],
     el_get_element: usize,
@@ -418,6 +424,8 @@ struct Nids {
     node_first: usize,
     node_remove_child: usize,
     node_insert_before: usize,
+    node_child_nodes: usize,
+    node_children: usize,
     node_dataset: usize,
     cls_add: usize,
     cls_remove: usize,
@@ -580,6 +588,12 @@ const D_COOKIE_GET: u16 = 4;
 const D_COOKIE_SET: u16 = 5;
 const D_GET_ELEMENTS_BY_TAG: u16 = 6;
 const D_GET_ELEMENTS_BY_CLASS: u16 = 7;
+/// `document.forms` (getter) and name lookup (method)
+const D_FORMS: u16 = 8;
+const D_GET_ELEMENTS_BY_NAME: u16 = 9;
+/// character-data constructors
+const D_CREATE_TEXT: u16 = 10;
+const D_CREATE_COMMENT: u16 = 11;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -653,6 +667,10 @@ const N_FIRST_CHILD: u16 = 6;
 const N_REMOVE_CHILD: u16 = 7;
 const N_INSERT_BEFORE: u16 = 8;
 const N_DATASET: u16 = 9;
+/// child collections (`Node.childNodes`, `Element.children`); both are
+/// snapshots built from the arena's child list
+const N_CHILD_NODES: u16 = 10;
+const N_CHILDREN: u16 = 11;
 
 // Scheduler budgets (MAX_PENDING_TIMERS / MAX_PENDING_FRAMES /
 // FRAME_EPOCH) live ONCE in runtime.rs — single source for both engines.
@@ -716,6 +734,23 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
                 js::Val::new_array(h.by_class(&names).into_iter().map(wrap_element).collect())
             }))
         }
+        D_FORMS => Ok(runtime::host(|h| {
+            js::Val::new_array(h.by_tag("form").into_iter().map(wrap_element).collect())
+        })),
+        D_GET_ELEMENTS_BY_NAME => {
+            let name = args.first().map(|v| v.to_string()).unwrap_or_default();
+            Ok(runtime::host(|h| {
+                js::Val::new_array(h.by_name(&name).into_iter().map(wrap_element).collect())
+            }))
+        }
+        D_CREATE_TEXT => {
+            let text = args.first().map(|v| v.to_string()).unwrap_or_default();
+            Ok(create_char_data(&text, false))
+        }
+        D_CREATE_COMMENT => {
+            let text = args.first().map(|v| v.to_string()).unwrap_or_default();
+            Ok(create_char_data(&text, true))
+        }
         // the `document.cookie` accessor pair; the plain get/setCookie
         // methods still exist for internal callers (module header)
         D_COOKIE_GET => Ok(runtime::host(|h| str_val(&h.cookie_get()))),
@@ -742,6 +777,15 @@ fn create_element(tag: &str) -> Result<Val, JsError> {
             eprintln!("[js] createElement: empty tag name");
             Ok(Val::Null)
         }
+    }
+}
+
+/// `createTextNode` / `createComment`: orphan character-data node, wrapped
+/// with the small CharacterData surface (`data`, `textContent`, navigation).
+fn create_char_data(text: &str, comment: bool) -> Val {
+    match runtime::host_mut(|h| h.create_text_node(text, comment)) {
+        Some(id) => wrap_char_data(id),
+        None => Val::Null,
     }
 }
 
@@ -1001,6 +1045,9 @@ fn wrap_char_data(node: u32) -> Val {
             setter: None,
         })),
     );
+    // character data never has children; a fresh empty array keeps
+    // `node.childNodes.length` truthful without a host round-trip
+    o.set("childNodes", Val::new_array(Vec::new()));
     o
 }
 
@@ -1037,6 +1084,19 @@ fn n_node(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
             Some(c) => wrap_any(c),
             None => Val::Null,
         },
+        N_CHILD_NODES => {
+            let kids = runtime::host(|h| h.child_nodes(node));
+            Val::new_array(kids.into_iter().map(wrap_any).collect())
+        }
+        N_CHILDREN => {
+            let kids = runtime::host(|h| h.child_nodes(node));
+            let elems: Vec<Val> = kids
+                .into_iter()
+                .filter(|&c| runtime::host(|h| h.node_type(c)) == Some(1))
+                .map(wrap_element)
+                .collect();
+            Val::new_array(elems)
+        }
         N_REMOVE_CHILD => {
             let child = this_node(&args.first().cloned().unwrap_or(Val::Undefined))?;
             if runtime::host(|h| h.is_child_of(node, child)) {
@@ -1467,6 +1527,10 @@ impl PageScripts {
             doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
             doc_get_by_tag: engine.register_native("document.getElementsByTagName", doc_native, D_GET_ELEMENTS_BY_TAG),
             doc_get_by_class: engine.register_native("document.getElementsByClassName", doc_native, D_GET_ELEMENTS_BY_CLASS),
+            doc_forms: engine.register_native("document.forms", doc_native, D_FORMS),
+            doc_get_by_name: engine.register_native("document.getElementsByName", doc_native, D_GET_ELEMENTS_BY_NAME),
+            doc_create_text: engine.register_native("document.createTextNode", doc_native, D_CREATE_TEXT),
+            doc_create_comment: engine.register_native("document.createComment", doc_native, D_CREATE_COMMENT),
             reflect,
             el_get_element: engine.register_native("Element.getElementById", el_native, E_GET_ELEMENT_BY_ID),
             el_query: engine.register_native("Element.querySelector", el_native, E_QUERY),
@@ -1493,6 +1557,8 @@ impl PageScripts {
             node_prev: engine.register_native("Node.previousSibling", n_node, N_PREV),
             node_next: engine.register_native("Node.nextSibling", n_node, N_NEXT),
             node_first: engine.register_native("Node.firstChild", n_node, N_FIRST_CHILD),
+            node_child_nodes: engine.register_native("Node.childNodes", n_node, N_CHILD_NODES),
+            node_children: engine.register_native("Element.children", n_node, N_CHILDREN),
             node_remove_child: engine.register_native("Node.removeChild", n_node, N_REMOVE_CHILD),
             node_insert_before: engine.register_native("Node.insertBefore", n_node, N_INSERT_BEFORE),
             node_dataset: engine.register_native("HTMLElement.dataset", n_node, N_DATASET),
@@ -1544,6 +1610,19 @@ impl PageScripts {
         doc.set("createElement", Val::Native(ids.doc_create));
         doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
         doc.set("getElementsByClassName", Val::Native(ids.doc_get_by_class));
+        doc.set("getElementsByName", Val::Native(ids.doc_get_by_name));
+        doc.set("createTextNode", Val::Native(ids.doc_create_text));
+        doc.set("createComment", Val::Native(ids.doc_create_comment));
+        // `document.forms` is a live HTMLCollection in the real DOM; here it
+        // is a document-order snapshot taken on each read (same shortcut as
+        // the other collection APIs).
+        doc.set(
+            "forms",
+            Val::Acc(Rc::new(js::AccEntry {
+                getter: Some(Val::Native(ids.doc_forms)),
+                setter: None,
+            })),
+        );
         doc.set("getCookie", Val::Native(ids.doc_cookie_get));
         doc.set("setCookie", Val::Native(ids.doc_cookie_set));
         // `document.cookie` — the property the web actually reads. The plain
@@ -2987,6 +3066,93 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "movedText"), "streamed");
         assert_eq!(get_global_str(&mut ps, "afterRemove"), "8");
         assert_eq!(get_global_str(&mut ps, "dgst"), "d1");
+    }
+
+    /// `document.forms` and `getElementsByName` are document-order snapshots
+    /// built from the arena (no live collection behind them).
+    #[test]
+    fn document_forms_and_get_elements_by_name() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><form id="a" name="login"><input name="user"></form><form id="b"></form><input name="user"><script>
+                window.formsLen = document.forms.length;
+                window.firstForm = document.forms[0].tagName;
+                window.formName = document.forms[0].getAttribute("name");
+                var named = document.getElementsByName("user");
+                window.namedLen = named.length;
+                window.namedTag = named[0].tagName;
+                window.missing = document.getElementsByName("nope").length;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "formsLen"), "2");
+        assert_eq!(get_global_str(&mut ps, "firstForm"), "FORM");
+        assert_eq!(get_global_str(&mut ps, "formName"), "login");
+        assert_eq!(get_global_str(&mut ps, "namedLen"), "2");
+        assert_eq!(get_global_str(&mut ps, "namedTag"), "INPUT");
+        assert_eq!(get_global_str(&mut ps, "missing"), "0");
+    }
+
+    /// `createTextNode` / `createComment` return real arena nodes: nodeType
+    /// 3/8, a live `data`, and they attach through `appendChild`.
+    #[test]
+    fn create_text_and_comment_nodes() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="h"></div><script>
+                var t = document.createTextNode("hi <b>");
+                var c = document.createComment("mark");
+                var h = document.getElementById("h");
+                h.appendChild(t);
+                h.appendChild(c);
+                window.types = t.nodeType + "," + c.nodeType;
+                window.data = t.data;
+                window.parentTag = t.parentNode.tagName;
+                window.text = document.getElementById("h").textContent;
+                window.kids = h.childNodes.length;
+                t.data = "changed";
+                window.live = h.firstChild.data;
+                window.commentKids = c.childNodes.length;
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert!(turn.dirty, "appended nodes re-layout");
+        assert_eq!(get_global_str(&mut ps, "types"), "3,8");
+        assert_eq!(get_global_str(&mut ps, "data"), "hi <b>");
+        assert_eq!(get_global_str(&mut ps, "parentTag"), "DIV");
+        assert_eq!(get_global_str(&mut ps, "text"), "hi <b>");
+        assert_eq!(get_global_str(&mut ps, "kids"), "2");
+        assert_eq!(get_global_str(&mut ps, "live"), "changed");
+        assert_eq!(get_global_str(&mut ps, "commentKids"), "0");
+    }
+
+    /// `Node.childNodes` includes text/comment children; `Element.children`
+    /// keeps only elements. Both are snapshots: an array read before a
+    /// mutation keeps its length, a fresh read sees the new child.
+    #[test]
+    fn child_nodes_and_children_snapshots() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="h">alpha<span id="s1"></span><!--c--><b id="s2"></b></div><script>
+                var h = document.getElementById("h");
+                var kids = h.childNodes;
+                window.all = kids.length;
+                window.elems = h.children.length;
+                window.types = kids[0].nodeType + "," + kids[1].nodeType + "," + kids[2].nodeType + "," + kids[3].nodeType;
+                window.firstTag = h.children[0].tagName;
+                window.secondTag = h.children[1].tagName;
+                h.appendChild(document.createTextNode("!"));
+                window.before = kids.length;
+                window.after = h.childNodes.length;
+                window.elemsAfter = h.children.length;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "all"), "4");
+        assert_eq!(get_global_str(&mut ps, "elems"), "2");
+        assert_eq!(get_global_str(&mut ps, "types"), "3,1,8,1");
+        assert_eq!(get_global_str(&mut ps, "firstTag"), "SPAN");
+        assert_eq!(get_global_str(&mut ps, "secondTag"), "B");
+        assert_eq!(get_global_str(&mut ps, "before"), "4");
+        assert_eq!(get_global_str(&mut ps, "after"), "5");
+        assert_eq!(get_global_str(&mut ps, "elemsAfter"), "2");
     }
 
     /// rAF coalescing: two callbacks queued in one epoch fire in ONE pass
