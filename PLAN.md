@@ -1703,6 +1703,33 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 38 (`getElementsByClassName` + element `getElementsByTagName`) | Hacker News + Wikipedia `/wiki/JavaScript` + MDN homepage | HN's `hn.js` now runs clean (`byClass` calls `el.getElementsByClassName`): script errors 1 -> 0, geometry unchanged at 1695px / 734 runs / 78.1 MB; Wikipedia 24454px / 10943 runs / 103.0 MB and MDN 2675px / 615 runs / 100.0 MB carry no script errors; suite **751** default / **755** `engine-b + woff2` |
 | 2026-11-05 | wave 39 (grid `justify-content`) | MDN homepage + nextjs.org + Wikipedia `/wiki/JavaScript` + Hacker News | grid columns now honour `justify-content` (`start`/`center`/`end`/`space-between`/`space-around`/`space-evenly`) and only `normal`/`stretch` grows `auto` tracks; flex no longer collapses `space-around`/`space-evenly` into `space-between`. No reference page changes: MDN 2675px / 615 runs / 100.0 MB, nextjs 7032px / 502 runs / 140.8 MB (same 11 errors), Wikipedia 24454px / 10943 runs / 103.2 MB, HN 1695px / 734 runs / 78.3 MB; suite **754** default / **758** `engine-b + woff2` |
 | 2026-11-05 | wave 40 (JS syntax compatibility) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | three lexer/parser gaps that rejected shipped framework code: regex `u`/`v`/`d` flags (the flag was lexed as an identifier), non-ASCII identifiers (lodash's deburr table uses accented keys), and computed keys in destructuring (`let {[key]: v, ...rest} = obj`). nextjs.org's script errors drop 11 -> 7 (all four syntax errors gone) with geometry unchanged at 7032px / 502 runs / 145.8 MB; MDN 2675px / 615 runs / 99.9 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 734 runs / 77.9 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **757** default / **761** `engine-b + woff2` |
+| 2026-11-05 | wave 41 (`performance` clock + rAF timestamp) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `performance` was an absent global, so nextjs's streaming bootstrap (`$RT=performance.now()`) and every timing bundle threw. Added a monotonic `performance.now()` / `timeOrigin` plus no-op `mark`/`measure`/`getEntries*`, and rAF callbacks now receive the frame timestamp on the same clock. nextjs.org's remaining rAF error disappears (7 -> 6 script errors) with geometry unchanged at 7032px / 502 runs / 145.3 MB; MDN 2675px / 615 runs / 98.7 MB, Wikipedia 24454px / 10943 runs / 100.9 MB, HN 1695px / 734 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB, all error-free; suite **759** default / **763** `engine-b + woff2` |
+
+### Wave 41 findings
+
+- **`performance` was simply missing.** Nothing in `builtins`/`script` defined
+  it, so `performance.now()` threw `Cannot read property 'now' of undefined`
+  inside nextjs's `requestAnimationFrame(function(){$RT=performance.now()})`
+  bootstrap (surfacing once per frame as `[js] rAF error`). A process-wide
+  `OnceLock<Instant>` epoch now backs `performance.now()`; `timeOrigin` is the
+  wall-clock instant that zero maps to. `mark`/`measure`/`getEntries` are
+  no-ops (`getEntries*` returns an empty array) because pages only probe them
+  for analytics.
+- **rAF callbacks had no timestamp.** `run_due_frames` called each callback
+  with zero arguments (a documented shortcut from the DOM wave). It now passes
+  `perf_now_ms()`, so `(t) => …` animation code sees a finite number on the
+  same clock as `performance.now()`.
+- **Live effect.** nextjs.org's rAF error disappears: 7 -> 6 script errors,
+  with layout and RAM essentially unchanged (7032 px / 502 runs / 145.3 MB vs
+  145.8 MB). The four other reference pages are byte-stable in geometry and
+  error-free. The five remaining `Cannot set property 'data' of undefined`
+  errors are a separate gap: their scripts read `previousSibling` of a
+  `<template id="B:n">` marker and expect a comment node with writable `data`,
+  but this DOM exposes no sibling navigation and drops comments entirely.
+- **Limits.** The epoch is process-wide rather than per-page/navigation, so
+  `performance.now()` keeps counting across tab loads; `mark`/`measure` do not
+  record entries; `performance.timeOrigin` is a one-shot number, not a live
+  property.
 
 ### Wave 40 findings
 

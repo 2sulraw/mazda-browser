@@ -1592,6 +1592,21 @@ fn computed_keys_in_destructuring_patterns() {
 }
 
 #[test]
+fn performance_now_is_a_monotonic_clock() {
+    let first = num("performance.now()");
+    let second = num("performance.now()");
+    assert!(first.is_finite() && first >= 0.0);
+    assert!(second >= first, "clock is monotonic");
+    assert!(num("performance.timeOrigin") > 0.0);
+    assert!(boolean("typeof performance.mark === 'function'"));
+    assert!(boolean("typeof performance.measure === 'function'"));
+    assert_eq!(num("performance.getEntries().length"), 0.0);
+    assert_eq!(num("performance.getEntriesByName('x').length"), 0.0);
+    // a bare global read must not be `undefined`
+    assert!(boolean("performance.now !== undefined"));
+}
+
+#[test]
 fn regex_unsupported_syntax_is_clean_error() {
     assert!(matches!(err("'x'.replace(/(?<=a)b/, '')"), JsError::Syntax { .. }));
     assert!(matches!(err("/\\p{L}/u"), JsError::Syntax { .. }));

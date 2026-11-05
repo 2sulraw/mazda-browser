@@ -39,6 +39,7 @@
 #![allow(dead_code)] // the embedder hasn't wired this module up yet
 
 mod builtins;
+pub(crate) use builtins::perf_now_ms;
 mod gen;
 mod interp;
 mod lexer;

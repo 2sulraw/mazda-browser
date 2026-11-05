@@ -1926,10 +1926,10 @@ impl PageScripts {
             let storage = self.storage.clone();
             let (r, mut host, cx) =
                 with_ctx(&mut self.engine, dom, &self.base, listeners, storage, |e| {
-                    // honest shortcut: no timestamp argument (the DOM wave will
-                    // add one when perf timing exists); scripts reading the
-                    // arg get undefined
-                    let r = e.call_function(&cb, Val::Undefined, &[]);
+                    // the callback receives the frame timestamp, same clock as
+                    // `performance.now()` (one coalesced pass = one timestamp)
+                    let ts = js::perf_now_ms();
+                    let r = e.call_function(&cb, Val::Undefined, &[Val::Num(ts)]);
                     if let Err(m) = e.drain_microtasks() {
                         eprintln!("[js] microtask error: {m}");
                     }
@@ -2821,6 +2821,28 @@ mod tests {
             ps.run_due_frames(&mut dom);
         }
         assert_eq!(get_global_str(&mut ps, "frames"), "3", "one pass per epoch");
+    }
+
+    /// rAF callbacks receive a frame timestamp on the same clock as
+    /// `performance.now()`: a finite, non-negative number.
+    #[test]
+    fn raf_callback_receives_performance_timestamp() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.ok = false;
+                requestAnimationFrame(function (t) {
+                    window.ok = typeof t === "number" && t >= 0 &&
+                        t <= performance.now() + 50;
+                    window.ts = t;
+                });
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        std::thread::sleep(Duration::from_millis(18));
+        ps.run_due_frames(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "ok"), "true", "timestamp is a number on the perf clock");
+        let ts: f64 = get_global_str(&mut ps, "ts").parse().expect("numeric timestamp");
+        assert!(ts.is_finite() && ts >= 0.0);
     }
 
     /// The rAF backlog guard: a page queueing more than the cap (without

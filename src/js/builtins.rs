@@ -65,6 +65,31 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&math), "E", Val::Num(std::f64::consts::E));
     e.set_global("Math", math);
 
+    // -- performance -------------------------------------------------------
+    // A monotonic millisecond clock. The epoch is fixed on first use, so
+    // `now()` starts near zero and `timeOrigin` is the wall-clock instant
+    // that zero corresponds to. `mark`/`measure`/`getEntries*` are no-op
+    // stubs: analytics bundles probe them, nothing on a page renders from
+    // their output.
+    // shortcut: one process-wide epoch, not one per page/navigation.
+    let perf = Val::new_object();
+    let perf_now = e.register_native("performance.now", n_perf, 0);
+    let perf_mark = e.register_native("performance.mark", n_perf, 1);
+    let perf_measure = e.register_native("performance.measure", n_perf, 2);
+    let perf_entries = e.register_native("performance.getEntries", n_perf, 3);
+    let perf_entries_by_name = e.register_native("performance.getEntriesByName", n_perf, 3);
+    obj_set_own(own(&perf), "now", Val::Native(perf_now));
+    obj_set_own(own(&perf), "mark", Val::Native(perf_mark));
+    obj_set_own(own(&perf), "measure", Val::Native(perf_measure));
+    obj_set_own(own(&perf), "getEntries", Val::Native(perf_entries));
+    obj_set_own(
+        own(&perf),
+        "getEntriesByName",
+        Val::Native(perf_entries_by_name),
+    );
+    obj_set_own(own(&perf), "timeOrigin", Val::Num(perf_time_origin()));
+    e.set_global("performance", perf);
+
     // -- JSON --------------------------------------------------------------
     let json = Val::new_object();
     let p = e.register_native("JSON.parse", n_json, 0);
@@ -704,6 +729,49 @@ fn n_math(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, 
         M_RANDOM => Val::Num(e.random_f64()),
         M_SIGN => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).signum()),
         _ => Val::Undefined,
+    })
+}
+
+// -- performance ------------------------------------------------------------
+
+/// Process-wide monotonic epoch for `performance.now()` and the rAF
+/// timestamp. Fixed on first access so both agree forever.
+fn perf_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Milliseconds since [`perf_epoch`]. This is the value `performance.now()`
+/// returns and the sole argument a `requestAnimationFrame` callback gets.
+pub(crate) fn perf_now_ms() -> f64 {
+    perf_epoch().elapsed().as_secs_f64() * 1000.0
+}
+
+/// Wall-clock milliseconds since the Unix epoch that `performance.now()`
+/// zero corresponds to (`timeOrigin`).
+fn perf_time_origin() -> f64 {
+    static ORIGIN: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        let since_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        since_unix - perf_now_ms()
+    })
+}
+
+const PF_NOW: u16 = 0;
+const PF_MARK: u16 = 1;
+const PF_MEASURE: u16 = 2;
+const PF_ENTRIES: u16 = 3;
+
+fn n_perf(_e: &mut JsEngine, idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    Ok(match idx {
+        PF_NOW => Val::Num(perf_now_ms()),
+        // mark/measure keep no entry list; returning undefined matches the
+        // spec's void return
+        PF_MEASURE | PF_MARK => Val::Undefined,
+        _ => Val::new_array(Vec::new()),
     })
 }
 
