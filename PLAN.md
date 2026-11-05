@@ -1710,6 +1710,44 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 45 (document/Node surface + `queueMicrotask`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 document/Node members: `queueMicrotask` (a `Job::Call` in the existing FIFO microtask queue, non-callables throw), `document.forms` and `getElementsByName`, `createTextNode` / `createComment` (real text/comment arena nodes), and `Node.childNodes` / `Element.children` (document-order snapshots). No layout change; all five references are geometry- and error-identical: nextjs 7578px / 569 runs / first layout 150.2 MB (settles 153-158 MB as its router re-renders), MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.5 MB; suite **768** default / **772** `engine-b + woff2` |
 | 2026-11-05 | wave 46 (`DataView` + `AbortController` / `AbortSignal`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the two remaining self-contained P1 constructors. `DataView` is a byte window over an `ArrayBuffer` with big-endian default, per-call little-endian flag, all 10 numeric accessor pairs (including BigInt), and RangeError/TypeError bounds checks. `AbortController` / `AbortSignal` expose `signal`, `aborted`, `reason`, `onabort`, `addEventListener` / `removeEventListener` for `abort`, `throwIfAborted`, and `AbortSignal.abort()`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.2 MB, MDN 2922px / 641 runs / 87.6 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.4 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **773** default / **777** `engine-b + woff2` |
 | 2026-11-05 | wave 47 (`Event` / `CustomEvent` + `dispatchEvent`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 event surface. `new Event(type, {bubbles, cancelable})` and `new CustomEvent(type, {detail, bubbles, cancelable})` build plain objects on linked prototypes (`CustomEvent` is an `Event`), with `preventDefault`, `stopPropagation` and `stopImmediatePropagation`. `element` / `document` / `window` `dispatchEvent` is synchronous: target, then ancestors, then the shared window/document bucket; `bubbles: false` stays on the target; `stopImmediatePropagation` also skips later listeners at the same stop; the return value is `!defaultPrevented`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 154.9 MB, MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 102.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **778** default / **782** `engine-b + woff2` |
+| 2026-11-05 | wave 48 (`MutationObserver`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `new MutationObserver(callback)` with `observe` / `disconnect` / `takeRecords`. The shared DOM host logs `childList`, `attributes` and `characterData` mutations (plus `subtree`, `attributeOldValue` / `characterDataOldValue`, `attributeFilter`), but only while an observer is registered, so pages that never observe pay nothing. Callbacks run at the end of a script turn with `(records, observer)`; each record carries `type`, `target`, `addedNodes`, `removedNodes`, `attributeName` and `oldValue`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.6 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24454px / 10943 runs / 99.7-102.6 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 85.0 MB; suite **781** default / **785** `engine-b + woff2` |
+
+### Wave 48 findings
+
+- **The log lives in the DOM host, behind a toggle.** `runtime::DomHost`
+  pushes a `MutationRec` from `append_child`, `insert_before`, `remove_node`,
+  `set_attribute`, `remove_attribute`, `set_node_data` and
+  `set_text_content`, gated by a thread-local `TRACK_MUTATIONS` flag the script
+  layer turns on at the first `observe` and off at the last `disconnect` /
+  page replace. A page with no observer allocates nothing for mutations.
+- **Each record snapshots its tree root.** Full-page frameworks create a
+  detached subtree, mutate it, then insert it; filtering delivery against the
+  live tree at turn end would report those pre-insert attribute changes to a
+  document observer (and report them with the wrong `target` ancestry).
+  `root_of` is recorded at mutation time, and `observed` requires both the
+  target relationship and the mutation-time root, so off-screen work stays
+  invisible until it is actually inserted.
+- **Delivery is at the turn end, one batch per observer.** `with_ctx` drains
+  the log after the turn body, matching each record against every live
+  observer (`subtree` ancestry, attribute filter, old-value flags), then calls
+  each callback with `(records, observer)`. A callback that mutates the DOM
+  produces more records, so delivery repeats up to 8 rounds and logs
+  `[js] mutation observer callback did not settle` instead of hanging.
+- **`takeRecords` splits the shared log.** It consumes only the records
+  matching that observer's own registration and puts the remainder back, so
+  two observers on different targets do not steal each other's records.
+  `disconnect` clears the target and drops the observer's strong reference.
+- **`observe` implies its category.** As in the spec, `attributeOldValue` or
+  `attributeFilter` implies `attributes: true`, and `characterDataOldValue`
+  implies `characterData: true`; `observe` with no enabled category throws.
+- **Shortcuts, documented here.** One observed target per observer (a second
+  `observe` replaces the first), callbacks at turn end instead of true
+  microtask checkpoints, no weak references, records are plain arrays, and
+  `previousSibling` / `nextSibling` are always `null`. The log only sees
+  script-visible mutations that flow through `DomHost`, not parser or layout
+  internals.
+- **No geometry change, as intended.** All five reference pages kept their
+  exact height and run count; RAM moved only within run-to-run noise.
 
 ### Wave 47 findings
 

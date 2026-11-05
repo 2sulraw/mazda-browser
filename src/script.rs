@@ -113,6 +113,12 @@ thread_local! {
     static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
 }
 
+// Live `MutationObserver` instances for the current page. Cleared by
+// `PageScripts::new`; the objects also stay reachable from page JS.
+thread_local! {
+    static OBSERVERS: RefCell<Vec<Val>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Install the script-local context for the duration of a turn.
 /// `None` tears the context down (no native may run outside a turn).
 fn ctx_set(listeners: HashMap<(u32, String), Vec<Val>>) {
@@ -144,6 +150,9 @@ fn with_ctx<R>(
     runtime::host_install(dom, base, &storage);
     ctx_set(listeners);
     let r = f(engine);
+    // MutationObserver callbacks queue in the spec; here they run at the
+    // turn's end, before the next timer/event turn (documented shortcut).
+    deliver_mutations(engine);
     let host = runtime::host_take();
     let cx = ctx_take().expect("[js] script context vanished mid-turn");
     (r, host, cx)
@@ -458,6 +467,10 @@ struct Nids {
     ev_stop_immediate: usize,
     ev_ctor: usize,
     cev_ctor: usize,
+    mo_observe: usize,
+    mo_disconnect: usize,
+    mo_take: usize,
+    mo_ctor: usize,
     raf: usize,
     storage_get: usize,
     storage_set: usize,
@@ -665,6 +678,11 @@ const V_STOP_IMMEDIATE: u16 = 44;
 const V_DISPATCH: u16 = 45;
 const V_CTOR: u16 = 46;
 const V_CEV_CTOR: u16 = 47;
+/// MutationObserver group idxs (wave 48)
+const MO_CTOR: u16 = 0;
+const MO_OBSERVE: u16 = 1;
+const MO_DISCONNECT: u16 = 2;
+const MO_TAKE: u16 = 3;
 /// storage group idxs
 const S_GET: u16 = 40;
 const S_SET: u16 = 41;
@@ -1482,6 +1500,342 @@ fn install_event_types(e: &mut JsEngine, ids: Nids) {
     e.set_global("CustomEvent", Val::Native(ids.cev_ctor));
 }
 
+// ---------------------------------------------------------------------------
+// MutationObserver (wave 48)
+// ---------------------------------------------------------------------------
+
+fn observer_obj(this: &Val) -> Result<Rc<RefCell<js::Obj>>, JsError> {
+    match this {
+        Val::Obj(o) if !matches!(js::obj_get_own(o, "__cb"), Val::Undefined) => Ok(o.clone()),
+        _ => Err(JsError::throw(
+            "TypeError: MutationObserver method called on a non-observer",
+        )),
+    }
+}
+
+/// `new MutationObserver(callback)`: one observer object, registered in the
+/// page's live list so mutation delivery can find it.
+fn n_mo(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        MO_CTOR => {
+            if !is_ctor_call(e, this) {
+                return Err(JsError::throw(
+                    "TypeError: MutationObserver is not a constructor",
+                ));
+            }
+            let cb = args.first().cloned().unwrap_or(Val::Undefined);
+            if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
+                return Err(JsError::throw(
+                    "TypeError: MutationObserver callback is not a function",
+                ));
+            }
+            let obs = proto_instance(
+                e.native_prop(nids().mo_ctor, "prototype")
+                    .unwrap_or(Val::Undefined),
+            );
+            obs.set("__cb", cb);
+            obs.set("__target", Val::Num(-1.0));
+            obs.set("__child", Val::Bool(false));
+            obs.set("__attr", Val::Bool(false));
+            obs.set("__char", Val::Bool(false));
+            obs.set("__subtree", Val::Bool(false));
+            obs.set("__attr_old", Val::Bool(false));
+            obs.set("__char_old", Val::Bool(false));
+            obs.set("__filter", Val::Null);
+            OBSERVERS.with(|o| o.borrow_mut().push(obs.clone()));
+            Ok(obs)
+        }
+        MO_OBSERVE => {
+            let o = observer_obj(this)?;
+            let target = match args.first() {
+                Some(t) => this_node(t)?,
+                None => {
+                    return Err(JsError::throw(
+                        "TypeError: MutationObserver.observe requires a target",
+                    ))
+                }
+            };
+            let opts = args.get(1);
+            let child = event_option(opts, "childList").to_bool();
+            // spec: oldValue/filter imply their category when it is omitted
+            let attr_old = event_option(opts, "attributeOldValue");
+            let char_old = event_option(opts, "characterDataOldValue");
+            let filter = event_option(opts, "attributeFilter");
+            let attr = event_option(opts, "attributes").to_bool()
+                || !matches!(attr_old, Val::Undefined)
+                || !matches!(filter, Val::Undefined);
+            let chars = event_option(opts, "characterData").to_bool()
+                || !matches!(char_old, Val::Undefined);
+            if !child && !attr && !chars {
+                return Err(JsError::throw(
+                    "TypeError: MutationObserver.observe needs at least one of childList/attributes/characterData",
+                ));
+            }
+            js::obj_set_own(&o, "__target", Val::Num(target as f64));
+            js::obj_set_own(&o, "__child", Val::Bool(child));
+            js::obj_set_own(&o, "__attr", Val::Bool(attr));
+            js::obj_set_own(&o, "__char", Val::Bool(chars));
+            js::obj_set_own(
+                &o,
+                "__subtree",
+                Val::Bool(event_option(opts, "subtree").to_bool()),
+            );
+            js::obj_set_own(&o, "__attr_old", Val::Bool(attr_old.to_bool()));
+            js::obj_set_own(&o, "__char_old", Val::Bool(char_old.to_bool()));
+            let filter = match filter {
+                Val::Obj(a) if matches!(a.borrow().kind, js::ObjKind::Array(_)) => Val::Obj(a),
+                _ => Val::Null,
+            };
+            js::obj_set_own(&o, "__filter", filter);
+            runtime::set_mutation_tracking(true);
+            let val = Val::Obj(o);
+            OBSERVERS.with(|v| {
+                let mut v = v.borrow_mut();
+                let known = v.iter().any(|x| match (x, &val) {
+                    (Val::Obj(a), Val::Obj(b)) => Rc::ptr_eq(a, b),
+                    _ => false,
+                });
+                if !known {
+                    v.push(val);
+                }
+            });
+            Ok(Val::Undefined)
+        }
+        MO_DISCONNECT => {
+            let o = observer_obj(this)?;
+            js::obj_set_own(&o, "__target", Val::Num(-1.0));
+            // drop our strong reference so a forgotten observer is not kept
+            // alive for the rest of the page
+            OBSERVERS.with(|v| {
+                v.borrow_mut().retain(|x| match x {
+                    Val::Obj(a) => !Rc::ptr_eq(a, &o),
+                    _ => true,
+                });
+            });
+            refresh_tracking();
+            Ok(Val::Undefined)
+        }
+        MO_TAKE => {
+            let o = observer_obj(this)?;
+            let all = runtime::host_mut(|h| h.take_mutations());
+            let obs = Val::Obj(o);
+            let mut matched = Vec::new();
+            let mut rest = Vec::new();
+            for rec in all {
+                match record_for(&obs, &rec) {
+                    Some(v) => matched.push(v),
+                    None => rest.push(rec),
+                }
+            }
+            if !rest.is_empty() {
+                runtime::host_mut(|h| h.restore_mutations(rest));
+            }
+            Ok(Val::new_array(matched))
+        }
+        _ => Err(JsError::throw("TypeError: bad MutationObserver native")),
+    }
+}
+
+fn refresh_tracking() {
+    runtime::set_mutation_tracking(OBSERVERS.with(|o| {
+        o.borrow().iter().any(|v| match v {
+            Val::Obj(o) => matches!(js::obj_get_own(o, "__target"), Val::Num(n) if n >= 0.0),
+            _ => false,
+        })
+    }));
+}
+
+/// Drain the turn's mutation log into one callback per observer. Called at
+/// the end of every script turn (see `with_ctx`). A callback that mutates
+/// the DOM queues more records, so the round is repeated a bounded number
+/// of times — a runaway observer is reported, not allowed to hang the page.
+fn deliver_mutations(e: &mut JsEngine) {
+    for _ in 0..8 {
+        let recs = match runtime::host_mut_opt(|h| h.take_mutations()) {
+            Some(r) => r,
+            None => return,
+        };
+        if recs.is_empty() {
+            return;
+        }
+        let observers: Vec<Val> = OBSERVERS.with(|o| o.borrow().clone());
+        for obs in observers {
+            let o = match &obs {
+                Val::Obj(o) => o.clone(),
+                _ => continue,
+            };
+            if !matches!(js::obj_get_own(&o, "__target"), Val::Num(n) if n >= 0.0) {
+                continue;
+            }
+            let mut batch = Vec::new();
+            for rec in &recs {
+                if let Some(v) = record_for(&obs, rec) {
+                    batch.push(v);
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            let cb = js::obj_get_own(&o, "__cb");
+            if let Err(err) = e.call_function(&cb, obs.clone(), &[Val::new_array(batch), obs]) {
+                eprintln!("[js] mutation observer error: {err}");
+            }
+        }
+        if let Err(m) = e.drain_microtasks() {
+            eprintln!("[js] microtask error: {m}");
+        }
+    }
+    eprintln!("[js] mutation observer callback did not settle");
+}
+
+/// One DOM mutation → one JS record, or None when this observer does not
+/// watch that node/kind.
+fn record_for(obs: &Val, rec: &runtime::MutationRec) -> Option<Val> {
+    let o = match obs {
+        Val::Obj(o) => o,
+        _ => return None,
+    };
+    let target = match js::obj_get_own(o, "__target") {
+        Val::Num(n) if n >= 0.0 => n as u32,
+        _ => return None,
+    };
+    let subtree = js::obj_get_own(o, "__subtree").to_bool();
+    match rec {
+        runtime::MutationRec::ChildList {
+            parent,
+            added,
+            removed,
+            root,
+        } => {
+            if !js::obj_get_own(o, "__child").to_bool()
+                || !observed(target, *parent, *root, subtree)
+            {
+                return None;
+            }
+            Some(mutation_record(
+                "childList", *parent, added, removed, None, None,
+            ))
+        }
+        runtime::MutationRec::Attr {
+            node,
+            name,
+            old,
+            root,
+        } => {
+            if !js::obj_get_own(o, "__attr").to_bool()
+                || !observed(target, *node, *root, subtree)
+                || !attr_allowed(o, name)
+            {
+                return None;
+            }
+            let old = if js::obj_get_own(o, "__attr_old").to_bool() {
+                old.as_deref()
+            } else {
+                None
+            };
+            Some(mutation_record(
+                "attributes",
+                *node,
+                &[],
+                &[],
+                Some(name),
+                old,
+            ))
+        }
+        runtime::MutationRec::CharData { node, old, root } => {
+            if !js::obj_get_own(o, "__char").to_bool()
+                || !observed(target, *node, *root, subtree)
+            {
+                return None;
+            }
+            let old = if js::obj_get_own(o, "__char_old").to_bool() {
+                old.as_deref()
+            } else {
+                None
+            };
+            Some(mutation_record(
+                "characterData",
+                *node,
+                &[],
+                &[],
+                None,
+                old,
+            ))
+        }
+    }
+}
+
+fn observed(target: u32, node: u32, root: u32, subtree: bool) -> bool {
+    // the mutation must belong to the observer target's tree as it was when
+    // it happened, and the target must be the node or (with subtree) an
+    // ancestor of it
+    let related = target == node || (subtree && is_ancestor(target, node));
+    related && (target == root || is_ancestor(root, target))
+}
+
+fn is_ancestor(ancestor: u32, node: u32) -> bool {
+    let mut cur = node;
+    for _ in 0..4096 {
+        match runtime::host(|h| h.parent_node(cur)) {
+            Some(p) if p != cur => {
+                if p == ancestor {
+                    return true;
+                }
+                cur = p;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn attr_allowed(o: &Rc<RefCell<js::Obj>>, name: &str) -> bool {
+    match js::obj_get_own(o, "__filter") {
+        Val::Obj(a) => match &a.borrow().kind {
+            js::ObjKind::Array(items) if !items.is_empty() => items
+                .iter()
+                .any(|v| v.as_string().is_some_and(|s| s.eq_ignore_ascii_case(name))),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+fn mutation_record(
+    kind: &str,
+    node: u32,
+    added: &[u32],
+    removed: &[u32],
+    attr: Option<&str>,
+    old: Option<&str>,
+) -> Val {
+    let r = Val::new_object();
+    r.set("type", str_val(kind));
+    r.set("target", wrap_element(node));
+    r.set(
+        "addedNodes",
+        Val::new_array(added.iter().map(|&n| wrap_element(n)).collect()),
+    );
+    r.set(
+        "removedNodes",
+        Val::new_array(removed.iter().map(|&n| wrap_element(n)).collect()),
+    );
+    r.set("attributeName", attr.map(str_val).unwrap_or(Val::Null));
+    r.set("oldValue", old.map(str_val).unwrap_or(Val::Null));
+    r.set("previousSibling", Val::Null);
+    r.set("nextSibling", Val::Null);
+    r
+}
+
+fn install_mutation_observer(e: &mut JsEngine, ids: Nids) {
+    let proto = Val::new_object();
+    proto.set("observe", Val::Native(ids.mo_observe));
+    proto.set("disconnect", Val::Native(ids.mo_disconnect));
+    proto.set("takeRecords", Val::Native(ids.mo_take));
+    e.set_native_prop(ids.mo_ctor, "prototype", proto);
+    e.set_global("MutationObserver", Val::Native(ids.mo_ctor));
+}
+
 /// `requestAnimationFrame(cb)` — the callback joins this turn's queue with
 /// a one-epoch deadline; the worker's scheduler fires every queued callback
 /// in a single coalesced pass and re-lays out once if any of them mutated
@@ -1755,6 +2109,9 @@ impl PageScripts {
     /// and the page-facing globals. `dom` is borrowed mutably only while
     /// snapshotting wrapper props (no mutation).
     pub fn new(dom: &mut Dom, base: &str) -> PageScripts {
+        // a fresh page starts with no observers and no mutation logging
+        OBSERVERS.with(|o| o.borrow_mut().clear());
+        runtime::set_mutation_tracking(false);
         let mut engine = JsEngine::new();
         // one native per reflected-prop accessor (getter + setter share it)
         let reflect = std::array::from_fn(|i| {
@@ -1830,6 +2187,10 @@ impl PageScripts {
             ev_stop_immediate: engine.register_native("Event.prototype.stopImmediatePropagation", ev_native, V_STOP_IMMEDIATE),
             ev_ctor: engine.register_native("Event", n_event, V_CTOR),
             cev_ctor: engine.register_native("CustomEvent", n_event, V_CEV_CTOR),
+            mo_observe: engine.register_native("MutationObserver.prototype.observe", n_mo, MO_OBSERVE),
+            mo_disconnect: engine.register_native("MutationObserver.prototype.disconnect", n_mo, MO_DISCONNECT),
+            mo_take: engine.register_native("MutationObserver.prototype.takeRecords", n_mo, MO_TAKE),
+            mo_ctor: engine.register_native("MutationObserver", n_mo, MO_CTOR),
             raf: engine.register_native("requestAnimationFrame", raf_native, 0),
             storage_get: engine.register_native("localStorage.getItem", storage_native, S_GET),
             storage_set: engine.register_native("localStorage.setItem", storage_native, S_SET),
@@ -1841,6 +2202,7 @@ impl PageScripts {
         };
         NIDS.with(|c| c.set(Some(ids)));
         install_event_types(&mut engine, ids);
+        install_mutation_observer(&mut engine, ids);
         // CSSOM bridge: the style object's member reads/writes go through
         // the shared host (js.rs itself stays DOM-free)
         engine.style_get = Some(style_get_hook);
@@ -3916,5 +4278,88 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "hit"), "3");
         assert_eq!(get_global_str(&mut ps, "d2"), "1");
         assert_eq!(get_global_str(&mut ps, "threw"), "true");
+    }
+
+    /// Child-list, attribute and character-data records arrive in mutation
+    /// order; `subtree` makes a descendant's own child-list change visible.
+    #[test]
+    fn mutation_observer_records_childlist_attributes_and_subtree() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="box"></div><script>
+                window.log = [];
+                var box = document.getElementById("box");
+                var mo = new MutationObserver(function (records) {
+                    for (var i = 0; i < records.length; i++) {
+                        var r = records[i];
+                        window.log.push(r.type + ":" + (r.attributeName || "") + ":" + (r.target.id || r.target.tagName));
+                    }
+                });
+                mo.observe(box, { childList: true, attributes: true, subtree: true });
+                var s = document.createElement("span");
+                s.id = "s";
+                box.appendChild(s);
+                box.setAttribute("data-x", "1");
+                s.setTextContent("hi");
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "log"),
+            "childList::box,attributes:data-x:box,childList::s"
+        );
+    }
+
+    /// `takeRecords` consumes only this observer's matching records, honours
+    /// `attributeFilter`/`attributeOldValue`, and `disconnect` stops delivery.
+    #[test]
+    fn mutation_observer_take_records_filter_and_disconnect() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="box"></div><script>
+                window.got = 0;
+                var box = document.getElementById("box");
+                var mo = new MutationObserver(function () { window.got = window.got + 1; });
+                mo.observe(box, {
+                    attributes: true,
+                    attributeOldValue: true,
+                    attributeFilter: ["data-k"]
+                });
+                box.setAttribute("data-k", "v1");
+                box.setAttribute("data-k", "v2");
+                box.setAttribute("other", "x");
+                var recs = mo.takeRecords();
+                window.n = recs.length;
+                window.old = recs[1].oldValue;
+                window.kind = recs[0].type;
+                mo.disconnect();
+                box.setAttribute("data-k", "v3");
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "n"), "2");
+        assert_eq!(get_global_str(&mut ps, "old"), "v1");
+        assert_eq!(get_global_str(&mut ps, "kind"), "attributes");
+        assert_eq!(get_global_str(&mut ps, "got"), "0");
+    }
+
+    /// Constructor/observe validation and `instanceof`.
+    #[test]
+    fn mutation_observer_rejects_bad_input() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.threw = 0;
+                try { new MutationObserver(1); } catch (e) { window.threw = window.threw + 1; }
+                try {
+                    var m = new MutationObserver(function () {});
+                    m.observe(document.body, {});
+                } catch (e) { window.threw = window.threw + 1; }
+                try {
+                    new MutationObserver(function () {}).observe(null, { childList: true });
+                } catch (e) { window.threw = window.threw + 1; }
+                window.iso = new MutationObserver(function () {}) instanceof MutationObserver;
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "threw"), "3");
+        assert_eq!(get_global_str(&mut ps, "iso"), "true");
     }
 }

@@ -434,6 +434,63 @@ impl Default for DomHost {
     }
 }
 
+/// One DOM mutation while at least one `MutationObserver` is observing.
+/// Logging is enabled/disabled by the script layer, so pages with no
+/// observers pay nothing.
+#[derive(Clone, Debug)]
+pub enum MutationRec {
+    ChildList {
+        parent: u32,
+        added: Vec<u32>,
+        removed: Vec<u32>,
+        /// topmost ancestor of `parent` at mutation time (an offscreen node
+        /// mutated before insertion must not reach a document observer)
+        root: u32,
+    },
+    Attr {
+        node: u32,
+        name: String,
+        old: Option<String>,
+        root: u32,
+    },
+    CharData {
+        node: u32,
+        old: Option<String>,
+        root: u32,
+    },
+}
+
+thread_local! {
+    static TRACK_MUTATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable mutation logging (the script layer switches it on when an
+/// observer starts observing and off when the page is replaced).
+pub fn set_mutation_tracking(on: bool) {
+    TRACK_MUTATIONS.with(|c| c.set(on));
+}
+
+fn tracking_mutations() -> bool {
+    TRACK_MUTATIONS.with(|c| c.get())
+}
+
+/// Topmost ancestor of `node` (itself when detached). Used to snapshot the
+/// tree a mutation belonged to at the moment it happened.
+fn root_of(dom: &Dom, node: u32) -> u32 {
+    let mut cur = node;
+    for _ in 0..4096 {
+        let p = match dom.nodes.get(cur as usize) {
+            Some(n) => n.parent,
+            None => return cur,
+        };
+        if p == cur || p == 0 {
+            return cur;
+        }
+        cur = p;
+    }
+    cur
+}
+
 /// The host the natives call into for the CURRENT script turn. Established
 /// fresh per turn by whichever runtime runs (`host_install`), torn down at
 /// turn end (`host_take`) and folded into the runtime's own scheduling
@@ -458,6 +515,9 @@ pub struct DomHost {
     prevent_default: bool,
     /// honest-log guard: the storage note prints once per page
     storage_noted: bool,
+    /// mutations queued for `MutationObserver` this turn (empty unless
+    /// tracking is on)
+    mutations: Vec<MutationRec>,
 }
 
 impl DomHost {
@@ -471,6 +531,7 @@ impl DomHost {
             dirty: false,
             prevent_default: false,
             storage_noted: false,
+            mutations: Vec::new(),
         }
     }
 
@@ -485,11 +546,24 @@ impl DomHost {
             dirty: false,
             prevent_default: false,
             storage_noted: true,
+            mutations: Vec::new(),
         }
     }
 
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// Drain the mutation log for the current turn (turn-end observer
+    /// delivery, or `MutationObserver.takeRecords()`).
+    pub fn take_mutations(&mut self) -> Vec<MutationRec> {
+        std::mem::take(&mut self.mutations)
+    }
+
+    /// Put records back that another observer still needs (a `takeRecords`
+    /// call only consumes the records matching its own registration).
+    pub fn restore_mutations(&mut self, mut recs: Vec<MutationRec>) {
+        self.mutations.append(&mut recs);
     }
 
     fn dom_ref(&self) -> &Dom {
@@ -633,6 +707,14 @@ impl DomHost {
             dom.nodes[child as usize].parent = parent;
             dom.nodes[parent as usize].children.push(child);
             self.dirty = true;
+            if tracking_mutations() {
+                self.mutations.push(MutationRec::ChildList {
+                    parent,
+                    added: vec![child],
+                    removed: Vec::new(),
+                    root: root_of(dom, parent),
+                });
+            }
         }
         ok
     }
@@ -645,23 +727,33 @@ impl DomHost {
         else {
             return false;
         };
+        let old = attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone());
         match attrs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
             Some((_, v)) => {
                 if v == val {
                     return false;
                 }
                 *v = val.to_string();
-                self.dirty = true;
-                true
             }
             None => {
                 let mut v: Vec<(String, String)> = attrs.iter().cloned().collect();
                 v.push((name.to_string(), val.to_string()));
                 *attrs = v.into_boxed_slice();
-                self.dirty = true;
-                true
             }
         }
+        self.dirty = true;
+        if tracking_mutations() {
+            self.mutations.push(MutationRec::Attr {
+                node,
+                name: name.to_string(),
+                old,
+                root: root_of(dom, node),
+            });
+        }
+        true
     }
 
     /// Raw text of an element's `style` attribute (empty when absent).
@@ -763,8 +855,16 @@ impl DomHost {
                 if s == text {
                     return false;
                 }
+                let old = s.clone();
                 *s = text.to_string();
                 self.dirty = true;
+                if tracking_mutations() {
+                    self.mutations.push(MutationRec::CharData {
+                        node,
+                        old: Some(old),
+                        root: root_of(dom, node),
+                    });
+                }
                 true
             }
             _ => false,
@@ -826,9 +926,11 @@ impl DomHost {
             return false;
         }
         let old = dom.nodes[new as usize].parent;
+        let mut removed_from = None;
         if old != new && (old as usize) < dom.nodes.len() {
             if let Some(pos) = dom.nodes[old as usize].children.iter().position(|&c| c == new) {
                 dom.nodes[old as usize].children.remove(pos);
+                removed_from = Some(old);
             }
         }
         let len = dom.nodes[parent as usize].children.len();
@@ -843,6 +945,22 @@ impl DomHost {
         dom.nodes[parent as usize].children.insert(pos, new);
         dom.nodes[new as usize].parent = parent;
         self.dirty = true;
+        if tracking_mutations() {
+            if let Some(old_parent) = removed_from {
+                self.mutations.push(MutationRec::ChildList {
+                    parent: old_parent,
+                    added: Vec::new(),
+                    removed: vec![new],
+                    root: root_of(dom, old_parent),
+                });
+            }
+            self.mutations.push(MutationRec::ChildList {
+                parent,
+                added: vec![new],
+                removed: Vec::new(),
+                root: root_of(dom, parent),
+            });
+        }
         true
     }
 
@@ -905,6 +1023,14 @@ impl DomHost {
         if removed {
             dom.nodes[node as usize].parent = 0;
             self.dirty = true;
+            if tracking_mutations() {
+                self.mutations.push(MutationRec::ChildList {
+                    parent,
+                    added: Vec::new(),
+                    removed: vec![node],
+                    root: root_of(dom, parent),
+                });
+            }
         }
         removed
     }
@@ -919,9 +1045,18 @@ impl DomHost {
         };
         if let Some(i) = attrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
             let mut v: Vec<(String, String)> = attrs.iter().cloned().collect();
+            let old = v[i].1.clone();
             v.remove(i);
             *attrs = v.into_boxed_slice();
             self.dirty = true;
+            if tracking_mutations() {
+                self.mutations.push(MutationRec::Attr {
+                    node,
+                    name: name.to_string(),
+                    old: Some(old),
+                    root: root_of(dom, node),
+                });
+            }
             true
         } else {
             false
@@ -935,7 +1070,8 @@ impl DomHost {
         if (node as usize) >= dom.nodes.len() {
             return;
         }
-        dom.nodes[node as usize].children.clear();
+        let removed = std::mem::take(&mut dom.nodes[node as usize].children);
+        let mut added = Vec::new();
         if !text.is_empty() {
             let id = dom.nodes.len() as u32;
             dom.nodes.push(html::Node {
@@ -944,8 +1080,17 @@ impl DomHost {
                 kind: NodeKind::Text(text.to_string()),
             });
             dom.nodes[node as usize].children.push(id);
+            added.push(id);
         }
         self.dirty = true;
+        if tracking_mutations() {
+            self.mutations.push(MutationRec::ChildList {
+                parent: node,
+                added,
+                removed,
+                root: root_of(dom, node),
+            });
+        }
     }
 
     /// `createElement(tag)`: interns the tag name on demand (any name is
