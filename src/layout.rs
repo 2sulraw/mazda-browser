@@ -4897,13 +4897,24 @@ fn row_track_floor(t: &Track, avail_h: f32) -> f32 {
 ///    (a definite `minmax(0, N)` that cannot fit) shrinks non-flex tracks
 ///    back toward their minimums, right to left.
 ///
+/// `stretch_auto` is `justify-content: normal`/`stretch`: only then does
+/// leftover space grow `auto` tracks. Any other value sizes the tracks
+/// normally and leaves the space for [`grid_content_offsets`].
+///
 /// shortcut: leftover space after all tracks reach their maximum is not
-/// distributed back to non-flex tracks (no `justify-content` stretch); when
-/// several non-flex tracks compete for too little space their growth is
-/// granted left-to-right rather than in equal shares; and a spanning item's
-/// contribution is spread by [`span_contribution`] (shortfall only, over the
-/// columns that can absorb it) rather than into every covered column.
-fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f32]) -> Vec<f32> {
+/// distributed back to non-flex tracks; when several non-flex tracks compete
+/// for too little space their growth is granted left-to-right rather than in
+/// equal shares; and a spanning item's contribution is spread by
+/// [`span_contribution`] (shortfall only, over the columns that can absorb
+/// it) rather than into every covered column.
+fn resolve_tracks(
+    cols: &[Track],
+    avail: f32,
+    gap: f32,
+    cmin: &[f32],
+    cmax: &[f32],
+    stretch_auto: bool,
+) -> Vec<f32> {
     let n = cols.len();
     if n == 0 {
         return Vec::new();
@@ -5008,7 +5019,7 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f3
     let used: f32 = w.iter().sum::<f32>() + gaps;
     let autos = cols.iter().filter(|t| matches!(t, Track::Auto)).count();
     let slack = avail - used;
-    if autos > 0 && slack > 0.5 {
+    if stretch_auto && autos > 0 && slack > 0.5 {
         let add = slack / autos as f32;
         for (i, t) in cols.iter().enumerate() {
             if matches!(t, Track::Auto) {
@@ -5017,6 +5028,25 @@ fn resolve_tracks(cols: &[Track], avail: f32, gap: f32, cmin: &[f32], cmax: &[f3
         }
     }
     w
+}
+
+/// `justify-content` distribution for grid columns: the leading offset and
+/// the extra space added to every inter-track gap. `Normal`/`Start` pack the
+/// tracks at the start edge.
+fn grid_content_offsets(justify: Justify, slack: f32, tracks: usize) -> (f32, f32) {
+    if slack <= 0.0 || tracks == 0 {
+        return (0.0, 0.0);
+    }
+    let n = tracks as f32;
+    match justify {
+        Justify::Center => (slack * 0.5, 0.0),
+        Justify::End => (slack, 0.0),
+        // a single track cannot be spread *between*: it stays at the start
+        Justify::SpaceBetween if tracks > 1 => (0.0, slack / (n - 1.0)),
+        Justify::SpaceAround => (slack / (2.0 * n), slack / n),
+        Justify::SpaceEvenly => (slack / (n + 1.0), slack / (n + 1.0)),
+        _ => (0.0, 0.0),
+    }
 }
 
 /// One placed float's margin box in DOC coordinates + its side.
@@ -5747,7 +5777,12 @@ fn flex_line(
             Justify::Center => (free * 0.5, 0.0),
             Justify::End => (free, 0.0),
             Justify::SpaceBetween if k > 1 => (0.0, free / (k as f32 - 1.0)),
-            _ => (0.0, 0.0), // Start
+            Justify::SpaceAround => (free / (2.0 * k as f32), free / k as f32),
+            Justify::SpaceEvenly => (
+                free / (k as f32 + 1.0),
+                free / (k as f32 + 1.0),
+            ),
+            _ => (0.0, 0.0), // Start / Normal (flex-start)
         }
     };
     let mut row_h = 0.0f32;
@@ -6045,12 +6080,28 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     let cols: Vec<f32> = if tracks.is_empty() {
         vec![n.w]
     } else {
-        resolve_tracks(&tracks, n.w, n.bx.gap_col, &col_min, &col_max)
+        resolve_tracks(
+            &tracks,
+            n.w,
+            n.bx.gap_col,
+            &col_min,
+            &col_max,
+            n.bx.justify == Justify::Normal,
+        )
     };
+    // `justify-content` over the leftover space (`normal` already stretched
+    // auto tracks, so slack is 0 there). The offset shifts the first track;
+    // `extra_gap` widens every gap between tracks, which also widens
+    // multi-track items (their area includes the spacing they span).
+    let col_used = cols.iter().sum::<f32>()
+        + n.bx.gap_col * (cols.len().saturating_sub(1)) as f32;
+    let (col_off, extra_gap) =
+        grid_content_offsets(n.bx.justify, (n.w - col_used).max(0.0), cols.len());
+    let gap_step = n.bx.gap_col + extra_gap;
     // x offset + width of columns [c0, c1)
     let span_xw = |c0: usize, c1: usize| {
-        let x: f32 = cols[..c0].iter().sum::<f32>() + n.bx.gap_col * c0 as f32;
-        let w: f32 = cols[c0..c1].iter().sum::<f32>() + n.bx.gap_col * (c1 - c0 - 1) as f32;
+        let x: f32 = col_off + cols[..c0].iter().sum::<f32>() + gap_step * c0 as f32;
+        let w: f32 = cols[c0..c1].iter().sum::<f32>() + gap_step * (c1 - c0 - 1) as f32;
         (x, w)
     };
     let nrows = spots.iter().map(|s| s.1).max().unwrap_or(1);
@@ -7066,6 +7117,44 @@ mod tests {
     }
 
     #[test]
+    fn flex_row_space_around_and_evenly_positions() {
+        // three 20px boxes in 100px: used 60, free 40 (adjacent text leaves
+        // would merge into one item, so each box is its own flex item)
+        let sx = |justify| {
+            let boxed = |t: &str| {
+                let mut g = BoxNode::group(
+                    Style::new(),
+                    BoxStyle {
+                        display: Display::Block,
+                        width: Some(Len::Px(20.0)),
+                        ..BoxStyle::default()
+                    },
+                );
+                g.children = vec![leaf(t)];
+                g
+            };
+            let mut root = flex_row(
+                vec![boxed("aa"), boxed("bb"), boxed("cc")],
+                BoxStyle {
+                    justify,
+                    ..BoxStyle::default()
+                },
+            );
+            let l = layout_tree(&mut root, 100.0, &m4);
+            l.runs.iter().map(|r| r.x).collect::<Vec<_>>()
+        };
+        let expect = |got: Vec<f32>, want: [f32; 3]| {
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 0.02, "got {got:?}, want {want:?}");
+            }
+        };
+        // half a share at each edge (6.667), one share between (13.333)
+        expect(sx(Justify::SpaceAround), [6.667, 40.0, 73.333]);
+        // four equal spaces of 10
+        expect(sx(Justify::SpaceEvenly), [10.0, 40.0, 70.0]);
+    }
+
+    #[test]
     fn flex_row_align_end_shifts_short_item_down() {
         // item 1: one text line; item 2: block box with 2 lines (via <br>)
         let tall = {
@@ -7858,6 +7947,72 @@ mod tests {
         layout_tree(&mut n, 200.0, &m4);
         assert_eq!(n.children[0].x, 0.0);
         assert_eq!(n.children[0].w, 200.0, "spans content-start..extended-full-end");
+    }
+
+    #[test]
+    fn grid_justify_content_offsets_fixed_tracks() {
+        // three 50px tracks, two 10px gaps => used 170 in a 290px row, slack 120
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let xs = |justify| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Grid,
+                    cols: vec![Track::Px(50.0), Track::Px(50.0), Track::Px(50.0)],
+                    gap_col: 10.0,
+                    justify,
+                    ..BoxStyle::default()
+                },
+            );
+            n.children = vec![boxed("a"), boxed("b"), boxed("c")];
+            layout_tree(&mut n, 290.0, &m4);
+            n.children.iter().map(|c| c.x).collect::<Vec<_>>()
+        };
+        assert_eq!(xs(Justify::Start), vec![0.0, 60.0, 120.0]);
+        assert_eq!(xs(Justify::Center), vec![60.0, 120.0, 180.0]);
+        assert_eq!(xs(Justify::End), vec![120.0, 180.0, 240.0]);
+        // 120 split over the two gaps
+        assert_eq!(xs(Justify::SpaceBetween), vec![0.0, 120.0, 240.0]);
+        // half a share at each edge (20), one share between (40)
+        assert_eq!(xs(Justify::SpaceAround), vec![20.0, 120.0, 220.0]);
+        // 120 split into four equal spaces of 30
+        assert_eq!(xs(Justify::SpaceEvenly), vec![30.0, 120.0, 210.0]);
+    }
+
+    #[test]
+    fn grid_auto_tracks_only_stretch_for_normal_justify() {
+        // `normal` is the only value that grows auto tracks into the leftover;
+        // `center` leaves them content-sized and centers the whole line.
+        // "maximize tracks" grows both to their 100px growth limit in both
+        // cases; only `normal` stretches the remaining 100px (50 each).
+        let auto = resolve_tracks(
+            &[Track::Auto, Track::Auto],
+            300.0,
+            0.0,
+            &[40.0, 40.0],
+            &[100.0, 100.0],
+            true,
+        );
+        assert_eq!(auto, vec![150.0, 150.0]);
+        let packed = resolve_tracks(
+            &[Track::Auto, Track::Auto],
+            300.0,
+            0.0,
+            &[40.0, 40.0],
+            &[100.0, 100.0],
+            false,
+        );
+        assert_eq!(packed, vec![100.0, 100.0]);
     }
 
     #[test]

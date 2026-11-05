@@ -1701,6 +1701,39 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 36 (live ES-module namespaces) | MDN homepage + Wikipedia `/wiki/JavaScript` + nextjs.org | MDN's client bundle now runs to completion - the `Cannot read property 'length' of undefined` at `index.08e…js` col 19277 is gone and the page logs no `[js]` errors (page 2675px / 615 runs / 100.5 MB, one layout); Wikipedia unchanged at 24454px / 10943 runs / 101.6 MB; nextjs.org 7032px / 502 runs / 141.4 MB (fresh 256 KB page, unchanged by this wave); suite **748** default / **752** `engine-b + woff2` |
 | 2026-11-05 | wave 37 (Function constructor compiles source) | Wikipedia `/wiki/JavaScript` + MDN homepage + nextjs.org + rust-lang.org + Hacker News | Wikipedia's 20 `Exception in resolve` / `Skipped unavailable module` pairs are gone (ResourceLoader evaluates each module's `skip` condition with `new Function(...)()`, which returned a plain object and threw) and the page logs no script errors; layout unchanged at 24454px / 10943 runs / 102.2 MB and the worker finished in 12.4s (wave 36: 18.2s); MDN 2675px / 615 runs / 99.7 MB, nextjs 7032 / 502 / 140.5 MB (same 11 pre-existing errors), rust-lang 483 runs, HN 734 runs (its `getElementsByClassName` gap is unrelated); suite **750** default / **754** `engine-b + woff2` |
 | 2026-11-05 | wave 38 (`getElementsByClassName` + element `getElementsByTagName`) | Hacker News + Wikipedia `/wiki/JavaScript` + MDN homepage | HN's `hn.js` now runs clean (`byClass` calls `el.getElementsByClassName`): script errors 1 -> 0, geometry unchanged at 1695px / 734 runs / 78.1 MB; Wikipedia 24454px / 10943 runs / 103.0 MB and MDN 2675px / 615 runs / 100.0 MB carry no script errors; suite **751** default / **755** `engine-b + woff2` |
+| 2026-11-05 | wave 39 (grid `justify-content`) | MDN homepage + nextjs.org + Wikipedia `/wiki/JavaScript` + Hacker News | grid columns now honour `justify-content` (`start`/`center`/`end`/`space-between`/`space-around`/`space-evenly`) and only `normal`/`stretch` grows `auto` tracks; flex no longer collapses `space-around`/`space-evenly` into `space-between`. No reference page changes: MDN 2675px / 615 runs / 100.0 MB, nextjs 7032px / 502 runs / 140.8 MB (same 11 errors), Wikipedia 24454px / 10943 runs / 103.2 MB, HN 1695px / 734 runs / 78.3 MB; suite **754** default / **758** `engine-b + woff2` |
+
+### Wave 39 findings
+
+- **Grid `justify-content` was a documented no-op.** Column widths came from
+  `resolve_tracks`, which unconditionally stretched `auto` tracks into the
+  leftover space, and every item was packed at the content-box start. Any
+  author value (`center`, `end`, the three `space-*` forms) was parsed and then
+  ignored by the grid path.
+- **Sizing vs. distribution are now separate.** `resolve_tracks` takes a
+  `stretch_auto` flag that is true only for `justify-content: normal` (the
+  initial value; `stretch` is an alias). "Maximize tracks" still grows
+  content-sized tracks to their growth limit in every case — that step is
+  intrinsic track sizing, not alignment. Whatever is left afterwards is handed
+  to `grid_content_offsets`, which returns a leading offset and an extra gap:
+  `center`/`end` shift the whole line, `space-between` splits the slack over
+  the `n-1` inter-track gaps, `space-around` puts half a share at each edge,
+  `space-evenly` splits it into `n+1` equal spaces. A spanning item's width
+  grows with the extra gap it covers, matching the grid-area rule.
+- **Flex had the same conflation.** `space-around`/`space-evenly` were parsed
+  into the `SpaceBetween` variant and therefore rendered as `space-between`
+  (edge items flush to both sides). They now have their own variants and
+  positions; with a single item both centre it, which is what the spec's
+  distribution resolves to.
+- **Live effect: none on the four reference pages.** Their grids either use a
+  `1fr` track (which already absorbs the slack, leaving nothing to
+  distribute) or no explicit `justify-content`; every geometry number is
+  unchanged (MDN, nextjs, Wikipedia, HN), and no new script errors appear. The
+  change is spec fidelity for pages that do use the property, proven by unit
+  tests for each value and by the auto-stretch flag test.
+- **Remaining gap.** `align-content` (the block-axis twin) is still unparsed,
+  so a grid taller than its rows packs them at the top; `justify-items` /
+  `place-content` shorthands are likewise absent.
 
 ### Wave 38 findings
 

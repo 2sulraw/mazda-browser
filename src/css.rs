@@ -114,10 +114,17 @@ pub enum Dir {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Justify {
+    /// `start` / `flex-start` / `left`: pack at the start edge
     Start,
     Center,
     End,
     SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+    /// `normal` (the initial value). For grid this behaves as `stretch`:
+    /// only `auto` tracks grow into the leftover space. For flex it means
+    /// `flex-start`.
+    Normal,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -572,7 +579,7 @@ impl Default for BoxStyle {
             display: Display::Auto,
             inline_box: false,
             dir: Dir::Row,
-            justify: Justify::Start,
+            justify: Justify::Normal,
             align: Align::Stretch,
             wrap: false,
             gap_row: 0.0,
@@ -2474,8 +2481,11 @@ fn apply_decl(
             bx.justify = match d.1.as_str() {
                 "center" => Justify::Center,
                 "flex-end" | "end" | "right" => Justify::End,
-                "space-between" | "space-around" | "space-evenly" => Justify::SpaceBetween,
-                _ => Justify::Start, // flex-start/left/default
+                "space-between" => Justify::SpaceBetween,
+                "space-around" => Justify::SpaceAround,
+                "space-evenly" => Justify::SpaceEvenly,
+                "normal" | "stretch" => Justify::Normal,
+                _ => Justify::Start, // flex-start/start/left
             }
         }
         "align-items" => {
