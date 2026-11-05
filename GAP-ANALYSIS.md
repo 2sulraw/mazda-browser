@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 159 in `KNOWN` + 1 alias | 752 non-vendor | ~21% | dataset includes drafts; ~24-26% against names shipping in two mainstream engines |
+| CSS property names | 163 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,11 +151,11 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 159 |
-| Additional accepted alias | 1 (`word-wrap` = `overflow-wrap`) |
-| Raw missing (non-vendor) | ~593 |
-| Coverage (non-vendor) | ~21% |
-| Coverage against names shipping in two mainstream engines | ~24-26% |
+| Names in the engine's `KNOWN` table | 163 |
+| Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
+| Raw missing (non-vendor) | ~590 |
+| Coverage (non-vendor) | ~22% |
+| Coverage against names shipping in two mainstream engines | ~25-27% |
 
 The `KNOWN` table is the source of truth for this count. A name in the table can
 still be only partially implemented; a name outside it can still work through a
@@ -170,12 +170,12 @@ handled, but the paint model still applies one radius to every corner.
 | Text & typography | 61 | `hyphens`, `text-shadow` | high: frequent in real CSS |
 | Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low: low frequency here |
 | Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required |
-| Borders & outlines | 35 | corner longhands, `border-style`, `border-image-*` | medium: common in resets |
+| Borders & outlines | 18 | `border-image-*`, `border-block-*`, `border-inline-*` | medium: common in resets |
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
 | Fonts | 23 | `font`, `font-variant-*`, `font-kerning` | medium |
 | Grid & alignment | 12 | `grid-row`, `grid-auto-flow`, `place-items` | high |
-| Transforms & motion paths | 14 | `perspective`, `offset-*`, `transform-style` | medium |
+| Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
 | Backgrounds | 13 | `background-clip`, `background-origin`, `background-attachment` | medium |
 | Masking & clipping | 13 | `mask-border-*`, `mask-mode`, `mask-composite` | low |
@@ -279,8 +279,9 @@ relevant only when transitions and animations exist.
   Focus rings and custom checkbox states are therefore missing.
 - `var()` is a flat page-wide map, not a per-element cascade.
 - `background-clip` and `filter` are absent.
-  `transform-origin` is honored for the translate/scale composite only (no
-  3D, and glyph size still does not scale — see the wave 53 notes);
+  `transform-origin` is honored for the translate/scale composite formed by
+  `transform`, `translate` and `scale` (no 3D; `rotate` parses but paints
+  unrotated, and glyph size still does not scale — see the wave 53 notes);
   `overflow-wrap` / `word-break` now break inside words during line layout,
   `text-overflow: ellipsis` marks a clipped line and `max-height` caps a box
   (see the wave 49-52 notes); `hyphens` is not modeled.
@@ -409,7 +410,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 825 self-authored unit tests (829 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 828 self-authored unit tests (832 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -431,8 +432,9 @@ The best signal is neither: instrument the engine to log unresolved property
 names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
-individual transforms, `font`, `filter`, `place-items`) now orders the CSS
-queue. The DOM/JS half is still open.
+`font`, `filter`/`backdrop-filter`, `place-items`) now orders the CSS
+queue, and wave 67 took the top visual item off it (individual
+`translate`/`scale`). The DOM/JS half is still open.
 
 ### 8.2 Priority by reference impact and RAM cost
 
@@ -475,7 +477,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (159 + 1 alias)
+## Appendix A - CSS property names accepted (163)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -515,13 +517,13 @@ stroke-linejoin, stroke-opacity, stroke-width, table-layout
 text-align, text-decoration, text-decoration-color, text-decoration-line
 text-decoration-style, text-decoration-thickness, text-indent, text-overflow
 text-transform, text-underline-offset, top, transform
-transform-origin, vertical-align, visibility, white-space
-width, word-break, word-spacing, word-wrap
+transform-origin, translate, rotate, scale, vertical-align, visibility
+white-space, width, word-break, word-spacing, word-wrap
 z-index
 ```
 
-`border-top-left-radius` is accepted as an alias of the corner-radius shorthand
-but is not listed in `KNOWN`.
+`word-wrap` is the legacy spelling of `overflow-wrap`; both names are in
+`KNOWN` and run the same handler.
 
 ## Appendix B - Missing CSS names worth considering
 
@@ -534,8 +536,7 @@ Layout and alignment:
   grid-row-start, grid-row-end, grid-template, grid-gap
 
 Box, border, outline:
-  corner longhands other than top-left, border-style, border-image*,
-  box-decoration-break
+  border-image-*, border-block-*, border-inline-*, box-decoration-break
 
 Text and typography:
   hyphens, text-shadow, text-emphasis, tab-size, quotes,
@@ -548,7 +549,7 @@ Backgrounds and effects:
   background-blend-mode, filter, backdrop-filter, mix-blend-mode, isolation
 
 Transforms and motion:
-  transform-style, perspective, perspective-origin, backface-visibility, rotate, scale, translate, transition,
+  transform-style, perspective, perspective-origin, backface-visibility, transition,
   transition-delay, transition-duration, transition-property,
   transition-timing-function, animation*, @keyframes (at-rule)
 

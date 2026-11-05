@@ -638,6 +638,16 @@ pub struct BoxStyle {
     /// offset from the border box's top-left. `%` stays symbolic and resolves
     /// against the box's own w/h at paint time. None = `50% 50%` (center).
     pub origin: Option<(Len, Len)>,
+    /// CSS `translate` (individual property, wave 67): a visual-only offset
+    /// that composes with [`Self::transform`] in the spec order (translate
+    /// outermost). `[0, 0]` = the initial `none`, so the composite needs no
+    /// separate "declared" flag. `%` resolves against the box's own w/h.
+    pub translate: [Len; 2],
+    /// CSS `scale` (individual property, wave 67): a visual-only factor
+    /// applied outside [`Self::transform`]. `[1.0, 1.0]` = the initial `none`.
+    /// `rotate` is accepted but contributes nothing: like `rotate()` inside a
+    /// transform list, rotation would need affine glyph/rect rasterization.
+    pub scale: [f32; 2],
     /// CSS `cursor` — pointer shape over this box. Inherited: layout
     /// threads the nearest ancestor's declared value down at build time,
     /// so a resolved box carries the effective value and None means
@@ -789,6 +799,8 @@ impl Default for BoxStyle {
             z: None,
             transform: None,
             origin: None,
+            translate: [Len::Px(0.0); 2],
+            scale: [1.0; 2],
             cursor: None,
             text_indent: Len::Px(0.0),
             table: TableRole::None,
@@ -1438,6 +1450,9 @@ const KNOWN: &[&str] = &[
     "vertical-align",
     "z-index",
     "transform",
+    "translate",
+    "rotate",
+    "scale",
     "cursor",
     "text-transform",
     "letter-spacing",
@@ -3517,6 +3532,49 @@ fn apply_decl(
         // declared before or after `transform` and works with the 2D
         // translate/scale composite this engine paints.
         "transform-origin" => bx.origin = parse_origin(&d.1, vp),
+        // individual transform properties (wave 67). They stay separate from
+        // `transform` because the cascade treats them as three properties:
+        // `transform: none` must not clear a prior `translate`. The composite
+        // is built in layout (`box_xf`) in spec order (translate outermost);
+        // `rotate` parses as an accepted no-op for the same reason the
+        // `rotate()` function contributes nothing (axis-aligned rasterizer).
+        "translate" => {
+            let t = d.1.trim();
+            if t.eq_ignore_ascii_case("none") {
+                bx.translate = [Len::Px(0.0); 2];
+            } else {
+                let toks = joined_tokens(t);
+                if let Some(x) = toks.first().and_then(|s| parse_len(s, vp)) {
+                    bx.translate = [x, Len::Px(0.0)];
+                    // a second value is the Y offset; a lone value keeps y=0
+                    if let Some(y) = toks.get(1).and_then(|s| parse_len(s, vp)) {
+                        bx.translate[1] = y;
+                    }
+                }
+            }
+        }
+        "scale" => {
+            let t = d.1.trim();
+            if t.eq_ignore_ascii_case("none") {
+                bx.scale = [1.0; 2];
+            } else {
+                let toks = joined_tokens(t);
+                // number or percentage (percentage / 100, CSS Transforms L2)
+                let factor = |s: &str| -> Option<f32> {
+                    match s.trim().strip_suffix('%') {
+                        Some(n) => n.trim().parse::<f32>().ok().map(|f| f / 100.0),
+                        None => s.trim().parse::<f32>().ok(),
+                    }
+                };
+                if let Some(x) = toks.first().and_then(|s| factor(s)) {
+                    // a lone value scales both axes; a second value is Y
+                    let y = toks.get(1).and_then(|s| factor(s)).unwrap_or(x);
+                    bx.scale = [x, y];
+                }
+            }
+        }
+        // accepted no-op (see the BoxStyle::scale doc)
+        "rotate" => {}
         // unknown keyword → None = the declaration is dropped and the
         // value inherits (see parse_cursor)
         "cursor" => bx.cursor = parse_cursor(&d.1),
@@ -9642,6 +9700,39 @@ mod tests {
             bx("k").transform.expect("rotate + translate").tx,
             Len::Px(7.0)
         );
+    }
+
+    #[test]
+    fn individual_translate_and_scale_parse_and_reset() {
+        let sheet = parse(
+            ".a{translate:10px 20%}.b{translate:-50%}.c{translate:none}\
+             .d{scale:2}.e{scale:2 3}.f{scale:150%}.g{scale:none}\
+             .h{translate:calc(10px + 5%) 0}.i{scale:bogus}\
+             .j{transform:none;translate:5px}\
+             .k{translate:1px;translate:none}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>\
+             <div class=j></div><div class=k></div>",
+        );
+        let bx = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx
+        };
+        assert_eq!(bx("a").translate, [Len::Px(10.0), Len::Pct(20.0)]);
+        assert_eq!(bx("b").translate, [Len::Pct(-50.0), Len::Px(0.0)], "y stays 0");
+        assert_eq!(bx("c").translate, [Len::Px(0.0); 2], "none = initial");
+        assert_eq!(bx("d").scale, [2.0, 2.0], "one value scales both axes");
+        assert_eq!(bx("e").scale, [2.0, 3.0]);
+        assert_eq!(bx("f").scale, [1.5, 1.5], "percentage factor");
+        assert_eq!(bx("g").scale, [1.0; 2], "none = initial");
+        assert!(matches!(bx("h").translate[0], Len::Calc { .. }));
+        assert_eq!(bx("i").scale, [1.0; 2], "garbage keeps the earlier value");
+        assert_eq!(bx("j").transform, None, "transform:none is independent");
+        assert_eq!(bx("j").translate, [Len::Px(5.0), Len::Px(0.0)]);
+        assert_eq!(bx("k").translate, [Len::Px(0.0); 2], "later none wins");
     }
 
     #[test]

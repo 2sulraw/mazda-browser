@@ -1740,6 +1740,54 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 66 (observed CSS misses + border longhands) | a local border-longhand page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The engine can now report what it drops: `MAZDA_MISS=1` counts every property name rejected by the `KNOWN` gate and every at-rule the parser does not implement, then prints a frequency-sorted table after each load. The first reference run ranked 111 distinct dropped properties on nextjs.org, 38 on Wikipedia, 23 on rust-lang.org, 20 on MDN and 4 on Hacker News; transitions/animations, the individual `translate`/`rotate`/`scale` properties, `user-select`/`pointer-events`, the `font` shorthand and `filter` led the list. The cheapest visual win in it was borders: the model already stores per-side widths, but the per-side width/colour longhands and all four corner-radius longhands were missing from `KNOWN` (the handler had an unreachable top-left arm), so reset/Tailwind styles like `border-top-width: 1px` drew nothing. All eight per-side width/colour longhands and all four corner-radius longhands now parse into the existing per-side-width / one-colour / one-radius model (style words remain collapsed to solid). A local page verifies a 6px top border, a 10px left border, a per-side red colour and 12/20px corner clipping. Distinct dropped-property counts fall to 94 on nextjs.org and 10 on rust-lang.org; all five references keep identical geometry: nextjs 7578px / 569 runs / 148.8 MB, MDN 2773 / 641 / 86.9 MB, Wikipedia 24575 / 10950 / 102.6 MB, HN 1695 / 728 / 78.2 MB, rust-lang 5800 / 483 / 84.7 MB; suite **825** default / **829** `engine-b + woff2` |
 
+| 2026-11-06 | wave 67 (individual `translate`/`scale` + rect edge clipping) | a local transform page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The top visual item in wave 66's miss ranking is implemented: the individual `translate` and `scale` properties now parse and paint, and `rotate` is accepted as a documented no-op (rotation still needs affine glyph/rect rasterization). Each property keeps its own `BoxStyle` field so the cascade keeps them independent of the `transform` list (`transform: none` does not clear a prior `translate`), and paint composes all three in spec order (translate outermost): the list's scale multiplies with `scale`, its offset is scaled by `scale`, and `translate` is added last. `%` offsets resolve against the box's own w/h, and single values follow CSS (`translate: 10px` leaves y at 0, `scale: 2` scales both axes; percentages divide by 100). Verifying the scale render exposed a painter bug: the solid-rect fill clamped a negative origin to pixel 0 but kept the full width/height, so any box a transform pushed past the left or top edge smeared its full size from the edge. The rect fill is now one helper that intersects the span with the buffer (gradients already did), and underline/caret rules share it. A local page verifies a 20/10px translate, a 2x scale about the center with the correct intersection at the page edge, and `rotate: 45deg` painting unrotated; `MAZDA_MISS` reports zero dropped names for it. Dropped-name counts fall to 91 on nextjs.org (was 94), 31 on Wikipedia (38) and 17 on MDN (20); references keep identical geometry: nextjs 7578px / 569 runs / 149.4 MB, MDN 2773 / 641 / 86.9 MB, Wikipedia 24575 / 10950 / 102.8 MB, HN 1695 / 728 / 78.2 MB, rust-lang 5800 / 483 / 84.9 MB; suite **828** default / **832** `engine-b + woff2` |
+
+### Wave 67 findings
+
+- **The miss table paid for itself again.** After wave 66 the top visual
+  entries were transitions (a deliberate no-animation shortcut), the
+  individual `translate` (177 declarations on nextjs.org), `rotate` (45) and
+  `scale` (36) properties. `translate` and `scale` reuse the existing
+  paint-time `Xf` composite, so they cost parse entries plus one box field,
+  not a new paint path. `rotate` cannot be faked: rects stay axis-aligned and
+  glyph runs stay horizontal, so it is accepted and contributes nothing, which
+  is exactly what `rotate()` inside a transform list has always done.
+- **Cascade independence needs separate storage.** `translate`, `rotate` and
+  `scale` are three properties, not a shorthand for `transform`: a later
+  `transform: none` must not clear an earlier `translate`. Folding them into
+  `BoxStyle::transform` at parse time would make declaration order change the
+  result, so `BoxStyle` gains `translate: [Len; 2]` and `scale: [f32; 2]`
+  with zero/one as the identity defaults (no "declared" flag needed). The cost
+  is 32 bytes per box: nextjs.org's 149.4 MB is about 0.5 MB above wave 66,
+  and the other references moved by at most 0.4 MB (RAM is noisy at this
+  scale).
+- **Composition order is the spec order.** The list applies innermost
+  (`translate -> rotate -> scale -> transform`), so the effective map is
+  `sx = scale.x * transform.sx`, `tx = scale.x * transform.tx + translate.x`
+  (likewise y), then the existing origin correction
+  `x + (n.x + ox)(1 - sx)`. A lone `translate` value leaves y at 0 and a lone
+  `scale` value scales both axes; `%` translate resolves against the box's own
+  w/h at paint, like the list form.
+- **Verifying the paint found a clipping bug.** The solid-rect fill computed
+  its start column as `sx.max(0.0)` but its end as `start + w`, so a rect at
+  `x = -50` painted 200 columns from x = 0 instead of 150. `transform:
+  scale(2)` already hit this (a left-edge box spans -50..150); with the
+  `scale` longhand it becomes routine, so the fill moved into one
+  `paint_solid_rect` helper that intersects the span with the buffer, with the
+  rounded-corner path and the underline/caret rules sharing it. Gradients were
+  already clipped per pixel and are unchanged. A unit test pins the
+  negative-origin intersection and the fully-off-buffer case.
+- **Measured.** Local page: 20/10px translate, `scale: 2` about the center
+  (painted 200x80 at -50, 40 and intersected to x <= 149 at the page edge),
+  `rotate: 45deg` unrotated, zero dropped names. References keep their exact
+  height/run counts; dropped-name counts are 91 (nextjs.org), 31 (Wikipedia),
+  17 (MDN), 4 (Hacker News), 10 (rust-lang.org). Suite **828** default /
+  **832** `engine-b + woff2`.
+- **Next in the queue.** The `font` shorthand (80 declarations on MDN is the
+  largest remaining visual miss), `filter`/`backdrop-filter`, `text-shadow`,
+  `background-clip`, `place-items`/`place-self`, then transitions only if
+  animation is ever required.
+
 ### Wave 66 findings
 
 - **Instrument the gate, not the renderer.** Every stylesheet rule and inline

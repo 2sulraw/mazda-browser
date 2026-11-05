@@ -3034,26 +3034,42 @@ impl Xf {
     }
 }
 
-/// The box's own [`css::Transform`] as an [`Xf`] about its transform
-/// origin — CSS default `center` (shortcut: `transform-origin` isn't
-/// parsed; centering is what `scale()`/`translate()` patterns expect).
-/// `%` translate resolves against the box's own w/h here (layout coords);
-/// None = no transform.
+/// The box's own visual transform — its [`css::Transform`] (the `transform`
+/// list) combined with the individual `translate`/`scale` properties, about
+/// its `transform-origin` (CSS default `center`). `%` lengths resolve against
+/// the box's own w/h here (layout coords). None = identity.
 fn box_xf(n: &BoxNode) -> Option<Xf> {
-    let t = n.bx.transform?;
-    let tx = resolve_len(t.tx, n.w);
-    let ty = resolve_len(t.ty, n.h);
-    // p' = (p − o)·s + o + d  ⇔  p·s + (o(1 − s) + d), where o is the
+    // Individual properties compose OUTSIDE the list (spec order:
+    // translate -> rotate -> scale -> transform), so the list's own offset is
+    // scaled by `scale` and the individual `translate` is added last. `rotate`
+    // is accepted but not modeled (axis-aligned rasterizer), so it drops out.
+    let (kx, ky) = (n.bx.scale[0], n.bx.scale[1]);
+    let (dx, dy) = (
+        resolve_len(n.bx.translate[0], n.w),
+        resolve_len(n.bx.translate[1], n.h),
+    );
+    let (sx0, sy0, t0x, t0y) = match n.bx.transform {
+        Some(t) => (t.sx, t.sy, resolve_len(t.tx, n.w), resolve_len(t.ty, n.h)),
+        None => (1.0, 1.0, 0.0, 0.0),
+    };
+    let sx = sx0 * kx;
+    let sy = sy0 * ky;
+    let tx = t0x * kx + dx;
+    let ty = t0y * ky + dy;
+    if sx == 1.0 && sy == 1.0 && tx == 0.0 && ty == 0.0 {
+        return None;
+    }
+    // p' = (p - o)s + o + d  ->  p*s + (o(1 - s) + d), where o is the
     // transform origin (default = the box center).
     let (ox, oy) = match n.bx.origin {
         Some((x, y)) => (resolve_len(x, n.w), resolve_len(y, n.h)),
         None => (n.w * 0.5, n.h * 0.5),
     };
     Some(Xf {
-        sx: t.sx,
-        sy: t.sy,
-        tx: (n.x + ox) * (1.0 - t.sx) + tx,
-        ty: (n.y + oy) * (1.0 - t.sy) + ty,
+        sx,
+        sy,
+        tx: (n.x + ox) * (1.0 - sx) + tx,
+        ty: (n.y + oy) * (1.0 - sy) + ty,
     })
 }
 
@@ -12500,6 +12516,76 @@ line</textarea></div>"#,
         assert_eq!(rot.rects, plain.rects, "rotate/skew-only = no transform");
         let tx = build(".t{min-height:40px;background:#aabbcc;transform:rotate(45deg) translateX(10px)}");
         assert!((tx.rects[0].0 - 10.0).abs() < 0.01, "co-listed translate still applies");
+    }
+
+    #[test]
+    fn individual_translate_and_scale_paint_without_moving_flow() {
+        let build = |css: &str| {
+            let mut root = boxes_of(
+                "<div class=t><div class=kid>k</div></div><div class=s>sib</div>",
+                css,
+            );
+            let l = layout_tree(&mut root, 400.0, &m4);
+            (root, l)
+        };
+        let bg = |l: &Layout| *l.rects.iter().find(|r| r.4 == 0xaabbcc).expect("bg");
+
+        let (root, l) = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;translate:10px 5px}\
+             .kid{background:#ddeeff}",
+        );
+        assert!((root.children[0].y - 0.0).abs() < 0.01);
+        assert!((root.children[1].y - 50.0).abs() < 0.01, "flow untouched");
+        let r = bg(&l);
+        assert!(
+            (r.0 - 10.0).abs() < 0.01 && (r.1 - 5.0).abs() < 0.01,
+            "translate: {r:?}"
+        );
+        let kid = l.rects.iter().find(|r| r.4 == 0xddeeff).expect("kid bg");
+        assert!(
+            (kid.0 - 10.0).abs() < 0.01 && (kid.1 - 5.0).abs() < 0.01,
+            "subtree rides the translate: {kid:?}"
+        );
+
+        // scale alone matches `transform: scale(2)` exactly
+        let (_, sc) = build(".t{width:100px;min-height:50px;background:#aabbcc;scale:2}");
+        let (_, tf) = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;transform:scale(2)}",
+        );
+        assert_eq!(bg(&sc), bg(&tf), "scale longhand == transform:scale()");
+
+        // both compose in spec order: `scale` multiplies the list's scale and
+        // scales its translate; `translate` is added last
+        let (_, both) = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;\
+             transform:translateX(8px) scale(2);scale:3;translate:4px 6px}",
+        );
+        let r = bg(&both);
+        // sx = 2*3 = 6, tx = 8*3 + 4 = 28; x = 50(1-6) + 28 = -222
+        assert!(
+            (r.0 - -222.0).abs() < 0.01 && (r.2 - 600.0).abs() < 0.01,
+            "composite: {r:?}"
+        );
+        // sy = 6, ty = 0*3 + 6 = 6; y = 25(1-6) + 6 = -119
+        assert!(
+            (r.1 - -119.0).abs() < 0.01 && (r.3 - 300.0).abs() < 0.01,
+            "composite y: {r:?}"
+        );
+
+        // `transform: none` doesn't clear the individual properties
+        let (_, indep) = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;\
+             transform:translateX(4px);translate:10px;transform:none}",
+        );
+        assert!(
+            (bg(&indep).0 - 10.0).abs() < 0.01,
+            "translate survives transform:none"
+        );
+
+        // explicit `none` on both is byte-identical to not declaring them
+        let (_, clear) = build(".t{min-height:40px;background:#aabbcc;translate:none;scale:none}");
+        let (_, plain) = build(".t{min-height:40px;background:#aabbcc}");
+        assert_eq!(clear.rects, plain.rects);
     }
 
     #[test]

@@ -5994,7 +5994,7 @@ fn render(
             if y + h < 0.0 || y > page {
                 continue;
             }
-            let (sx, sy) = (PADDING as f32 + x, (PADDING as f32 + top + y).max(0.0));
+            let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + top + y);
             let r = rad.min(w * 0.5).min(h * 0.5);
             // high byte = effective opacity (0 = un-packed colour, treat as
             // opaque so every pre-opacity caller keeps painting solid)
@@ -6009,53 +6009,7 @@ fn render(
                 paint_gradient(buf, width, height, sx, sy, w, h, r, g, alpha);
                 continue;
             }
-            let (sxi, syi) = (sx.max(0.0) as usize, sy as usize);
-            // square corners: one row fill per line instead of per-pixel math
-            if r <= 0.5 {
-                let (xa, xb) = (sxi, (sx.max(0.0) as usize + w.max(0.0) as usize).min(width));
-                for dy in 0..h.max(0.0) as usize {
-                    let py = syi + dy;
-                    if py >= height || xa >= xb {
-                        break;
-                    }
-                    if alpha == 255 {
-                        buf[py * width + xa..py * width + xb].fill(rgb);
-                    } else {
-                        for idx in &mut buf[py * width + xa..py * width + xb] {
-                            blend(idx, rgb, alpha);
-                        }
-                    }
-                }
-                continue;
-            }
-            for dy in 0..h.max(0.0) as usize {
-                let py = (sy as usize) + dy;
-                if py >= height {
-                    break;
-                }
-                let ly = dy as f32; // y relative to rect top
-                for dx in 0..w.max(0.0) as usize {
-                    let px = sx as usize + dx;
-                    if px >= width {
-                        break;
-                    }
-                    // rounded corners: cull pixels outside the corner circles
-                    if r > 0.5 {
-                        let lx = dx as f32;
-                        let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
-                        let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
-                        let (ex, ey) = (lx - cx, ly - cy);
-                        if ex * ex + ey * ey > r * r {
-                            continue;
-                        }
-                    }
-                    if alpha == 255 {
-                        buf[py * width + px] = rgb;
-                    } else {
-                        blend(&mut buf[py * width + px], rgb, alpha);
-                    }
-                }
-            }
+            paint_solid_rect(buf, width, height, sx, sy, w, h, r, rgb, alpha);
         }
         // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
         for (i, (x, y, w, h, img, fixed, ialpha)) in laid.images.iter().enumerate() {
@@ -6157,23 +6111,9 @@ fn render(
                 a => a,
             };
             let rgb = color & 0x00ff_ffff;
-            for dy in 0..h.max(1.0) as usize {
-                for dx in 0..w as usize {
-                    let px = sx as usize + dx;
-                    let py = (sy as usize) + dy;
-                    if px < width && py * width + px < buf.len() {
-                        let idx = py * width + px;
-                        if alpha == 255 {
-                            buf[idx] = rgb;
-                        } else {
-                            blend(&mut buf[idx], rgb, alpha);
-                        }
-                    }
-                }
-            }
+            paint_solid_rect(buf, width, height, sx, sy, w, h.max(1.0), 0.0, rgb, alpha);
         }
     }
-    let _ = height;
 }
 
 fn draw_text(
@@ -6388,6 +6328,91 @@ fn radial_radii(g: &css::Radial, w: f32, h: f32) -> (f32, f32, f32, f32) {
 /// CSS rule for a linear gradient), so `t` is 0 at the entry edge and 1 at
 /// the exit edge. A radial gradient maps each pixel through
 /// [`radial_radii`](fn.radial_radii.html)'s normalized distance instead.
+/// Fill one axis-aligned rect into the buffer, clipped to the buffer edges.
+/// `sx`/`sy` are buffer coords and may be negative (a painted transform can
+/// put a box left of / above the page): the span is intersected with the
+/// buffer instead of only clamping the origin, which would smear the box's
+/// full width/height from pixel 0.
+fn paint_solid_rect(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    sx: f32,
+    sy: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    rgb: u32,
+    alpha: u8,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let (ox, oy) = (sx as i32, sy as i32);
+    let (xa, xb) = (
+        ox.max(0) as usize,
+        (ox + w as i32).clamp(0, width as i32) as usize,
+    );
+    if xa >= xb {
+        return;
+    }
+    // square corners: one row fill per line instead of per-pixel math
+    if r <= 0.5 {
+        for dy in 0..h as i32 {
+            let py = oy + dy;
+            if py < 0 {
+                continue;
+            }
+            let py = py as usize;
+            if py >= height {
+                break;
+            }
+            if alpha == 255 {
+                buf[py * width + xa..py * width + xb].fill(rgb);
+            } else {
+                for idx in &mut buf[py * width + xa..py * width + xb] {
+                    blend(idx, rgb, alpha);
+                }
+            }
+        }
+        return;
+    }
+    for dy in 0..h as i32 {
+        let py = oy + dy;
+        if py < 0 {
+            continue;
+        }
+        let py = py as usize;
+        if py >= height {
+            break;
+        }
+        let ly = dy as f32; // y relative to rect top
+        for dx in 0..w as i32 {
+            let px = ox + dx;
+            if px < 0 {
+                continue;
+            }
+            if px >= width as i32 {
+                break;
+            }
+            let px = px as usize;
+            // rounded corners: cull pixels outside the corner circles
+            let lx = dx as f32;
+            let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
+            let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
+            let (ex, ey) = (lx - cx, ly - cy);
+            if ex * ex + ey * ey > r * r {
+                continue;
+            }
+            if alpha == 255 {
+                buf[py * width + px] = rgb;
+            } else {
+                blend(&mut buf[py * width + px], rgb, alpha);
+            }
+        }
+    }
+}
+
 fn paint_gradient(
     buf: &mut [u32],
     width: usize,
@@ -8343,6 +8368,31 @@ mod tests {
             ],
         };
         assert_eq!(grad_at(&solid, 0.5), (0x7f007f, 255));
+    }
+
+    #[test]
+    fn solid_rect_clips_instead_of_smearing_from_the_edge() {
+        // a painted transform can put a box left of / above the page; the
+        // visible span must be the INTERSECTION, not the full width drawn
+        // from pixel 0 (the old clamp smeared negative origins)
+        let mut buf = vec![0u32; 20 * 10];
+        paint_solid_rect(&mut buf, 20, 10, -5.0, -3.0, 10.0, 8.0, 0.0, 0xff0000, 255);
+        assert_eq!(buf[0], 0xff0000);
+        assert_eq!(buf[4], 0xff0000, "last visible column of the 10px rect");
+        assert_eq!(buf[5], 0, "rect ends at x=5");
+        assert_eq!(buf[4 * 20], 0xff0000, "last visible row");
+        assert_eq!(buf[5 * 20], 0, "rect ends at y=5");
+
+        // fully off-buffer: nothing is painted (no panic, no smear)
+        let mut buf = vec![0u32; 20 * 10];
+        paint_solid_rect(&mut buf, 20, 10, -30.0, 0.0, 10.0, 4.0, 0.0, 0xff0000, 255);
+        assert!(buf.iter().all(|&p| p == 0));
+
+        // the rounded path clips the same way
+        let mut buf = vec![0u32; 20 * 10];
+        paint_solid_rect(&mut buf, 20, 10, -5.0, -3.0, 10.0, 8.0, 3.0, 0x0000ff, 255);
+        assert_eq!(buf[3 * 20 + 5], 0, "outside the corner radius");
+        assert_eq!(buf[3 * 20 + 3], 0x0000ff, "inside the rounded rect");
     }
 
     #[test]
