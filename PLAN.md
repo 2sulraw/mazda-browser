@@ -1712,6 +1712,42 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 47 (`Event` / `CustomEvent` + `dispatchEvent`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 event surface. `new Event(type, {bubbles, cancelable})` and `new CustomEvent(type, {detail, bubbles, cancelable})` build plain objects on linked prototypes (`CustomEvent` is an `Event`), with `preventDefault`, `stopPropagation` and `stopImmediatePropagation`. `element` / `document` / `window` `dispatchEvent` is synchronous: target, then ancestors, then the shared window/document bucket; `bubbles: false` stays on the target; `stopImmediatePropagation` also skips later listeners at the same stop; the return value is `!defaultPrevented`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 154.9 MB, MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 102.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **778** default / **782** `engine-b + woff2` |
 | 2026-11-05 | wave 48 (`MutationObserver`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `new MutationObserver(callback)` with `observe` / `disconnect` / `takeRecords`. The shared DOM host logs `childList`, `attributes` and `characterData` mutations (plus `subtree`, `attributeOldValue` / `characterDataOldValue`, `attributeFilter`), but only while an observer is registered, so pages that never observe pay nothing. Callbacks run at the end of a script turn with `(records, observer)`; each record carries `type`, `target`, `addedNodes`, `removedNodes`, `attributeName` and `oldValue`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.6 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24454px / 10943 runs / 99.7-102.6 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 85.0 MB; suite **781** default / **785** `engine-b + woff2` |
 | 2026-11-05 | wave 49 (`overflow-wrap` / `word-break`) | a local 120px-box wrapping page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Line layout can now break inside a word. `overflow-wrap: break-word|anywhere`, the legacy `word-wrap` alias and `word-break: break-all|break-word|keep-all` parse into two inherited `Style` switches; when a word still does not fit, the breaker cuts the longest character prefix that fits (`fit_prefix`, a binary search over monotone widths) and continues on the next line. A local page isolates the behavior: a 28-character token in a 120px box stays one 217px overflowing run by default, becomes 117px + 76px with `break-word`, 112px + 97px with `break-all`, and short words on one line are untouched. Four references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.1 MB, MDN 2922px / 641 runs / 87.5 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.6 MB. Wikipedia moves to 24575px / 10950 runs / 100.9 MB because its own `word-break: break-all` / `break-word` rules now take effect (intended fidelity gain, 7 extra run pieces); suite **785** default / **789** `engine-b + woff2` |
+| 2026-11-05 | wave 50 (`text-overflow`) | a local 160px-row ellipsis page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Clipped lines can now end with an ellipsis. `text-overflow` is accepted and sets a box-level `ellipsis` flag (any `ellipsis` token matches, so the two-value form parses); `apply_run_clips` trims, per line, the run crossing the right content edge to the longest prefix that still leaves room for "…", empties later runs on that line, and leaves fitting lines and boxes without `overflow` alone. Runs are emptied, never removed, so other boxes' ranges stay valid. A local page shows the change directly: a 160px `nowrap`/`overflow:hidden` row dumps `ABCDEFGHIJKLMNOPQRST…` (153px) with `text-overflow: ellipsis`, while the same row without the declaration, a fitting label, and a `text-overflow`-only box without `overflow` keep their full text. No geometry change; all five references stay error-free: nextjs 7578px / 569 runs / 154.3 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24575px / 10950 runs / 101.8 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **787** default / **791** `engine-b + woff2` |
+
+### Wave 50 findings
+
+- **`text-overflow` is a box flag, applied by the clip pass.** `BoxStyle`
+  gained `ellipsis` (parsed from any `ellipsis` token in the value, so the
+  two-value `ellipsis clip` form is accepted). It takes effect only where
+  `apply_run_clips` already computes a content window (`overflow` not
+  `visible`); a box that only declares `text-overflow` keeps painting the
+  full text, which matches the spec's "needs a clipping box".
+- **Trimming happens per line after positions are final.** Each run whose
+  right edge crosses the content edge is rewritten to the longest prefix
+  that still leaves room for "…" (the same `fit_prefix` binary search and
+  spacing rule as line layout, so the marker lands exactly inside the
+  window). Later runs on that line become empty; runs on other lines and
+  runs that already fit are untouched.
+- **Runs are never removed.** Other boxes' `run_range` indices point into
+  the shared run vector, so a fully hidden run keeps its slot with an empty
+  string and zero width (paint draws nothing).
+- **The marker is ordinary text.** "…" is appended to the run, inheriting
+  its font, colour and letter-spacing and flowing through the existing
+  paint path — no special glyph or clip logic. A window too narrow for the
+  marker shows nothing rather than a half glyph.
+- **Shortcuts, documented here.** The box form only (no inline
+  `text-overflow`), no `direction`/RTL handling, no fade, no distinction
+  between the `clip` and `fade` second values, and vertical overflow is
+  not marked (only the horizontal edge is trimmed). The `:hover` target
+  still covers the untruncated run, as before.
+- **No geometry change on the references.** Truncation shortens text inside
+  an already-clipped window, so heights, run counts and RAM were identical:
+  nextjs 7578px / 569 runs / 154.3 MB, MDN 2922px / 641 runs / 87.7 MB,
+  Wikipedia 24575px / 10950 runs / 101.8 MB, HN 1695px / 728 runs /
+  78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB. A local 160px row with a
+  36-character token now dumps `ABCDEFGHIJKLMNOPQRST…` (153px) instead of
+  the cut-off full string; a fitting label and a box without `overflow`
+  are unchanged.
 
 ### Wave 49 findings
 

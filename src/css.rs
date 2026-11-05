@@ -458,6 +458,11 @@ pub struct BoxStyle {
     /// the two axes collapse into this one flag, so `overflow-x:hidden;
     /// overflow-y:visible` clips both axes.
     pub clip: bool,
+    /// `text-overflow: ellipsis` — an overflowing line of this box ends with
+    /// "…" instead of a cut glyph (`apply_run_clips` trims the run text).
+    /// Only takes effect together with `clip` (`overflow` not `visible`),
+    /// and the engine does not distinguish the two-value `clip` form.
+    pub ellipsis: bool,
     /// CSS 2.1 `clip: rect(top, right, bottom, left)` — edge offsets from
     /// the element's border-box top-left (all four from that corner, so the
     /// classic `rect(1px,1px,1px,1px)` skip-link is a zero-area window that
@@ -623,6 +628,7 @@ impl Default for BoxStyle {
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
             clip: false,
+            ellipsis: false,
             clip_rect: None,
             clip_path: None,
             pos: Pos::Static,
@@ -1237,6 +1243,7 @@ const KNOWN: &[&str] = &[
     "left",
     "inset",
     "overflow",
+    "text-overflow",
     "overflow-x",
     "overflow-y",
     "clip",
@@ -2650,6 +2657,11 @@ fn apply_decl(
                 d.1.split_whitespace().next().unwrap_or(""),
                 "hidden" | "clip" | "scroll" | "auto"
             );
+        }
+        // `text-overflow` — the ellipsis marker; only the keyword matters
+        // (the second `clip`/`fade` value has no visual difference here)
+        "text-overflow" => {
+            bx.ellipsis = d.1.split_whitespace().any(|t| t == "ellipsis");
         }
         // CSS 2.1 `clip: rect(top, right, bottom, left)` — all four offsets
         // from the border-box top-left, so `rect(1px,1px,1px,1px)` is a
@@ -5947,6 +5959,23 @@ mod tests {
         assert_eq!(st("g").ow, Ow::Normal);
         assert_eq!(st("h").ow, Ow::Normal);
         assert!(!st("h").breaks_inside_words());
+    }
+
+    #[test]
+    fn text_overflow_ellipsis_is_a_box_flag() {
+        let sheet = parse(".a { text-overflow: ellipsis } .b { text-overflow: clip } \
+                           .c { overflow: hidden; text-overflow: ellipsis clip }");
+        let dom = dom_of("<div class=a></div><div class=b></div><div class=c></div>");
+        let st = |cls: &str| {
+            let node = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, node, Style::new(), None)
+        };
+        assert!(st("a").bx.ellipsis);
+        assert!(!st("a").bx.clip, "the marker alone does not clip");
+        assert!(!st("b").bx.ellipsis);
+        // the two-value form is accepted; `overflow` supplies the clip
+        assert!(st("c").bx.ellipsis);
+        assert!(st("c").bx.clip);
     }
 
     #[test]

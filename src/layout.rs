@@ -1968,7 +1968,7 @@ pub fn layout_in_forms(
     position_all(root, cb, cb, cb, false, measure, &mut runs, &mut uls);
     // clip runs/underline rects to ancestor overflow + clip:rect windows
     // (after position_all so shifts are final; ranges are complete)
-    apply_run_clips(root, None, &mut runs, &mut uls);
+    apply_run_clips(root, None, &mut runs, &mut uls, measure);
     // hover targets: box rects + each box's own runs. Before zsort — the
     // stable sort would invalidate the run_range indices this walks.
     let mut hover_targets = Vec::new();
@@ -2329,6 +2329,7 @@ fn apply_run_clips(
     clip: Option<(f32, f32, f32, f32)>,
     runs: &mut [PositionedRun],
     uls: &mut [UR],
+    measure: &dyn Fn(&str, &Style) -> f32,
 ) {
     if n.is_text {
         return; // text leaves hold no ranges (batched by their container)
@@ -2361,6 +2362,11 @@ fn apply_run_clips(
                 None => w,
             });
         }
+        // text-overflow: ellipsis trims the box's own line boxes to the
+        // right content edge and leaves a marker (see [`ellipsize_runs`])
+        if n.bx.ellipsis {
+            ellipsize_runs(runs, n.run_range, w.2, measure);
+        }
         let (a, b) = n.ul_range;
         for u in &mut uls[a as usize..b as usize] {
             // intersect in place — dropping would shift indices other
@@ -2381,7 +2387,53 @@ fn apply_run_clips(
         }
     }
     for ch in &n.children {
-        apply_run_clips(ch, content_clip, runs, uls);
+        apply_run_clips(ch, content_clip, runs, uls, measure);
+    }
+}
+
+/// `text-overflow: ellipsis`, applied per line: the run crossing the right
+/// content edge keeps the longest prefix that still leaves room for "…",
+/// later runs on that line become empty (they are outside the window
+/// anyway). Runs are never removed — other boxes' ranges index them.
+fn ellipsize_runs(
+    runs: &mut [PositionedRun],
+    range: (u32, u32),
+    right: f32,
+    measure: &dyn Fn(&str, &Style) -> f32,
+) {
+    let (a, b) = (range.0 as usize, range.1 as usize);
+    let mut cut_line: Option<f32> = None;
+    for r in &mut runs[a..b] {
+        if cut_line == Some(r.y) {
+            r.text.clear();
+            r.width = 0.0;
+            continue;
+        }
+        if r.x + r.width <= right + 0.01 {
+            continue;
+        }
+        if r.x >= right {
+            // starts outside the window: fully hidden
+            r.text.clear();
+            r.width = 0.0;
+            continue;
+        }
+        let avail = right - r.x;
+        let ew = measure("…", &r.style) + spacing_extra("…", &r.style);
+        if avail <= ew + 0.01 {
+            // not even the marker fits in this window
+            r.text.clear();
+            r.width = 0.0;
+        } else {
+            let keep = fit_prefix(&r.text, &r.style, avail - ew, measure);
+            let mut t = String::with_capacity(keep + 3);
+            t.push_str(&r.text[..keep]);
+            t.push('…');
+            // width of the kept prefix + marker, same spacing rule as layout
+            r.width = measure(&t, &r.style) + spacing_extra(&t, &r.style);
+            r.text = t;
+        }
+        cut_line = Some(r.y);
     }
 }
 
@@ -6686,6 +6738,40 @@ mod tests {
             node: None,
             cursor: None,
         }
+    }
+
+    /// `text-overflow: ellipsis` truncates the run crossing the right edge,
+    /// keeps the marker inside the window, and hides the runs after it on
+    /// that line; later lines are unaffected.
+    #[test]
+    fn ellipsis_trims_the_overflowing_line() {
+        fn run(text: &str, x: f32, y: f32, w: f32) -> PositionedRun {
+            PositionedRun {
+                x,
+                y,
+                text: text.into(),
+                style: Style::new(),
+                width: w,
+                link: None,
+                fixed: false,
+                clip: None,
+                node: None,
+                cursor: None,
+            }
+        }
+        let mut runs = vec![
+            run("abcdefghij", 0.0, 0.0, 100.0),
+            run("tail", 100.0, 0.0, 40.0),
+            run("next", 0.0, 20.0, 40.0),
+            run("cut", 70.0, 40.0, 30.0),
+        ];
+        // 10px per char, window right edge at 60px, ellipsis is one char
+        ellipsize_runs(&mut runs, (0, 4), 60.0, &|s, _| s.chars().count() as f32 * 10.0);
+        assert_eq!(runs[0].text, "abcde…");
+        assert!((runs[0].x + runs[0].width - 60.0).abs() < 0.01);
+        assert_eq!(runs[1].text, "", "runs after the cut on that line hide");
+        assert_eq!(runs[2].text, "next", "a later line that fits is untouched");
+        assert_eq!(runs[3].text, "", "a run starting outside the window hides");
     }
 
     #[test]
