@@ -2430,7 +2430,7 @@ fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<V
     Ok(Val::Func(Rc::new(Closure {
         def,
         env: e.global_env.clone(),
-        this: Val::Undefined,
+        this: None,
         is_arrow: false,
         props: RefCell::new(Vec::new()),
         proto: RefCell::new(None),

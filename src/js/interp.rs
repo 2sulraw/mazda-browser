@@ -200,7 +200,7 @@ fn make_closure(_e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, is_arrow: bool)
     Val::Func(Rc::new(Closure {
         def: f.clone(),
         env: env.clone(),
-        this: Val::Undefined,
+        this: None,
         is_arrow,
         props: RefCell::new(Vec::new()),
         proto: RefCell::new(None),
@@ -580,7 +580,7 @@ fn make_val_closure(e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, arrow: bool)
     Val::Func(Rc::new(Closure {
         def: f.clone(),
         env: env.clone(),
-        this: Val::Undefined,
+        this: None,
         is_arrow: arrow,
         props: RefCell::new(Vec::new()),
         proto: RefCell::new(None),
@@ -1513,7 +1513,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             let c = Rc::new(Closure {
                 def: f.clone(),
                 env: env.clone(),
-                this: Val::Undefined,
+                this: None,
                 is_arrow: false,
                 props: RefCell::new(Vec::new()),
                 proto: RefCell::new(None),
@@ -1528,7 +1528,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                 let c = Rc::new(Closure {
                     def: f.clone(),
                     env: fenv.clone(),
-                    this: Val::Undefined,
+                    this: None,
                     is_arrow: false,
                     props: RefCell::new(Vec::new()),
                     proto: RefCell::new(None),
@@ -1545,7 +1545,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             Ok(Val::Func(Rc::new(Closure {
                 def: f.clone(),
                 env: env.clone(),
-                this: lexical_this,
+                this: Some(Box::new(lexical_this)),
                 is_arrow: true,
                 props: RefCell::new(Vec::new()),
                 proto: RefCell::new(None),
@@ -2669,7 +2669,7 @@ pub(crate) fn call_method(
                     Ok(Val::Func(Rc::new(Closure {
                         def,
                         env: Env::root(),
-                        this: Val::Undefined,
+                        this: None,
                         is_arrow: false,
                         props: RefCell::new(Vec::new()),
                         proto: RefCell::new(None),

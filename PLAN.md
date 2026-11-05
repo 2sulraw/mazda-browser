@@ -1734,6 +1734,37 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 63 (JS allocation units) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The two hottest JS allocation units got smaller without changing behavior. `ObjKind`'s rare large payloads (`PromiseState` 56 B, `IterState` 40 B, `TypedArray` 32 B and an error's two fat name/message strings) now live behind one pointer each, so `ObjKind` falls from 56 to 32 bytes and `Obj` from 88 to 64 (−24 B for every object, including plain objects and arrays). Error name/message share one `Rc<ErrorData>`. `Param`'s optional destructuring pattern and default expression are boxed, so `Param` falls from 144 to 40 bytes (−104 B per parameter); the boxes allocate only when a function actually uses a default or pattern. A new size-guard test pins these ceilings. All 820 behavior tests still pass. References keep their exact geometry: nextjs 7578px / 569 runs / 153.2 MB, MDN 2773px / 641 runs / 87.3 MB, Wikipedia 24575px / 10950 runs / 102.5 MB, HN 1695px / 728 runs / 77.5 MB (67-83 MB across reloads), rust-lang 5800px / 483 runs / 84.9 MB; suite **821** default / **825** `engine-b + woff2` |
 
+| 2026-11-05 | wave 64 (`Stmt`/`Closure` size) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The AST statement and closure units got smaller. `StmtKind`'s inline expressions are now boxed: `if`/`while`/`do` tests, `for` condition and update, `for-in`/`for-of` sources, `switch` discriminant, `throw`/`return` values and a class accessor owner; `try`'s catch clause is boxed too. That drops `StmtKind` from 176 to 56 bytes and `Stmt` from 192 to 72 (−120 B, −62%) for every statement, with an extra allocation only on statements that actually carry one of those expressions. `Closure.this` is now an optional boxed value: only arrow functions store a captured `this`, so `Closure` falls from 112 to 96 bytes. The size-guard test pins both ceilings. All 820 behavior tests still pass. References keep their exact geometry at the default viewport: nextjs 7578px / 569 runs / 148.2 MB (down from 153.2), MDN 2773px / 641 runs / 86.9 MB, Wikipedia 24575px / 10950 runs / 102.4 MB, HN 1695px / 728 runs / 78.3 MB (within the usual 67-83 MB reload range), rust-lang 5800px / 483 runs / 84.7 MB at 1000x616 (a later window resize to 1920x948 produced the shorter 4979px relayout, so that number is not comparable); suite **821** default / **825** `engine-b + woff2` |
+
+### Wave 64 findings
+
+- **One inline expression set the size of every statement.** `StmtKind` was
+  176 B because `For` inlined two 80 B expressions while `If`, `Switch` and
+  `DefineAcc` each inlined one. Boxing those fields leaves a 56 B enum, so
+  expression statements, declarations, blocks and every other common
+  statement save 120 B each. The box is allocated only for a statement that
+  actually carries the expression.
+- **Box the rare per-statement payloads, not the statement.** Boxing the
+  whole `StmtKind` would have moved the same bytes to the heap and added an
+  allocation per statement; boxing only the large fields keeps the common
+  variants compact in the enclosing `Vec<Stmt>`.
+- **`try`'s catch clause was the next-largest variant.** `CatchClause`
+  (name plus a statement vector) is 32 B and appears once per `try`, so
+  boxing it brings `StmtKind` down to the 56 B `Export`/`DefineAcc` range.
+- **Only arrows need captured `this`.** `Closure.this` had exactly one read
+  (the arrow-call path) and every non-arrow constructor wrote
+  `Val::Undefined` into a 24 B slot. `Option<Box<Val>>` makes normal closures
+  pay 8 B and arrows allocate their captured value once.
+- **Measured.** `StmtKind` 176 -> 56 B, `Stmt` 192 -> 72 B (-62%),
+  `Closure` 112 -> 96 B; `Obj` stays 64 B and `Param` 40 B from wave 63.
+  nextjs.org's working set fell from 153.2 to 148.2 MB with identical
+  7578px / 569-run geometry; MDN, Wikipedia and Hacker News stayed within
+  their previous noise bands.
+- **Tradeoff.** Loop tests and branch conditions gain one indirection; the
+  test suite runtime is unchanged and the common statement path is smaller
+  and more cache-friendly. Normal closures lose no behavior because their
+  `this` still comes from the call site.
+
 ### Wave 63 findings
 
 - **Box the rare payloads, keep the common ones inline.** `ObjKind` is

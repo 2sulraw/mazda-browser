@@ -629,8 +629,8 @@ fn stmt_has_yield(s: &parser::Stmt) -> bool {
             parser::StmtKind::DoWhile { body, test } => w(body) || expr_has_yield(test),
             parser::StmtKind::For { init, cond, upd, body } => {
                 init.as_deref().map_or(false, w)
-                    || cond.as_ref().map_or(false, expr_has_yield)
-                    || upd.as_ref().map_or(false, expr_has_yield)
+                    || cond.as_ref().map_or(false, |x| expr_has_yield(x))
+                    || upd.as_ref().map_or(false, |x| expr_has_yield(x))
                     || w(body)
             }
             parser::StmtKind::ForIn { obj, body, .. } => {
@@ -658,7 +658,7 @@ fn stmt_has_yield(s: &parser::Stmt) -> bool {
                     || finally.as_ref().map_or(false, |f| f.iter().any(w))
             }
             parser::StmtKind::Throw(x) => expr_has_yield(x),
-            parser::StmtKind::Return(o) => o.as_ref().map_or(false, expr_has_yield),
+            parser::StmtKind::Return(o) => o.as_ref().map_or(false, |x| expr_has_yield(x)),
             // nested function bodies own their yields
             parser::StmtKind::FuncDecl(_) | parser::StmtKind::Break(_)
             | parser::StmtKind::Continue(_) => false,
@@ -818,7 +818,7 @@ fn step_stmt(
         }
         parser::StmtKind::While { test, body } => {
             vm.frames.push(GFrame::While {
-                test: Rc::new(test.clone()),
+                test: Rc::new((**test).clone()),
                 body: batch_of(body),
                 env: env.clone(),
             });
@@ -827,7 +827,7 @@ fn step_stmt(
         parser::StmtKind::DoWhile { body, test } => {
             vm.frames.push(GFrame::DoWhile {
                 first: true,
-                test: Rc::new(test.clone()),
+                test: Rc::new((**test).clone()),
                 body: batch_of(body),
                 env: env.clone(),
             });
@@ -846,8 +846,8 @@ fn step_stmt(
             }
             vm.frames.push(GFrame::For {
                 first: true,
-                cond: cond.as_ref().map(|c| Rc::new(c.clone())),
-                upd: upd.as_ref().map(|u| Rc::new(u.clone())),
+                cond: cond.as_ref().map(|c| Rc::new((**c).clone())),
+                upd: upd.as_ref().map(|u| Rc::new((**u).clone())),
                 body: batch_of(body),
                 env: lenv,
             });

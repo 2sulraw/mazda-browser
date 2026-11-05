@@ -511,8 +511,10 @@ pub(crate) enum ReactKind {
 pub struct Closure {
     pub def: Rc<FnDef>,
     pub env: Rc<Env>,
-    /// lexical `this`, captured by arrow functions at creation
-    pub this: Val,
+    /// lexical `this`, captured by arrow functions at creation. Boxed and
+    /// optional: normal functions get `this` from the call site, so only
+    /// arrows pay for the payload. `None` reads as `undefined`.
+    pub this: Option<Box<Val>>,
     pub is_arrow: bool,
     pub props: RefCell<Vec<(Rc<str>, Val)>>,
     /// [[Prototype]] of the function object itself (class `extends` sets it
@@ -1859,7 +1861,7 @@ impl JsEngine {
             Val::Func(c) => {
                 let env = Env::child(&c.env);
                 let this_val = if c.is_arrow {
-                    c.this.clone() // lexical this
+                    c.this.as_deref().cloned().unwrap_or(Val::Undefined) // lexical this
                 } else if matches!(this, Val::Undefined) {
                     // sloppy-mode: plain calls get the global object as this
                     Val::Obj(self.global_obj.clone())

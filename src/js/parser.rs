@@ -343,47 +343,47 @@ pub enum StmtKind {
     /// class desugaring emits a list of statements
     List(Vec<Stmt>),
     If {
-        test: Expr,
+        test: Box<Expr>,
         then: Box<Stmt>,
         other: Option<Box<Stmt>>,
     },
     While {
-        test: Expr,
+        test: Box<Expr>,
         body: Box<Stmt>,
     },
     DoWhile {
         body: Box<Stmt>,
-        test: Expr,
+        test: Box<Expr>,
     },
     For {
         init: Option<Box<Stmt>>,
-        cond: Option<Expr>,
-        upd: Option<Expr>,
+        cond: Option<Box<Expr>>,
+        upd: Option<Box<Expr>>,
         body: Box<Stmt>,
     },
     ForIn {
         kind: Option<VarKind>,
         target: ForTarget,
-        obj: Expr,
+        obj: Box<Expr>,
         body: Box<Stmt>,
     },
     ForOf {
         kind: Option<VarKind>,
         target: ForTarget,
-        iter: Expr,
+        iter: Box<Expr>,
         body: Box<Stmt>,
     },
     Switch {
-        disc: Expr,
+        disc: Box<Expr>,
         cases: Vec<SwitchCase>,
     },
     Try {
         block: Vec<Stmt>,
-        catch: Option<CatchClause>,
+        catch: Option<Box<CatchClause>>,
         finally: Option<Vec<Stmt>>,
     },
-    Throw(Expr),
-    Return(Option<Expr>),
+    Throw(Box<Expr>),
+    Return(Option<Box<Expr>>),
     /// `break;` / `break label;` (and continue likewise); the label is
     /// resolved by the enclosing `Label` statement or labeled loop
     Break(Option<Rc<str>>),
@@ -403,7 +403,7 @@ pub enum StmtKind {
     /// class accessor desugar: install a getter/setter pair on an object
     /// (`Object`-style, no full property-descriptor model — shortcut)
     DefineAcc {
-        owner: Expr,
+        owner: Box<Expr>,
         key: Rc<str>,
         getter: Option<Rc<FnDef>>,
         setter: Option<Rc<FnDef>>,
@@ -1126,7 +1126,11 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                StmtKind::If { test, then, other }
+                StmtKind::If {
+                    test: Box::new(test),
+                    then,
+                    other,
+                }
             }
             Tok::Kw(Kw::While) => {
                 self.next();
@@ -1134,7 +1138,10 @@ impl<'a> Parser<'a> {
                 let test = self.expr()?;
                 self.expect_punct(Punct::RParen)?;
                 let body = Box::new(self.statement()?);
-                StmtKind::While { test, body }
+                StmtKind::While {
+                    test: Box::new(test),
+                    body,
+                }
             }
             Tok::Kw(Kw::Do) => {
                 self.next();
@@ -1146,7 +1153,10 @@ impl<'a> Parser<'a> {
                 let test = self.expr()?;
                 self.expect_punct(Punct::RParen)?;
                 self.eat_punct(Punct::Semi); // optional per spec
-                StmtKind::DoWhile { body, test }
+                StmtKind::DoWhile {
+                    body,
+                    test: Box::new(test),
+                }
             }
             Tok::Kw(Kw::For) => {
                 self.next();
@@ -1162,12 +1172,22 @@ impl<'a> Parser<'a> {
                 match f {
                     ForHead::Classic { init, cond, upd } => StmtKind::For {
                         init,
-                        cond,
-                        upd,
+                        cond: cond.map(Box::new),
+                        upd: upd.map(Box::new),
                         body,
                     },
-                    ForHead::In { kind, target, obj } => StmtKind::ForIn { kind, target, obj, body },
-                    ForHead::Of { kind, target, iter } => StmtKind::ForOf { kind, target, iter, body },
+                    ForHead::In { kind, target, obj } => StmtKind::ForIn {
+                        kind,
+                        target,
+                        obj: Box::new(obj),
+                        body,
+                    },
+                    ForHead::Of { kind, target, iter } => StmtKind::ForOf {
+                        kind,
+                        target,
+                        iter: Box::new(iter),
+                        body,
+                    },
                 }
             }
             Tok::Kw(Kw::Switch) => {
@@ -1197,7 +1217,10 @@ impl<'a> Parser<'a> {
                     }
                     cases.push(SwitchCase { test, body });
                 }
-                StmtKind::Switch { disc, cases }
+                StmtKind::Switch {
+                    disc: Box::new(disc),
+                    cases,
+                }
             }
             Tok::Kw(Kw::Try) => {
                 self.next();
@@ -1217,7 +1240,7 @@ impl<'a> Parser<'a> {
                     };
                     self.expect_punct(Punct::LBrace)?;
                     let cbody = self.block_body()?;
-                    catch = Some(CatchClause { name, block: cbody });
+                    catch = Some(Box::new(CatchClause { name, block: cbody }));
                 }
                 if self.eat_kw(Kw::Finally) {
                     self.expect_punct(Punct::LBrace)?;
@@ -1239,7 +1262,7 @@ impl<'a> Parser<'a> {
                 }
                 let e = self.expr()?;
                 self.finish_stmt()?;
-                StmtKind::Throw(e)
+                StmtKind::Throw(Box::new(e))
             }
             Tok::Kw(Kw::Return) => {
                 self.next();
@@ -1253,7 +1276,7 @@ impl<'a> Parser<'a> {
                     Some(self.expr()?)
                 };
                 self.finish_stmt()?;
-                StmtKind::Return(v)
+                StmtKind::Return(v.map(Box::new))
             }
             Tok::Kw(Kw::Break) => {
                 self.next();
@@ -2017,7 +2040,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                     ClassItem::Accessor(key, getter, setter) => Stmt {
                         kind: StmtKind::DefineAcc {
-                            owner: if is_static { ident(&name) } else { proto_of(&name) },
+                            owner: Box::new(if is_static {
+                                ident(&name)
+                            } else {
+                                proto_of(&name)
+                            }),
                             key,
                             getter,
                             setter,
@@ -4024,8 +4051,8 @@ fn scan_stmt_arguments(s: &Stmt) -> bool {
         DoWhile { body, test } => scan_stmt_arguments(body) || scan_expr_arguments(test),
         For { init, cond, upd, body } => {
             init.as_deref().map_or(false, scan_stmt_arguments)
-                || cond.as_ref().map_or(false, scan_expr_arguments)
-                || upd.as_ref().map_or(false, scan_expr_arguments)
+                || cond.as_ref().map_or(false, |x| scan_expr_arguments(x))
+                || upd.as_ref().map_or(false, |x| scan_expr_arguments(x))
                 || scan_stmt_arguments(body)
         }
         ForIn { obj, body, .. } => scan_expr_arguments(obj) || scan_stmt_arguments(body),
@@ -4048,7 +4075,7 @@ fn scan_stmt_arguments(s: &Stmt) -> bool {
                     .map_or(false, |f| scan_uses_arguments_stmts(f))
         }
         Throw(e) => scan_expr_arguments(e),
-        Return(o) => o.as_ref().map_or(false, scan_expr_arguments),
+        Return(o) => o.as_ref().map_or(false, |x| scan_expr_arguments(x)),
         Break(_) | Continue(_) => false,
         Label { body, .. } => scan_stmt_arguments(body),
         // nested function bodies have their own `arguments`; don't descend

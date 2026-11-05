@@ -2841,10 +2841,11 @@ fn abort_signal_static_and_listener_removal() {
 
 #[test]
 fn js_allocation_units_stay_compact() {
-    // RAM guards for wave 63: the rare `ObjKind` payloads live behind one
-    // pointer and `Param`'s optional pattern/default are boxed, so ordinary
-    // objects and parameters stay small. Raise these ceilings only with a
-    // measured reason.
+    // RAM guards for waves 63-64: rare `ObjKind` payloads and statement
+    // expressions live behind pointers, and `Param`'s optional
+    // pattern/default are boxed, so ordinary objects, parameters, statements
+    // and closures stay small. Raise these ceilings only with a measured
+    // reason.
     assert!(
         std::mem::size_of::<ObjKind>() <= 32,
         "ObjKind grew to {} bytes",
@@ -2859,5 +2860,15 @@ fn js_allocation_units_stay_compact() {
         std::mem::size_of::<parser::Param>() <= 40,
         "Param grew to {} bytes",
         std::mem::size_of::<parser::Param>()
+    );
+    assert!(
+        std::mem::size_of::<parser::Stmt>() <= 72,
+        "Stmt grew to {} bytes",
+        std::mem::size_of::<parser::Stmt>()
+    );
+    assert!(
+        std::mem::size_of::<Closure>() <= 96,
+        "Closure grew to {} bytes",
+        std::mem::size_of::<Closure>()
     );
 }
