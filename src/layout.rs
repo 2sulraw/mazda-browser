@@ -2858,12 +2858,17 @@ fn box_xf(n: &BoxNode) -> Option<Xf> {
     let t = n.bx.transform?;
     let tx = resolve_len(t.tx, n.w);
     let ty = resolve_len(t.ty, n.h);
-    // p' = (p − c)·s + c + d  ⇔  p·s + (c(1 − s) + d), c = box center
+    // p' = (p − o)·s + o + d  ⇔  p·s + (o(1 − s) + d), where o is the
+    // transform origin (default = the box center).
+    let (ox, oy) = match n.bx.origin {
+        Some((x, y)) => (resolve_len(x, n.w), resolve_len(y, n.h)),
+        None => (n.w * 0.5, n.h * 0.5),
+    };
     Some(Xf {
         sx: t.sx,
         sy: t.sy,
-        tx: (n.x + n.w * 0.5) * (1.0 - t.sx) + tx,
-        ty: (n.y + n.h * 0.5) * (1.0 - t.sy) + ty,
+        tx: (n.x + ox) * (1.0 - t.sx) + tx,
+        ty: (n.y + oy) * (1.0 - t.sy) + ty,
     })
 }
 
@@ -11660,6 +11665,47 @@ line</textarea></div>"#,
         assert!(
             (run.style.size - plain_run.style.size).abs() < 0.01,
             "glyph size unchanged"
+        );
+    }
+
+    #[test]
+    fn transform_origin_moves_the_scale_anchor() {
+        let build = |css: &str| {
+            let mut root = boxes_of("<div class=t>head</div>", css);
+            layout_tree(&mut root, 400.0, &m4)
+        };
+        // scale(2) about the top-left corner pins that corner
+        let l = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;\
+             transform:scale(2);transform-origin:0 0}",
+        );
+        let r = l.rects.iter().find(|r| r.4 == 0xaabbcc).expect("bg");
+        assert!(
+            r.0.abs() < 0.01 && r.1.abs() < 0.01,
+            "pinned at origin: {r:?}"
+        );
+        assert!((r.2 - 200.0).abs() < 0.01 && (r.3 - 100.0).abs() < 0.01);
+        // the keyword spelling gives the same point
+        let kw = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;\
+             transform:scale(2);transform-origin:top left}",
+        );
+        let k = kw.rects.iter().find(|r| r.4 == 0xaabbcc).expect("bg");
+        assert!(
+            (k.0 - r.0).abs() < 0.01 && (k.1 - r.1).abs() < 0.01,
+            "top left = 0 0: {k:?} vs {r:?}"
+        );
+        // an explicit 50% 50% matches the undeclared default (center)
+        let d = build(
+            ".t{width:100px;min-height:50px;background:#aabbcc;\
+             transform:scale(2);transform-origin:50% 50%}",
+        );
+        let p = build(".t{width:100px;min-height:50px;background:#aabbcc;transform:scale(2)}");
+        let dr = d.rects.iter().find(|r| r.4 == 0xaabbcc).expect("bg");
+        let pr = p.rects.iter().find(|r| r.4 == 0xaabbcc).expect("bg");
+        assert!(
+            (dr.0 - pr.0).abs() < 0.01 && (dr.1 - pr.1).abs() < 0.01,
+            "50% 50% = center: {dr:?} vs {pr:?}"
         );
     }
 

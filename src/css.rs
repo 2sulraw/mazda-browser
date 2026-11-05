@@ -535,6 +535,10 @@ pub struct BoxStyle {
     /// CSS `transform` — visual-only paint transform of this box's
     /// rendering (see [`Transform`]); None = no transform
     pub transform: Option<Transform>,
+    /// CSS `transform-origin` — point the transform scales/translates about,
+    /// offset from the border box's top-left. `%` stays symbolic and resolves
+    /// against the box's own w/h at paint time. None = `50% 50%` (center).
+    pub origin: Option<(Len, Len)>,
     /// CSS `cursor` — pointer shape over this box. Inherited: layout
     /// threads the nearest ancestor's declared value down at build time,
     /// so a resolved box carries the effective value and None means
@@ -678,6 +682,7 @@ impl Default for BoxStyle {
             valign: VAlign::Baseline,
             z: None,
             transform: None,
+            origin: None,
             cursor: None,
             text_indent: Len::Px(0.0),
             table: TableRole::None,
@@ -1235,6 +1240,7 @@ const KNOWN: &[&str] = &[
     "height",
     "min-height",
     "max-height",
+    "transform-origin",
     "outline",
     "outline-width",
     "outline-style",
@@ -3115,6 +3121,10 @@ fn apply_decl(
             bx.z = if v == "auto" { None } else { v.parse::<i32>().ok() };
         }
         "transform" => bx.transform = parse_transform(&d.1, vp),
+        // `transform-origin` is independent of the shorthand: it can be
+        // declared before or after `transform` and works with the 2D
+        // translate/scale composite this engine paints.
+        "transform-origin" => bx.origin = parse_origin(&d.1, vp),
         // unknown keyword → None = the declaration is dropped and the
         // value inherits (see parse_cursor)
         "cursor" => bx.cursor = parse_cursor(&d.1),
@@ -3522,6 +3532,64 @@ fn parse_clip_rect(v: &str, vp: (f32, f32)) -> Option<[Len; 4]> {
 /// all reduce to the identity → None = no transform (byte-identical
 /// paint). `rotate()`/`skew()`/3D functions are consumed but contribute
 /// nothing (rasterizer is axis-aligned — see [`Transform`]).
+/// `transform-origin` — one or two values (a third z offset is accepted and
+/// ignored). Each value is a keyword (`left`/`center`/`right`,
+/// `top`/`center`/`bottom`) or a length/percentage. Keyword pairs may be
+/// written in either order (`top left` = `left top`); with a single value
+/// the other axis stays `center`. `%` resolves against the box's own w/h at
+/// paint time, so it stays a symbolic [`Len`] here. None = invalid/`revert`
+/// → the initial `50% 50%` (center).
+fn parse_origin(v: &str, vp: (f32, f32)) -> Option<(Len, Len)> {
+    let t = v.trim();
+    if t.is_empty()
+        || t.eq_ignore_ascii_case("initial")
+        || t.eq_ignore_ascii_case("unset")
+        || t.eq_ignore_ascii_case("revert")
+        || t.eq_ignore_ascii_case("revert-layer")
+    {
+        return None;
+    }
+    let toks = joined_tokens(t);
+    let val = |tok: &str| -> Option<Len> {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "left" | "top" => Some(Len::Pct(0.0)),
+            "center" => Some(Len::Pct(50.0)),
+            "right" | "bottom" => Some(Len::Pct(100.0)),
+            _ => parse_len(tok, vp),
+        }
+    };
+    let is_y_kw = |tok: &str| {
+        matches!(
+            tok.trim().to_ascii_lowercase().as_str(),
+            "top" | "bottom"
+        )
+    };
+    let (x, y) = match toks.len() {
+        0 => return None,
+        1 => {
+            let a = toks[0].as_str();
+            let l = val(a)?;
+            // a lone vertical keyword is the Y axis
+            if is_y_kw(a) {
+                (Len::Pct(50.0), l)
+            } else {
+                (l, Len::Pct(50.0))
+            }
+        }
+        _ => {
+            let a = toks[0].as_str();
+            let b = toks[1].as_str();
+            // `top left` / `bottom right` swap into (x, y)
+            if is_y_kw(a) && !is_y_kw(b) {
+                (val(b)?, val(a)?)
+            } else {
+                (val(a)?, val(b)?)
+            }
+        }
+    };
+    Some((x, y))
+}
+
 fn parse_transform(v: &str, vp: (f32, f32)) -> Option<Transform> {
     let mut t = Transform { tx: Len::Px(0.0), ty: Len::Px(0.0), sx: 1.0, sy: 1.0 };
     // additive accumulation for a translate axis: translations compose by
@@ -8650,6 +8718,36 @@ mod tests {
             bx("k").transform.expect("rotate + translate").tx,
             Len::Px(7.0)
         );
+    }
+
+    #[test]
+    fn transform_origin_parses_keywords_and_lengths() {
+        let sheet = parse(
+            ".a{transform-origin:top left}.b{transform-origin:20% 30%}\
+             .c{transform-origin:right}.d{transform-origin:10px bottom}\
+             .e{transform-origin:center}.f{transform-origin:revert}\
+             .g{transform-origin:bogus}.h{transform-origin:top 25%}\
+             .i{transform-origin:bottom right}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>",
+        );
+        let o = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx.origin
+        };
+        assert_eq!(o("a"), Some((Len::Pct(0.0), Len::Pct(0.0))), "top left");
+        assert_eq!(o("b"), Some((Len::Pct(20.0), Len::Pct(30.0))));
+        assert_eq!(o("c"), Some((Len::Pct(100.0), Len::Pct(50.0))), "y defaults center");
+        assert_eq!(o("d"), Some((Len::Px(10.0), Len::Pct(100.0))));
+        assert_eq!(o("e"), Some((Len::Pct(50.0), Len::Pct(50.0))));
+        assert_eq!(o("f"), None, "revert = initial center");
+        assert_eq!(o("g"), None, "garbage ignored");
+        // a vertical keyword first still claims the Y axis
+        assert_eq!(o("h"), Some((Len::Pct(25.0), Len::Pct(0.0))));
+        assert_eq!(o("i"), Some((Len::Pct(100.0), Len::Pct(100.0))));
     }
 
     // ---- background-size / background-position / background-repeat ----

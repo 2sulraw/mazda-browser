@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 132 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
+| CSS property names | 133 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,7 +151,7 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 132 |
+| Names in the engine's `KNOWN` table | 133 |
 | Additional accepted alias | 1 (`border-top-left-radius`) |
 | Raw missing (non-vendor) | ~630 |
 | Coverage (non-vendor) | ~16% |
@@ -176,7 +176,7 @@ ignored.
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
 | Fonts | 23 | `font`, `font-variant-*`, `font-kerning` | medium |
 | Grid & alignment | 16 | `align-content`, `justify-items`, `grid-row`, `grid-auto-flow` | high |
-| Transforms & motion paths | 15 | `transform-origin`, `perspective`, `offset-*` | medium |
+| Transforms & motion paths | 14 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
 | Backgrounds | 13 | `background-clip`, `background-origin`, `background-attachment` | medium |
 | Masking & clipping | 13 | `mask-border-*`, `mask-mode`, `mask-composite` | low |
@@ -263,10 +263,12 @@ relevant only when transitions and animations exist.
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
   Focus rings and custom checkbox states are therefore missing.
 - `var()` is a flat page-wide map, not a per-element cascade.
-- `caption-side`, `transform-origin`, `background-clip`, and `filter` are
-  absent. `overflow-wrap` / `word-break` now break inside words during line
-  layout, `text-overflow: ellipsis` marks a clipped line and `max-height`
-  caps a box (see the wave 49-51 notes); `hyphens` is not modeled.
+- `caption-side`, `background-clip`, and `filter` are absent.
+  `transform-origin` is honored for the translate/scale composite only (no
+  3D, and glyph size still does not scale — see the wave 53 notes);
+  `overflow-wrap` / `word-break` now break inside words during line layout,
+  `text-overflow: ellipsis` marks a clipped line and `max-height` caps a box
+  (see the wave 49-52 notes); `hyphens` is not modeled.
 - `direction`, `unicode-bidi`, and writing modes are absent.
 
 ---
@@ -387,7 +389,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 796 self-authored unit tests (800 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 798 self-authored unit tests (802 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -416,7 +418,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
 | P1 | live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 1-2 waves |
-| P1 | CSS `transform-origin`, `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
+| P1 | CSS `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
@@ -451,7 +453,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (132 + 1 alias)
+## Appendix A - CSS property names accepted (133 + 1 alias)
 
 ```text
 align-items, align-self, aspect-ratio, background
@@ -485,8 +487,9 @@ right, row-gap, stroke, stroke-linecap
 stroke-linejoin, stroke-opacity, stroke-width, table-layout
 text-align, text-decoration, text-decoration-line, text-indent
 text-overflow, text-transform, top, transform
-vertical-align, visibility, white-space, width
-word-break, word-spacing, word-wrap, z-index
+transform-origin, vertical-align, visibility, white-space
+width, word-break, word-spacing, word-wrap
+z-index
 ```
 
 `border-top-left-radius` is accepted as an alias of the corner-radius shorthand
@@ -520,8 +523,7 @@ Backgrounds and effects:
   background-blend-mode, filter, backdrop-filter, mix-blend-mode, isolation
 
 Transforms and motion:
-  transform-origin, transform-style, perspective, perspective-origin,
-  backface-visibility, rotate, scale, translate, transition,
+  transform-style, perspective, perspective-origin, backface-visibility, rotate, scale, translate, transition,
   transition-delay, transition-duration, transition-property,
   transition-timing-function, animation*, @keyframes (at-rule)
 
@@ -588,7 +590,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 132 names
+# Engine property table: 133 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 
