@@ -367,6 +367,253 @@ pub struct Transform {
     pub sy: f32,
 }
 
+/// A resolved `filter` value (CSS Filter Effects), collapsed into ONE
+/// affine colour transform: `out = m · rgb + off` on normalised sRGB, plus an
+/// alpha multiplier. Every supported shorthand function is affine, so a
+/// whole list composes into this struct and applying it to a painted
+/// primitive is three multiply-adds per pixel. `blur()`, `drop-shadow()` and
+/// `url()` are valid CSS but contribute nothing (no effects pipeline).
+/// shortcut: applied per primitive with the same ancestor composition as
+/// `opacity`, not as a real offscreen group: overlapping children can show
+/// through each other, and text keeps its geometry (a colour matrix, so
+/// glyph coverage is not blurred or shadowed).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Filter {
+    /// row-major 3×3, multiplied into the normalised RGB column
+    pub m: [f32; 9],
+    /// added after the matrix (normalised units)
+    pub off: [f32; 3],
+    /// multiplies the alpha of everything the filter touches
+    pub alpha: f32,
+}
+
+impl Filter {
+    pub const IDENTITY: Filter = Filter {
+        m: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        off: [0.0; 3],
+        alpha: 1.0,
+    };
+
+    /// the colour half is the identity (alpha may still differ)
+    fn rgb_identity(&self) -> bool {
+        self.m == Filter::IDENTITY.m && self.off == Filter::IDENTITY.off
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.rgb_identity() && (self.alpha - 1.0).abs() < 1e-6
+    }
+
+    /// `self` applied first, then `outer` (CSS list order: left to right).
+    pub fn then(&self, outer: &Filter) -> Filter {
+        let mut m = [0.0f32; 9];
+        for r in 0..3 {
+            for c in 0..3 {
+                m[r * 3 + c] = (0..3).map(|k| outer.m[r * 3 + k] * self.m[k * 3 + c]).sum();
+            }
+        }
+        let mut off = [0.0f32; 3];
+        for r in 0..3 {
+            off[r] = outer.m[r * 3] * self.off[0]
+                + outer.m[r * 3 + 1] * self.off[1]
+                + outer.m[r * 3 + 2] * self.off[2]
+                + outer.off[r];
+        }
+        Filter {
+            m,
+            off,
+            alpha: self.alpha * outer.alpha,
+        }
+    }
+
+    /// Transform an `0xRRGGBB` (or `0xAARRGGBB`) colour, leaving the high
+    /// byte untouched so the opacity packing survives.
+    pub fn apply_rgb(&self, c: u32) -> u32 {
+        if self.rgb_identity() {
+            return c;
+        }
+        let f = |shift: u32| ((c >> shift) & 0xff) as f32 / 255.0;
+        let (r, g, b) = (f(16), f(8), f(0));
+        let ch = |row: usize| {
+            let v = self.m[row * 3] * r + self.m[row * 3 + 1] * g + self.m[row * 3 + 2] * b
+                + self.off[row];
+            (v.clamp(0.0, 1.0) * 255.0).round() as u32
+        };
+        (c & 0xff00_0000) | (ch(0) << 16) | (ch(1) << 8) | ch(2)
+    }
+}
+
+/// Parse a `filter` value. The outer `None` = invalid (drop the declaration,
+/// keep an earlier filter); `Some(None)` = `none`/`initial`/identity (clear
+/// it); `Some(Some(f))` = one collapsed filter list.
+/// shortcut: `inherit`/`unset` clear instead of inheriting (filter is not an
+/// inherited property, and the cascade has no parent value here).
+fn parse_filter(v: &str) -> Option<Option<Filter>> {
+    let t = v.trim();
+    if t.is_empty()
+        || matches!(
+            t.to_ascii_lowercase().as_str(),
+            "none" | "initial" | "inherit" | "unset"
+        )
+    {
+        return Some(None);
+    }
+    let mut f = Filter::IDENTITY;
+    for tok in joined_tokens(t) {
+        let (name, arg) = match split_filter_fn(&tok) {
+            Some(x) => x,
+            None => return None,
+        };
+        // a missing amount is the spec's default of 1 (hue-rotate: 0deg)
+        let amt = |default: f32| -> Option<f32> {
+            if arg.is_empty() {
+                Some(default)
+            } else {
+                filter_amount(arg)
+            }
+        };
+        let func = match name {
+            // valid CSS, no colour effect here (see the Filter doc)
+            "blur" | "drop-shadow" | "url" => continue,
+            "grayscale" => {
+                let a = amt(1.0)?.clamp(0.0, 1.0);
+                let s = 1.0 - a;
+                Filter {
+                    m: [
+                        0.2126 + 0.7874 * s, 0.7152 - 0.7152 * s, 0.0722 - 0.0722 * s,
+                        0.2126 - 0.2126 * s, 0.7152 + 0.2848 * s, 0.0722 - 0.0722 * s,
+                        0.2126 - 0.2126 * s, 0.7152 - 0.7152 * s, 0.0722 + 0.9278 * s,
+                    ],
+                    off: [0.0; 3],
+                    alpha: 1.0,
+                }
+            }
+            "sepia" => {
+                let a = amt(1.0)?.clamp(0.0, 1.0);
+                let s = 1.0 - a;
+                Filter {
+                    m: [
+                        0.393 + 0.607 * s, 0.769 - 0.769 * s, 0.189 - 0.189 * s,
+                        0.349 - 0.349 * s, 0.686 + 0.314 * s, 0.168 - 0.168 * s,
+                        0.272 - 0.272 * s, 0.534 - 0.534 * s, 0.131 + 0.869 * s,
+                    ],
+                    off: [0.0; 3],
+                    alpha: 1.0,
+                }
+            }
+            "saturate" => {
+                let s = amt(1.0)?.max(0.0);
+                Filter {
+                    m: [
+                        0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s,
+                        0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s,
+                        0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s,
+                    ],
+                    off: [0.0; 3],
+                    alpha: 1.0,
+                }
+            }
+            "hue-rotate" => {
+                let deg = if arg.is_empty() {
+                    0.0
+                } else {
+                    filter_angle(arg)?
+                };
+                let (sin, cos) = deg.to_radians().sin_cos();
+                Filter {
+                    m: [
+                        0.213 + cos * 0.787 - sin * 0.213,
+                        0.715 - cos * 0.715 - sin * 0.715,
+                        0.072 - cos * 0.072 + sin * 0.928,
+                        0.213 - cos * 0.213 + sin * 0.143,
+                        0.715 + cos * 0.285 + sin * 0.140,
+                        0.072 - cos * 0.072 - sin * 0.283,
+                        0.213 - cos * 0.213 - sin * 0.787,
+                        0.715 - cos * 0.715 + sin * 0.715,
+                        0.072 + cos * 0.928 + sin * 0.072,
+                    ],
+                    off: [0.0; 3],
+                    alpha: 1.0,
+                }
+            }
+            "invert" => {
+                let a = amt(1.0)?.clamp(0.0, 1.0);
+                let d = 1.0 - 2.0 * a;
+                Filter {
+                    m: [d, 0.0, 0.0, 0.0, d, 0.0, 0.0, 0.0, d],
+                    off: [a, a, a],
+                    alpha: 1.0,
+                }
+            }
+            "opacity" => Filter {
+                alpha: amt(1.0)?.clamp(0.0, 1.0),
+                ..Filter::IDENTITY
+            },
+            "brightness" => {
+                let a = amt(1.0)?.max(0.0);
+                Filter {
+                    m: [a, 0.0, 0.0, 0.0, a, 0.0, 0.0, 0.0, a],
+                    off: [0.0; 3],
+                    alpha: 1.0,
+                }
+            }
+            "contrast" => {
+                let a = amt(1.0)?.max(0.0);
+                let o = 0.5 - 0.5 * a;
+                Filter {
+                    m: [a, 0.0, 0.0, 0.0, a, 0.0, 0.0, 0.0, a],
+                    off: [o, o, o],
+                    alpha: 1.0,
+                }
+            }
+            _ => return None,
+        };
+        f = f.then(&func);
+    }
+    Some(if f.is_identity() { None } else { Some(f) })
+}
+
+/// `name(args)` → (`name`, `args`) for whitespace-joined filter tokens.
+fn split_filter_fn(tok: &str) -> Option<(&str, &str)> {
+    let open = tok.find('(')?;
+    let name = &tok[..open];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let arg = tok[open + 1..].strip_suffix(')')?;
+    Some((name, arg.trim()))
+}
+
+/// A filter amount: plain number or percentage (`250%` = 2.5).
+fn filter_amount(s: &str) -> Option<f32> {
+    let t = s.trim();
+    let n = match t.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f32>().ok()? / 100.0,
+        None => t.parse::<f32>().ok()?,
+    };
+    n.is_finite().then_some(n)
+}
+
+/// A filter angle in degrees (`deg`, `grad`, `rad`, `turn`, bare 0).
+fn filter_angle(s: &str) -> Option<f32> {
+    let t = s.trim().to_ascii_lowercase();
+    for (suffix, mul) in [
+        ("deg", 1.0),
+        ("grad", 0.9),
+        ("rad", 180.0 / std::f32::consts::PI),
+        ("turn", 360.0),
+    ] {
+        if let Some(n) = t.strip_suffix(suffix) {
+            let v = n.trim().parse::<f32>().ok()? * mul;
+            return v.is_finite().then_some(v);
+        }
+    }
+    if t == "0" {
+        Some(0.0)
+    } else {
+        None
+    }
+}
+
 /// `outline` — a ring painted OUTSIDE the border box (never inside, never in
 /// layout). Only "is it drawn", a width, an optional colour and an offset are
 /// modeled: every non-`none` style renders as a solid ring (`dotted`,
@@ -620,6 +867,12 @@ pub struct BoxStyle {
     /// semi-transparent box can show through each other. `0` hides the whole
     /// subtree (the cascade turns it into `display:none`).
     pub opacity: f32,
+    /// `filter` — a visual colour transform applied to this box's own
+    /// primitives (see [`Filter`] for the shortcuts). After the box tree is
+    /// built, layout composes ancestors into the EFFECTIVE filter stored
+    /// here, so an inner box carries `own.then(ancestor)` and needs no
+    /// second field. None = no filter.
+    pub filter: Option<std::sync::Arc<Filter>>,
     /// CSS `float` — out-of-flow box placed at the current line's edge
     /// (layout.rs `block()`)
     pub float: Float,
@@ -793,6 +1046,7 @@ impl Default for BoxStyle {
             inset: [None; 4],
             shadows: Vec::new(),
             opacity: 1.0,
+            filter: None,
             float: Float::None,
             clear: Clear::None,
             valign: VAlign::Baseline,
@@ -1343,6 +1597,7 @@ const KNOWN: &[&str] = &[
     "display",
     "content",
     "opacity",
+    "filter",
     "text-align",
     "flex-direction",
     "flex-flow",
@@ -2827,6 +3082,14 @@ fn apply_decl(
             let v = v.clamp(0.0, 1.0);
             bx.opacity = v;
             return v <= 0.0;
+        }
+        // `filter` — collapse the shorthand list into one affine colour
+        // transform (see [`Filter`]). Invalid lists are dropped whole, like
+        // a browser; `none`/an identity list clears an earlier declaration.
+        "filter" => {
+            if let Some(f) = parse_filter(&d.1) {
+                bx.filter = f.map(std::sync::Arc::new);
+            }
         }
         // shortcut: hidden/collapse treated as display:none (real CSS keeps
         // the box in flow — usually fine, sites use it on off-screen
@@ -10007,6 +10270,76 @@ mod tests {
             bx("k").transform.expect("rotate + translate").tx,
             Len::Px(7.0)
         );
+    }
+
+    #[test]
+    fn filter_parses_and_collapses_into_a_colour_matrix() {
+        let sheet = parse(
+            ".a{filter:none}.b{filter:grayscale(1)}.c{filter:invert(1)}\
+             .d{filter:brightness(50%)}.e{filter:contrast(200%)}\
+             .f{filter:opacity(25%)}.g{filter:blur(2px) grayscale(1)}\
+             .h{filter:url(#x)}.i{filter:bogus}.j{filter:grayscale(0)}\
+             .k{filter:grayscale(1);filter:none}\
+             .m{filter:grayscale(1);filter:grayscale(bogus)}\
+             .n{filter:grayscale(1) grayscale(1)}\
+             .o{filter:sepia(100%)}.p{filter:saturate(2)}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>\
+             <div class=j></div><div class=k></div><div class=m></div>\
+             <div class=n></div><div class=o></div><div class=p></div>",
+        );
+        let fl = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx.filter.map(|f| *f)
+        };
+        // no filter / unsupported-only / identity list = the initial value
+        assert_eq!(fl("a"), None);
+        assert_eq!(fl("h"), None, "url() is valid but contributes nothing");
+        assert_eq!(fl("j"), None, "grayscale(0) is the identity");
+        // grayscale(1) red = its luminance (~54) on every channel
+        assert_eq!(fl("b").expect("grayscale").apply_rgb(0xff_0000), 0x36_3636);
+        assert_eq!(fl("c").expect("invert").apply_rgb(0xff_0000), 0x00_ffff);
+        assert_eq!(fl("d").expect("brightness").apply_rgb(0xff_ffff), 0x80_8080);
+        let e = fl("e").expect("contrast").apply_rgb(0x80_8080) & 0xff;
+        assert!((e as i32 - 128).abs() <= 1, "mid grey stays mid grey, got {e}");
+        assert!((fl("f").expect("opacity").alpha - 0.25).abs() < 1e-6);
+        // an unsupported function is skipped, not fatal to the list
+        assert_eq!(fl("g").expect("blur + grayscale").apply_rgb(0xff_0000), 0x36_3636);
+        // garbage drops the declaration; a later valid one still applies
+        assert_eq!(fl("k"), None, "later none clears the earlier filter");
+        assert!(fl("m").is_some(), "invalid declaration keeps the earlier filter");
+        assert!(fl("o").is_some() && fl("p").is_some());
+        // grayscale twice = grayscale once (idempotent matrix)
+        let twice = fl("n").expect("two grayscales");
+        assert_eq!(twice.apply_rgb(0xff_0000), 0x36_3636);
+    }
+
+    #[test]
+    fn filter_list_order_and_alpha_multiply() {
+        // white through brightness(50%) then invert(1): one affine pass, so
+        // the composed matrix is -0.5x + 1 = 0.5 (128). The reverse order is
+        // white -> black -> black, so order matters.
+        let sheet = parse(
+            ".a{filter:brightness(50%) invert(1)}\
+             .b{filter:invert(1) brightness(50%)}\
+             .c{filter:opacity(50%) opacity(50%)}\
+             .d{filter:brightness(1.2) contrast(250%) hue-rotate(180deg)}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>",
+        );
+        let fl = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx.filter.map(|f| *f)
+        };
+        let a = fl("a").expect("a");
+        assert_eq!(a.apply_rgb(0xff_ffff), 0x80_8080);
+        assert_eq!(fl("b").expect("b").apply_rgb(0xff_ffff), 0x00_0000);
+        assert!((fl("c").expect("c").alpha - 0.25).abs() < 1e-6);
+        assert!(fl("d").is_some(), "percentages and angle accepted");
     }
 
     #[test]

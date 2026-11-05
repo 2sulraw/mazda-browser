@@ -5,8 +5,8 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide, Clear,
-    Cursor, Dir, Display, Float, Gradient, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole,
-    Track, TrackBreadth, VAlign, VarScope,
+    Cursor, Dir, Display, Filter, Float, Gradient, Justify, Len, ObjFit, Pos, PseudoEl, Sheet,
+    TableRole, Track, TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -835,22 +835,61 @@ pub fn build_scoped(
     if let Some(a) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::After) {
         root.children.push(a);
     }
-    apply_opacity(&mut root, 1.0);
+    apply_effects(&mut root, 1.0, None);
     root
 }
 
-/// Compose `opacity` down the built box tree: every box carries its own
-/// declared value and inherits the product of its ancestors'. shortcut: the
-/// effective value is applied to each primitive at paint time, not as a true
-/// group composite (an element and its children do not render into one
-/// offscreen layer first), which is cheap and correct for the common
-/// single-child fade but lets overlapping siblings of a translucent parent
-/// show through each other.
-fn apply_opacity(n: &mut BoxNode, parent: f32) {
-    let op = (parent * n.bx.opacity).clamp(0.0, 1.0);
+/// Compose `opacity` and `filter` down the built box tree: every box carries
+/// its own declared values and inherits the product of its ancestors'.
+/// shortcut: the effective values are applied to each primitive at paint
+/// time, not as a true group composite (an element and its children do not
+/// render into one offscreen layer first), which is cheap and correct for
+/// the common single-child fade but lets overlapping siblings of a
+/// translucent/filtered parent show through each other. The filter's colour
+/// matrix is ALSO baked into the box's used `style.color`, so text runs and
+/// decorations (which read `style.color`) follow it without carrying a
+/// filter of their own.
+fn apply_effects(n: &mut BoxNode, parent: f32, parent_filt: Option<&Filter>) {
+    // the box's own filter is applied to its rendering first, then the
+    // ancestor's (CSS list order is inner-before-outer)
+    let declared = n.bx.filter.take();
+    // alpha is applied exactly once per declaration: the ancestor's share is
+    // already in `parent`, so only this box's own filter alpha joins now.
+    let own_alpha = declared.as_ref().map_or(1.0, |f| f.alpha);
+    let filt = match (&declared, parent_filt) {
+        (None, None) => None,
+        (Some(f), None) => Some(f.clone()),
+        (None, Some(p)) => Some(std::sync::Arc::new(*p)),
+        (Some(f), Some(p)) => Some(std::sync::Arc::new(f.as_ref().then(p))),
+    };
+    let op = (parent * n.bx.opacity).clamp(0.0, 1.0) * own_alpha;
     n.eff = op;
+    if let Some(f) = filt.as_deref() {
+        n.style.color = f.apply_rgb(n.style.color);
+        // an explicit decoration colour is not inherited, so filter it here
+        // (currentcolor is already covered by `color`)
+        if let Some(c) = n.style.deco_color {
+            n.style.deco_color = Some(f.apply_rgb(c));
+        }
+    }
+    // hand the descendants the RGB half only — an alpha already folded into
+    // `op` must not multiply again at every level
+    let mut eff = filt;
+    if let Some(f) = eff.as_deref() {
+        if (f.alpha - 1.0).abs() > 1e-6 {
+            let mut neutral = *f;
+            neutral.alpha = 1.0;
+            eff = if neutral.is_identity() {
+                None
+            } else {
+                Some(std::sync::Arc::new(neutral))
+            };
+        }
+    }
+    n.bx.filter = eff;
+    let child_filt = n.bx.filter.as_deref();
     for c in &mut n.children {
-        apply_opacity(c, op);
+        apply_effects(c, op, child_filt);
     }
 }
 
@@ -870,6 +909,26 @@ fn with_alpha(color: u32, op: f32) -> u32 {
     } else {
         ((a.max(1) as u32) << 24) | (color & 0x00ff_ffff)
     }
+}
+
+/// Apply a box's effective filter to a solid colour (no-op without one).
+fn filt_color(color: u32, f: Option<&Filter>) -> u32 {
+    match f {
+        Some(f) => f.apply_rgb(color),
+        None => color,
+    }
+}
+
+/// Filter a gradient through its STOPS. A colour matrix is affine, so
+/// transforming each stop is the same as transforming every interpolated
+/// pixel (up to the 0..1 clamp) and costs one pass per gradient instead of
+/// per pixel.
+fn filter_gradient(g: &Gradient, f: &Filter) -> std::sync::Arc<Gradient> {
+    let mut g = g.clone();
+    for s in &mut g.stops {
+        s.color = f.apply_rgb(s.color);
+    }
+    std::sync::Arc::new(g)
 }
 
 /// Synthetic child for `background-image` — it rides the existing `<img>`
@@ -935,6 +994,9 @@ fn paints_chrome(bx: &BoxStyle) -> bool {
         // that declares one needs a real box (plain inline flow would
         // flatten it away and lose the clip)
         || bx.clip_path.is_some()
+        // a filter is inherited by the box's whole rendering; flattening the
+        // inline would drop the effect (the common icon-span pattern)
+        || bx.filter.is_some()
         // a baseline shift (`<sub>`/`<sup>`, numeric vertical-align) is
         // applied by inline placement, which only sees real inline boxes
         || matches!(bx.valign, VAlign::Sub | VAlign::Super | VAlign::Len(_))
@@ -1857,8 +1919,17 @@ pub struct Layout {
     /// gradient instead of its (sentinel) color. Sharing the rect channel
     /// keeps z-order, sticky spans and transforms exact for free.
     pub rect_grad: Vec<Option<std::sync::Arc<Gradient>>>,
-    /// decoded `<img>` boxes (x, y, w, h, pixels, fixed) — drawn under text
-    pub images: Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool, u8)>,
+    /// decoded `<img>` boxes (x, y, w, h, pixels, fixed, alpha, filter) — drawn under text
+    pub images: Vec<(
+        f32,
+        f32,
+        f32,
+        f32,
+        std::rc::Rc<ImageData>,
+        bool,
+        u8,
+        Option<std::sync::Arc<Filter>>,
+    )>,
     /// box-shadows (under backgrounds), paint order = list order
     pub shadows: Vec<ShadowRect>,
     /// true if the last line still has content on it (no trailing <br>) —
@@ -2254,7 +2325,7 @@ fn collect_forms(
                     n.y + bt + pt,
                     1.0,
                     caret_h,
-                    with_alpha(FORM_ACCENT, n.eff),
+                    with_alpha(filt_color(FORM_ACCENT, n.bx.filter.as_deref()), n.eff),
                     fixed,
                 ));
             }
@@ -2650,12 +2721,28 @@ fn collect_paint(
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     out_g: &mut Vec<Option<std::sync::Arc<Gradient>>>,
     out_z: &mut Vec<i32>,
-    imgs: &mut Vec<(f32, f32, f32, f32, std::rc::Rc<ImageData>, bool, u8)>,
+    imgs: &mut Vec<(
+        f32,
+        f32,
+        f32,
+        f32,
+        std::rc::Rc<ImageData>,
+        bool,
+        u8,
+        Option<std::sync::Arc<Filter>>,
+    )>,
     img_z: &mut Vec<i32>,
     shadows: &mut Vec<ShadowRect>,
     sticky: &mut Vec<StickyGroup>,
 ) {
     if !n.is_text {
+        // a fully transparent subtree paints nothing. `opacity: 0` already
+        // becomes display:none in the cascade, but `filter: opacity(0)` only
+        // reaches here as an effective 0 — and the packed-alpha convention
+        // reserves a 0 high byte for "unpacked/opaque", so skip explicitly.
+        if n.eff <= 0.0 {
+            return;
+        }
         let fixed = fixed || n.bx.pos == Pos::Fixed;
         // sticky box declaring `top`: open its group window BEFORE any of
         // this subtree's pushes (runs/uls come from the box's ranges) —
@@ -2699,9 +2786,18 @@ fn collect_paint(
         let bb = resolve_len(n.bx.border[2], n.w);
         let bl = resolve_len(n.bx.border[3], n.w);
         let has_b = bt > 0.0 || br > 0.0 || bb > 0.0 || bl > 0.0;
-        // currentcolor: unspecified border color = the element's text color
-        let bc = n.bx.bcolor.unwrap_or(n.style.color);
+        // currentcolor: unspecified border color = the element's text color,
+        // which `apply_effects` already filtered — an explicit border color
+        // still needs the filter applied here
+        let bc = match n.bx.bcolor {
+            Some(c) => filt_color(c, n.bx.filter.as_deref()),
+            None => n.style.color,
+        };
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
+        // this box's effective filter (own + ancestors) — applied to every
+        // primitive it emits; text reads it through the already-filtered
+        // `style.color`
+        let f = n.bx.filter.as_deref();
         // a LIVE mask placeholder on this box (slot not de-slotted — the
         // budget cap may have dropped it) REPLACES the box's own
         // background: the bg-color rect below and the background-image
@@ -2736,7 +2832,10 @@ fn collect_paint(
         // resolves to currentcolor when unspecified, alpha from the color
         for s in &n.bx.shadows {
             let sp = s.spread;
-            let c = s.color.unwrap_or(n.style.color);
+            let c = match s.color {
+                Some(c) => filt_color(c, f),
+                None => n.style.color, // currentcolor, already filtered
+            };
             let alpha = s.alpha as u32;
             // shortcut: culled against the un-blurred rect — blur may bleed
             // a few px past a clip edge (approximation, not spec-exact);
@@ -2781,7 +2880,7 @@ fn collect_paint(
             for (x, y, w, h, color, rad) in rects {
                 let (x, y, w, h) = m.map_rect((x, y, w, h));
                 if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
-                    out.push((x, y, w, h, with_alpha(color, n.eff), rad * m.sx.abs(), fixed));
+                    out.push((x, y, w, h, with_alpha(filt_color(color, f), n.eff), rad * m.sx.abs(), fixed));
                     out_g.push(None);
                     out_z.push(z);
                 }
@@ -2796,6 +2895,10 @@ fn collect_paint(
         if let Some(g) = n.bx.bg_gradient.clone().filter(|_| !masked) {
             let (x, y, w, h) = m.map_rect((n.x, n.y, n.w, n.h));
             if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
+                let g = match f {
+                    Some(f) => filter_gradient(&g, f),
+                    None => g,
+                };
                 out.push((x, y, w, h, with_alpha(u32::MAX, n.eff), r * m.sx.abs(), fixed));
                 out_g.push(Some(g));
                 out_z.push(z);
@@ -2830,7 +2933,10 @@ fn collect_paint(
             let ow = n.bx.outline.w;
             if ow > 0.0 {
                 let off = n.bx.outline.offset;
-                let oc = n.bx.outline.color.unwrap_or(n.style.color);
+                let oc = match n.bx.outline.color {
+                    Some(c) => filt_color(c, f),
+                    None => n.style.color, // currentcolor, already filtered
+                };
                 let x = n.x - off - ow;
                 let y = n.y - off - ow;
                 let ww = n.w + (off + ow) * 2.0;
@@ -2905,7 +3011,7 @@ fn collect_paint(
                             for kx in kx0..kx0 + cols {
                                 let t = m.map_rect((n.x + kx as f32 * tw, n.y + ky as f32 * th, tw, th));
                                 if let Some(q) = cull_rect(t, win) {
-                                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed, eff_alpha(n.eff)));
+                                    imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed, eff_alpha(n.eff), n.bx.filter.clone()));
                                     img_z.push(z);
                                 }
                             }
@@ -2923,7 +3029,7 @@ fn collect_paint(
                             (Some(a), None) => Some(a),
                         };
                         if let Some(q) = cull_rect(q, win) {
-                            imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed, eff_alpha(n.eff)));
+                            imgs.push((q.0, q.1, q.2, q.3, d.clone(), fixed, eff_alpha(n.eff), n.bx.filter.clone()));
                             img_z.push(z);
                         }
                     }
@@ -10300,6 +10406,97 @@ mod tests {
     }
 
     #[test]
+    fn filter_filters_own_primitives_and_composes_down_the_tree() {
+        // the box's own background and its descendant text are both
+        // inverted, because the filter composes into every primitive
+        let dom = crate::html::parse(
+            r#"<div id=a><span id=b style="color:#ff0000">x</span></div>"#,
+        );
+        let sheet = crate::css::parse(
+            "#a{width:60px;height:20px;background:#ff0000;color:#ff0000;\
+                border:2px solid;filter:invert(1)}\
+             #b{font-size:10px}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        // #a's background rect: red inverted = cyan, fully opaque
+        assert!(
+            l.rects.iter().any(|r| r.4 == 0x00_ffff && r.2 == 60.0),
+            "inverted background rect is cyan: {:?}",
+            l.rects
+        );
+        // currentcolor borders ride the already-filtered text colour; a
+        // second application would turn them back to red
+        assert!(
+            !l.rects.iter().any(|r| r.4 & 0x00ff_ffff == 0xff_0000),
+            "no primitive keeps the pre-filter red: {:?}",
+            l.rects
+        );
+        // the text inherits the ancestor filter: red -> cyan
+        let run = l.runs.iter().find(|r| r.text == "x").expect("text run");
+        assert_eq!(run.style.color, 0x00_ffff, "text colour filtered");
+        // the box tree carries the effective filter for image emission
+        let a = &root.children[0];
+        assert!(a.bx.filter.is_some(), "root of the subtree keeps its filter");
+        assert!(
+            a.children.iter().any(|c| c.bx.filter.is_some()),
+            "the filter composes into descendants"
+        );
+    }
+
+    #[test]
+    fn filter_on_a_plain_inline_promotes_it_to_a_box() {
+        // without chrome the inline would flatten into the parent's text and
+        // lose its filter; `paints_chrome` keeps a real box for it
+        let dom = crate::html::parse(
+            r#"<p><span style="filter:invert(1);color:#ff0000">solo</span></p>"#,
+        );
+        let sheet = crate::css::parse("");
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let run = l.runs.iter().find(|r| r.text == "solo").expect("run");
+        assert_eq!(run.style.color, 0x00_ffff, "the inline's filter survives");
+    }
+
+    #[test]
+    fn filter_transforms_gradient_stops_and_alpha() {
+        let dom = crate::html::parse(r#"<div id=a>y</div>"#);
+        let sheet = crate::css::parse(
+            "#a{width:40px;height:10px;background:linear-gradient(90deg, red, blue);\
+                filter:invert(1)}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let g = l.rect_grad.iter().flatten().next().expect("gradient");
+        let colors: Vec<u32> = g.stops.iter().map(|s| s.color).collect();
+        assert_eq!(colors, vec![0x00_ffff, 0xff_ff00], "red/blue inverted");
+        // `filter: opacity()` rides the packed alpha like `opacity`
+        let dom2 = crate::html::parse(r#"<div id=a>y</div>"#);
+        let sheet2 = crate::css::parse(
+            "#a{width:40px;height:10px;background:#000;filter:opacity(50%)}",
+        );
+        let mut root2 = build(&dom2, dom2.body_root(), Style::new(), BoxStyle::default(), &sheet2);
+        let l2 = layout_tree(&mut root2, 300.0, &m4);
+        let rect = l2.rects.iter().find(|r| r.4 & 0xffffff == 0).expect("bg rect");
+        assert_eq!(rect.4 >> 24, 128, "50% alpha packed into the colour");
+        assert_eq!(l2.runs[0].alpha, 128, "and into the text run");
+    }
+
+    #[test]
+    fn filter_opacity_zero_paints_nothing() {
+        let dom = crate::html::parse(r#"<div id=a>gone</div>"#);
+        let sheet = crate::css::parse(
+            "#a{width:40px;height:10px;background:#f00;filter:opacity(0)}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 300.0, &m4);
+        assert!(
+            !l.rects.iter().any(|r| r.2 == 40.0 && r.3 == 10.0),
+            "a fully transparent filtered box emits no rect"
+        );
+    }
+
+    #[test]
     fn floated_inline_span_gets_a_box_and_flows_as_a_float() {
         // end-to-end: parse → build → layout. A floated <span> blockifies
         // into its own box (it would otherwise flatten into the parent's
@@ -12862,7 +13059,7 @@ line</textarea></div>"#,
         content.img = Some(ImgSlot::Ready(img));
         let l = layout_tree(&mut root, 500.0, &m4);
         assert_eq!(l.images.len(), 2, "bg + content img");
-        let (x, y, w, h, _, _, _) = l.images[0];
+        let (x, y, w, h, _, _, _, _) = l.images[0];
         assert_eq!((x, y, w, h), (0.0, 0.0, 2.0, 1.0), "natural size at padding-box origin");
         // z-order: the bg entry precedes the content image; text runs draw
         // after ALL images in render(), so the text sits on top

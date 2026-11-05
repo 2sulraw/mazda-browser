@@ -2754,8 +2754,17 @@ struct PageWire {
     rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     /// parallel to `rects`: Some = paint that rect as a gradient
     rect_grad: Vec<Option<std::sync::Arc<css::Gradient>>>,
-    /// x, y, w, h, pixels (owned), fixed, effective opacity
-    images: Vec<(f32, f32, f32, f32, image::ImageData, bool, u8)>,
+    /// x, y, w, h, pixels (owned), fixed, effective opacity, filter
+    images: Vec<(
+        f32,
+        f32,
+        f32,
+        f32,
+        image::ImageData,
+        bool,
+        u8,
+        Option<std::sync::Arc<css::Filter>>,
+    )>,
     shadows: Vec<layout::ShadowRect>,
     /// sticky pinning records — the UI thread applies them per frame in
     /// `render` (indexes into the channels above, so they ride along)
@@ -2852,14 +2861,14 @@ fn page_to_wire(
             .laid
             .images
             .into_iter()
-            .map(|(x, y, w, h, img, fixed, alpha)| {
+            .map(|(x, y, w, h, img, fixed, alpha, filter)| {
                 // freshly decoded per page: refcount is 1, but be safe
                 let owned = std::rc::Rc::try_unwrap(img).unwrap_or_else(|rc| image::ImageData {
                     w: rc.w,
                     h: rc.h,
                     px: rc.px.clone(),
                 });
-                (x, y, w, h, owned, fixed, alpha)
+                (x, y, w, h, owned, fixed, alpha, filter)
             })
             .collect(),
         shadows: p.laid.shadows,
@@ -2906,7 +2915,9 @@ fn wire_to_page(w: PageWire) -> Page {
             images: w
                 .images
                 .into_iter()
-                .map(|(x, y, w, h, img, fixed, alpha)| (x, y, w, h, std::rc::Rc::new(img), fixed, alpha))
+                .map(|(x, y, w, h, img, fixed, alpha, filter)| {
+                    (x, y, w, h, std::rc::Rc::new(img), fixed, alpha, filter)
+                })
                 .collect(),
             shadows: w.shadows,
             sticky: w.sticky,
@@ -4883,7 +4894,16 @@ fn decode_images(
             // and nothing retained, so no budget is charged
             if let Some(Some((img, draw))) = slot {
                 *budget -= px;
-                laid.images.push((draw.0, draw.1, draw.2, draw.3, img, fixed, layout::eff_alpha(n.eff)));
+                laid.images.push((
+                    draw.0,
+                    draw.1,
+                    draw.2,
+                    draw.3,
+                    img,
+                    fixed,
+                    layout::eff_alpha(n.eff),
+                    n.bx.filter.clone(),
+                ));
                 count += 1;
             }
         }
@@ -6012,7 +6032,7 @@ fn render(
             paint_solid_rect(buf, width, height, sx, sy, w, h, r, rgb, alpha);
         }
         // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
-        for (i, (x, y, w, h, img, fixed, ialpha)) in laid.images.iter().enumerate() {
+        for (i, (x, y, w, h, img, fixed, ialpha, filt)) in laid.images.iter().enumerate() {
             if *fixed != want_fixed {
                 continue;
             }
@@ -6034,7 +6054,10 @@ fn render(
                         continue;
                     }
                     let u = (dx as f32 * img.w as f32 / w) as u32;
-                    let c = img.px[(v * img.w + u) as usize];
+                    let mut c = img.px[(v * img.w + u) as usize];
+                    if let Some(f) = filt.as_deref() {
+                        c = f.apply_rgb(c);
+                    }
                     let a = ((c >> 24) as u16 * *ialpha as u16 / 255) as u8;
                     let idx = py as usize * width + px as usize;
                     if a == 255 {
@@ -7082,6 +7105,7 @@ mod tests {
                 }),
                 false,
                 255,
+                None,
             )],
             shadows: vec![layout::ShadowRect {
                 x: 9.0,
@@ -8258,8 +8282,8 @@ mod tests {
         let drawn = laid
             .images
             .first()
-            .map(|(_, _, _, _, img, _, _)| (img.w, img.h, img.px.clone()));
-        let rcs = laid.images.iter().map(|(.., img, _, _)| img.clone()).collect();
+            .map(|(_, _, _, _, img, _, _, _)| (img.w, img.h, img.px.clone()));
+        let rcs = laid.images.iter().map(|e| e.4.clone()).collect();
         (probed, skipped, dims, drawn, rcs)
     }
 

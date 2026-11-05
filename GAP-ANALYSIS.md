@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 164 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 165 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 164 |
+| Names in the engine's `KNOWN` table | 165 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~589 |
+| Raw missing (non-vendor) | ~588 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -183,7 +183,7 @@ handled, but the paint model still applies one radius to every corner.
 | Box, display & positioning | 11 | `appearance`, `all`, `float-offset` | medium |
 | Color & theming | 9 | `accent-color`, `caret-color`, `caret-shape` | low-medium |
 | Lists | 6 | `list-style-image`, `marker-*` | low |
-| Filters & compositing | 5 | `filter`, `backdrop-filter`, `mix-blend-mode` | high for visual parity |
+| Filters & compositing | 4 | `backdrop-filter`, `mix-blend-mode` | high for visual parity |
 | Tables | 0 | - | low |
 | Flexbox | 1 | `flex-line-count` | low |
 
@@ -285,7 +285,14 @@ relevant only when transitions and animations exist.
   declaration). `font-size` also accepts the absolute-size keywords
   (`xx-small`…`xxx-large`, `larger`, `smaller`), and `line-height` accepts
   unitless, px/em/rem/%, viewport units and `normal`.
-- `background-clip` and `filter` are absent.
+- `filter` supports the shorthand colour functions (`grayscale`, `sepia`,
+  `saturate`, `hue-rotate`, `invert`, `opacity`, `brightness`, `contrast`)
+  collapsed into one affine RGB matrix plus an alpha multiplier. `blur`,
+  `drop-shadow` and `url()` references are accepted but have no effect, and
+  the result is applied per primitive (own background/border/outline/shadow/
+  gradient/image and text ink) rather than as a real offscreen group, so
+  overlapping children of a filtered parent can show through each other.
+  `background-clip` and `backdrop-filter` are absent.
   `transform-origin` is honored for the translate/scale composite formed by
   `transform`, `translate` and `scale` (no 3D; `rotate` parses but paints
   unrotated, and glyph size still does not scale — see the wave 53 notes);
@@ -417,7 +424,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 832 self-authored unit tests (836 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 838 self-authored unit tests (842 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -440,8 +447,9 @@ names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
 `filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
-waves 67-68 took the top visual items off it (individual `translate`/`scale`,
-then the `font` shorthand). The DOM/JS half is still open.
+waves 67-69 took the top visual items off it (individual `translate`/`scale`,
+the `font` shorthand, then the `filter` colour functions). The DOM/JS half is
+still open.
 
 ### 8.2 Priority by reference impact and RAM cost
 
@@ -450,7 +458,7 @@ then the `font` shorthand). The DOM/JS half is still open.
 | P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands | all six | negligible (dev-only) | CSS done, JS next |
 | P0 (done) | Shrink JS AST/env/object types (waves 63-64: `Obj` 88 to 64 B, `Param` 144 to 40 B, `Stmt` 192 to 72 B, `Closure` 112 to 96 B) | directly serves the success metric; wave 44 saved 36 MB on one workload and waves 63-64 cut ~5 MB off nextjs.org | all | negative (saves) | done |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
-| P2 | `background-clip`, `filter`/`mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
+| P2 | `background-clip`, `mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
 
@@ -484,7 +492,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (164)
+## Appendix A - CSS property names accepted (165)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -500,7 +508,7 @@ border-top-width, border-width, bottom
 box-shadow, box-sizing, caption-side, clear, clip
 clip-path, color, color-scheme, column-gap
 content, cursor, display, fill
-fill-opacity, fill-rule, flex, flex-basis
+fill-opacity, fill-rule, filter, flex, flex-basis
 flex-direction, flex-flow, flex-grow, flex-shrink
 flex-wrap, float, font, font-family, font-size
 font-style, font-weight, gap, grid-area
@@ -553,7 +561,7 @@ Text and typography:
 
 Backgrounds and effects:
   background-clip, background-origin, background-attachment,
-  background-blend-mode, filter, backdrop-filter, mix-blend-mode, isolation
+  background-blend-mode, backdrop-filter, mix-blend-mode, isolation
 
 Transforms and motion:
   transform-style, perspective, perspective-origin, backface-visibility, transition,

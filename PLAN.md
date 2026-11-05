@@ -1744,6 +1744,49 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 68 (the `font` shorthand + size keywords) | a local font-shorthand page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The largest remaining visual miss (80 declarations on MDN) is implemented. `font` parses `[style || variant || weight || stretch]? size [/ line-height]? family`, sets size, line-height, style, weight and family together, and resets the components it omits; a value that doesn't parse (including a missing family) and the system keywords are dropped whole, so earlier longhands survive. The family tail goes through the existing comma-stack interner, so `font: 16px Arial, sans-serif` and `font-family: Arial, sans-serif` share one id. Size detection distinguishes a bare weight (`700`) from a size (only a unit, `%`, a size keyword or `0` is a size), and all three slash spellings (`16px/1.5`, `16px /1.5`, `16px / 1.5`) work. `font-size` gains the absolute-size keywords (`xx-small`…`xxx-large`, `larger`/`smaller`), and `line-height` moved to one helper that now accepts unitless, px/em/rem/%, viewport units and `normal`. A local page verifies 24px/1.5 → a 36px box, `700 1.2rem` → 19.2px with the line-height reset, `2vw/2` → 20px/40px, and the invalid `700 16px` (no family) skipped. Dropped-name counts fall to 90 on nextjs.org, 16 on MDN, 30 on Wikipedia and 9 on rust-lang.org. Wikipedia's total height changes from 24575 to 24673 because its `line-height: 1.4em` declarations now resolve (previously they fell back to the 1.35 default); the other references keep their heights: nextjs 7578px / 569 runs / 149.2 MB, MDN 2773 / 641 / 87.1 MB, Wikipedia 24673 / 10951 / 103.5 MB, HN 1695 / 720 / 78.4 MB, rust-lang 5800 / 483 / 85.0 MB; suite **832** default / **836** `engine-b + woff2` |
 
+| 2026-11-06 | wave 69 (`filter` colour functions) | a local filter page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The other top visual miss is implemented. `filter` parses its function list into a single affine RGB map plus one alpha multiplier, so `grayscale`, `sepia`, `saturate`, `hue-rotate`, `invert`, `opacity`, `brightness` and `contrast` compose exactly and in order without a per-pixel function dispatch. `blur`, `drop-shadow` and `url()` are parsed and dropped (no offscreen buffer yet). One post-build pass composes each box's filter with its ancestors' into the same effective state that already carries `opacity`; the filter's alpha goes into that effective alpha once, while the stored RGB map is normalised to alpha 1 so children do not double-apply it. Every primitive the box emits is transformed: solid background/border/outline/shadow colours at layout emission, gradient stops as filtered clones (the affine map commutes with interpolation), images per pixel in the render blit, and text/underline colours by mutating the leaf's style before build. A filtered plain inline is promoted to a real box so icon-span filters paint. `filter: opacity(0)` early-outs all of that box's primitives. Dropped-name counts fall to 89 on nextjs.org, 15 on MDN, 29 on Wikipedia, 3 on Hacker News and stay at 9 on rust-lang.org (no `filter` there); zero `filter` declarations remain in `MAZDA_MISS`. References keep identical geometry: nextjs 7578px / 569 runs / 147-148 MB, MDN 2773 / 641 / 77-88 MB, Wikipedia 24673 / 10951 / 101-103 MB, HN 1695 / 720 / 67-78 MB, rust-lang 5800 / 483 / 77-85 MB (RAM is noisy between runs); suite **838** default / **842** `engine-b + woff2` |
+
+### Wave 69 findings
+
+- **Collapse the list at parse time.** A filter chain is a composition of
+  affine RGB maps interleaved with alpha multipliers, and that family is
+  closed under composition. `parse_filter` folds the whole value into one
+  `Filter { m: [f32; 9], off: [f32; 3], alpha: f32 }`, so runtime application
+  is nine multiplies, three adds and one alpha scale per colour - no function
+  list, no per-pixel branch. It also makes `stops` filtering exact: an affine
+  map commutes with the linear interpolation a gradient performs, so
+  filtering each stop is the same as filtering the ramp.
+- **One effective state, two channels.** `apply_effects` (renamed from
+  `apply_opacity`) walks the tree and composes `own.then(ancestor)`: a child's
+  filter runs before its parent's. RGB maps multiply that way; alpha does not
+  compose the same way, because the ancestor's alpha is already owed to the
+  child's output. So each box folds only its own filter alpha into `n.eff`
+  and stores the accumulated map with alpha normalised back to 1 for its
+  children. Applying the map and then `n.eff` once per primitive is what keeps
+  nested filters from double-darkening.
+- **Filtered inlines must become boxes.** The painter draws plain inline text
+  directly from the text leaf, with no box of its own to hang a filter on.
+  `paints_chrome` now returns true when `bx.filter` is set, reusing the same
+  promotion path as backgrounds and borders. Without it, the common
+  icon-filter pattern on a bare `<span>` silently drops the filter.
+- **Per primitive is honest but not a real group.** Colours, gradients,
+  images and text each pass through the filter, but there is no offscreen
+  composite, so overlapping children of a filtered parent blend with each other
+  instead of being filtered as one flattened image. `blur()` and
+  `drop-shadow()` need that buffer and stay no-ops; `backdrop-filter` is not
+  modelled. This is recorded as a `shortcut:` comment.
+- **Measured.** Local page: inverted text paints cyan (`0x00ffff`), grayscale
+  black is `0x363636`, `brightness(0) invert(1)` is white, `hue-rotate` gives
+  `0x006d6d`, a filtered gradient runs cyan to yellow, `opacity(0.5)` over
+  black packs as `0x80000000`, nested filters compose, and a filtered PNG is
+  cyan; `MAZDA_MISS` reports zero dropped `filter` names. Dropped-name totals:
+  89 (nextjs.org), 15 (MDN), 29 (Wikipedia), 3 (Hacker News), 9
+  (rust-lang.org). All five reference heights and run counts are unchanged.
+  Suite **838** default / **842** `engine-b + woff2`.
+- **Next in the queue.** `backdrop-filter` (needs the offscreen group this
+  wave skipped), `text-shadow`, `background-clip`, `place-items`/`place-self`;
+  transitions only if animation is ever required.
+
 ### Wave 68 findings
 
 - **A shorthand must reset, so it parses into its own struct first.** `font`
