@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 141 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
+| CSS property names | 142 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -185,7 +185,7 @@ ignored.
 | Color & theming | 9 | `accent-color`, `caret-color`, `caret-shape` | low-medium |
 | Lists | 6 | `list-style-image`, `marker-*` | low |
 | Filters & compositing | 5 | `filter`, `backdrop-filter`, `mix-blend-mode` | high for visual parity |
-| Tables | 1 | `caption-side` | low |
+| Tables | 0 | - | low |
 | Flexbox | 1 | `flex-line-count` | low |
 
 ### 4.2 Selectors
@@ -264,7 +264,7 @@ relevant only when transitions and animations exist.
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
   Focus rings and custom checkbox states are therefore missing.
 - `var()` is a flat page-wide map, not a per-element cascade.
-- `caption-side`, `background-clip`, and `filter` are absent.
+- `background-clip` and `filter` are absent.
   `transform-origin` is honored for the translate/scale composite only (no
   3D, and glyph size still does not scale — see the wave 53 notes);
   `overflow-wrap` / `word-break` now break inside words during line layout,
@@ -390,7 +390,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 807 self-authored unit tests (811 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 809 self-authored unit tests (813 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -419,7 +419,6 @@ and visual impact. That turns this document from a wish list into a work queue.
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
 | P1 | live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 1-2 waves |
-| P1 | CSS `caption-side` | frequent declarations with a small parser | some pages | low | 1 wave |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
@@ -454,7 +453,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (141 + 1 alias)
+## Appendix A - CSS property names accepted (142 + 1 alias)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -462,7 +461,7 @@ background, background-color, background-image, background-position, background-
 background-size, border, border-bottom, border-collapse
 border-color, border-left, border-radius, border-right
 border-spacing, border-top, border-width, bottom
-box-shadow, box-sizing, clear, clip
+box-shadow, box-sizing, caption-side, clear, clip
 clip-path, color, color-scheme, column-gap
 content, cursor, display, fill
 fill-opacity, fill-rule, flex, flex-basis
@@ -532,7 +531,7 @@ Scrolling and interaction:
   appearance
 
 Tables, columns, generated content:
-  caption-side, empty-cells, column-count, column-width, column-fill,
+  empty-cells, column-count, column-width, column-fill,
   column-span, column-rule, columns, counter-increment, counter-reset,
   counter-set, list-style-image, marker-start, marker-mid, marker-end
 
@@ -589,7 +588,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 141 names
+# Engine property table: 142 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 

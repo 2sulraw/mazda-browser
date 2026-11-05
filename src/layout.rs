@@ -4,8 +4,8 @@
 //! `block()`); upgrade when a real CSS engine lands (Phase 1b+).
 
 use crate::css::{
-    content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, Clear, Cursor,
-    Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track,
+    content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide, Clear,
+    Cursor, Dir, Display, Float, Justify, Len, ObjFit, Pos, PseudoEl, Sheet, TableRole, Track,
     TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
@@ -3180,7 +3180,8 @@ type CB = (f32, f32, f32, f32);
 // paints on top) rather than the spec's border-style/width cell comparison.
 // The table's OWN border is not folded into the grid: it keeps its box at
 // the table edge while the cells collapse against each other.
-// `caption-side: bottom` is unsupported (captions always render above).
+// `caption-side: top`/`bottom` places captions above or below the grid;
+// horizontal `inline-start`/`inline-end` are not modeled.
 
 /// One row of the table grid and where its cells sit.
 struct TRow {
@@ -3566,11 +3567,12 @@ fn table_plan(
 }
 
 /// Lay out a `table` box's content (called from `place` with `n.x`/`n.y` at
-/// the content origin and `n.w` the content width). Captions render first
-/// (above), then head rows, body rows, foot rows; each row's height is its
-/// tallest cell and shorter cells fill the row, aligning their content per
-/// `vertical-align` (`baseline` renders as top -- shortcut: first-line
-/// baseline alignment across cells is not modeled).
+/// the content origin and `n.w` the content width). Captions render above
+/// (default) or below per `caption-side`, then head rows, body rows, foot
+/// rows; each row's height is its tallest cell and shorter cells fill the
+/// row, aligning their content per `vertical-align` (`baseline` renders as
+/// top -- shortcut: first-line baseline alignment across cells is not
+/// modeled).
 fn table_layout(
     n: &mut BoxNode,
     measure: &dyn Fn(&str, &Style) -> f32,
@@ -3592,10 +3594,20 @@ fn table_layout(
         resolve_len(n.bx.border_spacing[1], n.w)
     };
     let (nx, nw) = (n.x, n.w);
-    // captions above the grid (in child order)
+    // `caption-side`: a caption's own declaration wins, else it inherits the
+    // table's (CSS marks the property inherited; the cascade here keeps
+    // BoxStyle per element, so resolve the fallback at layout time).
+    let cap_sides: Vec<Option<CaptionSide>> = n
+        .children
+        .iter()
+        .map(|c| {
+            (c.bx.table == TableRole::Caption)
+                .then(|| c.bx.caption_side.or(n.bx.caption_side).unwrap_or(CaptionSide::Top))
+        })
+        .collect();
     let mut y = n.y;
     for i in 0..n.children.len() {
-        if n.children[i].bx.table == TableRole::Caption {
+        if cap_sides[i] == Some(CaptionSide::Top) {
             let adv = place(&mut n.children[i], nx, y, nw, measure, runs, uls, flt);
             y += adv;
         }
@@ -3688,6 +3700,13 @@ fn table_layout(
             g.w = nw;
             g.y = top;
             g.h = bot - top;
+        }
+    }
+    // bottom captions sit after the last row (and its bottom spacing)
+    for i in 0..n.children.len() {
+        if cap_sides[i] == Some(CaptionSide::Bottom) {
+            let adv = place(&mut n.children[i], nx, y, nw, measure, runs, uls, flt);
+            y += adv;
         }
     }
     n.h = y - n.y;
@@ -13230,6 +13249,41 @@ line</textarea></div>"#,
         assert!(!captions.is_empty());
         assert!(captions[0].y < tbody.y, "caption above the rows");
         assert!(tfoot.y > tbody.y, "tfoot after the body rows");
+    }
+
+    #[test]
+    fn caption_side_places_the_caption_below_the_grid() {
+        let build = |table_css: &str, cap_css: &str| {
+            let html = format!(
+                r#"<table style="{table_css}"><caption style="{cap_css}">cap</caption><tbody><tr><td>x</td></tr></tbody></table>"#
+            );
+            let mut root = boxes_of(&html, "");
+            layout_tree(&mut root, 300.0, &m4);
+            let t = &root.children[0];
+            let cap = t
+                .children
+                .iter()
+                .find(|c| c.bx.table == crate::css::TableRole::Caption)
+                .expect("caption box");
+            let body = t
+                .children
+                .iter()
+                .find(|c| c.bx.table == crate::css::TableRole::Body)
+                .expect("tbody box");
+            (cap.y, body.y, body.h, t.h)
+        };
+        let (cy, by, _, th) = build("", "");
+        assert!(cy < by, "default caption above: cap {cy}, body {by}");
+        let (cy2, by2, bh2, th2) = build("caption-side:bottom", "");
+        assert!(
+            cy2 >= by2 + bh2,
+            "bottom caption below the rows: cap {cy2}, body end {}",
+            by2 + bh2
+        );
+        assert!((th2 - th).abs() < 0.01, "total height unchanged: {th} vs {th2}");
+        // the caption's own declaration wins over the table's
+        let (cy3, by3, _, _) = build("caption-side:bottom", "caption-side:top");
+        assert!(cy3 < by3, "caption-side:top on the caption overrides the table");
     }
 
     // ---- typography: text-transform / letter-spacing / word-spacing /

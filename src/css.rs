@@ -107,6 +107,14 @@ pub enum TableRole {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CaptionSide {
+    /// `top` / `block-start` (the initial value): caption above the grid
+    Top,
+    /// `bottom` / `block-end`: caption below the grid
+    Bottom,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Dir {
     Row,
     Column,
@@ -431,6 +439,9 @@ pub struct BoxStyle {
     /// `justify-self` — one grid item's override of `justify-items`.
     /// `auto` = None (inherit the container's value).
     pub justify_self: Option<Align>,
+    /// `caption-side` — where a `<caption>` sits relative to its table.
+    /// None = inherit the table's value (initial `Top`).
+    pub caption_side: Option<CaptionSide>,
     /// per-slot auto margins (`margin-left/right: auto`) — CSS: both auto →
     /// center, left-auto-only → push right, right-auto-only → hug left.
     /// `margin_x_auto` stays the shorthand "both auto" centering flag (the
@@ -664,6 +675,7 @@ impl Default for BoxStyle {
             align_self: None,
             justify_items: Align::Stretch,
             justify_self: None,
+            caption_side: None,
             margin_l_auto: false,
             margin_r_auto: false,
             pad: [Len::Px(0.0); 4],
@@ -1241,6 +1253,7 @@ const KNOWN: &[&str] = &[
     "align-self",
     "justify-items",
     "justify-self",
+    "caption-side",
     "flex-wrap",
     "flex-shrink",
     "flex-basis",
@@ -2673,6 +2686,15 @@ fn apply_decl(
             } else {
                 parse_inline_align(t)
             };
+        }
+        // `caption-side` (inherited): where a table caption sits. Horizontal
+        // `inline-start`/`inline-end` are not modeled, so they are ignored.
+        "caption-side" => {
+            bx.caption_side = match d.1.trim() {
+                "top" | "block-start" => Some(CaptionSide::Top),
+                "bottom" | "block-end" => Some(CaptionSide::Bottom),
+                _ => bx.caption_side,
+            }
         }
         "justify-content" => {
             bx.justify = parse_content_pos(&d.1).unwrap_or(Justify::Start);
@@ -8286,6 +8308,25 @@ mod tests {
         let sheet0 = parse(".a { flex: 0 }");
         let z = sheet0.resolve(&dom, by_attr(&dom, "class", "a"), Style::new(), None).bx;
         assert_eq!((z.grow, z.basis), (0.0, None), "flex: 0 = grow 0, basis auto");
+    }
+
+    #[test]
+    fn caption_side_parses_and_ignores_inline_axis() {
+        let sheet = parse(
+            ".t { caption-side: bottom } .c { caption-side: top } \
+             .i { caption-side: inline-end } .b { caption-side: block-end }",
+        );
+        let dom = dom_of(
+            "<table class=t></table><caption class=c></caption>\
+             <table class=i></table><table class=b></table>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("t").caption_side, Some(CaptionSide::Bottom));
+        assert_eq!(bx("c").caption_side, Some(CaptionSide::Top));
+        // horizontal inline-axis values have no top/bottom meaning here
+        assert_eq!(bx("i").caption_side, None);
+        assert_eq!(bx("b").caption_side, Some(CaptionSide::Bottom));
+        assert_eq!(BoxStyle::default().caption_side, None);
     }
 
     #[test]
