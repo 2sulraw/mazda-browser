@@ -550,6 +550,28 @@ impl DomHost {
             .collect()
     }
 
+    /// `document.getElementsByClassName`: elements carrying all the
+    /// whitespace-separated class names, in document order.
+    pub fn by_class(&self, names: &str) -> Vec<u32> {
+        crate::script::class_all_dom(self.dom_ref(), None, names)
+    }
+
+    /// `element.getElementsByClassName`: same match over the subtree of
+    /// `root` (the root element itself is excluded, per spec).
+    pub fn subtree_class(&self, root: u32, names: &str) -> Vec<u32> {
+        crate::script::class_all_dom(self.dom_ref(), Some(root), names)
+    }
+
+    /// `element.getElementsByTagName`: tags in the subtree of `root`
+    /// (root excluded; `"*"` = all descendants).
+    pub fn subtree_tag(&self, root: u32, name: &str) -> Vec<u32> {
+        let dom = self.dom_ref();
+        crate::script::subtree_elements_dom(dom, root)
+            .into_iter()
+            .filter(|&i| name == "*" || dom.tag(i).eq_ignore_ascii_case(name))
+            .collect()
+    }
+
     /// First `<html>` element (documentElement wrapper source). Only the
     /// engine-core adapter needs it (A reads this at page setup).
     #[cfg(feature = "engine-b")]

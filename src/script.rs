@@ -49,7 +49,9 @@
 //!   custom elements and `link`/`meta` work); created nodes are inert until
 //!   appended (no fetch, no stylesheet application for a created `<link>`).
 //!   `getElementsByTagName(name)` returns a document-order snapshot array
-//!   (`"*"` = every element), not a live collection.
+//!   (`"*"` = every element), not a live collection. `getElementsByClassName`
+//!   matches elements carrying all the whitespace-separated names (document
+//!   order; empty = nothing; on an element, descendants only).
 //! - reflected attribute props (`id`, `className`, `href`, `src`, `rel`,
 //!   `as`, `crossOrigin`, `nonce`, `name`, `title`, `alt`, `target`, `media`,
 //!   `integrity`, `referrerPolicy`) are live accessors on every element
@@ -244,6 +246,8 @@ fn wrap_element(node: u32) -> Val {
     o.set("getElementById", js::Val::Native(n.el_get_element));
     o.set("querySelector", js::Val::Native(n.el_query));
     o.set("querySelectorAll", js::Val::Native(n.el_query_all));
+    o.set("getElementsByClassName", js::Val::Native(n.el_get_by_class));
+    o.set("getElementsByTagName", js::Val::Native(n.el_get_by_tag));
     o.set("appendChild", js::Val::Native(n.el_append));
     o.set("append", js::Val::Native(n.el_append)); // shortcut: element args only
     o.set("remove", js::Val::Native(n.el_remove));
@@ -364,11 +368,14 @@ struct Nids {
     doc_cookie_get: usize,
     doc_cookie_set: usize,
     doc_get_by_tag: usize,
+    doc_get_by_class: usize,
     /// one native per `REFLECTED` entry (accessor pair halves)
     reflect: [usize; REFLECTED.len()],
     el_get_element: usize,
     el_query: usize,
     el_query_all: usize,
+    el_get_by_class: usize,
+    el_get_by_tag: usize,
     el_append: usize,
     el_set_attr: usize,
     el_get_attr: usize,
@@ -452,6 +459,55 @@ pub(crate) fn all_elements_dom(dom: &Dom) -> Vec<u32> {
         .collect()
 }
 
+/// Every element node in the subtree of `root` (root excluded, document
+/// order). Text and the `#document` sentinel are skipped.
+pub(crate) fn subtree_elements_dom(dom: &Dom, root: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack: Vec<u32> = dom
+        .nodes
+        .get(root as usize)
+        .map(|n| n.children.clone())
+        .unwrap_or_default();
+    while let Some(n) = stack.pop() {
+        let tag = dom.tag(n);
+        if tag != "#text" && tag != "#document" {
+            out.push(n);
+        }
+        if let Some(node) = dom.nodes.get(n as usize) {
+            for &c in node.children.iter().rev() {
+                stack.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// `getElementsByClassName` matches: elements carrying ALL the
+/// whitespace-separated class names. `root` limits the search to that
+/// element's descendants (`None` = whole document). An empty name list
+/// matches nothing (spec); class names compare case-sensitively.
+/// `pub(crate)`: the shared DomHost delegates to this canonical copy.
+pub(crate) fn class_all_dom(dom: &Dom, root: Option<u32>, names: &str) -> Vec<u32> {
+    let want: Vec<&str> = names.split_whitespace().collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let pool = match root {
+        Some(r) => subtree_elements_dom(dom, r),
+        None => all_elements_dom(dom),
+    };
+    pool.into_iter()
+        .filter(|&i| {
+            dom.attr(i, "class")
+                .map(|c| {
+                    let have: Vec<&str> = c.split_whitespace().collect();
+                    want.iter().all(|w| have.contains(w))
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 /// Simple-selector matches over the whole document (document order).
 /// `pub(crate)`: the shared DomHost delegates to this canonical copy.
 pub(crate) fn query_all_dom(dom: &Dom, sel: &str) -> Vec<u32> {
@@ -493,6 +549,7 @@ const D_CREATE_ELEMENT: u16 = 3;
 const D_COOKIE_GET: u16 = 4;
 const D_COOKIE_SET: u16 = 5;
 const D_GET_ELEMENTS_BY_TAG: u16 = 6;
+const D_GET_ELEMENTS_BY_CLASS: u16 = 7;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -526,6 +583,10 @@ const E_REMOVE: u16 = 37;
 const E_CAN_PLAY: u16 = 38;
 const E_MEDIA_PLAY: u16 = 39;
 const E_MEDIA_NOOP: u16 = 40;
+/// `getElementsByClassName` on an element (descendants only)
+const E_GET_ELEMENTS_BY_CLASS: u16 = 41;
+/// `getElementsByTagName` on an element (descendants only)
+const E_GET_ELEMENTS_BY_TAG: u16 = 42;
 /// location group idxs
 const L_ASSIGN: u16 = 30;
 const L_RELOAD: u16 = 31;
@@ -606,6 +667,12 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
                 js::Val::new_array(h.by_tag(&name).into_iter().map(wrap_element).collect())
             }))
         }
+        D_GET_ELEMENTS_BY_CLASS => {
+            let names = sel.unwrap_or_default();
+            Ok(runtime::host(|h| {
+                js::Val::new_array(h.by_class(&names).into_iter().map(wrap_element).collect())
+            }))
+        }
         // the `document.cookie` accessor pair; the plain get/setCookie
         // methods still exist for internal callers (module header)
         D_COOKIE_GET => Ok(runtime::host(|h| str_val(&h.cookie_get()))),
@@ -663,6 +730,28 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
             let Some(sel) = a0.as_string() else { return Ok(js::Val::new_array(vec![])) };
             Ok(runtime::host(|h| {
                 js::Val::new_array(h.subtree_all(node, &sel).into_iter().map(wrap_element).collect())
+            }))
+        }
+        E_GET_ELEMENTS_BY_CLASS => {
+            let names = a0.to_string();
+            Ok(runtime::host(|h| {
+                js::Val::new_array(
+                    h.subtree_class(node, &names)
+                        .into_iter()
+                        .map(wrap_element)
+                        .collect(),
+                )
+            }))
+        }
+        E_GET_ELEMENTS_BY_TAG => {
+            let name = a0.to_string();
+            Ok(runtime::host(|h| {
+                js::Val::new_array(
+                    h.subtree_tag(node, &name)
+                        .into_iter()
+                        .map(wrap_element)
+                        .collect(),
+                )
             }))
         }
         E_APPEND_CHILD => {
@@ -1212,10 +1301,13 @@ impl PageScripts {
             doc_cookie_get: engine.register_native("document.getCookie", doc_native, D_COOKIE_GET),
             doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
             doc_get_by_tag: engine.register_native("document.getElementsByTagName", doc_native, D_GET_ELEMENTS_BY_TAG),
+            doc_get_by_class: engine.register_native("document.getElementsByClassName", doc_native, D_GET_ELEMENTS_BY_CLASS),
             reflect,
             el_get_element: engine.register_native("Element.getElementById", el_native, E_GET_ELEMENT_BY_ID),
             el_query: engine.register_native("Element.querySelector", el_native, E_QUERY),
             el_query_all: engine.register_native("Element.querySelectorAll", el_native, E_QUERY_ALL),
+            el_get_by_class: engine.register_native("Element.getElementsByClassName", el_native, E_GET_ELEMENTS_BY_CLASS),
+            el_get_by_tag: engine.register_native("Element.getElementsByTagName", el_native, E_GET_ELEMENTS_BY_TAG),
             el_append: engine.register_native("Element.appendChild", el_native, E_APPEND_CHILD),
             el_set_attr: engine.register_native("Element.setAttribute", el_native, E_SET_ATTRIBUTE),
             el_get_attr: engine.register_native("Element.getAttribute", el_native, E_GET_ATTRIBUTE),
@@ -1276,6 +1368,7 @@ impl PageScripts {
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
         doc.set("createElement", Val::Native(ids.doc_create));
         doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
+        doc.set("getElementsByClassName", Val::Native(ids.doc_get_by_class));
         doc.set("getCookie", Val::Native(ids.doc_cookie_get));
         doc.set("setCookie", Val::Native(ids.doc_cookie_set));
         // `document.cookie` — the property the web actually reads. The plain
@@ -2458,6 +2551,43 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "second"), "b");
         // "*" = every element (html, head, link, body, link, p, script)
         assert_eq!(get_global_str(&mut ps, "any"), "7");
+    }
+
+    #[test]
+    fn get_elements_by_class_name_matches_all_names_in_document_order() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="d1" class="a b"><span class="b">x</span><span class="a">y</span></div><div id="d2" class="b"></div><p id="p1" class="a"></p><script>
+                var b = document.getElementsByClassName("b");
+                window.n = b.length;
+                window.first = b[0].id;
+                var both = document.getElementsByClassName("a b");
+                window.both = both.length;
+                window.bothId = both[0].id;
+                var scoped = document.getElementById("d1").getElementsByClassName("b");
+                window.scope = scoped.length;
+                window.scopeTag = scoped[0].tagName;
+                window.empty = document.getElementsByClassName("").length;
+                window.none = document.getElementsByClassName("a zzz").length;
+                var spans = document.getElementById("d1").getElementsByTagName("span");
+                window.elSpans = spans.length;
+                window.elAll = document.getElementById("d1").getElementsByTagName("*").length;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        // document order: #d1, its span.b, then #d2
+        assert_eq!(get_global_str(&mut ps, "n"), "3");
+        assert_eq!(get_global_str(&mut ps, "first"), "d1");
+        // multiple names are ANDed
+        assert_eq!(get_global_str(&mut ps, "both"), "1");
+        assert_eq!(get_global_str(&mut ps, "bothId"), "d1");
+        // on an element: descendants only, root excluded
+        assert_eq!(get_global_str(&mut ps, "scope"), "1");
+        assert_eq!(get_global_str(&mut ps, "scopeTag"), "SPAN");
+        assert_eq!(get_global_str(&mut ps, "empty"), "0");
+        assert_eq!(get_global_str(&mut ps, "none"), "0");
+        // element-level getElementsByTagName: subtree only, root excluded
+        assert_eq!(get_global_str(&mut ps, "elSpans"), "2");
+        assert_eq!(get_global_str(&mut ps, "elAll"), "2");
     }
 
     /// The shape a module-preload helper uses: scan existing links, create a

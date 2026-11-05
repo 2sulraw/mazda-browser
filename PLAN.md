@@ -1700,6 +1700,31 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 35 (page CSS inside inline SVG) | MDN homepage + a local page with the real mandala markup and the page's rules | the mandala now paints (5 concentric rings of slashes, was blank): the page's `.mandala svg>text` and `.mandala textPath[href="#circleN"]` rules reach the rasterizer through a mini-cascade over the SVG's ancestor chain, and `font-size: 1.5rem` resolves in svg.rs; page height 2675px, 615 runs and ~100 MB unchanged, Wikipedia unchanged at 24454px; suite **746** default / **750** `engine-b + woff2` |
 | 2026-11-05 | wave 36 (live ES-module namespaces) | MDN homepage + Wikipedia `/wiki/JavaScript` + nextjs.org | MDN's client bundle now runs to completion - the `Cannot read property 'length' of undefined` at `index.08e…js` col 19277 is gone and the page logs no `[js]` errors (page 2675px / 615 runs / 100.5 MB, one layout); Wikipedia unchanged at 24454px / 10943 runs / 101.6 MB; nextjs.org 7032px / 502 runs / 141.4 MB (fresh 256 KB page, unchanged by this wave); suite **748** default / **752** `engine-b + woff2` |
 | 2026-11-05 | wave 37 (Function constructor compiles source) | Wikipedia `/wiki/JavaScript` + MDN homepage + nextjs.org + rust-lang.org + Hacker News | Wikipedia's 20 `Exception in resolve` / `Skipped unavailable module` pairs are gone (ResourceLoader evaluates each module's `skip` condition with `new Function(...)()`, which returned a plain object and threw) and the page logs no script errors; layout unchanged at 24454px / 10943 runs / 102.2 MB and the worker finished in 12.4s (wave 36: 18.2s); MDN 2675px / 615 runs / 99.7 MB, nextjs 7032 / 502 / 140.5 MB (same 11 pre-existing errors), rust-lang 483 runs, HN 734 runs (its `getElementsByClassName` gap is unrelated); suite **750** default / **754** `engine-b + woff2` |
+| 2026-11-05 | wave 38 (`getElementsByClassName` + element `getElementsByTagName`) | Hacker News + Wikipedia `/wiki/JavaScript` + MDN homepage | HN's `hn.js` now runs clean (`byClass` calls `el.getElementsByClassName`): script errors 1 -> 0, geometry unchanged at 1695px / 734 runs / 78.1 MB; Wikipedia 24454px / 10943 runs / 103.0 MB and MDN 2675px / 615 runs / 100.0 MB carry no script errors; suite **751** default / **755** `engine-b + woff2` |
+
+### Wave 38 findings
+
+- **`getElementsByClassName` was missing entirely.** HN's cached `hn.js` defines
+  `byClass(el, cl) { return el ? el.getElementsByClassName(cl) : [] }` and calls
+  it on `document` and on elements; the `undefined is not a function` at
+  `hn.js` line 2 aborted the rest of the script.
+- **Semantics.** The name list is the argument's string form split on ASCII
+  whitespace, and an element matches only when it carries **every** name
+  (class names compare case-sensitively). An empty list matches nothing, per
+  spec. Results are snapshot arrays in document order — the same policy as the
+  existing `getElementsByTagName` — not live HTMLCollections. On an element the
+  search walks descendants only and excludes the element itself.
+- **Element-level `getElementsByTagName`** landed in the same pass, since HN's
+  `byTag` helper uses both forms; it shares `subtree_elements_dom` with the
+  class search, so one subtree walk backs both.
+- **Cost/limits.** No new per-node state: a query allocates one `Vec<u32>` of
+  matches (a snapshot would anyhow) and one wrapper per returned node. On HN
+  the only observable change is the error line disappearing — 734 runs, 1695px
+  and 78.1 MB are identical, so the script had no layout work left to do once
+  it stopped throwing. Wikipedia and MDN are unchanged with zero script
+  errors. Still missing around this surface: `document.getElementsByName`,
+  `document.forms`, and live-collection mutation semantics (a snapshot does not
+  see nodes added after the call).
 
 ### Wave 37 findings
 
