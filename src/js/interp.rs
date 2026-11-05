@@ -176,7 +176,8 @@ fn pat_leaf_names(p: &Pat) -> Vec<Rc<str>> {
             let mut out = Vec::new();
             for op in parts {
                 match op {
-                    super::parser::ObjPatPart::Prop { part, .. } => {
+                    super::parser::ObjPatPart::Prop { part, .. }
+                    | super::parser::ObjPatPart::ComputedProp { part, .. } => {
                         out.extend(pat_part_leaves(part))
                     }
                     super::parser::ObjPatPart::Rest(p) => out.extend(pat_leaf_names(p)),
@@ -705,29 +706,12 @@ fn bind_obj(
     // track keys already extracted so `...rest` doesn't repeat them
     let mut used: Vec<Rc<str>> = Vec::new();
     for op in parts {
-        match op {
-            ObjPatPart::Prop { key, part } => {
-                let v = get_member(e, value, key)?;
-                match part {
-                    PatPart::Bind(p, default) => {
-                        let v = if matches!(v, Val::Undefined) {
-                            match default {
-                                Some(d) => eval_expr(e, env, d)?,
-                                None => Val::Undefined,
-                            }
-                        } else {
-                            v
-                        };
-                        bind_pat(e, env, p, v, kind)?;
-                    }
-                    PatPart::Rest(_) => {
-                        return Err(JsError::throw(
-                            "TypeError: `{ key: ...rest }` is not supported ({...rest} only)",
-                        ))
-                    }
-                    PatPart::Hole => {}
-                }
-                used.push(key.clone());
+        // `{[expr]: target}` evaluates its key against the current scope first
+        let (key, part) = match op {
+            ObjPatPart::Prop { key, part } => (key.clone(), part),
+            ObjPatPart::ComputedProp { key: expr, part } => {
+                let k: Rc<str> = Rc::from(eval_expr(e, env, expr)?.to_string().as_str());
+                (k, part)
             }
             ObjPatPart::Rest(p) => {
                 // remaining own properties as an object
@@ -746,8 +730,30 @@ fn bind_obj(
                     }
                 }
                 bind_pat(e, env, p, o, kind)?;
+                continue;
             }
+        };
+        let v = get_member(e, value, &key)?;
+        match part {
+            PatPart::Bind(p, default) => {
+                let v = if matches!(v, Val::Undefined) {
+                    match default {
+                        Some(d) => eval_expr(e, env, d)?,
+                        None => Val::Undefined,
+                    }
+                } else {
+                    v
+                };
+                bind_pat(e, env, p, v, kind)?;
+            }
+            PatPart::Rest(_) => {
+                return Err(JsError::throw(
+                    "TypeError: `{ key: ...rest }` is not supported ({...rest} only)",
+                ))
+            }
+            PatPart::Hole => {}
         }
+        used.push(key);
     }
     Ok(())
 }

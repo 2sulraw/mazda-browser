@@ -1702,6 +1702,42 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 37 (Function constructor compiles source) | Wikipedia `/wiki/JavaScript` + MDN homepage + nextjs.org + rust-lang.org + Hacker News | Wikipedia's 20 `Exception in resolve` / `Skipped unavailable module` pairs are gone (ResourceLoader evaluates each module's `skip` condition with `new Function(...)()`, which returned a plain object and threw) and the page logs no script errors; layout unchanged at 24454px / 10943 runs / 102.2 MB and the worker finished in 12.4s (wave 36: 18.2s); MDN 2675px / 615 runs / 99.7 MB, nextjs 7032 / 502 / 140.5 MB (same 11 pre-existing errors), rust-lang 483 runs, HN 734 runs (its `getElementsByClassName` gap is unrelated); suite **750** default / **754** `engine-b + woff2` |
 | 2026-11-05 | wave 38 (`getElementsByClassName` + element `getElementsByTagName`) | Hacker News + Wikipedia `/wiki/JavaScript` + MDN homepage | HN's `hn.js` now runs clean (`byClass` calls `el.getElementsByClassName`): script errors 1 -> 0, geometry unchanged at 1695px / 734 runs / 78.1 MB; Wikipedia 24454px / 10943 runs / 103.0 MB and MDN 2675px / 615 runs / 100.0 MB carry no script errors; suite **751** default / **755** `engine-b + woff2` |
 | 2026-11-05 | wave 39 (grid `justify-content`) | MDN homepage + nextjs.org + Wikipedia `/wiki/JavaScript` + Hacker News | grid columns now honour `justify-content` (`start`/`center`/`end`/`space-between`/`space-around`/`space-evenly`) and only `normal`/`stretch` grows `auto` tracks; flex no longer collapses `space-around`/`space-evenly` into `space-between`. No reference page changes: MDN 2675px / 615 runs / 100.0 MB, nextjs 7032px / 502 runs / 140.8 MB (same 11 errors), Wikipedia 24454px / 10943 runs / 103.2 MB, HN 1695px / 734 runs / 78.3 MB; suite **754** default / **758** `engine-b + woff2` |
+| 2026-11-05 | wave 40 (JS syntax compatibility) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | three lexer/parser gaps that rejected shipped framework code: regex `u`/`v`/`d` flags (the flag was lexed as an identifier), non-ASCII identifiers (lodash's deburr table uses accented keys), and computed keys in destructuring (`let {[key]: v, ...rest} = obj`). nextjs.org's script errors drop 11 -> 7 (all four syntax errors gone) with geometry unchanged at 7032px / 502 runs / 145.8 MB; MDN 2675px / 615 runs / 99.9 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 734 runs / 77.9 MB, rust-lang 5800px / 483 runs / 84.8 MB, all error-free; suite **757** default / **761** `engine-b + woff2` |
+
+### Wave 40 findings
+
+- **Regex flags were under-lexed.** `read_regex` consumed only `g i m s y`, so
+  `/[A-Z]/u` lexed as a regex literal followed by the identifier `u`. Both
+  failures on nextjs.org were this shape: `/[A-Z]/u.test(t)` (expected `)`)
+  and `/^matrix3d\(…\)$/u` inside `String.match` (expected `,`). The lexer now
+  also accepts `d`, `u` and `v`; the regex engine accepts them as no-ops
+  because `u`/`v` only change escape/class grammar for the subset it supports
+  (`\p{…}` still fails cleanly) and `d` only adds match indices.
+- **Non-ASCII identifiers were rejected.** The lexer treated every byte >= 0x80
+  as an unexpected character. It now accepts them in identifier position and
+  consumes the whole UTF-8 sequence, which slices on a char boundary because
+  ASCII bytes never appear inside a multibyte character. This is deliberately
+  looser than Unicode ID_Start/ID_Continue (emoji pass too) — documented as a
+  shortcut; it unblocked lodash's `deburr` table (`{Ä:"A", é:"e", …}`), which
+  is emitted as real object keys in the vendored bundle.
+- **Computed keys in destructuring were a parse error.** `let {[e]: r, …rest}`
+  hit `prop_name()`, which only accepts identifiers/strings/numbers. Patterns
+  now carry `ObjPatPart::ComputedProp { key: Expr, part }`; the key expression
+  is evaluated at bind time against the current scope, stringified, and also
+  recorded for `...rest` exclusion. Binding-name collection, `arguments`/`yield`
+  usage scans and the leaf-name walk all recurse into the pattern part and
+  visit the key expression where appropriate.
+- **Live effect.** nextjs.org's four syntax errors disappear (11 -> 7 total
+  script errors); layout stays 7032 px / 502 runs because the newly-running
+  chunks are framework code that does not paint yet, and RAM rises 140.8 ->
+  145.8 MB as that code now executes. The other four reference pages are
+  byte-stable in geometry and error-free. Remaining nextjs errors are runtime
+  gaps: `.next` called on a non-iterator, inline scripts writing `.data` on an
+  undefined value, and a `performance.now` call on an undefined global.
+- **Limits.** `u` semantics are accepted but not enforced (surrogate pairs,
+  `\p{…}`, strict escape rules); a repeated `u`/`v`/`d` flag is not rejected;
+  and computed keys in `=`-form object-assignment patterns still go through the
+  old expression-to-pattern converter.
 
 ### Wave 39 findings
 

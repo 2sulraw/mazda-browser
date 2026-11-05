@@ -260,8 +260,14 @@ fn kw_of(s: &str) -> Option<Kw> {
     })
 }
 
+/// Identifier characters are read as raw bytes: every non-ASCII byte is
+/// accepted, so a UTF-8 identifier (`Ä`, `é`, …) is consumed whole and the
+/// slice stays on a char boundary (a multibyte sequence contains no ASCII
+/// byte). This is deliberately looser than Unicode ID_Start/ID_Continue —
+/// shortcut: emoji and symbols also pass — which costs nothing at runtime
+/// and keeps the lexer allocation-free.
 fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x80
 }
 
 fn is_ident_char(b: u8) -> bool {
@@ -506,7 +512,13 @@ impl<'a> Lexer<'a> {
                     let pattern = &self.src[body_start..self.pos];
                     self.pos += 1;
                     let fstart = self.pos;
-                    while matches!(self.peek(), Some(b'g' | b'i' | b'm' | b's' | b'y')) {
+                    // `d` (indices), `u` (unicode) and `v` (unicode sets) are
+                    // accepted; the regex engine treats them as no-ops for
+                    // pattern matching (see js/regex.rs).
+                    while matches!(
+                        self.peek(),
+                        Some(b'd' | b'g' | b'i' | b'm' | b's' | b'u' | b'v' | b'y')
+                    ) {
                         self.pos += 1;
                     }
                     let flags = &self.src[fstart..self.pos];

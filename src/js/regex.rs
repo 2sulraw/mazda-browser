@@ -814,7 +814,10 @@ fn parse_flags_str(flags: &str) -> Result<(bool, bool, bool, bool, bool), RegexE
             'm' if !m => m = true,
             's' if !s => s = true,
             'y' if !y => y = true,
-            'u' | 'v' => return rerr("unicode flag is not supported"),
+            // `u`/`v` only change escape/class grammar; for the patterns we
+            // support the matching result is identical, so accept and ignore
+            // them. `d` (match indices) is likewise an output-only flag.
+            'u' | 'v' | 'd' => {}
             _ => return rerr("invalid or repeated regex flag"),
         }
     }

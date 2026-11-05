@@ -1557,6 +1557,41 @@ fn regex_match_all_scan() {
 }
 
 #[test]
+fn regex_unicode_and_indices_flags_are_accepted() {
+    // `u`/`v` change the pattern grammar, not the match result for the
+    // escapes supported here; `d` only adds index information.
+    assert!(boolean("/[A-Z]/u.test('A')"));
+    assert!(boolean("/a/d.test('a')"));
+    assert!(boolean("/b/v.test('b')"));
+    assert_eq!(string("'aXb'.split(/X/u).join('-')"), "a-b");
+    assert_eq!(string("/a/gu.flags"), "gu");
+}
+
+#[test]
+fn unicode_identifiers_and_object_keys() {
+    // lodash's deburr table is written with accented keys
+    assert_eq!(num("var \u{00C4} = 1; \u{00C4}"), 1.0);
+    assert_eq!(string("({a\u{0301}: 'x'})['a\u{0301}']"), "x");
+    assert_eq!(
+        string("var m = {\u{00C4}:'A', \u{00E9}:'e'}; m['\u{00C4}'] + m['\u{00E9}']"),
+        "Ae"
+    );
+}
+
+#[test]
+fn computed_keys_in_destructuring_patterns() {
+    assert_eq!(num("var {['a' + 'b']: x} = {ab: 7}; x"), 7.0);
+    assert_eq!(
+        num("(function () { let k = 'a'; let {[k]: v, ...rest} = {a: 1, b: 2}; return v + rest.b; })()"),
+        3.0
+    );
+    assert_eq!(
+        string("(function () { let out = ''; let {[1]: v} = {1: 'n'}; out += v; return out; })()"),
+        "n"
+    );
+}
+
+#[test]
 fn regex_unsupported_syntax_is_clean_error() {
     assert!(matches!(err("'x'.replace(/(?<=a)b/, '')"), JsError::Syntax { .. }));
     assert!(matches!(err("/\\p{L}/u"), JsError::Syntax { .. }));

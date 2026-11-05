@@ -277,7 +277,12 @@ pub enum ObjPatPart {
         key: Rc<str>,
         part: PatPart,
     },
-    /// `{...rest}` — remaining own properties
+    /// `{[expr]: target}` - the key is evaluated when the pattern runs
+    ComputedProp {
+        key: Expr,
+        part: PatPart,
+    },
+    /// `{...rest}` - remaining own properties
     Rest(Pat),
 }
 
@@ -1428,11 +1433,25 @@ impl<'a> Parser<'a> {
                         parts.push(ObjPatPart::Rest(t));
                         continue;
                     }
-                    let key = self.prop_name()?;
+                    // `{[expr]: target}` - computed property name
+                    let computed = if self.eat_punct(Punct::LBrack) {
+                        let e = self.assign_expr()?;
+                        self.expect_punct(Punct::RBrack)?;
+                        Some(e)
+                    } else {
+                        None
+                    };
+                    let key = match computed {
+                        Some(_) => None,
+                        None => Some(self.prop_name()?),
+                    };
                     let part = if self.eat_punct(Punct::Colon) {
                         self.pat_part(decl_form)?
+                    } else if computed.is_some() {
+                        return self.err("expected `:` after a computed property name");
                     } else {
                         // shorthand: `{a}` / `{a = d}` binds the name `a`
+                        let key = key.clone().expect("shorthand key");
                         if *self.peek() == Tok::Op(Op::Assign) {
                             self.next();
                             let d = self.assign_expr()?;
@@ -1447,7 +1466,11 @@ impl<'a> Parser<'a> {
                             )
                         }
                     };
-                    parts.push(ObjPatPart::Prop { key, part });
+                    match (computed, key) {
+                        (Some(key), _) => parts.push(ObjPatPart::ComputedProp { key, part }),
+                        (None, Some(key)) => parts.push(ObjPatPart::Prop { key, part }),
+                        (None, None) => unreachable!(),
+                    }
                 }
                 Ok(Pat::Obj(parts))
             }
@@ -3602,10 +3625,12 @@ fn pat_binding_names(p: &Pat, out: &mut Vec<Rc<str>>) {
         Pat::Obj(props) => {
             for prop in props {
                 match prop {
-                    ObjPatPart::Prop { part, .. } => match part {
-                        PatPart::Hole => {}
-                        PatPart::Bind(p, _) | PatPart::Rest(p) => pat_binding_names(p, out),
-                    },
+                    ObjPatPart::Prop { part, .. } | ObjPatPart::ComputedProp { part, .. } => {
+                        match part {
+                            PatPart::Hole => {}
+                            PatPart::Bind(p, _) | PatPart::Rest(p) => pat_binding_names(p, out),
+                        }
+                    }
                     ObjPatPart::Rest(p) => pat_binding_names(p, out),
                 }
             }
@@ -3814,6 +3839,9 @@ fn pat_uses(p: &Pat, k: SusKind) -> bool {
         Pat::Arr(parts) => parts.iter().any(|pp| pat_part_uses(pp, k)),
         Pat::Obj(parts) => parts.iter().any(|op| match op {
             ObjPatPart::Prop { part, .. } => pat_part_uses(part, k),
+            ObjPatPart::ComputedProp { key, part } => {
+                expr_uses(key, k) || pat_part_uses(part, k)
+            }
             ObjPatPart::Rest(pat) => pat_uses(pat, k),
         }),
     }
@@ -4054,6 +4082,13 @@ fn pat_scan_args(p: &Pat) -> bool {
                 PatPart::Bind(_, Some(d)) => scan_expr_arguments(d),
                 _ => false,
             },
+            ObjPatPart::ComputedProp { key, part } => {
+                scan_expr_arguments(key)
+                    || match part {
+                        PatPart::Bind(_, Some(d)) => scan_expr_arguments(d),
+                        _ => false,
+                    }
+            }
             ObjPatPart::Rest(_) => false,
         }),
     }
