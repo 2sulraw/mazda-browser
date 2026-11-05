@@ -1225,16 +1225,23 @@ impl Sheet {
         (tab.len() - 1) as u16
     }
 
-    /// Interned stack id for one (var-substituted) declaration — only
-    /// `font-family` has one; everything else costs just the string compare.
-    /// inherit/unset/initial never name a family (see the apply_decl arm).
-    fn fam_stack_of(&self, d: &Decl) -> u16 {
-        if d.0 == "font-family"
-            && !matches!(d.1.trim(), "inherit" | "unset" | "initial")
-        {
-            self.intern_stack(&d.1)
-        } else {
-            0
+    /// Interned stack id for one (var-substituted) declaration - only
+    /// `font-family` and the `font` shorthand have one; everything else costs
+    /// just the string compare. inherit/unset/initial never name a family (see
+    /// the apply_decl arms).
+    fn fam_stack_of(&self, d: &Decl, parent: f32, vp: (f32, f32)) -> u16 {
+        match d.0.as_str() {
+            "font-family" if !matches!(d.1.trim(), "inherit" | "unset" | "initial") => {
+                self.intern_stack(&d.1)
+            }
+            // the `font` shorthand carries the family in its tail; the same
+            // splitter the apply arm uses locates it (`inherit`/`initial`/
+            // system keywords name no family, so they stay 0). Running it twice
+            // is cheap and keeps the split in one place.
+            "font" => parse_font_shorthand(&d.1, parent, vp)
+                .map(|f| self.intern_stack(&f.family))
+                .unwrap_or(0),
+            _ => 0,
         }
     }
 
@@ -1322,6 +1329,7 @@ const KNOWN: &[&str] = &[
     "mask-size",
     "mask-position",
     "mask-repeat",
+    "font",
     "font-size",
     "font-weight",
     "font-style",
@@ -1940,7 +1948,7 @@ impl Sheet {
             for d in &rule.decls {
                 color_declared |= d.0 == "color";
                 let sd = self.subst_scoped(d, vars.as_deref());
-                let fs = self.fam_stack_of(&sd);
+                let fs = self.fam_stack_of(&sd, parent_size, self.vp);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
                 }
@@ -1951,7 +1959,7 @@ impl Sheet {
             for d in &parse_decls(inline) {
                 color_declared |= d.0 == "color";
                 let sd = self.subst_scoped(d, vars.as_deref());
-                let fs = self.fam_stack_of(&sd);
+                let fs = self.fam_stack_of(&sd, parent_size, self.vp);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
                 }
@@ -2017,7 +2025,7 @@ impl Sheet {
             for d in &rule.decls {
                 color_declared |= d.0 == "color";
                 let sd = self.subst(d);
-                let fs = self.fam_stack_of(&sd);
+                let fs = self.fam_stack_of(&sd, base.size, self.vp);
                 if apply_decl(
                     &sd, &mut style, &mut bg, &mut bx, base.size, self.vp, dark, fs,
                 ) {
@@ -2652,6 +2660,43 @@ fn apply_decl(
                 style.fam_stack = fam_stack;
             }
         },
+        // The `font` shorthand sets size, line-height, style, weight and
+        // family together and RESETS the components it omits. A value that
+        // doesn't parse (or a system keyword) is dropped whole, matching the
+        // browser: an invalid shorthand never clears earlier longhands.
+        // shortcut: `inherit`/`unset` are a no-op - inherited properties
+        // already start from the parent, but an earlier same-element
+        // declaration isn't reverted (apply_decl only sees the parent size).
+        "font" => {
+            let t = d.1.trim();
+            if t.eq_ignore_ascii_case("initial") {
+                style.italic = false;
+                style.bold = false;
+                style.size = 16.0;
+                style.lh = 0.0;
+                style.fam = Fam::Sans;
+                style.fam_stack = 0;
+            } else if !matches!(
+                t.to_ascii_lowercase().as_str(),
+                "inherit"
+                    | "unset"
+                    | "caption"
+                    | "icon"
+                    | "menu"
+                    | "message-box"
+                    | "small-caption"
+                    | "status-bar"
+            ) {
+                if let Some(f) = parse_font_shorthand(t, parent, vp) {
+                    style.italic = f.italic;
+                    style.bold = f.bold;
+                    style.size = f.size.clamp(6.0, 400.0);
+                    style.lh = f.lh;
+                    style.fam = parse_fam(&f.family);
+                    style.fam_stack = fam_stack;
+                }
+            }
+        },
         // `text-decoration` is a shorthand over line/style/color/thickness;
         // `text-decoration-line` sets only the line flags. `none` clears
         // every line.
@@ -2736,22 +2781,9 @@ fn apply_decl(
             };
         }
         "line-height" => {
-            // unitless = multiplier of font-size; px/rem/% absolute (of size)
-            style.lh = if let Some(n) = d.1.strip_suffix('%') {
-                n.trim().parse::<f32>()
-                    .map(|f| f / 100.0 * style.size)
-                    .unwrap_or(0.0)
-            } else if d.1.trim().ends_with("px") {
-                d.1.trim().trim_end_matches("px").trim().parse::<f32>().unwrap_or(0.0)
-            } else if let Ok(n) = d.1.trim().parse::<f32>() {
-                if n > 0.0 && n < 10.0 {
-                    n * style.size // unitless multiplier (1.5, 1.75 …)
-                } else {
-                    0.0 // nonsense → default
-                }
-            } else {
-                0.0
-            };
+            // unitless = multiplier of font-size; px/em/rem/%/vw absolute (of
+            // size); `normal` = the layout default
+            style.lh = parse_line_height(&d.1, style.size, vp);
         }
         "display" => match d.1.as_str() {
             "none" => return true,
@@ -5255,6 +5287,29 @@ fn match_paren(b: &[u8], open: usize) -> Option<usize> {
 /// bare number (lenient px).
 fn parse_size(v: &str, current: f32, vp: (f32, f32)) -> Option<f32> {
     let v = v.trim();
+    // absolute-size keywords: the CSS Fonts 4 table (medium = 16px, the
+    // browser default). `larger`/`smaller` are relative to `current` (the
+    // parent's size) and use the spec's 1.2 factor.
+    for (kw, px) in [
+        ("xx-small", 9.0),
+        ("x-small", 10.0),
+        ("small", 13.0),
+        ("medium", 16.0),
+        ("large", 18.0),
+        ("x-large", 24.0),
+        ("xx-large", 32.0),
+        ("xxx-large", 48.0),
+    ] {
+        if v.eq_ignore_ascii_case(kw) {
+            return Some(px);
+        }
+    }
+    if v.eq_ignore_ascii_case("larger") {
+        return Some(current * 1.2);
+    }
+    if v.eq_ignore_ascii_case("smaller") {
+        return Some(current / 1.2);
+    }
     // calc()/min()/max()/clamp() — font-size has no containing block, so
     // `%` AND `em` resolve against the PARENT size (`current`) right here
     // (the same base the plain `em`/`%` branches below use)
@@ -5293,6 +5348,142 @@ fn parse_size(v: &str, current: f32, vp: (f32, f32)) -> Option<f32> {
         return n.trim().parse::<f32>().ok().map(|f| f / 100.0 * current);
     }
     v.trim().parse().ok()
+}
+
+/// A split `font` shorthand. `family` keeps the raw comma stack for the
+/// shared interner; the other fields are the longhands this engine models.
+struct FontSh {
+    size: f32,
+    /// px; 0 = `normal` (layout's default `size * 1.35`)
+    lh: f32,
+    italic: bool,
+    bold: bool,
+    family: String,
+}
+
+/// Split and parse `font: [ style || variant || weight || stretch ]? size
+/// [/ line-height]? family` (CSS Fonts 4). None = a value this engine must
+/// drop whole: system keywords, a missing size/family, or an unknown
+/// pre-size token. A dropped shorthand must not reset any longhand, so the
+/// caller only touches the style on `Some`.
+///
+/// shortcut: the `font-variant`/`font-stretch` components are accepted and
+/// ignored (one stretch per family, no small-caps), and `oblique <angle>`
+/// drops only the angle.
+fn parse_font_shorthand(v: &str, parent: f32, vp: (f32, f32)) -> Option<FontSh> {
+    let toks = joined_tokens(v);
+    let (mut italic, mut bold, mut oblique) = (false, false, false);
+    let mut size = None;
+    let mut lh = 0.0;
+    let mut i = 0usize;
+    while i < toks.len() {
+        let tok = toks[i].as_str();
+        // a size token may carry its line-height (`16px/1.5`); the slash can
+        // also ride the next token (`16px / 1.5`)
+        let (head, rest) = match tok.split_once('/') {
+            Some((h, r)) => (h, Some(r)),
+            None => (tok, None),
+        };
+        if let Some(px) = font_size_token(head, parent, vp) {
+            size = Some(px);
+            if let Some(r) = rest {
+                if !r.is_empty() {
+                    lh = parse_line_height(r, px, vp);
+                } else if let Some(n) = toks.get(i + 1) {
+                    lh = parse_line_height(n, px, vp); // `16px/ 1.5`
+                    i += 1;
+                }
+            } else if let Some(n) = toks.get(i + 1).and_then(|n| n.strip_prefix('/')) {
+                if n.is_empty() {
+                    if let Some(n2) = toks.get(i + 2) {
+                        lh = parse_line_height(n2, px, vp); // `16px / 1.5`
+                        i += 1;
+                    }
+                } else {
+                    lh = parse_line_height(n, px, vp); // `16px /1.5`
+                }
+                i += 1;
+            }
+            i += 1;
+            break;
+        }
+        let low = tok.to_ascii_lowercase();
+        match low.as_str() {
+            "italic" => italic = true,
+            "oblique" => {
+                italic = true;
+                oblique = true;
+            }
+            "bold" | "bolder" => bold = true,
+            // `normal` resets the optional components to their initial values
+            "normal" => {
+                italic = false;
+                bold = false;
+                oblique = false;
+            }
+            "small-caps" | "all-small-caps" | "petite-caps" | "unicase"
+            | "titling-caps" | "ultra-condensed" | "extra-condensed" | "condensed"
+            | "semi-condensed" | "semi-expanded" | "expanded" | "extra-expanded"
+            | "ultra-expanded" => {}
+            _ => {
+                if oblique && low.ends_with("deg") {
+                    i += 1; // `oblique 10deg`: the angle is accepted and ignored
+                    continue;
+                }
+                // a bare weight (1-1000 per CSS; sites use 100-900)
+                match low.parse::<u16>() {
+                    Ok(n) if (1..=1000).contains(&n) => bold = n >= 600,
+                    _ => return None,
+                }
+            }
+        }
+        i += 1;
+    }
+    let size = size?;
+    let family = toks[i..].join(" ");
+    if family.trim().is_empty() {
+        return None;
+    }
+    Some(FontSh {
+        size,
+        lh,
+        italic,
+        bold,
+        family,
+    })
+}
+
+/// The size slot of a `font` shorthand. A bare number is never a size here
+/// (`700` is the weight); `0` is the one valid unitless length. Values with a
+/// unit, `%`, a size keyword or a math function go through [`parse_size`],
+/// which returns None for the style/variant/stretch keywords so they fall
+/// through to the component matcher.
+fn font_size_token(t: &str, parent: f32, vp: (f32, f32)) -> Option<f32> {
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let looks = t == "0" || t.contains('%') || t.chars().any(|c| c.is_ascii_alphabetic());
+    if !looks {
+        return None;
+    }
+    parse_size(t, parent, vp)
+}
+
+/// Resolve one `line-height` value to px against `size` (the font-size in
+/// effect). `normal`/garbage = 0 = layout's default (`size * 1.35`).
+/// A unitless number is a multiplier; lengths, viewport units and `%` go
+/// through [`parse_size`], whose `em`/`%` base is `size` here.
+fn parse_line_height(v: &str, size: f32, vp: (f32, f32)) -> f32 {
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("normal") {
+        return 0.0;
+    }
+    if let Ok(n) = t.parse::<f32>() {
+        // unitless multiplier (1.5, 1.75, ...); values >= 10 are nonsense
+        return if n > 0.0 && n < 10.0 { n * size } else { 0.0 };
+    }
+    parse_size(t, size, vp).map(|px| px.max(0.0)).unwrap_or(0.0)
 }
 
 /// `light-dark(light, dark)` → the branch for the used scheme (`dark`),
@@ -9590,6 +9781,122 @@ mod tests {
             None,
             "the word 'inherit' never becomes a stack entry"
         );
+    }
+
+    #[test]
+    fn font_shorthand_sets_and_resets_every_longhand() {
+        let sheet = parse(
+            ".a{font:italic bold 20px/1.5 Georgia, serif}\
+             .b{font:700 1.2rem \"Helvetica Neue\", Arial}\
+             .c{font:small-caps 2vw/2 monospace}\
+             .d{font:oblique 10deg 18px serif}\
+             .e{font:16px serif}\
+             .f{font:20px / 2 serif}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        let a = get("a");
+        assert_eq!((a.size, a.lh), (20.0, 30.0), "size and 1.5 line-height");
+        assert!(a.italic && a.bold, "style and weight");
+        assert_eq!(a.fam, Fam::Serif);
+        let b = get("b");
+        assert!((b.size - 19.2).abs() < 0.01, "1.2rem = {}", b.size);
+        assert!(b.bold, "numeric 700");
+        assert!(!b.italic, "omitted style resets");
+        assert_eq!(b.lh, 0.0, "omitted line-height resets to normal");
+        assert_eq!(b.fam, Fam::Sans);
+        let c = get("c");
+        assert!((c.size - 20.0).abs() < 0.01, "2vw of the test viewport");
+        assert_eq!(c.lh, 40.0, "unitless multiplier against the shorthand size");
+        assert_eq!(c.fam, Fam::Mono);
+        assert!(!c.italic, "variant is accepted but ignored");
+        let d = get("d");
+        assert!(d.italic && d.size == 18.0, "oblique + angle parsed");
+        let e = get("e");
+        assert_eq!((e.size, e.bold, e.italic, e.lh), (16.0, false, false, 0.0));
+        // whitespace around the slash is still the line-height separator
+        let f = get("f");
+        assert_eq!((f.size, f.lh), (20.0, 40.0));
+    }
+
+    #[test]
+    fn font_shorthand_drops_invalid_values_without_resetting() {
+        let sheet = parse(
+            ".a{font:16px serif}.d{font-style:italic;font:inherit}\
+             .e{font-size:20px;font-style:italic;font:initial}\
+             .f{font:menu}.g{font:700 16px}.h{font:16px/1.5}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=d></div><div class=e></div>\
+             <div class=f></div><div class=g></div><div class=h></div>",
+        );
+        let mut base = Style::new();
+        base.size = 20.0;
+        base.bold = true;
+        base.italic = true;
+        base.lh = 40.0;
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), base, None).style;
+        // a valid shorthand resets the inherited bold/italic/line-height
+        let a = get("a");
+        assert_eq!(a.size, 16.0);
+        assert!(!a.bold && !a.italic && a.lh == 0.0, "omitted components reset");
+        // inherit is a documented no-op: the earlier same-element decl stays
+        assert!(get("d").italic, "font:inherit keeps the earlier font-style");
+        // initial clears every modeled component
+        let e = get("e");
+        assert_eq!((e.size, e.italic, e.bold, e.lh), (16.0, false, false, 0.0));
+        assert_eq!(e.fam, Fam::Sans);
+        // a system keyword is a no-op, not a reset
+        let f = get("f");
+        assert_eq!((f.size, f.lh), (20.0, 40.0), "font:menu leaves the font");
+        assert!(f.bold && f.italic);
+        // missing family = invalid shorthand = nothing applied
+        let g = get("g");
+        assert_eq!((g.size, g.lh), (20.0, 40.0), "font:700 16px dropped");
+        let h = get("h");
+        assert_eq!((h.size, h.lh), (20.0, 40.0), "font:16px/1.5 dropped");
+    }
+
+    #[test]
+    fn font_shorthand_family_shares_the_font_family_stack() {
+        let mut sheet = parse(
+            ".a{font:italic 16px/1.5 \"Alfa Slab One\", serif}\
+             .b{font-family:\"ALFA SLAB ONE\", SERIF}",
+        );
+        let table: StackTable = std::rc::Rc::new(std::cell::RefCell::new(vec![Vec::new()]));
+        sheet.set_stacks(table.clone());
+        let dom = dom_of("<div class=a></div><div class=b></div>");
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        assert_eq!(get("a").fam_stack, 1, "shorthand interns its family tail");
+        assert_eq!(get("b").fam_stack, 1, "longhand shares the same id");
+        assert_eq!(
+            table.borrow()[1],
+            ["alfa slab one".to_string(), "serif".to_string()]
+        );
+    }
+
+    #[test]
+    fn font_size_absolute_and_relative_keywords() {
+        let sheet = parse(
+            ".a{font-size:small}.b{font-size:large}.c{font-size:larger}\
+             .d{font-size:smaller}.e{font-size:medium}\
+             .f{font-size:20px;line-height:1.5rem}.g{line-height:normal}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div><div class=g></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
+        assert_eq!(get("a").size, 13.0);
+        assert_eq!(get("b").size, 18.0);
+        assert!((get("c").size - 18.0).abs() < 0.01, "15 * 1.2");
+        assert!((get("d").size - 12.5).abs() < 0.01, "15 / 1.2");
+        assert_eq!(get("e").size, 16.0);
+        assert_eq!(get("f").lh, 24.0, "line-height accepts rem");
+        assert_eq!(get("g").lh, 0.0, "normal = layout default");
     }
 
     #[test]

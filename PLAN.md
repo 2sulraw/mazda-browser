@@ -1742,6 +1742,47 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 67 (individual `translate`/`scale` + rect edge clipping) | a local transform page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The top visual item in wave 66's miss ranking is implemented: the individual `translate` and `scale` properties now parse and paint, and `rotate` is accepted as a documented no-op (rotation still needs affine glyph/rect rasterization). Each property keeps its own `BoxStyle` field so the cascade keeps them independent of the `transform` list (`transform: none` does not clear a prior `translate`), and paint composes all three in spec order (translate outermost): the list's scale multiplies with `scale`, its offset is scaled by `scale`, and `translate` is added last. `%` offsets resolve against the box's own w/h, and single values follow CSS (`translate: 10px` leaves y at 0, `scale: 2` scales both axes; percentages divide by 100). Verifying the scale render exposed a painter bug: the solid-rect fill clamped a negative origin to pixel 0 but kept the full width/height, so any box a transform pushed past the left or top edge smeared its full size from the edge. The rect fill is now one helper that intersects the span with the buffer (gradients already did), and underline/caret rules share it. A local page verifies a 20/10px translate, a 2x scale about the center with the correct intersection at the page edge, and `rotate: 45deg` painting unrotated; `MAZDA_MISS` reports zero dropped names for it. Dropped-name counts fall to 91 on nextjs.org (was 94), 31 on Wikipedia (38) and 17 on MDN (20); references keep identical geometry: nextjs 7578px / 569 runs / 149.4 MB, MDN 2773 / 641 / 86.9 MB, Wikipedia 24575 / 10950 / 102.8 MB, HN 1695 / 728 / 78.2 MB, rust-lang 5800 / 483 / 84.9 MB; suite **828** default / **832** `engine-b + woff2` |
 
+| 2026-11-06 | wave 68 (the `font` shorthand + size keywords) | a local font-shorthand page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The largest remaining visual miss (80 declarations on MDN) is implemented. `font` parses `[style || variant || weight || stretch]? size [/ line-height]? family`, sets size, line-height, style, weight and family together, and resets the components it omits; a value that doesn't parse (including a missing family) and the system keywords are dropped whole, so earlier longhands survive. The family tail goes through the existing comma-stack interner, so `font: 16px Arial, sans-serif` and `font-family: Arial, sans-serif` share one id. Size detection distinguishes a bare weight (`700`) from a size (only a unit, `%`, a size keyword or `0` is a size), and all three slash spellings (`16px/1.5`, `16px /1.5`, `16px / 1.5`) work. `font-size` gains the absolute-size keywords (`xx-small`…`xxx-large`, `larger`/`smaller`), and `line-height` moved to one helper that now accepts unitless, px/em/rem/%, viewport units and `normal`. A local page verifies 24px/1.5 → a 36px box, `700 1.2rem` → 19.2px with the line-height reset, `2vw/2` → 20px/40px, and the invalid `700 16px` (no family) skipped. Dropped-name counts fall to 90 on nextjs.org, 16 on MDN, 30 on Wikipedia and 9 on rust-lang.org. Wikipedia's total height changes from 24575 to 24673 because its `line-height: 1.4em` declarations now resolve (previously they fell back to the 1.35 default); the other references keep their heights: nextjs 7578px / 569 runs / 149.2 MB, MDN 2773 / 641 / 87.1 MB, Wikipedia 24673 / 10951 / 103.5 MB, HN 1695 / 720 / 78.4 MB, rust-lang 5800 / 483 / 85.0 MB; suite **832** default / **836** `engine-b + woff2` |
+
+### Wave 68 findings
+
+- **A shorthand must reset, so it parses into its own struct first.** `font`
+  sets five longhands at once and clears the ones it omits; applying pieces
+  as they are seen would leave a stale `bold`/`italic`/`line-height` behind on
+  a partial value. `parse_font_shorthand` returns `Some(FontSh)` only for a
+  complete value, and the apply arm touches the style inside that `Some`. A
+  missing family, an unknown pre-size token, a system keyword
+  (`caption`/`menu`/…) and `inherit`/`unset` therefore change nothing - the
+  spec's "invalid shorthand is ignored" behaviour falls out of the shape.
+  `font: initial` is the one keyword that resets everything (16px, normal
+  weight/style, default family, default line-height).
+- **The bare number is the ambiguity.** `font: 700 16px serif` must read 700
+  as a weight, but `parse_size` accepts a bare number (font-size has no
+  unitless form, but it does allow `0`). The size slot is recognised
+  syntactically instead: only a value with a unit, `%`, a size keyword or
+  math function (or the literal `0`) is tried as a size; a bare 1-1000 then
+  becomes a weight. `font: 700 16px` with no family is dropped whole.
+- **The family stays interned.** `fam_stack_of` gained the `font` case and
+  runs the same splitter to find the family tail, so the shorthand reuses the
+  existing `StackTable` ids and font picker. That parses the value twice per
+  declaration (once for the id, once to apply); at 80 declarations on MDN it
+  is not worth a second IR.
+- **The line-height helper paid a bonus.** Moving `line-height` onto
+  `parse_line_height` extended it from unitless/px/% to em/rem/vw/`normal`.
+  Wikipedia's `line-height: 1.4em` and `1.6em` rules now resolve, so its
+  reference height legitimately changes 24575 → 24673px (same content, the
+  line boxes grow). This is a behaviour change to re-baseline, not a
+  regression; the other four reference heights are unchanged.
+- **Measured.** Local page: a 24px/1.5 box is 36px tall, `700 1.2rem` is
+  19.2px with line-height reset to normal, `2vw/2` is 20px with a 40px line,
+  `oblique 10deg` is accepted italic, `font:inherit`/`menu`/`700 16px` leave
+  the inherited font alone. Dropped-name counts: 90 (nextjs.org), 16 (MDN),
+  30 (Wikipedia), 4 (Hacker News), 9 (rust-lang.org). Suite **832** default /
+  **836** `engine-b + woff2`.
+- **Next in the queue.** `filter`/`backdrop-filter`, `text-shadow`,
+  `background-clip`, `place-items`/`place-self`; transitions only if
+  animation is ever required.
+
 ### Wave 67 findings
 
 - **The miss table paid for itself again.** After wave 66 the top visual

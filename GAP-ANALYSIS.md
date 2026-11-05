@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 163 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 164 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 163 |
+| Names in the engine's `KNOWN` table | 164 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~590 |
+| Raw missing (non-vendor) | ~589 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -173,7 +173,7 @@ handled, but the paint model still applies one radius to every corner.
 | Borders & outlines | 18 | `border-image-*`, `border-block-*`, `border-inline-*` | medium: common in resets |
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
-| Fonts | 23 | `font`, `font-variant-*`, `font-kerning` | medium |
+| Fonts | 22 | `font-variant-*`, `font-kerning`, `font-stretch` | medium |
 | Grid & alignment | 12 | `grid-row`, `grid-auto-flow`, `place-items` | high |
 | Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
@@ -278,6 +278,13 @@ relevant only when transitions and animations exist.
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
   Focus rings and custom checkbox states are therefore missing.
 - `var()` is a flat page-wide map, not a per-element cascade.
+- The `font` shorthand sets size, line-height, style, weight and family and
+  resets the components it omits; its `font-variant-*`/`font-stretch`
+  components are accepted but ignored, and `font: inherit`/`unset` plus the
+  system keywords are no-ops (they don't revert an earlier same-element
+  declaration). `font-size` also accepts the absolute-size keywords
+  (`xx-small`…`xxx-large`, `larger`, `smaller`), and `line-height` accepts
+  unitless, px/em/rem/%, viewport units and `normal`.
 - `background-clip` and `filter` are absent.
   `transform-origin` is honored for the translate/scale composite formed by
   `transform`, `translate` and `scale` (no 3D; `rotate` parses but paints
@@ -410,7 +417,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 828 self-authored unit tests (832 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 832 self-authored unit tests (836 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -432,9 +439,9 @@ The best signal is neither: instrument the engine to log unresolved property
 names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
-`font`, `filter`/`backdrop-filter`, `place-items`) now orders the CSS
-queue, and wave 67 took the top visual item off it (individual
-`translate`/`scale`). The DOM/JS half is still open.
+`filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
+waves 67-68 took the top visual items off it (individual `translate`/`scale`,
+then the `font` shorthand). The DOM/JS half is still open.
 
 ### 8.2 Priority by reference impact and RAM cost
 
@@ -477,7 +484,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (163)
+## Appendix A - CSS property names accepted (164)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -495,7 +502,7 @@ clip-path, color, color-scheme, column-gap
 content, cursor, display, fill
 fill-opacity, fill-rule, flex, flex-basis
 flex-direction, flex-flow, flex-grow, flex-shrink
-flex-wrap, float, font-family, font-size
+flex-wrap, float, font, font-family, font-size
 font-style, font-weight, gap, grid-area
 grid-column, grid-column-end, grid-column-start, grid-template-areas
 grid-template-columns, grid-template-rows, height, inset
@@ -541,7 +548,7 @@ Box, border, outline:
 Text and typography:
   hyphens, text-shadow, text-emphasis, tab-size, quotes,
   direction, unicode-bidi, writing-mode, text-orientation,
-  white-space-collapse, text-wrap, font, font-stretch, font-variant,
+  white-space-collapse, text-wrap, font-stretch, font-variant,
   font-feature-settings, font-kerning, font-size-adjust, font-optical-sizing
 
 Backgrounds and effects:
