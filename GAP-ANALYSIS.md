@@ -1,4 +1,4 @@
-﻿# Mazda Browser - Gap Analysis: HTML / CSS / JavaScript
+# Mazda Browser - Gap Analysis: HTML / CSS / JavaScript
 
 **Date:** 2026-11-05
 **Revision:** rewritten after a source review. Corrected the selector,
@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 126 in `KNOWN` + 1 alias | 752 non-vendor | ~16% | dataset includes drafts; ~20-22% against names shipping in two mainstream engines |
+| CSS property names | 127 in `KNOWN` + 1 alias | 752 non-vendor | ~16% | dataset includes drafts; ~20-22% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,7 +151,7 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 126 |
+| Names in the engine's `KNOWN` table | 127 |
 | Additional accepted alias | 1 (`border-top-left-radius`) |
 | Raw missing (non-vendor) | ~630 |
 | Coverage (non-vendor) | ~16% |
@@ -254,7 +254,9 @@ relevant only when transitions and animations exist.
 - Flex: `wrap-reverse` does not reverse the cross axis.
 - Borders: one colour for all sides; dashed/dotted approximated; inner shadows
   dropped; only the top-left corner longhand is aliased.
-- `%` `min-height` resolves against width, not container height.
+- `%` `min-height` / `max-height` resolve against width, not container
+  height; an auto block still ignores a plain `height` (only `min-height`,
+  `max-height`, `aspect-ratio` and replaced boxes pin it).
 - `outline-*` absent; `clip-path` is `inset()` only.
 - Interaction pseudo-classes (`:focus`, `:focus-visible`, `:checked`,
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
@@ -262,8 +264,8 @@ relevant only when transitions and animations exist.
 - `var()` is a flat page-wide map, not a per-element cascade.
 - `caption-side`, `transform-origin`, `background-clip`, and `filter` are
   absent. `overflow-wrap` / `word-break` now break inside words during line
-  layout and `text-overflow: ellipsis` marks a clipped line (see the wave 49
-  and wave 50 notes), but `hyphens` is not modeled.
+  layout, `text-overflow: ellipsis` marks a clipped line and `max-height`
+  caps a box (see the wave 49-51 notes); `hyphens` is not modeled.
 - `direction`, `unicode-bidi`, and writing modes are absent.
 
 ---
@@ -384,7 +386,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 787 self-authored unit tests (791 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 792 self-authored unit tests (796 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -448,7 +450,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (122 + 1 alias)
+## Appendix A - CSS property names accepted (127 + 1 alias)
 
 ```text
 align-items, align-self, aspect-ratio, background
@@ -470,19 +472,19 @@ list-style, list-style-position, list-style-type, margin
 margin-block, margin-block-end, margin-block-start, margin-bottom
 margin-inline, margin-inline-end, margin-inline-start, margin-left
 margin-right, margin-top, mask, mask-image
-mask-position, mask-repeat, mask-size, max-width
-min-height, min-width, object-fit, object-position
-opacity, order, overflow, overflow-wrap
-overflow-x, overflow-y, padding, padding-block
-padding-block-end, padding-block-start, padding-bottom, padding-inline
-padding-inline-end, padding-inline-start, padding-left, padding-right
-padding-top, position, right, row-gap
-stroke, stroke-linecap, stroke-linejoin, stroke-opacity
-stroke-width, table-layout, text-align, text-decoration
-text-decoration-line, text-indent, text-overflow, text-transform
-top, transform, vertical-align, visibility
-white-space, width, word-break, word-spacing
-word-wrap, z-index
+mask-position, mask-repeat, mask-size, max-height
+max-width, min-height, min-width, object-fit
+object-position, opacity, order, overflow
+overflow-wrap, overflow-x, overflow-y, padding
+padding-block, padding-block-end, padding-block-start, padding-bottom
+padding-inline, padding-inline-end, padding-inline-start, padding-left
+padding-right, padding-top, position, right
+row-gap, stroke, stroke-linecap, stroke-linejoin
+stroke-opacity, stroke-width, table-layout, text-align
+text-decoration, text-decoration-line, text-indent, text-overflow
+text-transform, top, transform, vertical-align
+visibility, white-space, width, word-break
+word-spacing, word-wrap, z-index
 ```
 
 `border-top-left-radius` is accepted as an alias of the corner-radius shorthand
@@ -585,7 +587,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 122 names
+# Engine property table: 127 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 

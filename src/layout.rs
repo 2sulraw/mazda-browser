@@ -3800,6 +3800,17 @@ fn place(
             };
         }
     }
+    // max-height: cap the used height. Content is already placed, so a
+    // taller stack simply overflows the box (CSS: it is clipped only when
+    // `overflow` says so). Applied BEFORE the min-height floor below, so a
+    // larger min-height still wins — CSS Sizing 3 resolves that conflict in
+    // the minimum's favor.
+    if let Some(mx) = n.bx.max_height {
+        let cap = as_content_h(resolve_len(mx, avail), n.bx.content_box, v_extra);
+        if n.h > cap {
+            n.h = cap.max(0.0);
+        }
+    }
     // min-height: floor the used height in the SAME box `height`/`width`
     // use, so a 44px border-box touch target with a 1px border is exactly 44
     // tall (under the old content-box floor it was 46; `box-sizing:
@@ -8744,6 +8755,107 @@ mod tests {
         );
         layout_tree(&mut n, 200.0, &m4);
         assert!((n.h - 56.0).abs() < 0.01, "border box h={}", n.h);
+    }
+
+    #[test]
+    fn max_height_caps_the_used_height_and_content_overflows() {
+        // three block lines ≈ 60.75px of content in a box capped at 40px
+        let boxed = |t: &str| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            g
+        };
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                max_height: Some(Len::Px(40.0)),
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![boxed("a"), boxed("b"), boxed("c")];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        assert!((n.h - 40.0).abs() < 0.01, "capped h={}", n.h);
+        // the stack keeps its own positions and spills below the cap (CSS:
+        // overflow is visible unless `overflow` says otherwise)
+        let last = l.runs.iter().map(|r| r.y).fold(0.0f32, f32::max);
+        assert!(last >= 40.0, "content overflows the cap, last line y={last}");
+    }
+
+    #[test]
+    fn max_height_content_box_caps_content_only() {
+        // content-box keeps the declaration as the content ceiling; padding
+        // and border add outside it (44 + 10 pad + 2 border = 56)
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                max_height: Some(Len::Px(44.0)),
+                pad: [Len::Px(5.0), Len::Px(0.0), Len::Px(5.0), Len::Px(0.0)],
+                border: [Len::Px(1.0); 4],
+                content_box: true,
+                ..BoxStyle::default()
+            },
+        );
+        let mut tall = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                min_height: Some(Len::Px(200.0)),
+                ..BoxStyle::default()
+            },
+        );
+        tall.children = vec![leaf("tall")];
+        n.children = vec![tall];
+        layout_tree(&mut n, 200.0, &m4);
+        assert!((n.h - 56.0).abs() < 0.01, "border box h={}", n.h);
+    }
+
+    #[test]
+    fn min_height_wins_over_a_smaller_max_height() {
+        // CSS Sizing 3: when the floor is above the ceiling, the minimum wins
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                max_height: Some(Len::Px(10.0)),
+                min_height: Some(Len::Px(40.0)),
+                ..BoxStyle::default()
+            },
+        );
+        layout_tree(&mut n, 200.0, &m4);
+        assert!((n.h - 40.0).abs() < 0.01, "h={}", n.h);
+    }
+
+    #[test]
+    fn max_height_with_overflow_clips_the_spill() {
+        // `max-height: 40px; overflow: hidden` — runs below the box bottom
+        // carry a clip window ending at the border box edge
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                max_height: Some(Len::Px(40.0)),
+                clip: true,
+                ..BoxStyle::default()
+            },
+        );
+        let mut tall = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                min_height: Some(Len::Px(200.0)),
+                ..BoxStyle::default()
+            },
+        );
+        tall.children = vec![leaf("tall")];
+        n.children = vec![tall];
+        let l = layout_tree(&mut n, 200.0, &m4);
+        let r = l.runs.iter().find(|r| r.text == "tall").expect("run");
+        let (_, _, _, y1) = r.clip.expect("spill clipped");
+        assert!((y1 - 40.0).abs() < 0.01, "clip bottom={y1}");
     }
 
     #[test]

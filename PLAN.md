@@ -1713,6 +1713,34 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 48 (`MutationObserver`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `new MutationObserver(callback)` with `observe` / `disconnect` / `takeRecords`. The shared DOM host logs `childList`, `attributes` and `characterData` mutations (plus `subtree`, `attributeOldValue` / `characterDataOldValue`, `attributeFilter`), but only while an observer is registered, so pages that never observe pay nothing. Callbacks run at the end of a script turn with `(records, observer)`; each record carries `type`, `target`, `addedNodes`, `removedNodes`, `attributeName` and `oldValue`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.6 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24454px / 10943 runs / 99.7-102.6 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 85.0 MB; suite **781** default / **785** `engine-b + woff2` |
 | 2026-11-05 | wave 49 (`overflow-wrap` / `word-break`) | a local 120px-box wrapping page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Line layout can now break inside a word. `overflow-wrap: break-word|anywhere`, the legacy `word-wrap` alias and `word-break: break-all|break-word|keep-all` parse into two inherited `Style` switches; when a word still does not fit, the breaker cuts the longest character prefix that fits (`fit_prefix`, a binary search over monotone widths) and continues on the next line. A local page isolates the behavior: a 28-character token in a 120px box stays one 217px overflowing run by default, becomes 117px + 76px with `break-word`, 112px + 97px with `break-all`, and short words on one line are untouched. Four references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.1 MB, MDN 2922px / 641 runs / 87.5 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.6 MB. Wikipedia moves to 24575px / 10950 runs / 100.9 MB because its own `word-break: break-all` / `break-word` rules now take effect (intended fidelity gain, 7 extra run pieces); suite **785** default / **789** `engine-b + woff2` |
 | 2026-11-05 | wave 50 (`text-overflow`) | a local 160px-row ellipsis page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Clipped lines can now end with an ellipsis. `text-overflow` is accepted and sets a box-level `ellipsis` flag (any `ellipsis` token matches, so the two-value form parses); `apply_run_clips` trims, per line, the run crossing the right content edge to the longest prefix that still leaves room for "…", empties later runs on that line, and leaves fitting lines and boxes without `overflow` alone. Runs are emptied, never removed, so other boxes' ranges stay valid. A local page shows the change directly: a 160px `nowrap`/`overflow:hidden` row dumps `ABCDEFGHIJKLMNOPQRST…` (153px) with `text-overflow: ellipsis`, while the same row without the declaration, a fitting label, and a `text-overflow`-only box without `overflow` keep their full text. No geometry change; all five references stay error-free: nextjs 7578px / 569 runs / 154.3 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24575px / 10950 runs / 101.8 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **787** default / **791** `engine-b + woff2` |
+| 2026-11-05 | wave 51 (`max-height`) | a local capped/overflow page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | A box can now cap its used height. `max-height` parses (`none`/`auto`/garbage clear it) and `place()` clamps the content height after layout, before the `min-height` floor, so taller content simply overflows — clipped only when `overflow` says so, and a larger `min-height` still wins (CSS Sizing 3). The clamp reuses the existing `box-sizing` rule: the declaration caps the border box by default and the content under `content-box`. A local page isolates it: with `max-height: 90px` a seven-line box measures 90px (four lines painted under `overflow: hidden`), the same box without `overflow` spills its text over the next box, a box whose content is shorter is unchanged, and `max-height: 40px; min-height: 120px` stays 120px. Four references are byte-identical; MDN improves: 2922 -> 2690px (runs 641 unchanged, 87.6 MB) because `.homepage-header__mandala { max-height: 20rem; overflow: hidden }` now holds the 35rem globe to 320px, which is what a real browser does. nextjs 7578px / 569 runs / 155.0 MB, Wikipedia 24575px / 10950 runs / 102.3 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **792** default / **796** `engine-b + woff2` |
+
+### Wave 51 findings
+
+- **One clamp, placed after content layout.** `place()` already computes the
+  content height from the chosen layout (block/flex/grid/table/replaced),
+  then applies `min-height`, then adds padding/border. `max-height` is a cap
+  on that same content height, inserted just before the floor. Nothing about
+  child placement changes: content keeps its coordinates and spills past the
+  shorter box, exactly as CSS overflows.
+- **Clipping stays a separate decision.** A capped box clips only when
+  `overflow` is not `visible`; the existing content-clip pass then uses the
+  capped `n.h`, so runs and backgrounds below the edge are cut without any
+  new bookkeeping. `max-height` alone therefore never hides content.
+- **Ordering matches CSS Sizing 3.** The ceiling is applied before the
+  `min-height` floor, so `min-height` wins when the two conflict (verified by
+  a unit test). The declaration follows `box-sizing` like `height`: border
+  box by default, content box under `content-box`.
+- **The references needed no tuning.** Four of the five are geometry-
+  identical; MDN is the one page whose authored `max-height` was previously
+  ignored — its 35rem mandala SVG used to inflate the homepage header. The
+  runs are unchanged (only the container is shorter), which is why this is a
+  fidelity gain rather than a reflow.
+- **Shortcuts, documented here.** `%` `max-height` resolves against the
+  containing block width (same as `min-height`), an auto block still ignores
+  a plain `height`, there is no scrollbar for a capped `overflow: auto`
+  box (the content is clipped, not scrollable), and `max-height` on flex
+  lines/grid tracks is only the container cap — no track-level clamping.
 
 ### Wave 50 findings
 

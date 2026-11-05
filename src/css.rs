@@ -355,10 +355,15 @@ pub struct BoxStyle {
     /// explicit height — shortcut: only consulted for replaced (`<img>`) boxes,
     /// aspect-ratio boxes and grid percent rows; `box-sizing` applies
     pub height: Option<Len>,
-    /// `min-height` — floor on the box's used height (border-box by default;
+    /// `min-height` - floor on the box's used height (border-box by default;
     /// content height under `box-sizing: content-box`). Hero sections use
     /// `min-h-[560px]` + `justify-end` to push content to the bottom
     pub min_height: Option<Len>,
+    /// `max-height` - ceiling on the used height; taller content then
+    /// overflows (and is clipped only if `overflow` says so). `none`/garbage
+    /// → None. Shortcut: `%` resolves against the containing block width,
+    /// like `min-height`, not its height.
+    pub max_height: Option<Len>,
     pub margin_x_auto: bool,
     /// `flex-grow` — share of a flex ROW's free space this item absorbs
     /// (0 = fixed). Wikipedia's page title bar relies on `flex-grow: 1` on
@@ -601,6 +606,7 @@ impl Default for BoxStyle {
             content_box: false,
             height: None,
             min_height: None,
+            max_height: None,
             margin_x_auto: false,
             grow: 0.0,
             shrink: 1.0,
@@ -1195,6 +1201,7 @@ const KNOWN: &[&str] = &[
     "box-sizing",
     "height",
     "min-height",
+    "max-height",
     "white-space",
     "overflow-wrap",
     "word-wrap",
@@ -2676,6 +2683,15 @@ fn apply_decl(
             if let Some(l) = parse_len(&d.1, vp).filter(|_| d.1 != "auto") {
                 bx.min_height = Some(l);
                 bx.declared |= decl::MIN_HEIGHT;
+            }
+        }
+        // `none` (and garbage) clear the ceiling; a later `auto` is not a
+        // valid max-height value, so it clears as well
+        "max-height" => {
+            bx.max_height = if d.1 == "none" {
+                None
+            } else {
+                parse_len(&d.1, vp)
             }
         }
         "max-width" => {
@@ -5976,6 +5992,29 @@ mod tests {
         // the two-value form is accepted; `overflow` supplies the clip
         assert!(st("c").bx.ellipsis);
         assert!(st("c").bx.clip);
+    }
+
+    #[test]
+    fn max_height_parses_lengths_and_clears_on_none() {
+        let sheet = parse(
+            ".a { max-height: 40px } .b { max-height: 50% } \
+             .c { max-height: none } .d { max-height: 0 } \
+             .e { max-height: auto }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div>",
+        );
+        let st = |cls: &str| {
+            let node = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, node, Style::new(), None)
+        };
+        assert_eq!(st("a").bx.max_height, Some(Len::Px(40.0)));
+        assert_eq!(st("b").bx.max_height, Some(Len::Pct(50.0)));
+        assert_eq!(st("c").bx.max_height, None);
+        assert_eq!(st("d").bx.max_height, Some(Len::Px(0.0)));
+        // `auto` is not a valid max-height; it clears like an invalid value
+        assert_eq!(st("e").bx.max_height, None);
     }
 
     #[test]
