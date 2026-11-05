@@ -124,6 +124,18 @@ pub enum Tt {
     Capitalize,
 }
 
+/// `text-decoration-style` — the line pattern. `Wavy` has no per-pixel
+/// wave painter in this engine and is documented as falling back to solid;
+/// `text-decoration-style: none` is invalid CSS and is ignored on parse.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DecoStyle {
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct Style {
     pub size: f32,
@@ -136,6 +148,15 @@ pub struct Style {
     pub strike: bool,
     /// `text-decoration: overline` — a rule above the line box
     pub overline: bool,
+    /// `text-decoration-color`; None = currentcolor (the run's own color)
+    pub deco_color: Option<u32>,
+    /// `text-decoration-style` — pattern of underline/strike/overline
+    pub deco_style: DecoStyle,
+    /// `text-decoration-thickness` in px; 0 = `auto` (1px)
+    pub deco_thickness: f32,
+    /// `text-underline-offset` in px, added to the default underline y;
+    /// 0 = `auto` (the default position) — applies to underline only
+    pub deco_offset: f32,
     pub fam: Fam,
     /// 0 = left, 1 = center, 2 = right (inherited, text-align)
     pub text_align: u8,
@@ -174,6 +195,10 @@ impl Style {
             underline: false,
             strike: false,
             overline: false,
+            deco_color: None,
+            deco_style: DecoStyle::Solid,
+            deco_thickness: 0.0,
+            deco_offset: 0.0,
             fam: Fam::Sans,
             text_align: 0,
             lh: 0.0,
@@ -4153,6 +4178,49 @@ fn push_uls(mut src: Vec<UR>, dx: f32, dy: f32, dst: &mut Vec<UR>) {
     dst.append(&mut src);
 }
 
+/// Push the painted rule(s) for one decoration line. `thickness` is resolved
+/// px (0 = CSS `auto`, painted 1px). The wire channel carries solid rects, so
+/// dotted/dashed are expanded into short solid segments here; `Wavy` falls
+/// back to solid (documented shortcut — there is no wave painter).
+fn push_deco(
+    out: &mut Vec<UR>,
+    x: f32,
+    y: f32,
+    w: f32,
+    thickness: f32,
+    style: DecoStyle,
+    color: u32,
+) {
+    if w <= 0.0 {
+        return;
+    }
+    let th = if thickness > 0.0 { thickness } else { 1.0 };
+    match style {
+        DecoStyle::Solid | DecoStyle::Wavy => out.push((x, y, w, th, color, false)),
+        DecoStyle::Double => {
+            // two rules inside the declared overall thickness
+            let half = ((th - 1.0) * 0.5).max(1.0);
+            out.push((x, y, w, half, color, false));
+            out.push((x, y + half + 1.0, w, half, color, false));
+        }
+        DecoStyle::Dotted => {
+            let mut dx = 0.0;
+            while dx < w {
+                out.push((x + dx, y, (w - dx).min(th), th, color, false));
+                dx += th * 2.0;
+            }
+        }
+        DecoStyle::Dashed => {
+            let seg = (th * 3.0).max(2.0);
+            let mut dx = 0.0;
+            while dx < w {
+                out.push((x + dx, y, (w - dx).min(seg), th, color, false));
+                dx += seg + th;
+            }
+        }
+    }
+}
+
 /// The 1–2 items of a flex/grid row: consecutive text leaves merge into one
 /// anonymous item (matching the spec's anonymous flex item).
 #[derive(Clone, Copy)]
@@ -6691,15 +6759,40 @@ fn layout_from(
                 node: w.node,
                 cursor: w.cursor,
             });
+            let deco_color = w.style.deco_color.unwrap_or(w.style.color);
             if w.style.underline {
-                underline_rects.push((x, y + lh - 2.0, pw, 1.0, w.style.color, false));
+                push_deco(
+                    &mut underline_rects,
+                    x,
+                    y + lh - 2.0 + w.style.deco_offset,
+                    pw,
+                    w.style.deco_thickness,
+                    w.style.deco_style,
+                    deco_color,
+                );
             }
             if w.style.strike {
                 // mid-x-height: a hair above the vertical middle of the line box
-                underline_rects.push((x, y + lh * 0.5, pw, 1.0, w.style.color, false));
+                push_deco(
+                    &mut underline_rects,
+                    x,
+                    y + lh * 0.5,
+                    pw,
+                    w.style.deco_thickness,
+                    w.style.deco_style,
+                    deco_color,
+                );
             }
             if w.style.overline {
-                underline_rects.push((x, y + 1.0, pw, 1.0, w.style.color, false));
+                push_deco(
+                    &mut underline_rects,
+                    x,
+                    y + 1.0,
+                    pw,
+                    w.style.deco_thickness,
+                    w.style.deco_style,
+                    deco_color,
+                );
             }
             x += pw;
             line_height = line_height.max(lh);
@@ -11706,6 +11799,42 @@ line</textarea></div>"#,
         assert!(
             (dr.0 - pr.0).abs() < 0.01 && (dr.1 - pr.1).abs() < 0.01,
             "50% 50% = center: {dr:?} vs {pr:?}"
+        );
+    }
+
+    #[test]
+    fn text_decoration_paint_longhands_style_the_rule() {
+        let build = |css: &str| {
+            let mut root = boxes_of("<a class=x href=#>link</a>", css);
+            layout_tree(&mut root, 300.0, &m4)
+        };
+        let plain = build(".x{text-decoration:underline}");
+        assert_eq!(plain.underline_rects.len(), 1, "one default rule");
+        let p = plain.underline_rects[0];
+        assert!((p.3 - 1.0).abs() < 0.01, "default thickness = 1px");
+        // colour, thickness and underline offset all reach the painted rect
+        let styled = build(
+            ".x{text-decoration:underline;text-decoration-color:#ff0000;\
+             text-decoration-thickness:2px;text-underline-offset:4px}",
+        );
+        assert_eq!(styled.underline_rects.len(), 1);
+        let s = styled.underline_rects[0];
+        assert_eq!(s.4, 0x00ff_0000, "decoration colour");
+        assert!((s.3 - 2.0).abs() < 0.01, "thickness");
+        assert!(
+            (s.1 - p.1 - 4.0).abs() < 0.01,
+            "underline-offset moves the rule down: {} vs {}",
+            s.1,
+            p.1
+        );
+        // dotted/dashed expand into segments; double paints two rules
+        let dotted = build(".x{text-decoration:underline;text-decoration-style:dotted}");
+        assert!(dotted.underline_rects.len() > 1, "dotted = segments");
+        let double = build(".x{text-decoration:underline;text-decoration-style:double}");
+        assert_eq!(double.underline_rects.len(), 2, "double = two rules");
+        assert!(
+            (double.underline_rects[1].1 - double.underline_rects[0].1 - 2.0).abs() < 0.01,
+            "double rules are separated"
         );
     }
 

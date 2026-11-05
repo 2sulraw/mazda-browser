@@ -25,7 +25,7 @@
 //! layout.rs consumes it. Upgrade when the CSS engine grows (Phase 1c+).
 
 use crate::html::{Dom, NodeKind};
-use crate::layout::{Fam, ListPos, ListStyleType, Ow, Style, Tt, Wb, Ws};
+use crate::layout::{DecoStyle, Fam, ListPos, ListStyleType, Ow, Style, Tt, Wb, Ws};
 
 pub type Decl = (String, String);
 
@@ -1210,6 +1210,10 @@ const KNOWN: &[&str] = &[
     "font-family",
     "text-decoration",
     "text-decoration-line",
+    "text-decoration-color",
+    "text-decoration-style",
+    "text-decoration-thickness",
+    "text-underline-offset",
     "display",
     "content",
     "opacity",
@@ -2418,12 +2422,88 @@ fn apply_decl(
                 style.fam_stack = fam_stack;
             }
         },
-        // `text-decoration` is a shorthand list; `text-decoration-line` is
-        // the longhand sites actually use. `none` clears every line.
+        // `text-decoration` is a shorthand over line/style/color/thickness;
+        // `text-decoration-line` sets only the line flags. `none` clears
+        // every line.
         "text-decoration" | "text-decoration-line" => {
-            style.underline = d.1.contains("underline");
-            style.strike = d.1.contains("line-through");
-            style.overline = d.1.contains("overline");
+            let shorthand = d.0 == "text-decoration";
+            if shorthand {
+                style.deco_style = DecoStyle::Solid;
+                style.deco_color = None;
+                style.deco_thickness = 0.0;
+            }
+            for tok in joined_tokens(&d.1) {
+                match tok.to_ascii_lowercase().as_str() {
+                    "none" => {
+                        style.underline = false;
+                        style.strike = false;
+                        style.overline = false;
+                    }
+                    "underline" => style.underline = true,
+                    "line-through" => style.strike = true,
+                    "overline" => style.overline = true,
+                    other => {
+                        if shorthand {
+                            if let Some(s) = parse_deco_style(other) {
+                                style.deco_style = s;
+                            } else if other == "auto" || other == "from-font" {
+                                style.deco_thickness = 0.0;
+                            } else if other == "currentcolor" || other == "inherit" {
+                                style.deco_color = None;
+                            } else if let Some(c) =
+                                parse_color(pick_light_dark(other, dark))
+                            {
+                                style.deco_color = Some(c);
+                            } else if let Some(l) = parse_len(other, vp) {
+                                style.deco_thickness = len_px(l, style.size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "text-decoration-color" => {
+            let t = pick_light_dark(d.1.trim(), dark);
+            if t.eq_ignore_ascii_case("currentcolor")
+                || t.eq_ignore_ascii_case("inherit")
+                || t.eq_ignore_ascii_case("initial")
+                || t.eq_ignore_ascii_case("unset")
+                || t.eq_ignore_ascii_case("revert")
+                || t.eq_ignore_ascii_case("revert-layer")
+            {
+                style.deco_color = None;
+            } else if t.eq_ignore_ascii_case("transparent") {
+                style.deco_color = Some(0);
+            } else if let Some(c) = parse_color(t) {
+                style.deco_color = Some(c);
+            }
+        }
+        "text-decoration-style" => {
+            if let Some(s) = parse_deco_style(d.1.trim()) {
+                style.deco_style = s;
+            }
+        }
+        "text-decoration-thickness" => {
+            let t = d.1.trim();
+            style.deco_thickness = if t.eq_ignore_ascii_case("auto")
+                || t.eq_ignore_ascii_case("from-font")
+            {
+                0.0
+            } else {
+                parse_len(t, vp)
+                    .map(|l| len_px(l, style.size))
+                    .unwrap_or(style.deco_thickness)
+            };
+        }
+        "text-underline-offset" => {
+            let t = d.1.trim();
+            style.deco_offset = if t.eq_ignore_ascii_case("auto") {
+                0.0
+            } else {
+                parse_len(t, vp)
+                    .map(|l| len_px(l, style.size))
+                    .unwrap_or(style.deco_offset)
+            };
         }
         "line-height" => {
             // unitless = multiplier of font-size; px/rem/% absolute (of size)
@@ -3588,6 +3668,20 @@ fn parse_origin(v: &str, vp: (f32, f32)) -> Option<(Len, Len)> {
         }
     };
     Some((x, y))
+}
+
+/// `text-decoration-style` keyword → pattern. `none` is not a valid style
+/// value (it belongs to `text-decoration-line`), so it is rejected like any
+/// other unknown keyword and the declaration is dropped.
+fn parse_deco_style(v: &str) -> Option<DecoStyle> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "solid" => Some(DecoStyle::Solid),
+        "double" => Some(DecoStyle::Double),
+        "dotted" => Some(DecoStyle::Dotted),
+        "dashed" => Some(DecoStyle::Dashed),
+        "wavy" => Some(DecoStyle::Wavy),
+        _ => None,
+    }
 }
 
 fn parse_transform(v: &str, vp: (f32, f32)) -> Option<Transform> {
@@ -6860,6 +6954,50 @@ mod tests {
         base.overline = true;
         let s = sheet.resolve(&dom, by_attr(&dom, "class", "x"), base, None).style;
         assert!(!s.underline && !s.strike && !s.overline);
+    }
+
+    #[test]
+    fn text_decoration_paint_longhands_parse() {
+        let sheet = parse(
+            ".a{text-decoration:underline;text-decoration-color:#ff0000;\
+             text-decoration-style:dashed;text-decoration-thickness:2px;\
+             text-underline-offset:4px}\
+             .b{text-decoration:underline dotted rgb(1,2,3) 3px}\
+             .c{text-decoration-line:underline;text-decoration-color:transparent}\
+             .d{text-decoration:underline;text-decoration-style:none;\
+             text-decoration-thickness:bogus}\
+             .e{text-underline-offset:auto;text-decoration-color:currentcolor}",
+        );
+        let dom = dom_of(
+            "<span class=a>a</span><span class=b>b</span><span class=c>c</span>\
+             <span class=d>d</span><span class=e>e</span>",
+        );
+        let bx = |cls: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None)
+                .style
+        };
+        let a = bx("a");
+        assert_eq!(a.deco_color, Some(0x00ff_0000));
+        assert_eq!(a.deco_style, DecoStyle::Dashed);
+        assert!((a.deco_thickness - 2.0).abs() < 0.01);
+        assert!((a.deco_offset - 4.0).abs() < 0.01);
+        // shorthand carries line + style + colour + thickness
+        let b = bx("b");
+        assert!(b.underline);
+        assert_eq!(b.deco_style, DecoStyle::Dotted);
+        assert_eq!(b.deco_color, Some(0x0001_0203));
+        assert!((b.deco_thickness - 3.0).abs() < 0.01);
+        // `transparent` is a real colour, not an invalid declaration
+        assert_eq!(bx("c").deco_color, Some(0));
+        // invalid style/thickness are dropped, keeping the initial values
+        let d = bx("d");
+        assert_eq!(d.deco_style, DecoStyle::Solid);
+        assert_eq!(d.deco_thickness, 0.0);
+        // `auto` = the default offset, currentcolor = the run's own colour
+        let e = bx("e");
+        assert_eq!(e.deco_offset, 0.0);
+        assert_eq!(e.deco_color, None);
     }
 
     #[test]
