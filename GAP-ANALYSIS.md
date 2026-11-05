@@ -245,10 +245,11 @@ relevant only when transitions and animations exist.
 
 ### 4.4 Behavioural gaps that affect real pages
 
-- Backgrounds support a single `linear-gradient(...)` layer (angles, corner
-  keywords, percentage stops, hard stops and alpha); `radial-gradient`/
-  `conic-gradient`, multi-layer stacks, `repeating-*` tiling and
-  `background-clip` are absent. No animations or transitions, no `@keyframes`.
+- Backgrounds support a single `linear-gradient(...)` or
+  `radial-gradient(...)` layer (angles/corner keywords or centre/shape/extent
+  sizing, percentage stops, hard stops and alpha); `conic-gradient`,
+  multi-layer stacks, `repeating-*` tiling and `background-clip` are absent.
+  No animations or transitions, no `@keyframes`.
 - `@media` only understands width, hover, pointer, orientation, and
   `prefers-color-scheme`.
 - Grid: no `auto-fill`/`auto-fit`, no `min-content`/`max-content`, `repeat()`
@@ -403,7 +404,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 818 self-authored unit tests (822 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 820 self-authored unit tests (824 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -432,7 +433,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
-| P2 | `background-clip`, `radial-gradient`, `filter`/`mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
+| P2 | `background-clip`, `filter`/`mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
 

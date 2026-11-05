@@ -299,8 +299,38 @@ pub struct GradStop {
     pub alpha: u8,
 }
 
-/// A parsed `linear-gradient(...)`. `dir` is a unit vector in SCREEN space
-/// (y grows downward), so `to bottom` = `(0, 1)` and `90deg` = `(1, 0)`.
+/// Where a radial gradient's ending shape stops (CSS `<radial-size>`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RadExtent {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+}
+
+/// A radial gradient's size: either one of the extent keywords or explicit
+/// radii. `None` in [`RadSize::Lengths`] means that axis is auto.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RadSize {
+    Keyword(RadExtent),
+    /// explicit rx, ry (a single length is reused for both)
+    Lengths(Option<Len>, Option<Len>),
+}
+
+/// A parsed `radial-gradient(...)`: center as a symbolic position pair (%
+/// resolves against the box at paint), the shape, and its size.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Radial {
+    pub center: [BgPos; 2],
+    /// true = circle (one radius); false = ellipse (rx, ry)
+    pub circle: bool,
+    pub size: RadSize,
+}
+
+/// A parsed `linear-gradient(...)` / `radial-gradient(...)`. For a linear
+/// gradient `dir` is a unit vector in SCREEN space (y grows downward), so
+/// `to bottom` = `(0, 1)` and `90deg` = `(1, 0)`; for a radial one `dir`
+/// stays at its initial value and `radial` carries the geometry.
 /// Stops are stored in declaration order with positions made non-decreasing
 /// and the first/last defaults pinned to 0.0/1.0; the paint code clamps.
 /// shortcut: one layer only (the first gradient in the value), no
@@ -310,6 +340,8 @@ pub struct GradStop {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Gradient {
     pub dir: (f32, f32),
+    /// Some = a radial gradient (its center/shape/size); None = linear
+    pub radial: Option<Radial>,
     pub stops: Vec<GradStop>,
 }
 
@@ -500,8 +532,8 @@ pub struct BoxStyle {
     /// `background-repeat` — None = undeclared (single draw, see
     /// [`BgRepeat`]); Some(...) tiles on the named axis/axes at paint
     pub bg_repeat: Option<BgRepeat>,
-    /// `background: linear-gradient(...)` / `background-image:
-    /// linear-gradient(...)` — parsed once per declaration and painted
+    /// `background: linear-gradient(...)` / `radial-gradient(...)` (also
+    /// via `background-image`) — parsed once per declaration and painted
     /// per-pixel over the box's border box (see [`Gradient`] for the
     /// shortcuts). Painted above the background-color and below children.
     pub bg_gradient: Option<std::sync::Arc<Gradient>>,
@@ -2403,7 +2435,7 @@ fn apply_decl(
             // later color-only `background:` clears an earlier url.
             if d.0 == "background" {
                 bx.bg_image = parse_bg_url(&d.1);
-                bx.bg_gradient = parse_linear_gradient(&d.1, dark);
+                bx.bg_gradient = parse_gradient(&d.1, dark, vp);
                 // the shorthand resets the geometry longhands, then parses
                 // any repeat / position / size tokens it carries (spec
                 // cascade: a shorthand wins over earlier longhands)
@@ -2419,7 +2451,7 @@ fn apply_decl(
                     if let Some(u) = parse_bg_url(&d.1) {
                         bx.bg_image = Some(u);
                     }
-                    bx.bg_gradient = parse_linear_gradient(&d.1, dark);
+                    bx.bg_gradient = parse_gradient(&d.1, dark, vp);
                 }
             }
         }
@@ -3959,14 +3991,110 @@ fn split_top_level_commas(v: &str) -> Vec<&str> {
     parts
 }
 
-/// Parse the FIRST `linear-gradient(...)` in a `background` /
-/// `background-image` value. The match is a plain substring, so prefixed
-/// spellings land in the same parser (and `repeating-*` draws one pass —
-/// see [`Gradient`]). `None` = no gradient or an unparseable one.
-fn parse_linear_gradient(v: &str, dark: bool) -> Option<std::sync::Arc<Gradient>> {
-    const FN: &str = "linear-gradient(";
+/// Parse the pre-stop part of `radial-gradient(...)`: an optional shape and
+/// size followed by `at <position>`. Returns None when the part looks like a
+/// color stop instead (so it stays in the stop list).
+fn parse_radial_head(head: &str, vp: (f32, f32)) -> Option<Radial> {
+    let mut circle = false;
+    let mut shape_given = false;
+    let mut extent: Option<RadExtent> = None;
+    let mut lengths: Vec<Len> = Vec::new();
+    let mut pos_at: Option<usize> = None;
+    let toks = joined_tokens(head);
+    for (i, t) in toks.iter().enumerate() {
+        match t.to_ascii_lowercase().as_str() {
+            "circle" => {
+                circle = true;
+                shape_given = true;
+            }
+            "ellipse" => {
+                shape_given = true;
+            }
+            "closest-side" => extent = Some(RadExtent::ClosestSide),
+            "farthest-side" => extent = Some(RadExtent::FarthestSide),
+            "closest-corner" => extent = Some(RadExtent::ClosestCorner),
+            "farthest-corner" => extent = Some(RadExtent::FarthestCorner),
+            // CSS synonyms: contain = closest-side, cover = farthest-corner
+            "contain" => extent = Some(RadExtent::ClosestSide),
+            "cover" => extent = Some(RadExtent::FarthestCorner),
+            "at" => {
+                pos_at = Some(i + 1);
+                break;
+            }
+            _ => match parse_len(t, vp) {
+                Some(l) => lengths.push(l),
+                None => return None, // a color token -> first stop
+            },
+        }
+    }
+    // no shape/size/position: this is just the first color stop
+    if !shape_given && extent.is_none() && lengths.is_empty() && pos_at.is_none() {
+        return None;
+    }
+    let center = match pos_at {
+        Some(i) if i < toks.len() => parse_radial_pos(&toks[i..].join(" "), vp),
+        _ => [BgPos::Pct(50.0); 2],
+    };
+    let size = if let Some(e) = extent {
+        RadSize::Keyword(e)
+    } else {
+        match lengths.as_slice() {
+            [one] => {
+                if !shape_given {
+                    circle = true; // one length implies a circle
+                }
+                RadSize::Lengths(Some(*one), Some(*one))
+            }
+            [rx, ry, ..] => {
+                if circle {
+                    RadSize::Lengths(Some(*rx), Some(*rx))
+                } else {
+                    RadSize::Lengths(Some(*rx), Some(*ry))
+                }
+            }
+            [] => RadSize::Keyword(RadExtent::FarthestCorner),
+        }
+    };
+    Some(Radial {
+        center,
+        circle,
+        size,
+    })
+}
+
+/// `at <position>`: the same axis grammar as `background-position`, but a
+/// lone length centers the other axis (spec: `at 30%` = `30% 50%`).
+fn parse_radial_pos(v: &str, vp: (f32, f32)) -> [BgPos; 2] {
+    let toks = joined_tokens(v);
+    let mut p = parse_bg_pos(v, vp);
+    if toks.len() == 1 {
+        let low = toks[0].to_ascii_lowercase();
+        if !matches!(low.as_str(), "left" | "right" | "top" | "bottom" | "center") {
+            p[1] = BgPos::Pct(50.0);
+        }
+    }
+    p
+}
+
+/// Parse the FIRST `linear-gradient(...)` or `radial-gradient(...)` in a
+/// `background` / `background-image` value. The match is a plain substring,
+/// so prefixed spellings land in the same parser (and `repeating-*` draws
+/// one pass — see [`Gradient`]). `None` = no gradient or an unparseable one.
+fn parse_gradient(
+    v: &str,
+    dark: bool,
+    vp: (f32, f32),
+) -> Option<std::sync::Arc<Gradient>> {
+    const LIN: &str = "linear-gradient(";
+    const RAD: &str = "radial-gradient(";
     let lower = v.to_ascii_lowercase();
-    let at = lower.find(FN)? + FN.len();
+    let (at, is_radial) = if let Some(i) = lower.find(LIN) {
+        (i + LIN.len(), false)
+    } else if let Some(i) = lower.find(RAD) {
+        (i + RAD.len(), true)
+    } else {
+        return None;
+    };
     // closing paren, counting nested color functions (rgba(), light-dark())
     let mut depth = 1usize;
     let mut end = None;
@@ -3988,8 +4116,25 @@ fn parse_linear_gradient(v: &str, dark: bool) -> Option<std::sync::Arc<Gradient>
     // CSS initial direction: to bottom. `to <side>` / `<angle>` is only a
     // direction when it is the FIRST component.
     let mut dir = (0.0f32, 1.0f32);
+    let mut radial: Option<Radial> = None;
     let mut first_stop = 0usize;
-    if let Some(head) = parts.first() {
+    if is_radial {
+        if let Some(head) = parts.first() {
+            if let Some(r) = parse_radial_head(head, vp) {
+                radial = Some(r);
+                first_stop = 1;
+            }
+        }
+        // no shape/size/position head: CSS initial = centered ellipse at
+        // farthest-corner
+        if radial.is_none() {
+            radial = Some(Radial {
+                center: [BgPos::Pct(50.0); 2],
+                circle: false,
+                size: RadSize::Keyword(RadExtent::FarthestCorner),
+            });
+        }
+    } else if let Some(head) = parts.first() {
         let head = head.trim();
         let low = head.to_ascii_lowercase();
         if let Some(rest) = low.strip_prefix("to ") {
@@ -4086,7 +4231,11 @@ fn parse_linear_gradient(v: &str, dark: bool) -> Option<std::sync::Arc<Gradient>
             i += 1;
         }
     }
-    Some(std::sync::Arc::new(Gradient { dir, stops }))
+    Some(std::sync::Arc::new(Gradient {
+        dir,
+        radial,
+        stops,
+    }))
 }
 
 /// `<angle>` for gradient directions: `deg`, `grad`, `rad`, `turn`.
@@ -9461,6 +9610,74 @@ mod tests {
         let h = bx("h").bg_gradient.unwrap();
         assert!((h.stops[0].pos - 0.4).abs() < 1e-6);
         assert!((h.stops[1].pos - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn radial_gradient_parses_shape_size_and_position() {
+        let sheet = parse(
+            ".a { background-image: radial-gradient(#000, #fff) } \
+             .b { background: radial-gradient(circle at 30% 40%, red, blue) } \
+             .c { background-image: radial-gradient(circle closest-side at center, red, blue) } \
+             .d { background-image: radial-gradient(ellipse 40px 20px at left top, red, blue) } \
+             .e { background-image: radial-gradient(farthest-side, red, blue) } \
+             .f { background-image: radial-gradient(20px, red, blue) } \
+             .g { background: linear-gradient(red, blue) } \
+             .h { background-image: radial-gradient(at 10px 20px, red, blue) } \
+             .i { background-image: radial-gradient(cover, red, blue) } \
+             .j { background-image: radial-gradient(red 20%, blue) }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>\
+             <div class=e></div><div class=f></div><div class=g></div><div class=h></div>\
+             <div class=i></div><div class=j></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        let rad = |cls: &str| bx(cls).bg_gradient.unwrap().radial.unwrap();
+        // initial: ellipse, farthest-corner, centered
+        let a = rad("a");
+        assert_eq!(a.center, [BgPos::Pct(50.0); 2]);
+        assert!(!a.circle);
+        assert_eq!(a.size, RadSize::Keyword(RadExtent::FarthestCorner));
+        assert_eq!(bx("a").bg_gradient.unwrap().stops.len(), 2);
+
+        let b = rad("b");
+        assert!(b.circle);
+        assert_eq!(b.center, [BgPos::Pct(30.0), BgPos::Pct(40.0)]);
+
+        let c = rad("c");
+        assert!(c.circle);
+        assert_eq!(c.size, RadSize::Keyword(RadExtent::ClosestSide));
+        assert_eq!(c.center, [BgPos::Pct(50.0); 2]);
+
+        let d = rad("d");
+        assert!(!d.circle);
+        assert_eq!(
+            d.size,
+            RadSize::Lengths(Some(Len::Px(40.0)), Some(Len::Px(20.0)))
+        );
+        assert_eq!(d.center, [BgPos::Pct(0.0), BgPos::Pct(0.0)]);
+
+        assert_eq!(rad("e").size, RadSize::Keyword(RadExtent::FarthestSide));
+        // one length implies a circle
+        let f = rad("f");
+        assert!(f.circle);
+        assert_eq!(
+            f.size,
+            RadSize::Lengths(Some(Len::Px(20.0)), Some(Len::Px(20.0)))
+        );
+
+        assert!(bx("g").bg_gradient.unwrap().radial.is_none(), "linear stays linear");
+
+        let h = rad("h");
+        assert_eq!(h.center, [BgPos::Px(10.0), BgPos::Px(20.0)]);
+        assert_eq!(h.size, RadSize::Keyword(RadExtent::FarthestCorner));
+        assert_eq!(rad("i").size, RadSize::Keyword(RadExtent::FarthestCorner));
+
+        // a color stop that carries a position must not be eaten as a head
+        let j = rad("j");
+        assert_eq!(j.size, RadSize::Keyword(RadExtent::FarthestCorner));
+        let js = bx("j").bg_gradient.unwrap();
+        assert!((js.stops[0].pos - 0.2).abs() < 1e-6);
     }
 
     // ---- object-fit / object-position / aspect-ratio ----

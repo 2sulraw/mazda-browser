@@ -1730,6 +1730,43 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-05 | wave 61 (`line-clamp`) | a local clamped-card page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | A box can now cap how many text lines it shows. `line-clamp: N` (any single-dash vendor spelling unprefixes to it) parses into an optional positive count on `BoxStyle`; `none`, garbage and `0` clear it. After the box's flow is laid out, `place()` groups the subtree's runs by their line top; when more than N lines exist it clears every run below the cut, trims the kept line's last run with `fit_prefix` so a trailing marker fits inside the content edge, zeros underlines below the cut, and shrinks the content height to the cut so following siblings move up. `display: flex/grid` containers ignore the clamp. A local page shows a two-line card, a three-line card, an unclamped sibling and a short paragraph that already fits. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.5 MB, MDN 2773px / 641 runs / 87.9 MB, Wikipedia 24575px / 10950 runs / 102.8 MB, HN 1695px / 728 runs / 78.3 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **818** default / **822** `engine-b + woff2` |
 
+| 2026-11-05 | wave 62 (`radial-gradient`) | a local radial page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Backgrounds can now use `radial-gradient(...)` in `background` and `background-image` alongside the linear form. The parser accepts `circle`/`ellipse`, the `closest-side`/`farthest-side`/`closest-corner`/`farthest-corner` extents (plus the `contain`/`cover` synonyms), one or two explicit radii, and `at <position>` using the `background-position` grammar; a lone length implies a circle and a headless gradient defaults to a centred ellipse at farthest-corner. The extra geometry is one optional `Radial` field on the existing `Gradient`, so linear parsing, storage and the paint channel are unchanged. Paint resolves the centre and radii against the painted border box and maps each pixel through the normalized distance `sqrt(((x-cx)/rx)^2 + ((y-cy)/ry)^2)`, so `t` is 0 at the centre and 1 on the ending shape; rounded corners, stacking, transforms and sticky pinning reuse the solid-background path. A local page shows an off-centre circle, the default ellipse, explicit `20px 40px` radii, `closest-side`, positioned stops, a rounded-corner clip and a headless gradient. References stay error-free with unchanged geometry: nextjs 7578px / 569 runs / 155.7 MB, MDN 2773px / 641 runs / 89.8 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **820** default / **824** `engine-b + woff2` |
+
+### Wave 62 findings
+
+- **Geometry resolves at paint time.** The centre is stored as the same
+  symbolic `BgPos` pair that `background-position` uses, so percentage centres
+  follow the box's painted size without a layout pass and the radial path
+  needs no new rect or layout field. `radial_radii` turns centre, shape and
+  size into `(cx, cy, rx, ry)` once per gradient and the per-pixel loop only
+  does the normalized-distance test.
+- **The linear path stays byte-identical.** `Gradient` gained one
+  `Option<Radial>` and a `None` value means linear; `dir` keeps its initial
+  value for radial gradients. The per-pixel branch picks the radial metric or
+  the old projection, so stored linear gradients, their tests and measured
+  geometry are untouched.
+- **A single normalized metric covers every shape.** `t = sqrt(...)` is 0 at
+  the centre and 1 on the ending shape, and the shared stop interpolation
+  clamps outside it, so the last stop fills the corners and everything past
+  the shape. Corner keywords pick the chosen corner's `|dx|`/`|dy|` as the
+  ellipse radii so `t` reaches exactly 1 there; a circle's percentage radius
+  resolves against `hypot(w, h) / sqrt(2)`, and a degenerate axis falls back to
+  1.0 to keep the metric finite.
+- **Shortcuts.** Corner-keyword ellipses use the corner offsets directly
+  instead of the spec's aspect-ratio scaling, `repeating-*` still paints one
+  pass, only the first gradient layer is used, there is no
+  `background-origin`/`background-clip`, and a gradient whose stops use a
+  named colour outside the 16-entry table is dropped whole (the pre-existing
+  linear behaviour, surfaced by a local `gold`/`crimson` case).
+- **Geometry is untouched.** None of the five references changes height, run
+  count or error output, and the only new memory is one `Option<Radial>` per
+  gradient-bearing box.
+- **Test coverage.** One parser test (shape, extents and synonyms, explicit
+  radii, `at` positions, one-length circle inference, headless default, linear
+  staying linear, a positioned first colour stop not being eaten as a head)
+  and one paint test (centre = first stop, corner past the radius = last stop,
+  off-centre blending).
+
 ### Wave 61 findings
 
 - **Lines are run tops, not objects.** The engine has no line-box structure:

@@ -6268,10 +6268,88 @@ fn grad_at(g: &css::Gradient, t: f32) -> (u32, u8) {
     (last.color, last.alpha)
 }
 
-/// Paint one `linear-gradient` into a rect of the page buffer. The
-/// gradient line crosses the rect centre along `g.dir`; its length is the
-/// rect's extent along that direction (the CSS rule for a linear gradient),
-/// so `t` is 0 at the entry edge and 1 at the exit edge.
+/// Resolve one radial center axis against the painted box extent.
+fn rad_axis(p: css::BgPos, extent: f32) -> f32 {
+    match p {
+        css::BgPos::Pct(v) => v / 100.0 * extent,
+        css::BgPos::Px(v) => v,
+    }
+}
+
+/// Resolve a radial gradient's center and radii against the painted box.
+/// `t = sqrt(((x-cx)/rx)^2 + ((y-cy)/ry)^2)` is 0 at the center and 1 on the
+/// ending shape. shortcut: corner keywords use the chosen corner's |dx|/|dy|
+/// as the ellipse radii (so `t` reaches 1 exactly at that corner) rather
+/// than the spec's aspect-ratio scaling; a circle's percentage radius
+/// resolves against `hypot(w, h) / sqrt(2)`.
+fn radial_radii(g: &css::Radial, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let cx = rad_axis(g.center[0], w);
+    let cy = rad_axis(g.center[1], h);
+    let near_x = cx.min((w - cx).abs());
+    let far_x = cx.max((w - cx).abs());
+    let near_y = cy.min((h - cy).abs());
+    let far_y = cy.max((h - cy).abs());
+    let corner = |x: f32, y: f32| (x * x + y * y).sqrt();
+    let circ_pct = (w * w + h * h).sqrt() / std::f32::consts::SQRT_2;
+    let (mut rx, mut ry) = match g.size {
+        css::RadSize::Keyword(e) => match (g.circle, e) {
+            (true, css::RadExtent::ClosestSide) => {
+                let v = near_x.min(near_y);
+                (v, v)
+            }
+            (true, css::RadExtent::FarthestSide) => {
+                let v = far_x.max(far_y);
+                (v, v)
+            }
+            (true, css::RadExtent::ClosestCorner) => {
+                let v = corner(near_x, near_y);
+                (v, v)
+            }
+            (true, css::RadExtent::FarthestCorner) => {
+                let v = corner(far_x, far_y);
+                (v, v)
+            }
+            (false, css::RadExtent::ClosestSide) => (near_x, near_y),
+            (false, css::RadExtent::FarthestSide) => (far_x, far_y),
+            (false, css::RadExtent::ClosestCorner) => (near_x, near_y),
+            (false, css::RadExtent::FarthestCorner) => (far_x, far_y),
+        },
+        css::RadSize::Lengths(lx, ly) => {
+            let one = |l: css::Len, base: f32| match l {
+                css::Len::Px(v) => v,
+                css::Len::Pct(p) => p / 100.0 * base,
+                css::Len::Calc { px, pct } => px + pct / 100.0 * base,
+            };
+            let x = lx
+                .map(|l| one(l, if g.circle { circ_pct } else { w }))
+                .unwrap_or(far_x);
+            let y = ly
+                .map(|l| one(l, if g.circle { circ_pct } else { h }))
+                .unwrap_or(far_y);
+            if g.circle {
+                let v = x.max(0.0);
+                (v, v)
+            } else {
+                (x, y)
+            }
+        }
+    };
+    // degenerate axes: keep the metric finite (the last stop fills the box)
+    if !(rx > 1e-4) {
+        rx = 1.0;
+    }
+    if !(ry > 1e-4) {
+        ry = 1.0;
+    }
+    (cx, cy, rx, ry)
+}
+
+/// Paint one `linear-gradient` / `radial-gradient` into a rect of the page
+/// buffer. For a linear gradient the gradient line crosses the rect centre
+/// along `g.dir`; its length is the rect's extent along that direction (the
+/// CSS rule for a linear gradient), so `t` is 0 at the entry edge and 1 at
+/// the exit edge. A radial gradient maps each pixel through
+/// [`radial_radii`](fn.radial_radii.html)'s normalized distance instead.
 fn paint_gradient(
     buf: &mut [u32],
     width: usize,
@@ -6289,6 +6367,7 @@ fn paint_gradient(
     let len = (w * g.dir.0).abs() + (h * g.dir.1).abs();
     let len = if len > 1e-6 { len } else { 1.0 };
     let (hw, hh) = (w * 0.5, h * 0.5);
+    let radial = g.radial.as_ref().map(|r| radial_radii(r, w, h));
     let (ox, oy) = (sx as i32, sy as i32);
     for dy in 0..h.max(0.0) as usize {
         let py = oy + dy as i32;
@@ -6316,7 +6395,15 @@ fn paint_gradient(
                     continue;
                 }
             }
-            let t = 0.5 + ((dx as f32 - hw) * g.dir.0 + (ly - hh) * g.dir.1) / len;
+            let lx = dx as f32;
+            let t = match radial {
+                Some((cx, cy, rx, ry)) => {
+                    let nx = (lx - cx) / rx;
+                    let ny = (ly - cy) / ry;
+                    (nx * nx + ny * ny).sqrt()
+                }
+                None => 0.5 + ((lx - hw) * g.dir.0 + (ly - hh) * g.dir.1) / len,
+            };
             let (c, a) = grad_at(g, t.clamp(0.0, 1.0));
             let idx = py as usize * width + px as usize;
             if a == 255 {
@@ -8192,6 +8279,7 @@ mod tests {
     fn gradient_stop_interpolation_is_linear_and_clamped() {
         let g = css::Gradient {
             dir: (1.0, 0.0),
+            radial: None,
             stops: vec![
                 css::GradStop { pos: 0.2, color: 0xff0000, alpha: 255 },
                 css::GradStop { pos: 0.6, color: 0x0000ff, alpha: 0 },
@@ -8205,6 +8293,7 @@ mod tests {
         // two opaque stops still interpolate both RGB channels linearly
         let solid = css::Gradient {
             dir: (1.0, 0.0),
+            radial: None,
             stops: vec![
                 css::GradStop { pos: 0.0, color: 0xff0000, alpha: 255 },
                 css::GradStop { pos: 1.0, color: 0x0000ff, alpha: 255 },
@@ -8217,6 +8306,7 @@ mod tests {
     fn linear_gradient_paints_along_its_direction() {
         let g = css::Gradient {
             dir: (1.0, 0.0), // to right
+            radial: None,
             stops: vec![
                 css::GradStop { pos: 0.0, color: 0xff0000, alpha: 255 },
                 css::GradStop { pos: 1.0, color: 0x0000ff, alpha: 255 },
@@ -8236,6 +8326,32 @@ mod tests {
         paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 1.0, 10.0, 0.0, &v);
         assert_eq!(buf[0], 0xff0000);
         assert!(buf[9 * 10] & 0xff > 200, "bottom row near blue");
+    }
+
+    #[test]
+    fn radial_gradient_paints_from_its_center_outward() {
+        // 10x10 box, circle radius 5 at the center: the middle pixel is the
+        // first stop and a corner (distance ~7.07) is past the last stop
+        let g = css::Gradient {
+            dir: (0.0, 1.0),
+            radial: Some(css::Radial {
+                center: [css::BgPos::Pct(50.0); 2],
+                circle: true,
+                size: css::RadSize::Lengths(
+                    Some(css::Len::Px(5.0)),
+                    Some(css::Len::Px(5.0)),
+                ),
+            }),
+            stops: vec![
+                css::GradStop { pos: 0.0, color: 0xff0000, alpha: 255 },
+                css::GradStop { pos: 1.0, color: 0x0000ff, alpha: 255 },
+            ],
+        };
+        let mut buf = vec![0u32; 100];
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, 0.0, &g);
+        assert_eq!(buf[5 * 10 + 5], 0xff0000, "center = first stop");
+        assert_eq!(buf[0], 0x0000ff, "corner past the radius = last stop");
+        assert!(buf[6 * 10 + 6] != 0xff0000, "off-center pixel blended");
     }
 
     #[test]
