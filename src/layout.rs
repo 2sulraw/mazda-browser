@@ -2639,6 +2639,34 @@ fn collect_paint(
                 }
             }
         }
+        if n.bx.outline.on && !n.bx.outline.transparent {
+            // `outline` — a ring OUTSIDE the border box, shifted by
+            // `outline-offset`. Paint-only: layout never sees it, so it
+            // overlaps neighbours like a real outline does. Four strips make
+            // the ring; every style renders solid (see [`css::Outline`]).
+            let ow = n.bx.outline.w;
+            if ow > 0.0 {
+                let off = n.bx.outline.offset;
+                let oc = n.bx.outline.color.unwrap_or(n.style.color);
+                let x = n.x - off - ow;
+                let y = n.y - off - ow;
+                let ww = n.w + (off + ow) * 2.0;
+                let hh = n.h + (off + ow) * 2.0;
+                let strips: [(f32, f32, f32, f32); 4] = [
+                    (x, y, ww, ow),
+                    (x, y + hh - ow, ww, ow),
+                    (x, y + ow, ow, (hh - ow * 2.0).max(0.0)),
+                    (x + ww - ow, y + ow, ow, (hh - ow * 2.0).max(0.0)),
+                ];
+                for q in strips {
+                    let q = m.map_rect(q);
+                    if let Some(q) = cull_rect(q, clip) {
+                        out.push((q.0, q.1, q.2, q.3, oc, 0.0, fixed));
+                        out_z.push(z);
+                    }
+                }
+            }
+        }
         if let Some(ImgSlot::Ready(d)) = &n.img {
             if n.w > 0.0 && n.h > 0.0 {
                 match (n.bx.bg_repeat, n.bg_tile_region) {
@@ -8856,6 +8884,114 @@ mod tests {
         let r = l.runs.iter().find(|r| r.text == "tall").expect("run");
         let (_, _, _, y1) = r.clip.expect("spill clipped");
         assert!((y1 - 40.0).abs() < 0.01, "clip bottom={y1}");
+    }
+
+    #[test]
+    fn outline_paints_a_ring_outside_the_border_box() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                width: Some(Len::Px(100.0)),
+                border: [Len::Px(1.0); 4],
+                outline: crate::css::Outline {
+                    on: true,
+                    w: 2.0,
+                    color: Some(0x0000ff),
+                    offset: 0.0,
+                    transparent: false,
+                },
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("x")];
+        let l = layout_tree(&mut n, 300.0, &m4);
+        let ring: Vec<_> = l.rects.iter().filter(|r| r.4 == 0x0000ff).collect();
+        assert_eq!(ring.len(), 4, "four strips make the ring");
+        // top strip: 2px above and left of the border box, 4px wider
+        let top = ring
+            .iter()
+            .find(|r| (r.3 - 2.0).abs() < 0.01 && r.1 < n.y)
+            .expect("top strip");
+        assert!((top.0 - (n.x - 2.0)).abs() < 0.01, "top x={}", top.0);
+        assert!((top.1 - (n.y - 2.0)).abs() < 0.01, "top y={}", top.1);
+        assert!((top.2 - (n.w + 4.0)).abs() < 0.01, "top w={}", top.2);
+        // and the bottom strip sits past the border box bottom
+        let bottom = ring
+            .iter()
+            .find(|r| (r.3 - 2.0).abs() < 0.01 && r.1 > n.y)
+            .expect("bottom strip");
+        assert!(
+            (bottom.1 - (n.y + n.h)).abs() < 0.01,
+            "bottom y={} box ends at {}",
+            bottom.1,
+            n.y + n.h
+        );
+    }
+
+    #[test]
+    fn outline_offset_moves_the_ring_outward() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                width: Some(Len::Px(100.0)),
+                outline: crate::css::Outline {
+                    on: true,
+                    w: 2.0,
+                    color: Some(0x00aa00),
+                    offset: 3.0,
+                    transparent: false,
+                },
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("x")];
+        let l = layout_tree(&mut n, 300.0, &m4);
+        let top = l
+            .rects
+            .iter()
+            .filter(|r| r.4 == 0x00aa00)
+            .find(|r| (r.3 - 2.0).abs() < 0.01 && r.1 < n.y)
+            .expect("top strip");
+        // offset 3 + width 2 outside every edge
+        assert!((top.0 - (n.x - 5.0)).abs() < 0.01, "top x={}", top.0);
+        assert!((top.1 - (n.y - 5.0)).abs() < 0.01, "top y={}", top.1);
+        assert!((top.2 - (n.w + 10.0)).abs() < 0.01, "top w={}", top.2);
+    }
+
+    #[test]
+    fn outline_none_or_zero_width_paints_nothing() {
+        for outline in [
+            crate::css::Outline::NONE,
+            crate::css::Outline {
+                on: true,
+                w: 0.0,
+                color: Some(0x123456),
+                offset: 0.0,
+                transparent: false,
+            },
+            crate::css::Outline {
+                on: true,
+                w: 2.0,
+                color: Some(0x123456),
+                offset: 0.0,
+                transparent: true,
+            },
+        ] {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    width: Some(Len::Px(100.0)),
+                    outline,
+                    ..BoxStyle::default()
+                },
+            );
+            n.children = vec![leaf("x")];
+            let l = layout_tree(&mut n, 300.0, &m4);
+            assert!(
+                l.rects.iter().all(|r| r.4 != 0x123456),
+                "no ring rect for {outline:?}"
+            );
+        }
     }
 
     #[test]

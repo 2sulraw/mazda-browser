@@ -1714,6 +1714,34 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 49 (`overflow-wrap` / `word-break`) | a local 120px-box wrapping page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Line layout can now break inside a word. `overflow-wrap: break-word|anywhere`, the legacy `word-wrap` alias and `word-break: break-all|break-word|keep-all` parse into two inherited `Style` switches; when a word still does not fit, the breaker cuts the longest character prefix that fits (`fit_prefix`, a binary search over monotone widths) and continues on the next line. A local page isolates the behavior: a 28-character token in a 120px box stays one 217px overflowing run by default, becomes 117px + 76px with `break-word`, 112px + 97px with `break-all`, and short words on one line are untouched. Four references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.1 MB, MDN 2922px / 641 runs / 87.5 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.6 MB. Wikipedia moves to 24575px / 10950 runs / 100.9 MB because its own `word-break: break-all` / `break-word` rules now take effect (intended fidelity gain, 7 extra run pieces); suite **785** default / **789** `engine-b + woff2` |
 | 2026-11-05 | wave 50 (`text-overflow`) | a local 160px-row ellipsis page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Clipped lines can now end with an ellipsis. `text-overflow` is accepted and sets a box-level `ellipsis` flag (any `ellipsis` token matches, so the two-value form parses); `apply_run_clips` trims, per line, the run crossing the right content edge to the longest prefix that still leaves room for "…", empties later runs on that line, and leaves fitting lines and boxes without `overflow` alone. Runs are emptied, never removed, so other boxes' ranges stay valid. A local page shows the change directly: a 160px `nowrap`/`overflow:hidden` row dumps `ABCDEFGHIJKLMNOPQRST…` (153px) with `text-overflow: ellipsis`, while the same row without the declaration, a fitting label, and a `text-overflow`-only box without `overflow` keep their full text. No geometry change; all five references stay error-free: nextjs 7578px / 569 runs / 154.3 MB, MDN 2922px / 641 runs / 87.7 MB, Wikipedia 24575px / 10950 runs / 101.8 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **787** default / **791** `engine-b + woff2` |
 | 2026-11-05 | wave 51 (`max-height`) | a local capped/overflow page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | A box can now cap its used height. `max-height` parses (`none`/`auto`/garbage clear it) and `place()` clamps the content height after layout, before the `min-height` floor, so taller content simply overflows — clipped only when `overflow` says so, and a larger `min-height` still wins (CSS Sizing 3). The clamp reuses the existing `box-sizing` rule: the declaration caps the border box by default and the content under `content-box`. A local page isolates it: with `max-height: 90px` a seven-line box measures 90px (four lines painted under `overflow: hidden`), the same box without `overflow` spills its text over the next box, a box whose content is shorter is unchanged, and `max-height: 40px; min-height: 120px` stays 120px. Four references are byte-identical; MDN improves: 2922 -> 2690px (runs 641 unchanged, 87.6 MB) because `.homepage-header__mandala { max-height: 20rem; overflow: hidden }` now holds the 35rem globe to 320px, which is what a real browser does. nextjs 7578px / 569 runs / 155.0 MB, Wikipedia 24575px / 10950 runs / 102.3 MB, HN 1695px / 728 runs / 78.2 MB, rust-lang 5800px / 483 runs / 84.8 MB; suite **792** default / **796** `engine-b + woff2` |
+| 2026-11-05 | wave 52 (`outline`) | a local outline page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | A box can now paint an outline: a ring outside the border box that layout never sees. `outline` and its `outline-width`/`-style`/`-color`/`-offset` longhands parse into a compact `BoxStyle.outline` (on, width, optional colour, offset); every non-`none` style paints solid, `auto` counts as off, an unset colour is currentcolor, and the width defaults to the CSS `medium` 3px. Paint emits four strips around the border box shifted outward by `outline-offset`, mapped through the box transform and culled by the inherited clip like the border strips. A local page shows all five cases: a 4px red ring hugging the border box, the same ring pushed 6px out by `outline-offset`, a `none` box with no ring, `thick dashed #06c` drawn as a 5px solid blue ring, and `1px solid transparent` keeping its geometry but painting nothing. All five references are geometry-identical and error-free: nextjs 7578px / 569 runs / 155.4 MB, MDN 2690px / 641 runs / 88.0 MB, Wikipedia 24575px / 10950 runs / 103.0 MB, HN 1695px / 728 runs / 79.3 MB, rust-lang 5800px / 483 runs / 85.8 MB; suite **796** default / **800** `engine-b + woff2` |
+
+### Wave 52 findings
+
+- **Paint-only, as CSS defines it.** The ring is emitted next to the border
+  strips and never touches layout: neighbours keep their coordinates and an
+  outline can overlap them, which is exactly why it is not a `border`.
+- **Four strips, no corner rounding.** The ring is the border box expanded by
+  `offset + width`, split into top/bottom/left/right rectangles. It therefore
+  has square corners even on a rounded box, and a negative `outline-offset`
+  pulls it inside the border box (the strips still paint, possibly over the
+  background).
+- **One appearance for every style.** `dotted`, `dashed`, `double`, `groove`,
+  `ridge`, `inset` and `outset` all render as a solid ring; the rasterizer has
+  no dash phase or bevel model and inventing one would cost memory for no
+  layout gain. `auto` is off because the engine drops the `:focus` rules that
+  would ever show the platform ring.
+- **Defaults match CSS.** `outline: solid` is 3px currentcolor; `outline:
+  thick dashed` is 5px currentcolor; `outline: none`, `initial`, `unset`,
+  `revert` and `revert-layer` clear it. A width longhand after the shorthand
+  overrides it, and `outline-offset` is independent of declaration order.
+  `outline-color: transparent` (the common "reserve a focus ring" reset) keeps
+  the ring's parsed geometry but suppresses its pixels.
+- **The references needed no tuning**, which confirms outlines are mostly
+  focus/`outline: none` reset material on static pages: four of five captures
+  are pixel-identical and every height/run count is unchanged. The new
+  `outline: none` resets also mean fewer UA rings would appear if focus rules
+  existed, but they are dropped before that matters.
 
 ### Wave 51 findings
 

@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 127 in `KNOWN` + 1 alias | 752 non-vendor | ~16% | dataset includes drafts; ~20-22% against names shipping in two mainstream engines |
+| CSS property names | 132 in `KNOWN` + 1 alias | 752 non-vendor | ~18% | dataset includes drafts; ~21-23% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,7 +151,7 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 127 |
+| Names in the engine's `KNOWN` table | 132 |
 | Additional accepted alias | 1 (`border-top-left-radius`) |
 | Raw missing (non-vendor) | ~630 |
 | Coverage (non-vendor) | ~16% |
@@ -171,7 +171,7 @@ ignored.
 | Text & typography | 61 | `hyphens`, `text-shadow` | high: frequent in real CSS |
 | Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low: low frequency here |
 | Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required |
-| Borders & outlines | 40 | corner longhands, `border-style`, `outline-*` | medium: `outline` is common |
+| Borders & outlines | 35 | corner longhands, `border-style`, `border-image-*` | medium: common in resets |
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
 | Fonts | 23 | `font`, `font-variant-*`, `font-kerning` | medium |
@@ -257,7 +257,8 @@ relevant only when transitions and animations exist.
 - `%` `min-height` / `max-height` resolve against width, not container
   height; an auto block still ignores a plain `height` (only `min-height`,
   `max-height`, `aspect-ratio` and replaced boxes pin it).
-- `outline-*` absent; `clip-path` is `inset()` only.
+- `outline` paints a solid ring only (styles collapse, `auto` is off);
+  `clip-path` is `inset()` only.
 - Interaction pseudo-classes (`:focus`, `:focus-visible`, `:checked`,
   `:active`) drop the whole rule; only `:hover` and `:not(:focus)` survive.
   Focus rings and custom checkbox states are therefore missing.
@@ -386,7 +387,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 792 self-authored unit tests (796 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 796 self-authored unit tests (800 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -415,7 +416,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
 | P1 | live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 1-2 waves |
-| P1 | CSS `outline`, `transform-origin`, `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
+| P1 | CSS `transform-origin`, `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
@@ -450,7 +451,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (127 + 1 alias)
+## Appendix A - CSS property names accepted (132 + 1 alias)
 
 ```text
 align-items, align-self, aspect-ratio, background
@@ -474,17 +475,18 @@ margin-inline, margin-inline-end, margin-inline-start, margin-left
 margin-right, margin-top, mask, mask-image
 mask-position, mask-repeat, mask-size, max-height
 max-width, min-height, min-width, object-fit
-object-position, opacity, order, overflow
-overflow-wrap, overflow-x, overflow-y, padding
-padding-block, padding-block-end, padding-block-start, padding-bottom
-padding-inline, padding-inline-end, padding-inline-start, padding-left
-padding-right, padding-top, position, right
-row-gap, stroke, stroke-linecap, stroke-linejoin
-stroke-opacity, stroke-width, table-layout, text-align
-text-decoration, text-decoration-line, text-indent, text-overflow
-text-transform, top, transform, vertical-align
-visibility, white-space, width, word-break
-word-spacing, word-wrap, z-index
+object-position, opacity, order, outline
+outline-color, outline-offset, outline-style, outline-width
+overflow, overflow-wrap, overflow-x, overflow-y
+padding, padding-block, padding-block-end, padding-block-start
+padding-bottom, padding-inline, padding-inline-end, padding-inline-start
+padding-left, padding-right, padding-top, position
+right, row-gap, stroke, stroke-linecap
+stroke-linejoin, stroke-opacity, stroke-width, table-layout
+text-align, text-decoration, text-decoration-line, text-indent
+text-overflow, text-transform, top, transform
+vertical-align, visibility, white-space, width
+word-break, word-spacing, word-wrap, z-index
 ```
 
 `border-top-left-radius` is accepted as an alias of the corner-radius shorthand
@@ -503,7 +505,6 @@ Layout and alignment:
 
 Box, border, outline:
   corner longhands other than top-left, border-style, border-image*,
-  outline, outline-color, outline-style, outline-width, outline-offset,
   box-decoration-break
 
 Text and typography:
@@ -587,7 +588,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 127 names
+# Engine property table: 132 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 

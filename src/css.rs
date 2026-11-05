@@ -304,6 +304,35 @@ pub struct Transform {
     pub sy: f32,
 }
 
+/// `outline` — a ring painted OUTSIDE the border box (never inside, never in
+/// layout). Only "is it drawn", a width, an optional colour and an offset are
+/// modeled: every non-`none` style renders as a solid ring (`dotted`,
+/// `dashed`, `double`, `groove` … all look solid here), and `auto` counts as
+/// off because this engine drops the `:focus` rules that would show the
+/// platform ring. `color: None` = currentcolor. `w` defaults to the CSS
+/// `medium` 3px, `offset` to 0.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Outline {
+    /// a non-`none` style was declared (the ring is painted when `w > 0`)
+    pub on: bool,
+    pub w: f32,
+    pub color: Option<u32>,
+    pub offset: f32,
+    /// `outline-color: transparent` — the ring keeps its geometry but paints
+    /// nothing (the usual "reserve a focus ring" reset)
+    pub transparent: bool,
+}
+
+impl Outline {
+    pub const NONE: Outline = Outline {
+        on: false,
+        w: 3.0,
+        color: None,
+        offset: 0.0,
+        transparent: false,
+    };
+}
+
 /// Per-element box layout properties — the non-inherited half of CSS.
 /// Default = plain block flow (matches pre-flex rendering).
 #[derive(Clone, PartialEq, Debug)]
@@ -455,6 +484,9 @@ pub struct BoxStyle {
     /// border color; None = currentcolor (the element's own text color,
     /// resolved at paint time — never a hardcoded default)
     pub bcolor: Option<u32>,
+    /// `outline` — a ring outside the border box, painted with the box's
+    /// chrome and never part of layout (see [`Outline`])
+    pub outline: Outline,
     /// `overflow`/`overflow-x`/`overflow-y` non-visible (`hidden`, `clip`,
     /// `scroll`, `auto`) — the box's CONTENT (children, their fills/text)
     /// is clipped to its padding box at paint. The element's own
@@ -633,6 +665,7 @@ impl Default for BoxStyle {
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
+            outline: Outline::NONE,
             clip: false,
             ellipsis: false,
             clip_rect: None,
@@ -1202,6 +1235,11 @@ const KNOWN: &[&str] = &[
     "height",
     "min-height",
     "max-height",
+    "outline",
+    "outline-width",
+    "outline-style",
+    "outline-color",
+    "outline-offset",
     "white-space",
     "overflow-wrap",
     "word-wrap",
@@ -2933,6 +2971,34 @@ fn apply_decl(
             }
             bx.declared |= decl::BCOLOR;
         }
+        // `outline` and its longhands — a ring outside the border box (see
+        // [`Outline`]). `outline-offset` is a separate property and can
+        // arrive before or after the shorthand.
+        "outline" => bx.outline = parse_outline(&d.1, vp, dark),
+        "outline-width" => {
+            if let Some(w) = outline_width(&d.1, vp) {
+                bx.outline.w = w;
+            }
+        }
+        "outline-style" => bx.outline.on = outline_style_on(&d.1),
+        "outline-color" => {
+            let t = d.1.trim();
+            if t.eq_ignore_ascii_case("transparent") {
+                bx.outline.color = None;
+                bx.outline.transparent = true;
+            } else if t.eq_ignore_ascii_case("currentcolor") {
+                bx.outline.color = None;
+                bx.outline.transparent = false;
+            } else if let Some(c) = parse_color(pick_light_dark(t, dark)) {
+                bx.outline.color = Some(c);
+                bx.outline.transparent = false;
+            }
+        }
+        "outline-offset" => {
+            if let Some(l) = parse_len(&d.1, vp) {
+                bx.outline.offset = len_px(l, 0.0);
+            }
+        }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
             let side = match d.0.as_str() {
                 "border-top" => 0,
@@ -3320,6 +3386,62 @@ fn border_parts(v: &str, dark: bool, vp: (f32, f32)) -> (Option<Len>, Option<u32
 
 /// CSS side shorthand (`margin`/`padding`: 1–4 whitespace-separated values)
 /// → [top, right, bottom, left].
+/// `outline` shorthand — `[width || style || color]` in any order, all
+/// optional. `initial`/`unset`/`revert` reset every longhand. Styles are
+/// collapsed: any non-`none` style turns the ring on and renders solid (see
+/// [`Outline`]); `auto` counts as off because the engine drops the `:focus`
+/// rules that would show the platform ring.
+fn parse_outline(v: &str, vp: (f32, f32), dark: bool) -> Outline {
+    let t = v.trim();
+    if t.is_empty()
+        || t.eq_ignore_ascii_case("initial")
+        || t.eq_ignore_ascii_case("unset")
+        || t.eq_ignore_ascii_case("revert")
+        || t.eq_ignore_ascii_case("revert-layer")
+    {
+        return Outline::NONE;
+    }
+    let mut o = Outline::NONE;
+    for tok in joined_tokens(t) {
+        let low = tok.to_ascii_lowercase();
+        if matches!(low.as_str(), "none" | "hidden" | "auto") {
+            o.on = false;
+        } else if outline_style_on(&low) {
+            o.on = true;
+        } else if let Some(w) = outline_width(&low, vp) {
+            o.w = w;
+        } else if low == "transparent" {
+            o.color = None;
+            o.transparent = true;
+        } else if let Some(c) = parse_color(pick_light_dark(&tok, dark)) {
+            o.color = Some(c);
+            o.transparent = false;
+        }
+        // `invert`, system colours and junk are ignored, like `border_parts`
+    }
+    o
+}
+
+/// `outline-width`: a length or `thin`/`medium`/`thick`. `%` is invalid
+/// (resolved against 0), and an unrecognized value returns None so a
+/// longhand declaration leaves the previous width alone.
+fn outline_width(v: &str, vp: (f32, f32)) -> Option<f32> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        _ => parse_len(v, vp).map(|l| len_px(l, 0.0)),
+    }
+}
+
+/// True for the outline styles this engine paints (all as a solid ring).
+fn outline_style_on(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "dotted" | "dashed" | "solid" | "double" | "groove" | "ridge" | "inset" | "outset"
+    )
+}
+
 fn parse_sides(v: &str, vp: (f32, f32)) -> [Len; 4] {
     let z = Len::Px(0.0);
     let vals: Vec<Len> = joined_tokens(v)
@@ -6015,6 +6137,54 @@ mod tests {
         assert_eq!(st("d").bx.max_height, Some(Len::Px(0.0)));
         // `auto` is not a valid max-height; it clears like an invalid value
         assert_eq!(st("e").bx.max_height, None);
+    }
+
+    #[test]
+    fn outline_shorthand_and_longhands() {
+        let sheet = parse(
+            ".a { outline: 2px solid #ff0000 } \
+             .b { outline: none } \
+             .c { outline: auto } \
+             .d { outline: thick dotted } \
+             .e { outline: 1px solid #00ff00; outline-offset: 4px } \
+             .f { outline: 2px solid #ff0000; outline-style: none } \
+             .g { outline: thin dashed; outline-width: 7px } \
+             .h { outline: revert } \
+             .i { outline-style: solid; outline-color: #0000ff } \
+             .j { outline: 1px solid transparent } \
+             .k { outline: 2px solid #ff0000; outline-color: transparent }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>\
+             <div class=j></div><div class=k></div>",
+        );
+        let st = |cls: &str| {
+            let node = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, node, Style::new(), None)
+        };
+        let a = st("a").bx.outline;
+        assert!(a.on, "a: ring on");
+        assert!((a.w - 2.0).abs() < 0.01, "a: w={}", a.w);
+        assert_eq!(a.color, Some(0xff0000));
+        assert!(!st("b").bx.outline.on, "none turns the ring off");
+        assert!(!st("c").bx.outline.on, "auto is treated as off");
+        let d = st("d").bx.outline;
+        assert!(d.on && (d.w - 5.0).abs() < 0.01, "thick = 5px");
+        assert_eq!(d.color, None, "unset colour = currentcolor");
+        assert!((st("e").bx.outline.offset - 4.0).abs() < 0.01);
+        assert!(!st("f").bx.outline.on, "longhand style none wins");
+        // a width longhand after the shorthand overrides it
+        assert!((st("g").bx.outline.w - 7.0).abs() < 0.01);
+        assert!(!st("h").bx.outline.on, "revert resets to no ring");
+        let i = st("i").bx.outline;
+        assert!(i.on, "longhand style turns the ring on");
+        assert!((i.w - 3.0).abs() < 0.01, "default medium width");
+        assert_eq!(i.color, Some(0x0000ff));
+        let j = st("j").bx.outline;
+        assert!(j.on && j.transparent, "transparent colour keeps the ring on");
+        assert!(st("k").bx.outline.transparent, "longhand stays transparent");
     }
 
     #[test]
