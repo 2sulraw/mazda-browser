@@ -73,8 +73,11 @@
 //!   and dirty DOM produces at most one re-layout per pass. On cheap pages
 //!   that lands near 60Hz; on expensive layout pages the pipeline latency
 //!   (not vsync) governs the callback rate.
-//! - `event.stopPropagation()` does not exist yet (absent method — pages
-//!   calling it get a TypeError logged, nothing silently ignored).
+//! - shell-dispatched event objects still have no `stopPropagation()` (the
+//!   bubble walk owns those events, and each listener currently gets a
+//!   fresh wrapper). Events built with `new Event(...)` / `new
+//!   CustomEvent(...)` do have both stop flags, and `dispatchEvent` honours
+//!   them synchronously.
 //! - `preventDefault` is honored only for the shell's one native default
 //!   action: link navigation. The flag crosses to the UI thread with the
 //!   click's decision result (see the LoadDone.prevent_default contract
@@ -267,6 +270,7 @@ fn wrap_element(node: u32) -> Val {
     o.set("getAttribute", js::Val::Native(n.el_get_attr));
     o.set("removeAttribute", js::Val::Native(n.el_rm_attr));
     o.set("addEventListener", js::Val::Native(n.el_add_listener));
+    o.set("dispatchEvent", js::Val::Native(n.el_dispatch));
     o.set("setTextContent", js::Val::Native(n.el_set_text));
     o.set("setInnerHTML", js::Val::Native(n.el_set_inner));
     o.set("setValue", js::Val::Native(n.el_set_value));
@@ -405,6 +409,8 @@ struct Nids {
     el_get_attr: usize,
     el_rm_attr: usize,
     el_add_listener: usize,
+    /// one shared `dispatchEvent` native for elements, document and window
+    el_dispatch: usize,
     el_set_text: usize,
     el_set_inner: usize,
     el_set_value: usize,
@@ -448,6 +454,10 @@ struct Nids {
     history_replace: usize,
     history_go: usize,
     ev_prevent_default: usize,
+    ev_stop: usize,
+    ev_stop_immediate: usize,
+    ev_ctor: usize,
+    cev_ctor: usize,
     raf: usize,
     storage_get: usize,
     storage_set: usize,
@@ -648,6 +658,13 @@ const H_REPLACE: u16 = 1;
 const H_GO: u16 = 2;
 /// event object group idxs
 const V_PREVENT_DEFAULT: u16 = 33;
+/// `Event` / `CustomEvent` constructors and the stop flags (wave 47).
+/// `dispatchEvent` is shared by elements, document and window.
+const V_STOP: u16 = 43;
+const V_STOP_IMMEDIATE: u16 = 44;
+const V_DISPATCH: u16 = 45;
+const V_CTOR: u16 = 46;
+const V_CEV_CTOR: u16 = 47;
 /// storage group idxs
 const S_GET: u16 = 40;
 const S_SET: u16 = 41;
@@ -1228,16 +1245,241 @@ fn hist_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
 }
 
 /// The event object's preventDefault - flags the click so the UI thread
-/// cancels a not-yet-started link navigation (see module docs).
-fn ev_native(_e: &mut JsEngine, idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+/// cancels a not-yet-started link navigation (see module docs), or sets the
+/// script event's own `defaultPrevented` when the event was constructed in
+/// JS (those carry `__pd`; shell event objects do not).
+fn ev_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         V_PREVENT_DEFAULT => {
+            if let Val::Obj(o) = this {
+                if !matches!(js::obj_get_own(o, "__pd"), Val::Undefined) {
+                    // a non-cancelable event ignores preventDefault
+                    if js::obj_get_own(o, "cancelable").to_bool() {
+                        js::obj_set_own(o, "__pd", Val::Bool(true));
+                        js::obj_set_own(o, "defaultPrevented", Val::Bool(true));
+                    }
+                    return Ok(Val::Undefined);
+                }
+            }
             let node = this_node(this).unwrap_or(0);
             runtime::host_mut(|h| h.note_prevent_default(node));
             Ok(Val::Undefined)
         }
+        V_STOP => {
+            set_event_flag(this, "__sp");
+            Ok(Val::Undefined)
+        }
+        V_STOP_IMMEDIATE => {
+            set_event_flag(this, "__sp");
+            set_event_flag(this, "__sip");
+            Ok(Val::Undefined)
+        }
+        V_DISPATCH => {
+            let Some(evt) = args.first().cloned() else {
+                return Err(JsError::throw(
+                    "TypeError: dispatchEvent requires an event object",
+                ));
+            };
+            if !matches!(evt, Val::Obj(_)) {
+                return Err(JsError::throw(
+                    "TypeError: dispatchEvent requires an event object",
+                ));
+            }
+            // element calls carry `__node`; document/window do not and share
+            // the global listener bucket (WIN_NODE), but keep their own
+            // `target` object (document vs window)
+            let target = this_node(this).unwrap_or(WIN_NODE);
+            let target_val = if target == WIN_NODE {
+                match this {
+                    Val::Obj(_) => this.clone(),
+                    _ => e.global_object(),
+                }
+            } else {
+                wrap_element(target)
+            };
+            dispatch_event(e, target, target_val, &evt)
+        }
         _ => Err(JsError::throw("TypeError: bad event native")),
     }
+}
+
+fn set_event_flag(evt: &Val, key: &str) {
+    if let Val::Obj(o) = evt {
+        js::obj_set_own(o, key, Val::Bool(true));
+    }
+}
+
+fn event_flag(evt: &Val, key: &str) -> bool {
+    match evt {
+        Val::Obj(o) => js::obj_get_own(o, key).to_bool(),
+        _ => false,
+    }
+}
+
+/// Listener snapshot for one `(node, kind)` stop. Clone first: listeners may
+/// register more listeners while this dispatch is running.
+fn ctx_listeners(node: u32, kind: &str) -> Vec<Val> {
+    CTX.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|cx| cx.listeners.get(&(node, kind.to_string())).cloned())
+            .unwrap_or_default()
+    })
+}
+
+/// Synchronous `dispatchEvent`: target first, then ancestors, then window.
+/// A `bubbles: false` event stops at its target. `stopPropagation` ends the
+/// walk, `stopImmediatePropagation` also skips the rest of that stop.
+/// Returns `!defaultPrevented`.
+fn dispatch_event(e: &mut JsEngine, target: u32, target_val: Val, evt: &Val) -> Result<Val, JsError> {
+    let kind = match evt {
+        Val::Obj(o) => match js::obj_get_own(o, "type") {
+            Val::Str(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(JsError::throw("TypeError: event has no type")),
+        },
+        _ => {
+            return Err(JsError::throw(
+                "TypeError: dispatchEvent requires an event object",
+            ))
+        }
+    };
+    evt.set("target", target_val);
+
+    let mut chain = vec![target];
+    if event_flag(evt, "bubbles") && target != WIN_NODE {
+        let mut cur = target;
+        loop {
+            match runtime::host(|h| h.parent_node(cur)) {
+                Some(p) if p != 0 && p != cur => {
+                    chain.push(p);
+                    cur = p;
+                }
+                _ => break,
+            }
+        }
+        chain.push(WIN_NODE);
+    }
+
+    for n in chain {
+        let is_win = n == WIN_NODE;
+        let current = if is_win {
+            e.global_object()
+        } else {
+            wrap_element(n)
+        };
+        evt.set("currentTarget", current.clone());
+        let phase = if n == target && !is_win { 2.0 } else { 3.0 };
+        evt.set("eventPhase", Val::Num(phase));
+        for cb in ctx_listeners(n, &kind) {
+            if event_flag(evt, "__sip") {
+                break;
+            }
+            if let Err(err) = e.call_function(&cb, current.clone(), &[evt.clone()]) {
+                eprintln!("[js] listener error ({kind} on node {n}): {err}");
+            }
+            if let Err(m) = e.drain_microtasks() {
+                eprintln!("[js] microtask error: {m}");
+            }
+        }
+        if event_flag(evt, "__sp") {
+            break;
+        }
+    }
+    evt.set("currentTarget", Val::Null);
+    evt.set("eventPhase", Val::Num(0.0));
+    Ok(Val::Bool(!event_flag(evt, "__pd")))
+}
+
+fn is_ctor_call(e: &JsEngine, this: &Val) -> bool {
+    matches!(this, Val::Obj(o) if !Rc::ptr_eq(o, &e.global_obj))
+}
+
+fn proto_instance(proto: Val) -> Val {
+    let proto = match proto {
+        Val::Obj(o) => Some(o),
+        _ => None,
+    };
+    Val::Obj(Rc::new(RefCell::new(js::Obj {
+        kind: js::ObjKind::Plain,
+        props: Vec::new(),
+        proto,
+    })))
+}
+
+fn event_option(opts: Option<&Val>, key: &str) -> Val {
+    match opts {
+        Some(Val::Obj(o)) => js::obj_get_own(o, key),
+        _ => Val::Undefined,
+    }
+}
+
+/// `new Event(type, {bubbles, cancelable})` and
+/// `new CustomEvent(type, {detail, bubbles, cancelable})`. Instances are
+/// plain objects on the prototype installed in `install_event_types`, so
+/// `instanceof Event` / `instanceof CustomEvent` both work.
+fn n_event(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx != V_CTOR && idx != V_CEV_CTOR {
+        return Err(JsError::throw("TypeError: bad event constructor native"));
+    }
+    if !is_ctor_call(e, this) {
+        return Err(JsError::throw("TypeError: Event is not a constructor"));
+    }
+    let ctor = if idx == V_CTOR {
+        nids().ev_ctor
+    } else {
+        nids().cev_ctor
+    };
+    let ev = proto_instance(e.native_prop(ctor, "prototype").unwrap_or(Val::Undefined));
+    let kind = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let opts = args.get(1);
+    ev.set("type", Val::Str(Rc::from(kind)));
+    ev.set("bubbles", Val::Bool(event_option(opts, "bubbles").to_bool()));
+    ev.set(
+        "cancelable",
+        Val::Bool(event_option(opts, "cancelable").to_bool()),
+    );
+    ev.set("defaultPrevented", Val::Bool(false));
+    ev.set("target", Val::Null);
+    ev.set("currentTarget", Val::Null);
+    ev.set("eventPhase", Val::Num(0.0));
+    ev.set("isTrusted", Val::Bool(false));
+    // internal flags checked by preventDefault / dispatchEvent
+    ev.set("__pd", Val::Bool(false));
+    ev.set("__sp", Val::Bool(false));
+    ev.set("__sip", Val::Bool(false));
+    if idx == V_CEV_CTOR {
+        let detail = match event_option(opts, "detail") {
+            Val::Undefined => Val::Null,
+            v => v,
+        };
+        ev.set("detail", detail);
+    }
+    Ok(ev)
+}
+
+/// Install `Event` and `CustomEvent`, sharing one prototype object whose
+/// chain gives CustomEvent instances the Event methods.
+fn install_event_types(e: &mut JsEngine, ids: Nids) {
+    let ev_proto = Val::new_object();
+    ev_proto.set("preventDefault", Val::Native(ids.ev_prevent_default));
+    ev_proto.set("stopPropagation", Val::Native(ids.ev_stop));
+    ev_proto.set(
+        "stopImmediatePropagation",
+        Val::Native(ids.ev_stop_immediate),
+    );
+    e.set_native_prop(ids.ev_ctor, "prototype", ev_proto.clone());
+    e.set_global("Event", Val::Native(ids.ev_ctor));
+
+    let cev_proto = Val::Obj(Rc::new(RefCell::new(js::Obj {
+        kind: js::ObjKind::Plain,
+        props: Vec::new(),
+        proto: match &ev_proto {
+            Val::Obj(o) => Some(o.clone()),
+            _ => None,
+        },
+    })));
+    e.set_native_prop(ids.cev_ctor, "prototype", cev_proto);
+    e.set_global("CustomEvent", Val::Native(ids.cev_ctor));
 }
 
 /// `requestAnimationFrame(cb)` — the callback joins this turn's queue with
@@ -1542,6 +1784,7 @@ impl PageScripts {
             el_get_attr: engine.register_native("Element.getAttribute", el_native, E_GET_ATTRIBUTE),
             el_rm_attr: engine.register_native("Element.removeAttribute", el_native, E_REMOVE_ATTRIBUTE),
             el_add_listener: engine.register_native("Element.addEventListener", el_native, E_ADD_EVENT_LISTENER),
+            el_dispatch: engine.register_native("EventTarget.dispatchEvent", ev_native, V_DISPATCH),
             el_set_text: engine.register_native("Element.setTextContent", el_native, E_SET_TEXT_CONTENT),
             el_set_inner: engine.register_native("Element.setInnerHTML", el_native, E_SET_INNER_HTML),
             el_set_value: engine.register_native("Element.setValue", el_native, E_SET_VALUE),
@@ -1583,6 +1826,10 @@ impl PageScripts {
             history_replace: engine.register_native("history.replaceState", hist_native, H_REPLACE),
             history_go: engine.register_native("history.back", hist_native, H_GO),
             ev_prevent_default: engine.register_native("event.preventDefault", ev_native, V_PREVENT_DEFAULT),
+            ev_stop: engine.register_native("Event.prototype.stopPropagation", ev_native, V_STOP),
+            ev_stop_immediate: engine.register_native("Event.prototype.stopImmediatePropagation", ev_native, V_STOP_IMMEDIATE),
+            ev_ctor: engine.register_native("Event", n_event, V_CTOR),
+            cev_ctor: engine.register_native("CustomEvent", n_event, V_CEV_CTOR),
             raf: engine.register_native("requestAnimationFrame", raf_native, 0),
             storage_get: engine.register_native("localStorage.getItem", storage_native, S_GET),
             storage_set: engine.register_native("localStorage.setItem", storage_native, S_SET),
@@ -1593,6 +1840,7 @@ impl PageScripts {
             fetch_text: engine.register_native("response.text", fetch_text_native, 0),
         };
         NIDS.with(|c| c.set(Some(ids)));
+        install_event_types(&mut engine, ids);
         // CSSOM bridge: the style object's member reads/writes go through
         // the shared host (js.rs itself stays DOM-free)
         engine.style_get = Some(style_get_hook);
@@ -1695,12 +1943,14 @@ impl PageScripts {
         // window aliases the global object — methods installed on the global
         // object are reachable as window.x / globalThis.x both ways
         engine.set_global("addEventListener", Val::Native(ids.win_add_listener));
+        engine.set_global("dispatchEvent", Val::Native(ids.el_dispatch));
         engine.set_global("matchMedia", Val::Native(ids.match_media));
         engine.set_global("requestAnimationFrame", Val::Native(ids.raf));
         // document-level listeners share the global (window) bucket: both
         // are page-wide targets with no own arena node, and the global stop
         // already fires after the bubble chain (logged design shortcut)
         doc.set("addEventListener", Val::Native(ids.win_add_listener));
+        doc.set("dispatchEvent", Val::Native(ids.el_dispatch));
 
         // window.alert/confirm/prompt: stderr stand-ins, no dialog UI
         let alert = engine.define_native("alert", n_alert);
@@ -3525,5 +3775,146 @@ mod tests {
             "POST form.submit() queues the body-carrying FormNav"
         );
         assert!(turn.nav.is_none(), "POST never rides the plain nav channel");
+    }
+
+    /// `new CustomEvent` + `dispatchEvent`: target first, then ancestors,
+    /// then the window/document bucket. `detail`, `target` and
+    /// `currentTarget` reach listeners; the event settles back to phase 0.
+    #[test]
+    fn custom_event_dispatch_bubbles() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="p"><button id="t">x</button></div><script>
+                window.log = [];
+                var t = document.getElementById("t");
+                var p = document.getElementById("p");
+                t.addEventListener("ping", function (e) {
+                    window.log.push("t:" + e.detail + ":" + e.target.id + ":" + e.currentTarget.id);
+                });
+                p.addEventListener("ping", function (e) {
+                    window.log.push("p:" + e.detail + ":" + e.currentTarget.id);
+                });
+                document.addEventListener("ping", function (e) { window.log.push("d"); });
+                addEventListener("ping", function (e) {
+                    window.log.push("w:" + e.detail + ":" + e.target.id);
+                });
+                var ev = new CustomEvent("ping", { detail: 7, bubbles: true });
+                window.ok = t.dispatchEvent(ev);
+                window.phase = ev.eventPhase;
+                window.cur = ev.currentTarget;
+                window.tgt = ev.target.id;
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "log"),
+            "t:7:t:t,p:7:p,d,w:7:t",
+            "target, ancestor, then the shared window/document stop"
+        );
+        assert_eq!(get_global_str(&mut ps, "ok"), "true");
+        assert_eq!(get_global_str(&mut ps, "phase"), "0");
+        assert_eq!(get_global_str(&mut ps, "cur"), "null");
+        assert_eq!(get_global_str(&mut ps, "tgt"), "t");
+    }
+
+    /// `bubbles: false` (the constructor default) stops at the target.
+    #[test]
+    fn custom_event_without_bubbles_stays_on_target() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="p"><button id="t">x</button></div><script>
+                window.log = "";
+                var t = document.getElementById("t");
+                var p = document.getElementById("p");
+                t.addEventListener("ping", function () { window.log = window.log + "t"; });
+                p.addEventListener("ping", function () { window.log = window.log + "p"; });
+                addEventListener("ping", function () { window.log = window.log + "w"; });
+                t.dispatchEvent(new Event("ping"));
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "log"), "t");
+    }
+
+    /// Stop flags: `stopPropagation` ends the bubble walk;
+    /// `stopImmediatePropagation` also skips later listeners on that stop.
+    #[test]
+    fn custom_event_stop_flags() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="p"><button id="t">x</button></div><script>
+                window.log = "";
+                var t = document.getElementById("t");
+                var p = document.getElementById("p");
+                t.addEventListener("s", function (e) {
+                    window.log = window.log + "a";
+                    e.stopImmediatePropagation();
+                });
+                t.addEventListener("s", function () { window.log = window.log + "b"; });
+                p.addEventListener("s", function () { window.log = window.log + "p"; });
+                t.dispatchEvent(new Event("s", { bubbles: true }));
+
+                window.log2 = "";
+                t.addEventListener("q", function (e) {
+                    window.log2 = window.log2 + "t";
+                    e.stopPropagation();
+                });
+                p.addEventListener("q", function () { window.log2 = window.log2 + "p"; });
+                addEventListener("q", function () { window.log2 = window.log2 + "w"; });
+                t.dispatchEvent(new Event("q", { bubbles: true }));
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "log"), "a");
+        assert_eq!(get_global_str(&mut ps, "log2"), "t");
+    }
+
+    /// `preventDefault` only sticks on cancelable events and flips
+    /// `dispatchEvent`'s return value.
+    #[test]
+    fn custom_event_prevent_default_is_cancelable() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><button id="t">x</button><script>
+                var t = document.getElementById("t");
+                t.addEventListener("c", function (e) { e.preventDefault(); });
+                var yes = new Event("c", { cancelable: true });
+                window.r1 = t.dispatchEvent(yes);
+                window.d1 = yes.defaultPrevented;
+                var no = new Event("c");
+                window.r2 = t.dispatchEvent(no);
+                window.d2 = no.defaultPrevented;
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "r1"), "false");
+        assert_eq!(get_global_str(&mut ps, "d1"), "true");
+        assert_eq!(get_global_str(&mut ps, "r2"), "true");
+        assert_eq!(get_global_str(&mut ps, "d2"), "false");
+    }
+
+    /// Constructors are real constructors: prototype chain makes a
+    /// CustomEvent an Event; window and document dispatch share the global
+    /// bucket; calling without `new` throws.
+    #[test]
+    fn event_constructors_and_window_dispatch() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.a = new Event("x") instanceof Event;
+                window.b = new CustomEvent("x") instanceof CustomEvent;
+                window.c = new CustomEvent("x") instanceof Event;
+                window.hit = 0;
+                addEventListener("w", function (e) { window.hit = window.hit + e.detail; });
+                window.dispatchEvent(new CustomEvent("w", { detail: 3 }));
+                document.addEventListener("d2", function () { window.d2 = 1; });
+                document.dispatchEvent(new Event("d2"));
+                var threw = false;
+                try { Event("x"); } catch (err) { threw = true; }
+                window.threw = threw;
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "a"), "true");
+        assert_eq!(get_global_str(&mut ps, "b"), "true");
+        assert_eq!(get_global_str(&mut ps, "c"), "true");
+        assert_eq!(get_global_str(&mut ps, "hit"), "3");
+        assert_eq!(get_global_str(&mut ps, "d2"), "1");
+        assert_eq!(get_global_str(&mut ps, "threw"), "true");
     }
 }

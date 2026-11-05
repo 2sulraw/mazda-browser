@@ -68,7 +68,7 @@ engine is from scratch.
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
 | Web IDL interfaces | ~8 families | 1,251 | <1% | denominator dominated by GPU, audio, XR, workers |
-| DOM methods bound to JS | 73 | - | - | common tree, event, style, and form surface only |
+| DOM methods bound to JS | 76 | - | - | common tree, event, style, and form surface only |
 | JS language globals | 47 | ~50 | ~94% | strongest layer; `Proxy`, `Reflect`, `Intl`, `eval` absent |
 | test262 | not run | ~50k | unknown | highest-value missing measurement |
 | WPT | not run | ~50k | unknown | needs a harness; targeted subsets only |
@@ -306,16 +306,18 @@ page needs.
 Notably absent:
 
 ```text
-MutationObserver, IntersectionObserver, ResizeObserver,
-CustomEvent (the constructor itself), Worker, WebSocket, XMLHttpRequest,
-IndexedDB, crypto.subtle, requestIdleCallback, structuredClone,
+MutationObserver, IntersectionObserver, ResizeObserver, Worker, WebSocket,
+XMLHttpRequest, IndexedDB, crypto.subtle, requestIdleCallback, structuredClone,
 dataset writes (reads work, writes do not update the attribute)
 ```
 
 `document.forms`, `getElementsByName`, `createTextNode`, `createComment`,
 `Node.childNodes` / `Element.children`, `queueMicrotask`, `DataView`,
-`AbortController` / `AbortSignal` now exist; the collection APIs are
-document-order snapshots, not live collections.
+`AbortController` / `AbortSignal`, and the `Event` / `CustomEvent`
+constructors with synchronous `dispatchEvent` now exist; the collection APIs
+are document-order snapshots, not live collections. Console-created (`new`)
+events bubble through elements, document and window and honour both stop
+flags; shell-created events still lack `stopPropagation`.
 
 Correction: `sessionStorage` is **present**. It is deliberately merged with
 `localStorage` into one in-memory store (`src/script.rs`), and neither is backed
@@ -374,7 +376,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 773 self-authored unit tests (777 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 778 self-authored unit tests (782 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -402,7 +404,7 @@ and visual impact. That turns this document from a wish list into a work queue.
 |---|---|---|---|---|---|
 | P0 | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list | all six | negligible (dev-only) | short |
 | P0 | Shrink JS AST/env/object types (`Stmt` 192 B, `Param` 144 B, `Obj` 88 B, `Closure` 112 B) | directly serves the success metric; wave 44 saved 36 MB on one workload | all | negative (saves) | medium |
-| P1 | `CustomEvent`, `MutationObserver`, live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 2-4 waves |
+| P1 | `MutationObserver`, live collections / named form access | common library and framework dependencies | likely nextjs/MDN | low | 2-4 waves |
 | P1 | CSS `text-overflow`, `overflow-wrap`/`word-break`, `outline`, `transform-origin`, `justify-items`/`justify-self`, `align-content`, `caption-side` | frequent declarations with small parsers | some pages | low | 1-3 waves |
 | P2 | `background-clip`, `filter`/`mix-blend-mode`, gradients, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |

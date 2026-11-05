@@ -1709,6 +1709,35 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-05 | wave 44 (property-name interning) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Every property insert allocated its own `Rc<str>` copy of the key, so a React render paid one string per slot for a handful of repeated names. A thread-local intern table (`KEY_INTERN`, cap 4096, cleared per `JsEngine::new`) now hands out one shared `Rc` per name; used by `obj_set_own`, `set_member`'s function-property insert and `Object.defineProperty`'s function path. Deterministic 150k-object x 8-key workload: 108.0 MB -> 71.7 MB, **36.3 MB (~34%) saved**. Live pages geometry-stable and error-free: nextjs 7578px / 569 runs / first layout ~152 MB, MDN 2922px / 641 runs / 87.3 MB, Wikipedia 24454px / 10943 runs / 101.1 MB, HN 1695px / 728 runs / 78.1 MB, rust-lang 5800px / 483 runs / 84.7 MB; suite **763** default / **767** `engine-b + woff2` |
 | 2026-11-05 | wave 45 (document/Node surface + `queueMicrotask`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 document/Node members: `queueMicrotask` (a `Job::Call` in the existing FIFO microtask queue, non-callables throw), `document.forms` and `getElementsByName`, `createTextNode` / `createComment` (real text/comment arena nodes), and `Node.childNodes` / `Element.children` (document-order snapshots). No layout change; all five references are geometry- and error-identical: nextjs 7578px / 569 runs / first layout 150.2 MB (settles 153-158 MB as its router re-renders), MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.5 MB; suite **768** default / **772** `engine-b + woff2` |
 | 2026-11-05 | wave 46 (`DataView` + `AbortController` / `AbortSignal`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the two remaining self-contained P1 constructors. `DataView` is a byte window over an `ArrayBuffer` with big-endian default, per-call little-endian flag, all 10 numeric accessor pairs (including BigInt), and RangeError/TypeError bounds checks. `AbortController` / `AbortSignal` expose `signal`, `aborted`, `reason`, `onabort`, `addEventListener` / `removeEventListener` for `abort`, `throwIfAborted`, and `AbortSignal.abort()`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 155.2 MB, MDN 2922px / 641 runs / 87.6 MB, Wikipedia 24454px / 10943 runs / 101.2 MB, HN 1695px / 728 runs / 78.4 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **773** default / **777** `engine-b + woff2` |
+| 2026-11-05 | wave 47 (`Event` / `CustomEvent` + `dispatchEvent`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Added the P1 event surface. `new Event(type, {bubbles, cancelable})` and `new CustomEvent(type, {detail, bubbles, cancelable})` build plain objects on linked prototypes (`CustomEvent` is an `Event`), with `preventDefault`, `stopPropagation` and `stopImmediatePropagation`. `element` / `document` / `window` `dispatchEvent` is synchronous: target, then ancestors, then the shared window/document bucket; `bubbles: false` stays on the target; `stopImmediatePropagation` also skips later listeners at the same stop; the return value is `!defaultPrevented`. No layout change; all five references keep their exact geometry and stay error-free: nextjs 7578px / 569 runs / 154.9 MB, MDN 2922px / 641 runs / 87.5 MB, Wikipedia 24454px / 10943 runs / 102.2 MB, HN 1695px / 728 runs / 78.0 MB, rust-lang 5800px / 483 runs / 84.9 MB; suite **778** default / **782** `engine-b + woff2` |
+
+### Wave 47 findings
+
+- **Constructed events are plain objects with hidden flags.** `Event` and
+  `CustomEvent` instances get their prototype from the registered
+  constructor, carry own `__pd` / `__sp` / `__sip` booleans, and expose
+  `type`, `bubbles`, `cancelable`, `defaultPrevented`, `target`,
+  `currentTarget`, `eventPhase` and `isTrusted`. `CustomEvent.prototype`
+  chains to `Event.prototype`, so one `instanceof Event` check covers both;
+  calling either constructor without `new` throws.
+- **Dispatch is synchronous and owns no state.** The single `dispatchEvent`
+  native walks the target's parent chain, then the shared
+  window/document bucket, snapshotting the `(node, type)` listener list at
+  each stop. Listener exceptions are logged and the walk continues.
+  `stopPropagation` ends the walk; `stopImmediatePropagation` also stops the
+  current stop. `target` is restored to `null` `currentTarget` and phase 0
+  after the walk; the return value is `!defaultPrevented`.
+- **`preventDefault` is cancelable-aware.** On script events it only sets
+  `defaultPrevented` when `cancelable` is true. Shell event objects carry no
+  `__pd`, so they keep the old host side channel and the link-navigation
+  veto is unchanged.
+- **Shortcuts, documented here.** Shell-dispatched events still lack both
+  stop methods (each listener already receives a fresh wrapper, so a flag
+  could not travel between them); there is no capture phase, no re-dispatch
+  guard, and `document` and `window` remain one listener bucket.
+  `createEvent` / `initEvent` / `initCustomEvent` are absent.
+- **No geometry change, as intended.** All five reference pages kept their
+  exact height and run count; RAM moved only within run-to-run noise.
 
 ### Wave 46 findings
 
