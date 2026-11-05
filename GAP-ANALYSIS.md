@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 165 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 167 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 165 |
+| Names in the engine's `KNOWN` table | 167 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~588 |
+| Raw missing (non-vendor) | ~586 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -174,7 +174,7 @@ handled, but the paint model still applies one radius to every corner.
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
 | Fonts | 22 | `font-variant-*`, `font-kerning`, `font-stretch` | medium |
-| Grid & alignment | 12 | `grid-row`, `grid-auto-flow`, `place-items` | high |
+| Grid & alignment | 10 | `grid-row`, `grid-auto-flow`, `grid-auto-rows` | high |
 | Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
 | Backgrounds | 13 | `background-clip`, `background-origin`, `background-attachment` | medium |
@@ -252,8 +252,12 @@ relevant only when transitions and animations exist.
 - `@media` only understands width, hover, pointer, orientation, and
   `prefers-color-scheme`.
 - Grid: no `auto-fill`/`auto-fit`, no `min-content`/`max-content`, `repeat()`
-  capped at 64; `place-items`/`place-self` are absent; `justify-items` and
-  `justify-self` align grid items inside their area; `align-content`
+  capped at 64; `place-items`/`place-self` map to the existing
+  `align-items`/`justify-items` and `align-self`/`justify-self` fields
+  (one value covers both axes, a second value sets the inline axis, and
+  `place-self: auto` clears the override). `justify-items`/`justify-self`
+  align grid items inside their area, and `align-self` now shifts a grid
+  item within its row as it already did in flex; `align-content`
   distributes rows, but `stretch` packs at the start (auto rows never grow).
 - Flex: `wrap-reverse` does not reverse the cross axis.
 - Borders: per-side width and colour longhands parse into the existing model,
@@ -424,7 +428,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 838 self-authored unit tests (842 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 840 self-authored unit tests (844 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -447,9 +451,9 @@ names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
 `filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
-waves 67-69 took the top visual items off it (individual `translate`/`scale`,
-the `font` shorthand, then the `filter` colour functions). The DOM/JS half is
-still open.
+waves 67-70 took the top visual items off it (individual `translate`/`scale`,
+the `font` shorthand, the `filter` colour functions, then the `place-items`/
+`place-self` alignment shorthands). The DOM/JS half is still open.
 
 ### 8.2 Priority by reference impact and RAM cost
 
@@ -492,7 +496,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (165)
+## Appendix A - CSS property names accepted (167)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -526,7 +530,7 @@ outline-color, outline-offset, outline-style, outline-width
 overflow, overflow-wrap, overflow-x, overflow-y
 padding, padding-block, padding-block-end, padding-block-start
 padding-bottom, padding-inline, padding-inline-end, padding-inline-start
-padding-left, padding-right, padding-top, place-content
+padding-left, padding-right, padding-top, place-content, place-items, place-self
 position, right, row-gap, stroke, stroke-linecap
 stroke-linejoin, stroke-opacity, stroke-width, table-layout
 text-align, text-decoration, text-decoration-color, text-decoration-line
@@ -547,7 +551,7 @@ The full list is reproducible with Appendix D.
 
 ```text
 Layout and alignment:
-  place-items, place-self, grid-auto-columns, grid-auto-rows, grid-auto-flow, grid-row,
+  grid-auto-columns, grid-auto-rows, grid-auto-flow, grid-row,
   grid-row-start, grid-row-end, grid-template, grid-gap
 
 Box, border, outline:

@@ -6834,9 +6834,14 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         }
         row_hs[r] = row_h;
         // cross-axis align within the row (ranges are safe: the next row
-        // hasn't been laid yet)
+        // hasn't been laid yet). `align-self` (from the `align-self` longhand
+        // or `place-self`) overrides the grid's `align-items` per item.
         for (ci, &(rs, us, h)) in marks.iter().enumerate() {
-            let dy = match n.bx.align {
+            let align = match items[row_items[ci]] {
+                Item::Grp(i) => n.children[i].bx.align_self.unwrap_or(n.bx.align),
+                Item::Text(..) => n.bx.align,
+            };
+            let dy = match align {
                 Align::Center => (row_h - h) * 0.5,
                 Align::End => row_h - h,
                 _ => 0.0,
@@ -9239,6 +9244,42 @@ mod tests {
         layout_tree(&mut n, 200.0, &m4);
         assert_eq!(n.children[0].x, 0.0, "container start");
         assert_eq!(n.children[1].x, 160.0, "item end inside its 100px area");
+    }
+
+    #[test]
+    fn align_self_shifts_grid_items_vertically() {
+        let build = |sa: Option<Align>| {
+            let mut n = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Grid,
+                    cols: vec![Track::Px(100.0), Track::Px(100.0)],
+                    ..BoxStyle::default()
+                },
+            );
+            // the tall first cell sets the row height
+            n.children.push(BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    min_height: Some(Len::Px(100.0)),
+                    ..BoxStyle::default()
+                },
+            ));
+            n.children.push(BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    min_height: Some(Len::Px(10.0)),
+                    align_self: sa,
+                    ..BoxStyle::default()
+                },
+            ));
+            layout_tree(&mut n, 200.0, &m4);
+            n.children[1].y
+        };
+        // None inherits the container's align-items (default stretch = start)
+        assert_eq!(build(None), 0.0);
+        assert_eq!(build(Some(Align::Center)), 45.0);
+        assert_eq!(build(Some(Align::End)), 90.0);
     }
 
     #[test]

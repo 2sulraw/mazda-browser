@@ -1608,6 +1608,8 @@ const KNOWN: &[&str] = &[
     "align-self",
     "justify-items",
     "justify-self",
+    "place-items",
+    "place-self",
     "caption-side",
     "flex-wrap",
     "flex-shrink",
@@ -3183,6 +3185,23 @@ fn apply_decl(
                 bx.justify_items = a;
             }
         }
+        // `place-items: <align-items> <justify-items>?`; with one value both
+        // axes take it (the spec's single-value rule).
+        "place-items" => {
+            if let Some((a, j)) = parse_place_items(&d.1) {
+                bx.align = a;
+                bx.justify_items = j;
+            }
+        }
+        // `place-self: <align-self> <justify-self>?`; `auto` is meaningful on
+        // both axes (it clears a previous override), so it is parsed rather
+        // than treated as invalid.
+        "place-self" => {
+            if let Some((a, j)) = parse_place_self(&d.1) {
+                bx.align_self = a;
+                bx.justify_self = j;
+            }
+        }
         // `justify-self: auto` inherits `justify-items`; every other keyword
         // overrides it for this item only
         "justify-self" => {
@@ -4362,6 +4381,50 @@ fn parse_inline_align(v: &str) -> Option<Align> {
         "stretch" | "normal" => Some(Align::Stretch),
         _ => None,
     }
+}
+
+/// `place-items` value → (block-axis, inline-axis) alignment. One value
+/// applies to both axes; two values are `<align-items> <justify-items>`.
+/// `baseline` is valid for `align-items` but has no baseline model here, so
+/// it packs at the start (the `align-items` arm's existing fallback).
+fn parse_place_items(v: &str) -> Option<(Align, Align)> {
+    let toks = joined_tokens(v);
+    if toks.len() > 2 {
+        return None;
+    }
+    let first = toks.first()?.trim();
+    let a = if first.eq_ignore_ascii_case("baseline") {
+        Align::Start
+    } else {
+        parse_inline_align(first)?
+    };
+    let j = match toks.get(1) {
+        None => a,
+        Some(t) => parse_inline_align(t)?,
+    };
+    Some((a, j))
+}
+
+/// `place-self` value → (block-axis, inline-axis) override. `auto` clears
+/// the override, so it maps to `None`; one value applies to both axes.
+fn parse_place_self(v: &str) -> Option<(Option<Align>, Option<Align>)> {
+    let toks = joined_tokens(v);
+    if toks.len() > 2 {
+        return None;
+    }
+    let one = |t: &str| -> Option<Option<Align>> {
+        if t.trim().eq_ignore_ascii_case("auto") {
+            Some(None)
+        } else {
+            parse_inline_align(t).map(Some)
+        }
+    };
+    let a = one(toks.first()?)?;
+    let j = match toks.get(1) {
+        None => a,
+        Some(t) => one(t)?,
+    };
+    Some((a, j))
 }
 
 /// `text-decoration-style` keyword → pattern. `none` is not a valid style
@@ -9478,6 +9541,57 @@ mod tests {
         );
         // an unknown keyword falls back to start rather than leaking garbage
         assert_eq!(bx("f").align_content, Justify::Start);
+    }
+
+    #[test]
+    fn place_items_and_place_self_parse() {
+        let sheet = parse(
+            ".a { place-items: center } .b { place-items: end start } \
+             .c { place-items: stretch } .d { place-items: center bogus } \
+             .e { place-self: center } .f { place-self: end start } \
+             .g { place-self: center; place-self: auto } \
+             .h { place-self: center auto } .i { place-items: baseline } \
+             .j { place-items: center start end } \
+             .k { place-self: center start end }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>\
+             <div class=j></div><div class=k></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        // one value sets both axes
+        assert_eq!((bx("a").align, bx("a").justify_items), (Align::Center, Align::Center));
+        assert_eq!(
+            (bx("b").align, bx("b").justify_items),
+            (Align::End, Align::Start),
+            "place-items: align then justify"
+        );
+        assert_eq!((bx("c").align, bx("c").justify_items), (Align::Stretch, Align::Stretch));
+        // an invalid second value drops the whole declaration (CSS shorthand
+        // invalid-at-computed-value-time rules keep the earlier value)
+        assert_eq!(
+            (bx("d").align, bx("d").justify_items),
+            (Align::Stretch, Align::Stretch)
+        );
+        assert_eq!((bx("e").align_self, bx("e").justify_self), (Some(Align::Center), Some(Align::Center)));
+        assert_eq!(
+            (bx("f").align_self, bx("f").justify_self),
+            (Some(Align::End), Some(Align::Start))
+        );
+        // `auto` clears the per-item override on both axes
+        assert_eq!((bx("g").align_self, bx("g").justify_self), (None, None));
+        assert_eq!((bx("h").align_self, bx("h").justify_self), (Some(Align::Center), None));
+        // baseline is valid for align-items but has no baseline model; it
+        // packs at the start rather than dropping the declaration
+        assert_eq!((bx("i").align, bx("i").justify_items), (Align::Start, Align::Start));
+        // three values are invalid (both shorthands take one or two)
+        assert_eq!(
+            (bx("j").align, bx("j").justify_items),
+            (Align::Stretch, Align::Stretch)
+        );
+        assert_eq!((bx("k").align_self, bx("k").justify_self), (None, None));
     }
 
     #[test]

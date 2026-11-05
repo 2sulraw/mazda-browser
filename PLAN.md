@@ -1746,6 +1746,45 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 69 (`filter` colour functions) | a local filter page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The other top visual miss is implemented. `filter` parses its function list into a single affine RGB map plus one alpha multiplier, so `grayscale`, `sepia`, `saturate`, `hue-rotate`, `invert`, `opacity`, `brightness` and `contrast` compose exactly and in order without a per-pixel function dispatch. `blur`, `drop-shadow` and `url()` are parsed and dropped (no offscreen buffer yet). One post-build pass composes each box's filter with its ancestors' into the same effective state that already carries `opacity`; the filter's alpha goes into that effective alpha once, while the stored RGB map is normalised to alpha 1 so children do not double-apply it. Every primitive the box emits is transformed: solid background/border/outline/shadow colours at layout emission, gradient stops as filtered clones (the affine map commutes with interpolation), images per pixel in the render blit, and text/underline colours by mutating the leaf's style before build. A filtered plain inline is promoted to a real box so icon-span filters paint. `filter: opacity(0)` early-outs all of that box's primitives. Dropped-name counts fall to 89 on nextjs.org, 15 on MDN, 29 on Wikipedia, 3 on Hacker News and stay at 9 on rust-lang.org (no `filter` there); zero `filter` declarations remain in `MAZDA_MISS`. References keep identical geometry: nextjs 7578px / 569 runs / 147-148 MB, MDN 2773 / 641 / 77-88 MB, Wikipedia 24673 / 10951 / 101-103 MB, HN 1695 / 720 / 67-78 MB, rust-lang 5800 / 483 / 77-85 MB (RAM is noisy between runs); suite **838** default / **842** `engine-b + woff2` |
 
+| 2026-11-06 | wave 70 (`place-items`/`place-self` + grid `align-self`) | a local place-alignment page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The two alignment shorthands are implemented. `place-items: <align-items> <justify-items>?` sets the container's block- and inline-axis alignment, and `place-self: <align-self> <justify-self>?` sets the per-item overrides; with one value both axes take it, with two the first is block and the second inline. `place-self` treats `auto` as meaningful (it clears an earlier override) and drops the declaration when either value is unknown, so a shorthand never half-applies. Checking the result exposed a real grid bug: the row cross-axis pass read the container's `align-items` only, so a grid item's `align-self` did nothing (the flex path already honoured it). Grid now resolves `align-self` per item before shifting, which is what MDN's `place-self: center start` / `center end` grid arrows rely on. Dropped-name counts fall to 88 on nextjs.org (was 89) and 13 on MDN (15); Wikipedia 29, Hacker News 3 and rust-lang.org 9 are unchanged. References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 85 MB, Wikipedia 24673 / 10951 / 100 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 82 MB; suite **840** default / **844** `engine-b + woff2` |
+
+### Wave 70 findings
+
+- **The shorthand is only worth adding when the longhands already exist.**
+  `place-items` and `place-self` introduce no layout code: they parse into
+  `align` + `justify_items` and `align_self` + `justify_self`, which grid and
+  flex already consume. The wave is therefore two parse arms, one shared
+  keyword parser, and no new box fields, so RAM is unchanged.
+- **One value means both axes; a bad second value means no declaration.**
+  `place-items: center` centers both axes, while `place-items: center bogus`
+  keeps the element's earlier values rather than half-applying the first
+  token. Both helpers return `Option` for the whole value and the apply arm
+  writes only inside `Some`, so the invalid-at-computed-value-time rule falls
+  out of the shape. `place-content` predates this and still falls back to
+  start per axis; it is left as is.
+- **`auto` is a value, not an error.** `place-self: auto` is valid and means
+  "inherit the container's alignment" on both axes, which is exactly the
+  `None` state of `align_self`/`justify_self`. Treating it as an unknown
+  keyword would leave a stale override behind after a later `auto`.
+- **Verifying it uncovered a grid alignment bug.** The grid row pass shifted
+  items by `bx.align` only, ignoring `align_self`; flex already did
+  `align_self.unwrap_or(align)`. So `place-self: end start` on a grid item
+  moved it horizontally but not vertically. Grid now resolves the per-item
+  value the same way flex does, and a unit test pins `None` / `Center` /
+  `End` to y = 0 / 45 / 90 inside a 100px row.
+- **Auto rows do not stretch, so the check needs a definite row.** With
+  `min-height: 120px` and no `grid-template-rows`, the row stays 20px (the
+  content height) and `align-items: center` has no slack to distribute -
+  the documented shortcut that `stretch` packs auto rows at the start. The
+  local page therefore uses `grid-template-rows: 100px`: two 20px items in
+  100px cells land at x = 40/140 and y = 40 with `place-items: center`,
+  x = 80/180 and y = 0 with `start end`, a `place-self: end start` item at
+  x = 0 and y = 80, and the flex row centers at y = 40. `MAZDA_MISS` reports
+  no `place-*` names left.
+- **Next in the queue.** `backdrop-filter` (needs the offscreen group wave
+  69 skipped), `text-shadow`, `background-clip`, `grid-auto-flow`;
+  transitions only if animation is ever required.
+
 ### Wave 69 findings
 
 - **Collapse the list at parse time.** A filter chain is a composition of
