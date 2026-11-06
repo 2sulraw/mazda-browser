@@ -1758,6 +1758,48 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 75 (JS observed-miss instrumentation) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org (no local page — nothing paints differently) | The JS half of the wave-66 P0 ships: `MAZDA_MISS=1` now also ranks names the JS engine could not resolve, in two buckets. `global` = a bare identifier that resolved nowhere (`env_get` falling through to `undefined`) plus reads on the `window` object itself; `member` = a read that came back `undefined` on an object the engine built — classified by `miss_bucket`, which counts the global object, any object with an own `__node` marker or a native method/accessor (element wrappers, the document/navigator/location/history/storage singletons built from natives alone, and native-backed built-ins such as `Object`/`Math`), and `Live`/`Style` kinds, while a plain script object's undefined read records nothing — that is ordinary JavaScript (feature detection on your own object). Two exclusions keep the census honest: the name `undefined` (it reads as itself by definition, bare or as `window.undefined`) and `#`-prefixed keys (engine internal slots such as `#new.target`). Each bucket keeps 512 distinct names with counts; past the cap already-seen names keep counting and a running `over_*` tally reports how many distinct names were dropped, so a page synthesizing `window['k'+i]` cannot grow the census without bound. `js::dump_misses()` runs beside `css::dump_misses()` after every navigation and prints each bucket ranked by frequency then name (`[js-miss] {n} distinct missing {bucket} names` … `[js-miss] {bucket} {count} {name}`). Engine A only — the hooks live in `env_get`/`get_member_impl`, engine B resolves its own lookups — and off by default: recording is one cached-bool branch at each hook, nothing allocated. The two new tests drive pure local-state helpers (`miss_bucket`, `record_js_miss`, `report_js_bucket`) so parallel tests never race the process-wide census. Suite **854** default / **858** `engine-b + woff2`. Reference runs with `MAZDA_MISS=1` keep byte-identical geometry and CSS counts: nextjs 7578px / 569 runs / 146.4 MB, MDN 2773 / 641 / 84.7 MB, Wikipedia 24673 / 10951 / 101.0 MB, HN 1695 / 720 / 76.0 MB, rust-lang 5800 / 483 / 82.5 MB; `[css-miss]` 84 / 12 / 29 / 3 / 9 unchanged. First JS census: nextjs 61 distinct missing globals (top: `process` 6, `Reflect` 5, `__REACT_DEVTOOLS_GLOBAL_HOOK__` 3, `reportError` 3) and 58 members (top: a page-built `Symbol(…)_<n>` key 8, `@@iterator` 4, `deleteAll` 4, `_reactRetry`/`find`/`getOwnPropertySymbols`/`isExtensible` 3); MDN 1 global (`trustedTypes`) / 0 members, Wikipedia 2 (`requestIdleCallback`, `RLQ`) / 1 (`timing`), HN 0 / 1 (`innerHTML`), rust-lang 1 (`exports`) / 0 |
 
+| 2026-11-06 | wave 76 (`Reflect`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org (no local page — nothing paints differently) | The top actionable global from the wave-75 census ships: `Reflect` with all thirteen standard methods (`apply`, `construct`, `defineProperty`, `deleteProperty`, `get`, `getOwnPropertyDescriptor`, `getPrototypeOf`, `has`, `isExtensible`, `ownKeys`, `preventExtensions`, `set`, `setPrototypeOf`). It is routing, not a second implementation: `get`/`set`/`deleteProperty` call `get_member`/`set_member`/`delete_member`, `defineProperty` shares `define_prop`, `ownKeys`/`getOwnPropertyDescriptor`/`getPrototypeOf`/`setPrototypeOf` delegate to the same `n_object` arms the `Object` statics use, and `construct` was extracted from the `new` operator so both build the fresh `this`, set `new.target` (`pending_construct`) and apply the "object result wins" rule — `Reflect.construct` ignores its optional `newTarget` (documented shortcut). `apply`/`construct` take a real array as the argument list (the engine has no array-likes and no `arguments` object) and throw TypeError otherwise. The `in` operator's per-type walk moved into a `has_member` helper that `Reflect.has` shares, so the operator and the meta-API cannot drift. `isExtensible`/`preventExtensions` are constants — there are no integrity levels (`freeze`/`seal` are identity too). Suite **856** default / **860** `engine-b + woff2`; two new tests cover apply/construct/error paths and the object operations against the operator semantics. References keep identical geometry and CSS counts: nextjs 7578px / 569 runs / 146.7 MB, MDN 2773 / 641 / 75-93 MB (two runs — the page's script timing decides how much executes), Wikipedia 24673 / 10951 / 101.2 MB, HN 1695 / 720 / 76.0 MB, rust-lang 5800 / 483 / 82.5 MB; `[css-miss]` 84 / 12 / 29 / 3 / 9 unchanged. The census confirms the fix: nextjs globals 61 → 60 with `Reflect` the only name removed, and exposes the next layer — nine `Reflect` decorator-metadata names (`defineMetadata`, `deleteMetadata`, `getMetadata`, `getMetadataKeys`, `getOwnMetadata`, `getOwnMetadataKeys`, `hasMetadata`, `hasOwnMetadata`, `metadata`) now read as member misses because core-js's metadata module only probes them once `Reflect` exists (nextjs members 58 → 67; the other four sites unchanged) |
+
+### Wave 76 findings
+
+- **`Reflect` is glue, not a subsystem.** Every method already had an
+  implementation: the operators (`get`/`set`/`delete`), the `Object` static
+  arms, the prototype walk, and the `new` path. The wave is routing plus one
+  extraction (`construct` out of `ExprKind::New`) and one unification (`in`'s
+  per-type lookup became `has_member`, shared with `Reflect.has`). A test
+  asserts `'x' in o` and `Reflect.has(o, 'x')` together so the two surfaces
+  cannot disagree later.
+- **`construct` had to be shared, not copied.** `Reflect.construct` must
+  behave like `new`: a fresh `this` from `target.prototype`, `new.target` set
+  (`pending_construct`, which class field initializers and brand checks read),
+  and a returned object overriding `this`. Copying the arm would have
+  duplicated all three rules; extracting it left `ExprKind::New` one line.
+  The optional `newTarget` argument is ignored — documented, since nothing on
+  the references passes it.
+- **A built-in object's missing members read as `member`, correctly.** The
+  census classifies by the *base*, so `Reflect.defineMetadata` (undefined on
+  an object full of natives) lands in the member bucket, not the global one.
+  That is why nextjs members rose 58 → 67 while globals fell 61 → 60: the new
+  `Reflect` object let core-js's decorator-metadata module run its probes for
+  the first time (`defineMetadata`, `deleteMetadata`, `getMetadata`,
+  `getMetadataKeys`, `getOwnMetadata`, `getOwnMetadataKeys`, `hasMetadata`,
+  `hasOwnMetadata`, `metadata` — one read each). Nothing regressed; the queue
+  got one layer deeper, which is exactly what the instrumentation is for.
+- **The lenient/strict split is deliberate.** `Object.freeze`/`seal` are
+  identity and `Object.isFrozen`/`isSealed` say false for objects, so there
+  are no integrity levels to consult: `Reflect.isExtensible` is always `true`
+  and `Reflect.preventExtensions` reports success without tracking anything.
+  `Object.*` stay lenient (they return the target), while `Reflect.*` return
+  booleans and throw TypeError on a non-object where the spec does, because
+  callers branch on the return value.
+- **Measured.** Geometry and run counts are identical to wave 75 on all five
+  references (nextjs 7578/569, MDN 2773/641, Wikipedia 24673/10951, HN
+  1695/720, rust-lang 5800/483) and the CSS census is unchanged
+  (84/12/29/3/9). RAM stayed in its usual noise band: nextjs 146.7 vs 146.4
+  MB, Wikipedia 101.2 vs 101.0, HN 76.0, rust-lang 82.5, and MDN measured
+  92.7 MB on the first run and 75.3 MB on a second — the page's own script
+  timing, not the wave. Suite **856** default / **860** `engine-b + woff2`.
+
 ### Wave 75 findings
 
 - **Two buckets because `undefined` means two different things.** An

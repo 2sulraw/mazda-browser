@@ -137,6 +137,33 @@ pub(crate) fn install(e: &mut JsEngine) {
     let oc = e.register_native("Object", n_object, O_CALL);
     obj_set_own(own(&object), "__call", Val::Native(oc));
 
+    // -- Reflect -----------------------------------------------------------
+    // The standard meta-API. One dispatch table, installed after Object so it
+    // shares every helper the Object statics already use.
+    let reflect = Val::new_object();
+    for (i, name) in [
+        "apply",
+        "construct",
+        "defineProperty",
+        "deleteProperty",
+        "get",
+        "getOwnPropertyDescriptor",
+        "getPrototypeOf",
+        "has",
+        "isExtensible",
+        "ownKeys",
+        "preventExtensions",
+        "set",
+        "setPrototypeOf",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = e.register_native(&format!("Reflect.{name}"), n_reflect, i as u16);
+        obj_set_own(own(&reflect), name, Val::Native(id));
+    }
+    e.set_global("Reflect", reflect);
+
     // Object.prototype + Array.prototype chain
     let obj_proto = Val::new_object();
     let ts = e.register_native("toString", n_objproto, 0);
@@ -1612,6 +1639,96 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
         }
         _ => Ok(Val::Undefined),
     }
+}
+
+// -- Reflect ---------------------------------------------------------------
+// Thin dispatch over the same helpers the Object statics and the operators
+// use, so behavior cannot drift. Reflect returns booleans where the spec says
+// so, while the Object.* forms stay lenient (they return the target).
+//
+// shortcut: no integrity levels — `isExtensible` is always true and
+// `preventExtensions` only reports success (Object.freeze/seal are identity
+// for the same reason).
+
+const R_APPLY: u16 = 0;
+const R_CONSTRUCT: u16 = 1;
+const R_DEFINE_PROP: u16 = 2;
+const R_DELETE_PROP: u16 = 3;
+const R_GET: u16 = 4;
+const R_GET_DESC: u16 = 5;
+const R_GET_PROTO: u16 = 6;
+const R_HAS: u16 = 7;
+const R_IS_EXTENSIBLE: u16 = 8;
+const R_OWN_KEYS: u16 = 9;
+const R_PREVENT_EXTENSIONS: u16 = 10;
+const R_SET: u16 = 11;
+const R_SET_PROTO: u16 = 12;
+
+/// The list argument of `Reflect.apply`/`Reflect.construct`. The engine has no
+/// array-likes (and no `arguments` object), so a real array is the accepted
+/// shape; a missing list is empty. shortcut: the spec requires the argument.
+fn arg_list(v: Option<&Val>) -> Result<Vec<Val>, JsError> {
+    match v {
+        None | Some(Val::Undefined) | Some(Val::Null) => Ok(Vec::new()),
+        Some(Val::Obj(o)) => match &o.borrow().kind {
+            ObjKind::Array(items) => Ok(items.clone()),
+            _ => Err(JsError::throw(
+                "TypeError: Reflect argument list is not an array",
+            )),
+        },
+        _ => Err(JsError::throw(
+            "TypeError: Reflect argument list is not an array",
+        )),
+    }
+}
+
+fn n_reflect(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let target = args.first().cloned().unwrap_or(Val::Undefined);
+    Ok(match idx {
+        R_APPLY => {
+            if !is_callable(&target) {
+                return Err(JsError::throw(
+                    "TypeError: Reflect.apply target is not a function",
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(Val::Undefined);
+            e.call(target, this_arg, arg_list(args.get(2))?)?
+        }
+        R_CONSTRUCT => {
+            if !is_callable(&target) {
+                return Err(JsError::throw(
+                    "TypeError: Reflect.construct target is not a constructor",
+                ));
+            }
+            super::interp::construct(e, target, arg_list(args.get(1))?)?
+        }
+        R_DEFINE_PROP => {
+            let key = arg_str(args, 1);
+            define_prop(e, &target, &key, args.get(2))?;
+            Val::Bool(true)
+        }
+        R_DELETE_PROP => Val::Bool(delete_member(&target, &arg_str(args, 1))),
+        R_GET => get_member(e, &target, &arg_str(args, 1))?,
+        R_SET => {
+            set_member(
+                e,
+                &target,
+                &arg_str(args, 1),
+                args.get(2).cloned().unwrap_or(Val::Undefined),
+            )?;
+            Val::Bool(true)
+        }
+        R_GET_DESC => n_object(e, O_GET_DESC, &Val::Undefined, args)?,
+        R_GET_PROTO => n_object(e, O_GET_PROTO, &Val::Undefined, args)?,
+        R_SET_PROTO => {
+            n_object(e, O_SET_PROTO, &Val::Undefined, args)?;
+            Val::Bool(true)
+        }
+        R_HAS => Val::Bool(has_member(e, &target, &arg_str(args, 1))?),
+        R_IS_EXTENSIBLE | R_PREVENT_EXTENSIONS => Val::Bool(true),
+        R_OWN_KEYS => n_object(e, O_PROP_NAMES, &Val::Undefined, args)?,
+        _ => Val::Undefined,
+    })
 }
 
 const OP_TOSTRING: u16 = 0;

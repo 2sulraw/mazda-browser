@@ -3277,6 +3277,47 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
     }
 }
 
+/// `key in v` — shared by the operator and `Reflect.has` so the two cannot
+/// drift. Functions answer through their synthesized slots (`name`/`length`/
+/// `prototype`) plus the prototype chain; strings count indices and `length`;
+/// every other primitive throws the operator's TypeError.
+pub(crate) fn has_member(e: &JsEngine, v: &Val, key: &str) -> Result<bool, JsError> {
+    Ok(match v {
+        Val::Obj(o) => e.chain_has(o, key),
+        // functions are objects: `"name" in f`, `"prototype" in f`
+        Val::Func(c) => {
+            let mut found = key == "name"
+                || key == "length"
+                || (key == "prototype" && !c.is_arrow)
+                || c.props.borrow().iter().any(|(k, _)| k.as_ref() == key);
+            let mut cur = c.proto.borrow().clone();
+            if !found {
+                for _ in 0..100 {
+                    match cur {
+                        Some(Val::Obj(o)) => {
+                            if e.chain_has(&o, key) {
+                                found = true;
+                                break;
+                            }
+                            cur = e.proto_of(&o).map(Val::Obj);
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            found
+        }
+        // `"0" in "abc"` -> true (index/length/method names)
+        Val::Str(s) => key == "length" || key.parse::<usize>().ok().and_then(|i| s.chars().nth(i)).is_some(),
+        _ => {
+            return Err(JsError::throw(&format!(
+                "TypeError: Cannot use `in` operator on {}",
+                v.type_of()
+            )))
+        }
+    })
+}
+
 /// JS `ToPrimitive` (default hint): what `+`/`==` do with objects — objects
 /// collapse to their string form (arrays join, errors "Name: msg", plain
 /// objects "[object Object]").

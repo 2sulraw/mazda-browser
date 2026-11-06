@@ -69,7 +69,7 @@ engine is from scratch.
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
 | Web IDL interfaces | ~8 families | 1,251 | <1% | denominator dominated by GPU, audio, XR, workers |
 | DOM methods bound to JS | 79 | - | - | common tree, event, observer, style, and form surface only |
-| JS language globals | 47 | ~50 | ~94% | strongest layer; `Proxy`, `Reflect`, `Intl`, `eval` absent |
+| JS language globals | 48 | ~50 | ~96% | strongest layer; `Proxy`, `Intl`, `eval` absent; `Reflect` ships (wave 76) |
 | test262 | not run | ~50k | unknown | highest-value missing measurement |
 | WPT | not run | ~50k | unknown | needs a harness; targeted subsets only |
 
@@ -446,7 +446,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 854 self-authored unit tests (858 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 856 self-authored unit tests (860 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -481,9 +481,12 @@ page-built `Symbol(…)_<n>` key ×8, `@@iterator` ×4, `deleteAll` ×4 — the
 page-built keys and the one-shot environment probes sit on top, so the
 actionable queue starts below them), MDN 1/0, Wikipedia 2/1, Hacker News 0/1
 (`innerHTML` as a read on element wrappers), rust-lang.org 1/0. The ranked
-lists are now the JS work queue: ES2024 Set methods, Map `emplace`/`upsert`,
-Array `find`/`findIndex`/`flat`/`flatMap`, `Object.isExtensible`/
-`getOwnPropertySymbols`, `reportError`, and the `Reflect` global.
+lists are the JS work queue; wave 76 took its top global, `Reflect` (nextjs
+globals 61 → 60, members 58 → 67 because core-js's decorator-metadata module
+now probes `Reflect.defineMetadata`/`getMetadata`/…). What remains: those
+metadata methods, ES2024 Set methods, Map `emplace`/`upsert`, Array
+`find`/`findIndex`/`flat`/`flatMap`, `Object.isExtensible`/
+`getOwnPropertySymbols`, `reportError`, and `innerHTML` reads.
 
 ### 8.2 Priority by reference impact and RAM cost
 

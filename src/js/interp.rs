@@ -1305,32 +1305,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
         ExprKind::New { callee, args } => {
             let f = eval_expr(e, env, callee)?;
             let argvals = eval_args(e, env, args)?;
-            let fresh = match &f {
-                Val::Func(c) => {
-                    let proto = ensure_prototype(c);
-                    Val::Obj(Rc::new(RefCell::new(Obj {
-                        kind: ObjKind::Plain,
-                        props: Vec::new(),
-                        proto: Some(proto),
-                    })))
-                }
-                _ => Val::new_object(),
-            };
-            // `new Promise(executor)` needs to run its executor arg; handled
-            // generically: natives get the fresh object as `this`
-            e.pending_construct = Some(f.clone());
-            let res = e.call(f, fresh.clone(), argvals)?;
-            // a constructor returning an OBJECT overrides `this`. Functions
-            // are objects too (this is how `new Function(...)` hands back the
-            // compiled function instead of the discarded fresh object).
-            Ok(if matches!(
-                res,
-                Val::Obj(_) | Val::Func(_) | Val::Native(_) | Val::Method(_)
-            ) {
-                res
-            } else {
-                fresh
-            })
+            construct(e, f, argvals)
         }
         ExprKind::Member { base, key } => {
             let b = eval_expr(e, env, base)?;
@@ -1711,6 +1686,39 @@ fn assign_target(
     }
 }
 
+/// `new callee(args)`: build the fresh `this`, run the call, and apply the
+/// "an object result wins" rule. Shared by the `new` operator and
+/// `Reflect.construct`; the latter ignores its `newTarget` argument (shortcut:
+/// the constructed object always takes `callee.prototype`).
+pub(crate) fn construct(e: &mut JsEngine, f: Val, argvals: Vec<Val>) -> Result<Val, JsError> {
+    let fresh = match &f {
+        Val::Func(c) => {
+            let proto = ensure_prototype(c);
+            Val::Obj(Rc::new(RefCell::new(Obj {
+                kind: ObjKind::Plain,
+                props: Vec::new(),
+                proto: Some(proto),
+            })))
+        }
+        _ => Val::new_object(),
+    };
+    // `new Promise(executor)` needs to run its executor arg; handled
+    // generically: natives get the fresh object as `this`
+    e.pending_construct = Some(f.clone());
+    let res = e.call(f, fresh.clone(), argvals)?;
+    // a constructor returning an OBJECT overrides `this`. Functions are
+    // objects too (this is how `new Function(...)` hands back the compiled
+    // function instead of the discarded fresh object).
+    Ok(if matches!(
+        res,
+        Val::Obj(_) | Val::Func(_) | Val::Native(_) | Val::Method(_)
+    ) {
+        res
+    } else {
+        fresh
+    })
+}
+
 /// `.prototype` accessor for constructors: created lazily on first use so
 /// plain (non-constructor) functions pay no prototype allocation.
 pub(crate) fn ensure_prototype(c: &Rc<Closure>) -> Rc<RefCell<Obj>> {
@@ -1903,45 +1911,7 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
         ),
         In => {
             let key = l.to_string();
-            match r {
-                Val::Obj(o) => Val::Bool(e.chain_has(o, &key)),
-                // functions are objects: `"name" in f`, `"prototype" in f`
-                Val::Func(c) => {
-                    // `name`/`length` are synthesized by get_member (no own
-                    // slot); `prototype` exists for non-arrow functions
-                    let mut found = key == "name"
-                        || key == "length"
-                        || (key == "prototype" && !c.is_arrow)
-                        || c.props.borrow().iter().any(|(k, _)| k.as_ref() == key);
-                    let mut cur = c.proto.borrow().clone();
-                    if !found {
-                        for _ in 0..100 {
-                            match cur {
-                                Some(Val::Obj(o)) => {
-                                    if e.chain_has(&o, &key) {
-                                        found = true;
-                                        break;
-                                    }
-                                    cur = e.proto_of(&o).map(Val::Obj);
-                                }
-                                _ => break,
-                            }
-                        }
-                    }
-                    Val::Bool(found)
-                }
-                Val::Str(s) => {
-                    // `"0" in "abc"` -> true (index/length/method names)
-                    let idx = key.parse::<usize>().ok().and_then(|i| s.chars().nth(i));
-                    Val::Bool(idx.is_some() || key == "length")
-                }
-                _ => {
-                    return Err(JsError::throw(&format!(
-                        "TypeError: Cannot use `in` operator on {}",
-                        r.type_of()
-                    )))
-                }
-            }
+            Val::Bool(super::has_member(e, &r, &key)?)
         }
         InstanceOf => match r {
             Val::Func(c) => {

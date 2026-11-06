@@ -2958,3 +2958,71 @@ fn js_miss_report_ranks_caps_and_excludes() {
         "[js-miss] member: 1 further distinct names over the {JS_MISS_CAP} cap not recorded"
     )));
 }
+
+// ---------------------------------------------------------------------------
+// Reflect
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reflect_apply_and_construct_run_calls() {
+    assert_eq!(string("typeof Reflect"), "object");
+    assert_eq!(
+        num("function f(a) { return this.n + a } Reflect.apply(f, { n: 2 }, [3])"),
+        5.0
+    );
+    // construct builds the instance from `target.prototype` and returns it
+    assert_eq!(
+        num("class A { constructor(x) { this.x = x } } Reflect.construct(A, [7]).x"),
+        7.0
+    );
+    assert!(boolean(
+        "class B { constructor() { this.b = 1 } } Reflect.construct(B, []) instanceof B"
+    ));
+    // an object returned from the constructor wins, exactly like `new`
+    assert!(boolean(
+        "function C() { return { hot: true } } Reflect.construct(C, []).hot"
+    ));
+    err("Reflect.apply(1, null, [])");
+    err("Reflect.apply(function () {}, null, 1)");
+    err("Reflect.construct(1, [])");
+}
+
+#[test]
+fn reflect_object_operations_match_the_operators() {
+    assert_eq!(num("var o = { a: 1 }; Reflect.get(o, 'a')"), 1.0);
+    assert!(boolean("var o = { a: 1 }; Reflect.set(o, 'a', 2) && o.a === 2"));
+    assert!(boolean("Reflect.has({ x: 1 }, 'x')"));
+    assert!(
+        boolean("Reflect.has([], 'push')"),
+        "inherited methods are members"
+    );
+    assert!(boolean("'x' in { x: 1 }"), "the operator shares the helper");
+    assert!(!boolean("Reflect.has({ x: 1 }, 'y')"));
+    assert!(boolean(
+        "var o = { a: 1 }; Reflect.deleteProperty(o, 'a') && !('a' in o)"
+    ));
+    assert_eq!(
+        num("Reflect.getOwnPropertyDescriptor({ x: 1 }, 'x').value"),
+        1.0
+    );
+    assert_eq!(
+        string("JSON.stringify(Reflect.ownKeys({ a: 1, b: 2 }).sort())"),
+        "[\"a\",\"b\"]"
+    );
+    assert!(boolean("Reflect.getPrototypeOf([]) === Array.prototype"));
+    assert!(boolean(
+        "var p = {}; Reflect.setPrototypeOf(p, Array.prototype); \
+         Reflect.getPrototypeOf(p) === Array.prototype"
+    ));
+    assert!(boolean("Reflect.isExtensible({})"));
+    // shortcut: no integrity levels — preventExtensions reports success only
+    assert!(boolean(
+        "var e = {}; Reflect.preventExtensions(e) && Reflect.isExtensible(e)"
+    ));
+    assert!(boolean(
+        "var t = {}; Reflect.defineProperty(t, 'n', { value: 5 }) && t.n === 5"
+    ));
+    // both methods throw on a non-object target (unlike the lenient Object.*)
+    err("Reflect.get(null, 'x')");
+    err("Reflect.has(1, 'x')");
+}
