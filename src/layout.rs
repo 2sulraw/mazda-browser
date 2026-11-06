@@ -5,8 +5,8 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgClip, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide,
-    Clear, Cursor, Dir, Display, Filter, Float, Gradient, Justify, Len, ObjFit, Pos, PseudoEl, Sheet,
-    TableRole, Track, TrackBreadth, VAlign, VarScope,
+    Clear, Cursor, Dir, Display, Filter, Float, Gradient, GridFlow, Justify, Len, ObjFit, Pos, PseudoEl,
+    Sheet, TableRole, Track, TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -6643,7 +6643,10 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     }
     // area-template columns (rows may be ragged; a missing cell is empty)
     let area_cols = n.bx.areas.iter().map(|r| r.len()).max().unwrap_or(0);
-    let nc = n.bx.cols.len().max(area_cols).max(1);
+    let nc0 = n.bx.cols.len().max(area_cols).max(1);
+    // rows the column-flow cursor wraps at: the explicit template's rows,
+    // else the area rows, else a single implicit row
+    let nr_flow = n.bx.rows.len().max(n.bx.areas.len()).max(1);
     // resolve each item's (row, c0, c1) — needs only the column COUNT, so it
     // runs BEFORE track widths are resolved (content tracks are sized from
     // the items placed in them)
@@ -6661,9 +6664,9 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         let s = start.and_then(|nm| line(nm, "-start"));
         let e = end.and_then(|nm| line(nm, "-end"));
         match (s, e) {
-            (Some(s), Some(e)) if e > s => Some((s, e.min(nc))),
-            (Some(s), _) => Some((s, (s + 1).min(nc))),
-            (None, Some(e)) => Some((e.saturating_sub(1).min(nc - 1), e.min(nc))),
+            (Some(s), Some(e)) if e > s => Some((s, e.min(nc0))),
+            (Some(s), _) => Some((s, (s + 1).min(nc0))),
+            (None, Some(e)) => Some((e.saturating_sub(1).min(nc0 - 1), e.min(nc0))),
             (None, None) => None,
         }
     };
@@ -6684,9 +6687,9 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                 }
             }
         }
-        found.then_some((r0, r1, c0.min(nc), c1.min(nc)))
+        found.then_some((r0, r1, c0.min(nc0), c1.min(nc0)))
     };
-    let mut col_row = vec![0usize; nc]; // next free row per column (named)
+    let mut col_row = vec![0usize; nc0]; // next free row per column (named)
     let mut ar = 0usize; // auto cursor row
     let mut ac = 0usize; // auto cursor col
     // (row0, row1, col0, col1) — row1/col1 exclusive
@@ -6719,25 +6722,48 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                 (r, r + 1, s, e)
             }
             (None, None) => {
-                let sp = (ar, ar + 1, ac, (ac + 1).min(nc));
-                ac += 1;
-                if ac >= nc {
-                    ac = 0;
+                if n.bx.grid_flow == GridFlow::Column {
+                    // column flow: fill the current column top→bottom, then
+                    // wrap to the next column once the template's rows are
+                    // used up (implicit rows never grow this grid)
+                    let sp = (ar, ar + 1, ac, ac + 1);
                     ar += 1;
+                    if ar >= nr_flow {
+                        ar = 0;
+                        ac += 1;
+                    }
+                    sp
+                } else {
+                    let sp = (ar, ar + 1, ac, (ac + 1).min(nc0));
+                    ac += 1;
+                    if ac >= nc0 {
+                        ac = 0;
+                        ar += 1;
+                    }
+                    sp
                 }
-                sp
             }
         });
     }
+    // column flow can place items past the explicit template: those implicit
+    // tracks are auto-sized (row flow never exceeds nc0, so this is a no-op
+    // there and every reference row stays byte-identical)
+    let nc = nc0.max(spots.iter().map(|s| s.3).max().unwrap_or(0));
     // explicit columns, else one auto (content-sized) track per area column,
-    // else the single full-width implicit track
-    let tracks: Vec<Track> = if !n.bx.cols.is_empty() {
+    // else one per column-flow implicit column, else the single full-width
+    // implicit track
+    let mut tracks: Vec<Track> = if !n.bx.cols.is_empty() {
         n.bx.cols.clone()
-    } else if area_cols > 0 {
+    } else if area_cols > 0 || nc > 1 {
         vec![Track::Auto; nc]
     } else {
         Vec::new()
     };
+    // implicit columns past an explicit template (`grid-template-columns:
+    // 1fr` + column flow) size as auto too
+    if !tracks.is_empty() && tracks.len() < nc {
+        tracks.resize(nc, Track::Auto);
+    }
     // Per-column measured widths for `auto`/`min-content`/`max-content`/
     // `minmax(…)`: min-content = widest unbreakable word, max-content = the
     // item on one line, both outer (padding/border/margins). Single-column
@@ -9207,6 +9233,107 @@ mod tests {
         layout_tree(&mut n, 300.0, &m4);
         assert_eq!(n.children[0].y, 0.0);
         assert_eq!(n.children[1].y, 100.0, "second row starts after 100px");
+    }
+
+    #[test]
+    fn grid_row_flow_wraps_after_the_explicit_columns() {
+        // row flow (the initial value) with an explicit 2×2 template must
+        // keep the wrap order: a b / c d
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Px(30.0), Track::Px(30.0)],
+                rows: vec![Track::Px(50.0), Track::Px(50.0)],
+                ..BoxStyle::default()
+            },
+        );
+        for t in ["a", "b", "c", "d"] {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            n.children.push(g);
+        }
+        layout_tree(&mut n, 300.0, &m4);
+        let pos = |i: usize| (n.children[i].x, n.children[i].y);
+        assert_eq!(pos(0), (0.0, 0.0), "a");
+        assert_eq!(pos(1), (30.0, 0.0), "b");
+        assert_eq!(pos(2), (0.0, 50.0), "c");
+        assert_eq!(pos(3), (30.0, 50.0), "d");
+    }
+
+    #[test]
+    fn grid_column_flow_fills_down_then_wraps_right() {
+        // no explicit rows: column flow puts every auto item on ONE row in
+        // its own (implicit) column, top to bottom then right
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                grid_flow: GridFlow::Column,
+                ..BoxStyle::default()
+            },
+        );
+        for t in ["a", "b", "c"] {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            n.children.push(g);
+        }
+        layout_tree(&mut n, 300.0, &m4);
+        let pos = |i: usize| (n.children[i].x, n.children[i].y);
+        assert_eq!(pos(0).1, 0.0, "a is on the single implicit row");
+        assert_eq!(pos(1).1, 0.0, "b shares that row");
+        assert_eq!(pos(2).1, 0.0, "c shares that row");
+        assert_eq!(pos(0).0, 0.0);
+        assert!(
+            pos(1).0 > pos(0).0 && pos(2).0 > pos(1).0,
+            "each item gets its own column: {:?}",
+            (pos(0), pos(1), pos(2))
+        );
+    }
+
+    #[test]
+    fn grid_column_flow_wraps_at_the_explicit_rows() {
+        // 2 explicit rows: column flow fills rows 1-2 of column 1 before
+        // moving to column 2 (a c / b d in visual order)
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                grid_flow: GridFlow::Column,
+                rows: vec![Track::Px(50.0), Track::Px(50.0)],
+                cols: vec![Track::Px(30.0), Track::Px(30.0)],
+                ..BoxStyle::default()
+            },
+        );
+        for t in ["a", "b", "c", "d"] {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            n.children.push(g);
+        }
+        layout_tree(&mut n, 300.0, &m4);
+        let pos = |i: usize| (n.children[i].x, n.children[i].y);
+        assert_eq!(pos(0), (0.0, 0.0), "a");
+        assert_eq!(pos(1), (0.0, 50.0), "b under a");
+        assert_eq!(pos(2), (30.0, 0.0), "c wraps to the next column");
+        assert_eq!(pos(3), (30.0, 50.0), "d under c");
     }
 
     #[test]

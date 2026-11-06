@@ -305,6 +305,19 @@ pub enum BgClip {
     Content,
 }
 
+/// `grid-auto-flow` — the axis auto-placed grid items advance along.
+/// shortcut: `dense` is accepted by the parser but NOT stored — the
+/// placement cursor here never passes a free cell (auto items are 1×1 and
+/// there are no row spans to leave a hole behind), so dense packing would
+/// place items exactly where the sparse cursor already puts them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GridFlow {
+    /// fill each row left→right, then wrap (CSS initial)
+    Row,
+    /// fill each column top→bottom, then wrap right
+    Column,
+}
+
 /// One color stop of a [`Gradient`]. `pos` is 0..1 along the gradient line
 /// (positions may sit outside the box's 0..1 span, exactly like CSS).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -704,6 +717,9 @@ pub struct BoxStyle {
     pub areas: Vec<Vec<Option<String>>>,
     /// this grid item's `grid-area: <name>` (a custom ident)
     pub grid_area: Option<String>,
+    /// `grid-auto-flow` — which axis auto-placed items advance along
+    /// (container property, see [`GridFlow`])
+    pub grid_flow: GridFlow,
     pub width: Option<Len>,
     pub max_width: Option<Len>,
     /// `box-sizing`: false = border-box (the engine default AND the CSS
@@ -1040,6 +1056,7 @@ impl Default for BoxStyle {
             grid_col_end: None,
             areas: Vec::new(),
             grid_area: None,
+            grid_flow: GridFlow::Row,
             width: None,
             max_width: None,
             content_box: false,
@@ -1667,6 +1684,7 @@ const KNOWN: &[&str] = &[
     "grid-column",
     "grid-column-start",
     "grid-column-end",
+    "grid-auto-flow",
     "width",
     "max-width",
     "min-width",
@@ -3416,6 +3434,27 @@ fn apply_decl(
                 && first.parse::<u32>().is_err()
             {
                 bx.grid_col_end = Some(first.to_string());
+            }
+        }
+        // `grid-auto-flow: [row|column] || dense` — tokens in any order;
+        // `dense` parses but isn't stored (see [`GridFlow`]). An unknown or
+        // repeated token drops the WHOLE declaration (CSS invalid-value
+        // rule), leaving any earlier value in place.
+        "grid-auto-flow" => {
+            let mut axis = None;
+            let mut bad = false;
+            for t in d.1.split_whitespace() {
+                match t {
+                    "dense" => {}
+                    "row" if axis.is_none() => axis = Some(GridFlow::Row),
+                    "column" if axis.is_none() => axis = Some(GridFlow::Column),
+                    "row" | "column" => bad = true,
+                    _ => bad = true,
+                }
+            }
+            if !bad {
+                // `dense` alone is valid (`grid-auto-flow: dense` = row dense)
+                bx.grid_flow = axis.unwrap_or(GridFlow::Row);
             }
         }
         "width" => {
@@ -9455,6 +9494,40 @@ mod tests {
         let sheet = parse(".s { grid-area: 1 / 2 / 3 / 4 }");
         let s = sheet.resolve(&dom, by_attr(&dom, "class", "s"), Style::new(), None).bx;
         assert_eq!(s.grid_area, None);
+    }
+
+    #[test]
+    fn grid_auto_flow_parses_axis_and_dense_in_any_order() {
+        let sheet = parse(
+            ".a { grid-auto-flow: column } \
+             .b { grid-auto-flow: row } \
+             .c { grid-auto-flow: column dense } \
+             .d { grid-auto-flow: dense row } \
+             .e { grid-auto-flow: dense } \
+             .f { grid-auto-flow: column; grid-auto-flow: bogus } \
+             .g { }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("a").grid_flow, GridFlow::Column);
+        assert_eq!(bx("b").grid_flow, GridFlow::Row, "explicit initial value");
+        assert_eq!(bx("c").grid_flow, GridFlow::Column, "`dense` after the axis");
+        assert_eq!(bx("d").grid_flow, GridFlow::Row, "`dense` before the axis");
+        assert_eq!(
+            bx("e").grid_flow,
+            GridFlow::Row,
+            "`dense` alone means row dense"
+        );
+        assert_eq!(
+            bx("f").grid_flow,
+            GridFlow::Column,
+            "an invalid value drops the whole declaration, keeping the earlier one"
+        );
+        assert_eq!(bx("g").grid_flow, GridFlow::Row, "unset = initial");
     }
 
     #[test]

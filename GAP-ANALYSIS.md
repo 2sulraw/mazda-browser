@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 169 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 170 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in Â§4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 169 |
+| Names in the engine's `KNOWN` table | 170 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~584 |
+| Raw missing (non-vendor) | ~583 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -174,7 +174,7 @@ handled, but the paint model still applies one radius to every corner.
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
 | Paged & multi-column | 31 | `break-*`, `column-*` | low |
 | Fonts | 22 | `font-variant-*`, `font-kerning`, `font-stretch` | medium |
-| Grid & alignment | 10 | `grid-row`, `grid-auto-flow`, `grid-auto-rows` | high |
+| Grid & alignment | 9 | `grid-row`, `grid-auto-rows` | high |
 | Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
 | Backgrounds | 12 | `background-origin`, `background-attachment`, `background-blend-mode` | medium |
@@ -311,6 +311,10 @@ relevant only when transitions and animations exist.
   array so `Style` stays `Copy`), each offset + box-blurred (three passes ≈
   Gaussian, σ = blur/2) under the glyphs; offsets are rounded to whole
   pixels and the underline/strike/overline decorations are not shadowed.
+- `grid-auto-flow: [row|column] || dense` picks the auto-placement axis;
+  `dense` parses but is not stored (the sparse cursor never passes a free
+  cell while auto items are 1×1 and row spans don't exist), and column flow
+  grows the grid with implicit `auto` columns past the explicit template.
 - `direction`, `unicode-bidi`, and writing modes are absent.
 
 ---
@@ -436,7 +440,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 844 self-authored unit tests (848 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 848 self-authored unit tests (852 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -459,9 +463,10 @@ names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
 `filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
-waves 67-72 took the top visual items off it (individual `translate`/`scale`,
+waves 67-73 took the top visual items off it (individual `translate`/`scale`,
 the `font` shorthand, the `filter` colour functions, the `place-items`/
-`place-self` alignment shorthands, `background-clip`, then `text-shadow`).
+`place-self` alignment shorthands, `background-clip`, `text-shadow`, then
+`grid-auto-flow`).
 The DOM/JS half is
 still open.
 
@@ -506,7 +511,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (169)
+## Appendix A - CSS property names accepted (170)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -525,7 +530,7 @@ content, cursor, display, fill
 fill-opacity, fill-rule, filter, flex, flex-basis
 flex-direction, flex-flow, flex-grow, flex-shrink
 flex-wrap, float, font, font-family, font-size
-font-style, font-weight, gap, grid-area
+font-style, font-weight, gap, grid-area, grid-auto-flow
 grid-column, grid-column-end, grid-column-start, grid-template-areas
 grid-template-columns, grid-template-rows, height, inset
 justify-content, justify-items, justify-self, left, letter-spacing, line-clamp
@@ -561,7 +566,7 @@ The full list is reproducible with Appendix D.
 
 ```text
 Layout and alignment:
-  grid-auto-columns, grid-auto-rows, grid-auto-flow, grid-row,
+  grid-auto-columns, grid-auto-rows, grid-row,
   grid-row-start, grid-row-end, grid-template, grid-gap
 
 Box, border, outline:

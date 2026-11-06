@@ -1752,6 +1752,40 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 72 (`text-shadow`) | a local text-shadow page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `text-shadow` now paints: up to TWO layers per run (`none`/garbage clears, extra layers dropped), inherited like the rest of the text properties and resolved at paint time — a layer with no colour is `currentcolor`. The style field is a fixed `[Option<TextShadow>; 2]` so `Style` stays `Copy` (a `Vec` would have forced `.clone()` through the whole box/run pipeline) and costs ~40 bytes per style with no heap. Paint stamps the run's glyph coverage into one small plane, box-blurs it per layer (three passes ≈ a Gaussian with σ = blur/2, the CSS definition of the blur radius) and composites at the layer's offset UNDER the run's own glyphs; the first layer composites last so it stays topmost, exactly as CSS orders them. The glyph walk moved into a shared `for_each_glyph` helper so the letter/word-spacing arithmetic — which must stay bit-identical to the width layout measured — is written once instead of twice. A local page verifies a hard offset shadow (the lit pixels are exactly the ink moved by dx/dy, with the glyph ink still painted over it), a blurred glow, two stacked layers and a `currentcolor` glow; the capture matches. Dropped-name counts: 86 on nextjs.org (was 87, `text-shadow` gone), 13 on MDN, 29 on Wikipedia, 3 on Hacker News, 9 on rust-lang.org. References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 101 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 83 MB; suite **844** default / **848** `engine-b + woff2` |
 
+| 2026-11-06 | wave 73 (`grid-auto-flow`) | a local grid-flow page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Auto-placed grid items now pack along either axis. `grid-auto-flow: [row|column] || dense` parses (tokens in any order; `dense` is accepted but NOT stored — the sparse cursor here never passes a free cell, since auto items are 1×1 and there are no row spans to leave a hole behind, so dense packing would place items identically; documented on the `GridFlow` enum), an unknown/repeated token drops the whole declaration so an earlier value survives, and `dense` alone means `row dense`. `grid()` keeps the base column count as `nc0` for the placement cursors, and column flow advances the auto cursor row-first, wrapping to the next column at `nr_flow` = explicit rows, else area rows, else one implicit row. Because column flow can place items past the explicit template, the column count is re-derived from the placed spots (`nc = nc0.max(max c1)`) and `tracks` grows `Track::Auto` to match — a no-op in row flow (the cursor never exceeds `nc0`), so every reference row stays byte-identical. A local page verifies row flow over a 2×2 template (a b / c d), column fill (x y z side by side on one row), column wrap at two explicit rows (a c / b d), `dense column` in either token order, and an invalid second value keeping `column`. Dropped-name counts fall to 85 on nextjs.org and 12 on MDN (both had `grid-auto-flow`; Wikipedia 29, Hacker News 3, rust-lang.org 9 unchanged, zero `grid-auto-flow` misses anywhere). References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 85 MB, Wikipedia 24673 / 10951 / 102 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 83 MB; suite **848** default / **852** `engine-b + woff2` |
+
+### Wave 73 findings
+
+- **The axis is the only thing stored.** `dense` would need a placement
+  cursor that backfills holes, but this grid's auto items are always 1×1
+  (no `grid-row*` spans exist yet) and named/area placement already tracks
+  its own per-column occupancy, so the sparse cursor never skips over a
+  cell an auto item could use — dense and sparse place identically today.
+  Accepting the token and documenting why it isn't stored keeps the parser
+  honest (sites emit `grid-auto-flow: dense` 6× in the CSS cache) without
+  a second cursor for zero behavioral difference.
+- **Two counts, because column flow grows the grid sideways.** Row flow
+  wraps at the column count, so one number (`nc0`) served both the cursor
+  and track sizing. Column flow wraps at the ROW count and creates
+  implicit columns, so `nc` is re-derived from the placed spots after the
+  loop and `tracks` is resized with `Track::Auto`. The row-flow path is
+  arithmetically unchanged (`max c1 ≤ nc0` there), which is why all five
+  references stayed byte-identical — the resize guard `!tracks.is_empty()`
+  also preserves the single-full-width-track fallback when nothing places.
+- **Reference runs must match the recorded URLs.** The first verification
+  pass used `nextjs.org/docs/app`, the MDN `grid-auto-flow` article and
+  `/wiki/Web_browser`, and got wildly different heights (2030/5539/7329)
+  — the wave table's numbers are for `nextjs.org/`, the MDN homepage and
+  `/wiki/JavaScript`. Worth a note: comparing runs across different URLs
+  looks exactly like a layout regression.
+- **Measured.** Local capture shows all five grid cases in order.
+  Dropped-name counts: 85 nextjs.org (was 86), 12 MDN (13), 29
+  Wikipedia, 3 Hacker News, 9 rust-lang.org — zero `grid-auto-flow` misses
+  remain. References keep identical geometry: nextjs 7578px / 569 runs /
+  147 MB, MDN 2773 / 641 / 85 MB, Wikipedia 24673 / 10951 / 102 MB, HN
+  1695 / 720 / 76 MB, rust-lang 5800 / 483 / 83 MB; suite **848** default
+  / **852** `engine-b + woff2`.
+
 ### Wave 72 findings
 
 - **Two layers, because `Style` has to stay `Copy`.** `text-shadow` is an
