@@ -916,6 +916,10 @@ pub struct BoxStyle {
     /// border color; None = currentcolor (the element's own text color,
     /// resolved at paint time — never a hardcoded default)
     pub bcolor: Option<u32>,
+    /// the border colour is `transparent`: the sides keep their WIDTH (it
+    /// still occupies space and participates in sizing) but paint nothing.
+    /// Distinct from `bcolor: None`, which means the current text colour.
+    pub btransparent: bool,
     /// `outline` — a ring outside the border box, painted with the box's
     /// chrome and never part of layout (see [`Outline`])
     pub outline: Outline,
@@ -1157,6 +1161,7 @@ impl Default for BoxStyle {
             radius: Len::Px(0.0),
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
+            btransparent: false,
             outline: Outline::NONE,
             clip: false,
             ellipsis: false,
@@ -3817,6 +3822,7 @@ fn apply_decl(
                 bx.border = [w; 4];
             }
             bx.bcolor = c;
+            bx.btransparent = border_transparent(&d.1);
             // the shorthand always declares the border (width+color, color
             // defaulting to currentcolor) — even `border:none` must suppress
             // the UA chrome rather than read as "undeclared"
@@ -3847,6 +3853,10 @@ fn apply_decl(
         "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
             if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 bx.bcolor = Some(c);
+                bx.btransparent = false;
+                bx.declared |= decl::BCOLOR;
+            } else if border_transparent(&d.1) {
+                bx.btransparent = true;
                 bx.declared |= decl::BCOLOR;
             }
         }
@@ -3861,6 +3871,9 @@ fn apply_decl(
         "border-color" => {
             if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
                 bx.bcolor = Some(c);
+                bx.btransparent = false;
+            } else if border_transparent(&d.1) {
+                bx.btransparent = true;
             }
             bx.declared |= decl::BCOLOR;
         }
@@ -3905,6 +3918,9 @@ fn apply_decl(
             }
             if c.is_some() {
                 bx.bcolor = c;
+                bx.btransparent = false;
+            } else if border_transparent(&d.1) {
+                bx.btransparent = true;
             }
             bx.declared |= decl::BORDER;
             if c.is_some() {
@@ -4322,6 +4338,16 @@ fn border_parts(v: &str, dark: bool, vp: (f32, f32)) -> (Option<Len>, Option<u32
         }
     }
     (w, c)
+}
+
+/// A colour token of `transparent` in a border shorthand/longhand. The width
+/// still applies (google's search field reserves its caret room with
+/// `border-bottom: 8px solid transparent`), so this never zeroes a side - the
+/// paint pass just skips it.
+fn border_transparent(v: &str) -> bool {
+    joined_tokens(v)
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("transparent"))
 }
 
 /// CSS side shorthand (`margin`/`padding`: 1–4 whitespace-separated values)
@@ -9971,6 +9997,31 @@ mod tests {
         assert_eq!(b.bx.bcolor, Some(0x00ff00));
         // style longhands are accepted no-ops (all borders render solid)
         let c = get("c");
+        assert_eq!(c.bx.bcolor, Some(0xff0000));
+    }
+
+    #[test]
+    fn transparent_border_keeps_width_but_paints_nothing() {
+        // google's search field reserves its caret room with
+        // `border-bottom: 8px solid transparent`; treating "no colour token"
+        // as currentcolor painted an 8px black bar across the page.
+        let sheet = parse(
+            ".a { border-bottom: 8px solid transparent }\n\
+             .b { border: 1px solid #111111 }\n\
+             .c { border: 2px solid transparent; border-left-color: red }",
+        );
+        let dom = dom_of(r#"<div class=a></div><div class=b></div><div class=c></div>"#);
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let a = get("a");
+        assert_eq!(a.bx.border[2], Len::Px(8.0), "the side still reserves space");
+        assert!(a.bx.btransparent, "transparent border colour");
+        assert_eq!(a.bx.bcolor, None, "must not fall back to currentcolor");
+        let b = get("b");
+        assert!(!b.bx.btransparent);
+        assert_eq!(b.bx.bcolor, Some(0x111111));
+        // a later real colour turns painting back on
+        let c = get("c");
+        assert!(!c.bx.btransparent);
         assert_eq!(c.bx.bcolor, Some(0xff0000));
     }
 

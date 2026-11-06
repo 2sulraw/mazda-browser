@@ -14,20 +14,54 @@ use crate::image::ImageData;
 /// 2x2 supersampling — cheap antialiasing for thin logo strokes.
 const SS: usize = 2;
 
-/// Intrinsic size from the root `<svg>` width/height (fallback: viewBox,
-/// then the spec default 300x150). `None` = not an SVG.
+/// Intrinsic size from the root `<svg>` width/height. `None` = not an SVG.
+///
+/// A `viewBox` is a user-space rectangle, NOT a pixel size: Google's icon set
+/// uses `viewBox="0 -960 960 960"`, and treating those numbers as px made every
+/// icon 960x960 (it stretched the search field to 968px and painted a black
+/// block over the page). A viewBox contributes only its RATIO.
+///
+/// With no width/height at all the SVG spec defaults the width to `100%` (see
+/// [`fills_width`]), so the size returned here is only a stand-in whose ratio
+/// is right - layout overrides the width. The 300x150 CSS default object size
+/// applies when there is no viewBox either.
 pub fn probe(bytes: &[u8]) -> Option<(u32, u32)> {
     let txt = std::str::from_utf8(bytes).ok()?;
     let (_, raw) = root_tag(txt)?;
     let w = get_attr(raw, "width").and_then(parse_px);
     let h = get_attr(raw, "height").and_then(parse_px);
-    if let (Some(w), Some(h)) = (w, h) {
-        return Some((w.max(1.0) as u32, h.max(1.0) as u32));
-    }
-    if let Some(v) = get_attr(raw, "viewBox").and_then(nums4) {
-        return Some((v[2].max(1.0) as u32, v[3].max(1.0) as u32));
-    }
-    Some((w.unwrap_or(300.0) as u32, h.unwrap_or(150.0) as u32)) // spec default
+    let ratio = get_attr(raw, "viewBox")
+        .and_then(nums4)
+        .map(|v| v[2] / v[3]);
+    let (w, h) = match (w, h) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, ratio.map(|r| w / r).unwrap_or(150.0)),
+        (None, Some(h)) => (ratio.map(|r| h * r).unwrap_or(300.0), h),
+        // `width: 100%` + a ratio-derived height; keep the ratio exact so the
+        // height a declared/CSS width derives stays right.
+        (None, None) => match ratio {
+            Some(r) => (300.0, 300.0 / r),
+            None => (300.0, 150.0), // CSS default object size
+        },
+    };
+    Some(((w.max(1.0)) as u32, (h.max(1.0)) as u32))
+}
+
+/// True when the root `<svg ...>` has a `viewBox` but neither width nor
+/// height: SVG then defaults to `width: 100%` of the containing block, with
+/// the height from the viewBox ratio (checked against a real engine: a square
+/// icon lays out 600x600 in a 600px block, and 24x12 for a 2:1 viewBox in a
+/// 24px one). Layout turns this into `width: 100%`.
+pub fn fills_width(bytes: &[u8]) -> bool {
+    let Ok(txt) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some((_, raw)) = root_tag(txt) else {
+        return false;
+    };
+    get_attr(raw, "viewBox").and_then(nums4).is_some()
+        && get_attr(raw, "width").is_none()
+        && get_attr(raw, "height").is_none()
 }
 
 /// Rasterize at the requested size (vector → pixel-exact at any scale).
@@ -2727,10 +2761,42 @@ mod tests {
     #[test]
     fn probe_width_height_and_viewbox() {
         assert_eq!(probe(SVG.as_bytes()), Some((10, 10)));
+        // a viewBox is user-space, not a pixel size. With no width/height the
+        // width is 100% (layout) and only the RATIO comes from the viewBox, so
+        // the stand-in size keeps that ratio: 2:1 -> 300x150, 1:1 -> 300x300
         let vb = br#"<svg viewBox="0 0 40 20"><path d="M0 0h40v20H0z"/></svg>"#;
-        assert_eq!(probe(vb), Some((40, 20)));
+        assert_eq!(probe(vb), Some((300, 150)));
+        // one declared dimension + viewBox -> the other follows the ratio
+        let w_only = br#"<svg viewBox="0 0 40 20" width="80"><path d="M0 0h40v20H0z"/></svg>"#;
+        assert_eq!(probe(w_only), Some((80, 40)));
+        let h_only = br#"<svg viewBox="0 0 40 20" height="30"><path d="M0 0h40v20H0z"/></svg>"#;
+        assert_eq!(probe(h_only), Some((60, 30)));
+        // Material icon markup: the 960 is viewBox scale, not px
+        let icon = br#"<svg viewBox="0 -960 960 960"><path d="M0 0h10v10H0z"/></svg>"#;
+        assert_eq!(probe(icon), Some((300, 300)));
+        // no viewBox at all: the CSS default object size
+        assert_eq!(probe(br#"<svg><path d="M0 0h10v10H0z"/></svg>"#), Some((300, 150)));
         assert_eq!(probe(b"<html><body>nope"), None);
         assert_eq!(probe(b""), None);
+    }
+
+    #[test]
+    fn viewbox_only_svg_defaults_to_full_width() {
+        // real-engine check: 600px block -> 600x600 (square icon), 24px -> 24x12
+        let icon = br#"<svg viewBox="0 -960 960 960"><path d="M0 0h10v10H0z"/></svg>"#;
+        assert!(fills_width(icon));
+        let vb = br#"<svg viewBox="0 0 40 20"><path d="M0 0h40v20H0z"/></svg>"#;
+        assert!(fills_width(vb));
+        // any declared axis (attribute or CSS) means auto sizing, not 100%
+        assert!(!fills_width(
+            br#"<svg viewBox="0 0 40 20" width="80"><path d="M0 0h1v1H0z"/></svg>"#
+        ));
+        assert!(!fills_width(
+            br#"<svg viewBox="0 0 40 20" height="30"><path d="M0 0h1v1H0z"/></svg>"#
+        ));
+        // no viewBox: the 300x150 object size, not a stretched box
+        assert!(!fills_width(br#"<svg><path d="M0 0h1v1H0z"/></svg>"#));
+        assert!(!fills_width(b"not an svg"));
     }
 
     #[test]

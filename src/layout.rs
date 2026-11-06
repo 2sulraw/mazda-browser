@@ -1316,6 +1316,17 @@ fn build_into(
                     if g.bx.height.is_none() {
                         g.bx.height = dom.attr(child, "height").and_then(|v| v.parse::<f32>().ok()).map(Len::Px);
                     }
+                    // SVG's own `width: 100%` default: a viewBox-only icon
+                    // fills its containing block (a 20px flex button gives a
+                    // 20px icon), instead of the 300x150 object size. Only
+                    // when neither CSS nor the attributes pin a box, and the
+                    // height still derives from the viewBox ratio.
+                    if g.bx.width.is_none()
+                        && g.bx.height.is_none()
+                        && crate::svg::fills_width(markup.as_bytes())
+                    {
+                        g.bx.width = Some(Len::Pct(100.0));
+                    }
                     g.img = Some(ImgSlot::Pending(std::rc::Rc::from(markup)));
                     g.inline = inline_level(&g.bx);
                     out.push(g);
@@ -2902,7 +2913,7 @@ fn collect_paint(
         let br = resolve_len(n.bx.border[1], n.w);
         let bb = resolve_len(n.bx.border[2], n.w);
         let bl = resolve_len(n.bx.border[3], n.w);
-        let has_b = bt > 0.0 || br > 0.0 || bb > 0.0 || bl > 0.0;
+        let has_b = (bt > 0.0 || br > 0.0 || bb > 0.0 || bl > 0.0) && !n.bx.btransparent;
         // currentcolor: unspecified border color = the element's text color,
         // which `apply_effects` already filtered — an explicit border color
         // still needs the filter applied here
@@ -4299,6 +4310,15 @@ fn place(
     {
         if let Some((iw, _)) = n.img.as_ref().and_then(ImgSlot::dims) {
             w = (iw as f32).min(avail);
+            // the intrinsic size is a used width like any other: clamp it
+            // with `max-width`/`min-width` (rust-lang.org's product logos are
+            // 512px SVGs under `max-width:128px` and painted 512px wide)
+            if let Some(m) = n.bx.max_width {
+                w = w.min(resolve_len(m, avail));
+            }
+            if let Some(m) = n.bx.min_width {
+                w = w.max(resolve_len(m, avail));
+            }
         }
     }
     // border box = content inset by borders + padding (shortcut: default
@@ -6362,17 +6382,20 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
             }
             Some(l) => widths[idx] = resolve_len(l, n.w) + mlr,
             None => {
-                // `width: %` doubles as the basis (flex-basis: auto)
+                // `width: %` doubles as the basis (flex-basis: auto). The
+                // percentage is DEFINITE (it resolves against this row), so
+                // the item's intrinsic width must not floor it: google's
+                // icon buttons are `span.z1asCe{width:20px}` flex containers
+                // holding `svg{width:100%}`, and flooring 20 with the SVG's
+                // 300px intrinsic width painted 300x300 icons over the page.
                 if let Some(Len::Pct(p)) = c.bx.width {
-                    let others: f32 = widths
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j != idx)
-                        .map(|(_, v)| *v)
-                        .sum();
-                    let basis = (p / 100.0 * n.w + mlr).max(widths[idx]);
-                    let cap = (n.w - gaps - others).max(widths[idx]);
-                    widths[idx] = basis.min(cap);
+                    let basis = p / 100.0 * n.w + mlr;
+                    // No cap here: several `width:100%` siblings (rust-lang's
+                    // three "Why Rust?" columns) each start at the full row
+                    // and `shrink_row` below splits the overflow evenly, the
+                    // way `flex-shrink: 1` does. Capping each against its
+                    // siblings drove all three to 0.
+                    widths[idx] = basis;
                 }
             }
         }
@@ -8187,6 +8210,44 @@ mod tests {
         assert!((a.w - 60.0).abs() < 0.01, "col A w={} (want 60 = 30% of 200)", a.w);
         assert!((b.x - 60.0).abs() < 0.01, "col B x={} (want 60)", b.x);
         assert!((b.w - 60.0).abs() < 0.01, "col B w={}", b.w);
+    }
+
+    #[test]
+    fn flex_row_pct_width_not_floored_by_intrinsic_width() {
+        // google's icon buttons: a `width:20px` flex span holding
+        // `svg{width:100%}` whose intrinsic width is 300px (a viewBox icon).
+        // The percentage is definite, so the intrinsic width must not floor
+        // it - the old basis took max(20, 300) and painted 300x300 icons.
+        let mut icon = BoxNode::group(Style::new(), BoxStyle::default());
+        icon.bx.width = Some(Len::Pct(100.0));
+        icon.children = vec![leaf("a very wide intrinsic label")];
+        let mut root = flex_row(vec![icon], BoxStyle::default());
+        layout_tree(&mut root, 20.0, &m4);
+        let w = root.children[0].w;
+        assert!(w <= 20.01, "width:100% of a 20px row used {w}px");
+    }
+
+    #[test]
+    fn flex_row_pct_width_siblings_split_the_row() {
+        // rust-lang.org's "Why Rust?" row: three `width:100%` columns side by
+        // side. Each basis is the full row, so the overflow is split by
+        // `flex-shrink` — each takes an equal share. Capping each item at
+        // (row - sum of siblings) made all three 0px wide.
+        let cols: Vec<_> = (0..3)
+            .map(|i| {
+                let mut c = BoxNode::group(Style::new(), BoxStyle {
+                    width: Some(Len::Pct(100.0)),
+                    ..BoxStyle::default()
+                });
+                c.children = vec![leaf(&format!("column {i}"))];
+                c
+            })
+            .collect();
+        let mut row = flex_row(cols, BoxStyle::default());
+        layout_tree(&mut row, 300.0, &m4);
+        for c in &row.children {
+            assert!((c.w - 100.0).abs() < 0.5, "each column takes a third: w={}", c.w);
+        }
     }
 
     #[test]
@@ -11059,6 +11120,22 @@ mod tests {
         assert_eq!(l2.rects[0].4, 0x000000, "outer ring = currentcolor (text color)");
         assert!((l2.rects[1].2 - 46.0).abs() < 0.01, "inner w={}", l2.rects[1].2);
         assert!((l2.rects[1].5 - 4.0).abs() < 0.01, "inner radius={}", l2.rects[1].5);
+        // transparent border: width still lays out (space reserved) but only
+        // the background paints - no strips, no ring
+        let mut t = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                border: [Len::Px(8.0); 4],
+                btransparent: true,
+                bg: Some(0x123456),
+                ..BoxStyle::default()
+            },
+        );
+        t.children = vec![leaf("a")];
+        let l3 = layout_tree(&mut t, 50.0, &m4);
+        assert_eq!(l3.rects.len(), 1, "background only: {:?}", l3.rects);
+        assert_eq!(l3.rects[0].4, 0x123456, "no border-colour rect");
+        assert!((t.h - (15.0 * 1.35 + 16.0)).abs() < 0.01, "8px borders still size the box: h={}", t.h);
     }
 
     #[test]
@@ -11233,6 +11310,37 @@ mod tests {
         layout_tree(&mut narrow, 60.0, &m4);
         assert!((narrow.w - 60.0).abs() < 0.01, "clamped w={}", narrow.w);
         assert!((narrow.h - 30.0).abs() < 0.01, "aspect h={}", narrow.h);
+    }
+
+    #[test]
+    fn img_intrinsic_width_clamped_by_max_width() {
+        // rust-lang.org's product logos: 512x512 SVGs under `max-width:128px`.
+        // The intrinsic width used to ignore max/min-width and laid out at
+        // 512px (and, once the viewBox ratio was honoured, 512px tall too).
+        let mut n = img_sized(
+            BoxStyle {
+                max_width: Some(Len::Px(128.0)),
+                ..BoxStyle::default()
+            },
+            512,
+            512,
+        );
+        layout_tree(&mut n, 600.0, &m4);
+        assert!((n.w - 128.0).abs() < 0.01, "w={}", n.w);
+        assert!((n.h - 128.0).abs() < 0.01, "aspect h={}", n.h);
+
+        // min-width still floors the intrinsic size
+        let mut m = img_sized(
+            BoxStyle {
+                min_width: Some(Len::Px(200.0)),
+                ..BoxStyle::default()
+            },
+            100,
+            50,
+        );
+        layout_tree(&mut m, 600.0, &m4);
+        assert!((m.w - 200.0).abs() < 0.01, "min-width w={}", m.w);
+        assert!((m.h - 100.0).abs() < 0.01, "aspect h={}", m.h);
     }
 
     #[test]

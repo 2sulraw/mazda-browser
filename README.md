@@ -3,14 +3,14 @@
 # Mazda Browser
 
 **A browser engine written in Rust from scratch.**
-No Chromium, no WebView, no third-party engine code — just a renderer built around one question:
+No third-party engine code — just a renderer built around one question:
 *how little RAM can a browser use?*
 
 [![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-3DA639?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4?style=flat-square)](https://github.com/2sulraw/mazda-browser)
 [![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](#status)
-[![Tests](https://img.shields.io/badge/tests-714-blueviolet?style=flat-square)](#status)
+[![Tests](https://img.shields.io/badge/tests-866-blueviolet?style=flat-square)](#status)
 
 [Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Configuration](#configuration) · [Memory](#memory) · [Plan](PLAN.md)
 
@@ -133,7 +133,7 @@ Measured RSS on Windows 11 with the status-bar meter:
 | Idle window | ~106 MB |
 | Wikipedia article | ~100 MB |
 | MDN reference page | ~80–95 MB |
-| google.com homepage | ~96 MB |
+| google.com homepage | ~92 MB |
 | Additional tabs | restored from snapshots — no live renderer |
 
 The `glow`/winit GL context sets the floor. The real target is the **shape of the curve**: a

@@ -12,9 +12,8 @@ serves that.
   errors, at the lowest RAM we can reach.
 - Reference pages: Wikipedia `/wiki/JavaScript`, MDN homepage, nextjs.org,
   rust-lang.org, Hacker News, google.com homepage; example.com is the shell
-  floor. google.com joined in wave 77 with a first baseline (1400px / 28 runs
-  / 95.8 MB); its oversized search form and two undiagnosed black shapes are
-  known gaps.
+  floor. google.com joined in wave 77; wave 78 fixed its viewBox sizing, flex
+  `%` basis and transparent borders (1400px -> 488px / 28 runs / 92.3 MB).
 - A feature that does not improve one of those pages must justify itself as
   infrastructure (correctness, safety, or measured RAM) before it is built.
 

@@ -142,7 +142,12 @@ engine has no bidi algorithm or `direction` handling.
 - Forms: `input` (text/checkbox/radio/submit/button), `button`, `select`/`option`,
   `textarea`, `fieldset`/`legend`, `label` (partial).
 - Images: PNG, JPEG, WebP, SVG (hand-written rasterizer); `srcset` partial.
+  A replaced element's intrinsic size is its content's; `width`/`height`
+  attributes, `max-width`/`min-width` and CSS sizes clamp it.
 - Declarative shadow DOM, inline `<svg>`, `<script>`/`<style>`/`<link>`/`<meta>`.
+  Inline SVG sizing follows the intrinsic rules above: the root `viewBox` is a
+  coordinate system (its ratio sizes an auto axis) and a viewBox-only root
+  defaults to `width: 100%` of its containing block, height from the ratio.
 
 ---
 
@@ -262,10 +267,14 @@ relevant only when transitions and animations exist.
   align grid items inside their area, and `align-self` now shifts a grid
   item within its row as it already did in flex; `align-content`
   distributes rows, but `stretch` packs at the start (auto rows never grow).
-- Flex: `wrap-reverse` does not reverse the cross axis.
+- Flex: `wrap-reverse` does not reverse the cross axis. A `width: %` item's
+  basis is the percentage resolved against the row (no intrinsic floor), so
+  several `width:100%` siblings shrink evenly via `flex-shrink`; absolute
+  min/max widths still clamp after shrink.
 - Borders: per-side width and colour longhands parse into the existing model,
   which still keeps one colour for all sides and one radius for all corners
-  (the last declaration wins); style words collapse to a solid border;
+  (the last declaration wins); a `transparent` colour keeps the side's width
+  but paints nothing; style words collapse to a solid border;
   dashed/dotted text decorations are approximated; inner shadows are dropped.
 - `%` `min-height` / `max-height` resolve against width, not container
   height; an auto block still ignores a plain `height` (only `min-height`,
@@ -449,7 +458,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 861 self-authored unit tests (865 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 866 self-authored unit tests (870 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -491,14 +500,17 @@ Array extras (`find`/`findIndex`/`flat`/`flatMap`/`at`/`fill`/`copyWithin` and
 `findLast*`; nextjs members 67 → 61 with no new names). google.com joined the
 reference set in wave 77 and immediately paid for itself: its first capture
 was blank because `<noscript>` content was parsed as elements, so its
-non-JS `<style>` hid the page; with the parser fixed it lays out 1400px /
-28 runs / 95.8 MB at `[css-miss]` 50 / `[js-miss]` 20 globals + 11 members
-(`XMLHttpRequest`, `trustedTypes`, `fonts.timing`, `sendBeacon`, …), and its
-search form is still 968px tall with two undiagnosed black shapes over it (a
-layout/SVG gap). What remains: `Reflect`
+non-JS `<style>` hid the page. Wave 78 then fixed the three visual defects the
+baseline exposed — viewBox numbers read as pixels, the flex `%` basis
+floor/cap, and transparent borders painted as currentColor — taking it from
+1400px to 488px / 28 runs / 92.3 MB (Chrome: 525px), form 56px, icons
+36/24/20px; `[css-miss]` 50 and `[js-miss]` 20 globals + 11 members
+(`XMLHttpRequest`, `trustedTypes`, `fonts.timing`, `sendBeacon`, …) are
+unchanged. What remains: `Reflect`
 metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
 `Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`
-reads, and google's oversized form / SVG fills.
+reads, and the flex/grid gaps that keep rust-lang.org at 5344px against
+Chrome's 3841px.
 
 ### 8.2 Priority by reference impact and RAM cost
 
