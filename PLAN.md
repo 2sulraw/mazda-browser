@@ -1750,6 +1750,53 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 71 (`background-clip`) | a local background-clip page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `background-clip` now clips the background: `border-box` (initial, unchanged), `padding-box` stops the colour/gradient at the padding edge and `content-box` stops it at the content edge. The colour and gradient layers are single rects, so the wave computes one `bg_box` and emits it instead of the border box; the background IMAGE keeps its padding-box sizing (`%` sizes/positions resolve where CSS says) and is cropped by passing the content window down to the placeholder child when the clip is `content-box`. A rounded box with a border still paints the ring: the border colour fills the border box and the colour layer paints inside it, with `content-box` moving that inner rect to the content box and shrinking the radius by border + padding (max-inset approximation). `background-clip: text` is deliberately NOT accepted - it needs a glyph-shaped mask this renderer has no place to build, and accepting it would paint a rectangle behind invisible text; it stays a dropped declaration. The `background` shorthand resets `background-clip` with the rest of the background longhands. A local page with a 6px transparent border and 10px padding verifies the three clip boxes: red fills 100px (border box), blue paints 88px at x=6 (padding box), green paints 68px at x=16 (content box) and the gradient follows the same clip; the capture matches. Dropped-name counts: 87 on nextjs.org (was 88), 13 on MDN, 29 on Wikipedia, 3 on Hacker News, 9 on rust-lang.org. References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 100 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 82 MB; suite **842** default / **846** `engine-b + woff2` |
 
+| 2026-11-06 | wave 72 (`text-shadow`) | a local text-shadow page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `text-shadow` now paints: up to TWO layers per run (`none`/garbage clears, extra layers dropped), inherited like the rest of the text properties and resolved at paint time — a layer with no colour is `currentcolor`. The style field is a fixed `[Option<TextShadow>; 2]` so `Style` stays `Copy` (a `Vec` would have forced `.clone()` through the whole box/run pipeline) and costs ~40 bytes per style with no heap. Paint stamps the run's glyph coverage into one small plane, box-blurs it per layer (three passes ≈ a Gaussian with σ = blur/2, the CSS definition of the blur radius) and composites at the layer's offset UNDER the run's own glyphs; the first layer composites last so it stays topmost, exactly as CSS orders them. The glyph walk moved into a shared `for_each_glyph` helper so the letter/word-spacing arithmetic — which must stay bit-identical to the width layout measured — is written once instead of twice. A local page verifies a hard offset shadow (the lit pixels are exactly the ink moved by dx/dy, with the glyph ink still painted over it), a blurred glow, two stacked layers and a `currentcolor` glow; the capture matches. Dropped-name counts: 86 on nextjs.org (was 87, `text-shadow` gone), 13 on MDN, 29 on Wikipedia, 3 on Hacker News, 9 on rust-lang.org. References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 101 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 83 MB; suite **844** default / **848** `engine-b + woff2` |
+
+### Wave 72 findings
+
+- **Two layers, because `Style` has to stay `Copy`.** `text-shadow` is an
+  inherited text property, so it belongs on `Style` — but `Style` is `Copy`
+  and is stored on every box and every run, so a `Vec` was never an option.
+  `[Option<TextShadow>; 2]` keeps the copy, costs ~40 bytes per style with
+  no allocation, and caps the layer count honestly (documented on
+  `TextShadow` rather than silently truncating). Parsing reuses the
+  `box-shadow` tokenizer — the grammar is the same minus spread — so a new
+  value parser was 15 lines of mapping, not a second tokenizer.
+- **One plane per run, not one pass per glyph.** The shadow rasterizes the
+  run's glyph masks into a single coverage plane, blurs the plane, then
+  composites it per layer. Blurring per glyph would either halo each glyph
+  separately (wrong: the shadow must merge across glyphs) or re-walk the run
+  per layer. The walk itself moved into `for_each_glyph`, shared with
+  `draw_text`: the letter/word-spacing arithmetic has a standing COUPLING
+  comment saying it must match layout's measured width exactly, and a
+  second copy of it is exactly how that breaks.
+- **Blur is three box passes ≈ a Gaussian with σ = blur/2** — the CSS
+  definition of the blur radius, so `text-shadow: 0 1px 4px` lands at the
+  same softness as the box-shadow pass. The plane is clamped to the buffer
+  before allocation, so an off-screen run never allocates for pixels that
+  cannot be drawn, and offsets are rounded to whole pixels (no sub-pixel
+  shadow position — documented).
+- **Paint order falls out of the existing run loop.** The shadow is emitted
+  at the top of `draw_text`, so it is under its own glyphs, and because runs
+  paint in list order a later run's shadow paints over an earlier run's
+  text — which is what in-flow CSS order does anyway. Layer 0 composites
+  last (CSS: first layer on top). The underline/strike/overline decorations
+  are NOT shadowed; they ride a separate rect channel and would need the
+  same treatment in a follow-up.
+- **Measured.** Local page: hard red offset, blurred blue glow, two stacked
+  layers (green at +3/+3, magenta at +9/+9) and a `currentcolor` glow all
+  render, and a unit test pins the hard shadow's pixel set to exactly the
+  ink translated by (dx, dy) plus the ink itself. Dropped-name counts: 86
+  on nextjs.org (was 87), 13 MDN, 29 Wikipedia, 3 Hacker News, 9
+  rust-lang.org. References keep identical geometry: nextjs 7578px / 569
+  runs / 147 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 101 MB,
+  HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 83 MB; suite **844**
+  default / **848** `engine-b + woff2`. The +40 bytes per Style show up as
+  ~1 MB on Wikipedia's 11k runs, inside the ±10 MB run-to-run spread.
+- **Next in the queue.** `backdrop-filter` (needs the offscreen group wave
+  69 skipped), `grid-auto-flow`, `hyphens`; transitions only if animation
+  is ever required.
+
 ### Wave 71 findings
 
 - **`background-clip` is three boxes, not a paint feature.** The colour and

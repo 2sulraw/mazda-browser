@@ -157,6 +157,11 @@ pub struct Style {
     /// `text-underline-offset` in px, added to the default underline y;
     /// 0 = `auto` (the default position) — applies to underline only
     pub deco_offset: f32,
+    /// `text-shadow` layers, first = topmost; `None` slots = no layer (the
+    /// painter composites the filled slots in REVERSE so slot 0 ends up on
+    /// top). Inherited like the rest of the text properties, capped at two
+    /// (see [`crate::css::TextShadow`]) so this struct stays `Copy`.
+    pub text_shadow: [Option<crate::css::TextShadow>; 2],
     pub fam: Fam,
     /// 0 = left, 1 = center, 2 = right (inherited, text-align)
     pub text_align: u8,
@@ -199,6 +204,7 @@ impl Style {
             deco_style: DecoStyle::Solid,
             deco_thickness: 0.0,
             deco_offset: 0.0,
+            text_shadow: [None, None],
             fam: Fam::Sans,
             text_align: 0,
             lh: 0.0,

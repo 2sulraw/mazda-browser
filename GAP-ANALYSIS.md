@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 168 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 169 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in Â§4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 168 |
+| Names in the engine's `KNOWN` table | 169 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~585 |
+| Raw missing (non-vendor) | ~584 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -167,7 +167,7 @@ handled, but the paint model still applies one radius to every corner.
 | Category | Missing | Examples | Decision relevance |
 |---|---:|---|---|
 | Other / miscellaneous | 217 | `bookmark-label`, `block-step-align`, `corner-*`, `cue` | ignore: drafts, print, speech |
-| Text & typography | 61 | `hyphens`, `text-shadow` | high: frequent in real CSS |
+| Text & typography | 60 | `hyphens` | high: frequent in real CSS |
 | Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low: low frequency here |
 | Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required |
 | Borders & outlines | 18 | `border-image-*`, `border-block-*`, `border-inline-*` | medium: common in resets |
@@ -307,6 +307,10 @@ relevant only when transitions and animations exist.
   `overflow-wrap` / `word-break` now break inside words during line layout,
   `text-overflow: ellipsis` marks a clipped line and `max-height` caps a box
   (see the wave 49-52 notes); `hyphens` is not modeled.
+- `text-shadow` paints up to TWO layers per run (the style field is a fixed
+  array so `Style` stays `Copy`), each offset + box-blurred (three passes ≈
+  Gaussian, σ = blur/2) under the glyphs; offsets are rounded to whole
+  pixels and the underline/strike/overline decorations are not shadowed.
 - `direction`, `unicode-bidi`, and writing modes are absent.
 
 ---
@@ -432,7 +436,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 842 self-authored unit tests (846 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 844 self-authored unit tests (848 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -455,9 +459,10 @@ names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
 `filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
-waves 67-71 took the top visual items off it (individual `translate`/`scale`,
+waves 67-72 took the top visual items off it (individual `translate`/`scale`,
 the `font` shorthand, the `filter` colour functions, the `place-items`/
-`place-self` alignment shorthands, then `background-clip`). The DOM/JS half is
+`place-self` alignment shorthands, `background-clip`, then `text-shadow`).
+The DOM/JS half is
 still open.
 
 ### 8.2 Priority by reference impact and RAM cost
@@ -501,7 +506,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (168)
+## Appendix A - CSS property names accepted (169)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
@@ -540,7 +545,7 @@ position, right, row-gap, stroke, stroke-linecap
 stroke-linejoin, stroke-opacity, stroke-width, table-layout
 text-align, text-decoration, text-decoration-color, text-decoration-line
 text-decoration-style, text-decoration-thickness, text-indent, text-overflow
-text-transform, text-underline-offset, top, transform
+text-shadow, text-transform, text-underline-offset, top, transform
 transform-origin, translate, rotate, scale, vertical-align, visibility
 white-space, width, word-break, word-spacing, word-wrap
 z-index
@@ -563,7 +568,7 @@ Box, border, outline:
   border-image-*, border-block-*, border-inline-*, box-decoration-break
 
 Text and typography:
-  hyphens, text-shadow, text-emphasis, tab-size, quotes,
+  hyphens, text-emphasis, tab-size, quotes,
   direction, unicode-bidi, writing-mode, text-orientation,
   white-space-collapse, text-wrap, font-stretch, font-variant,
   font-feature-settings, font-kerning, font-size-adjust, font-optical-sizing

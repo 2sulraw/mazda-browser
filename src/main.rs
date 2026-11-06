@@ -6154,18 +6154,73 @@ fn draw_text(
     // stack; intersection was pre-applied to the run's window in layout)
     clip: Option<(f32, f32, f32, f32)>,
 ) {
+    // `text-shadow` layers paint UNDER this run's own glyphs (the shadow is
+    // part of the text's painting), so they go first. shortcut: the
+    // underline/strike/overline decorations are NOT shadowed — they ride a
+    // separate rect channel.
+    if style.text_shadow.iter().any(Option::is_some) {
+        draw_text_shadows(buf, width, x0, y0, s, fonts, style, alpha, clip);
+    }
+    for_each_glyph(x0, y0, s, fonts, style, |m, gx0, gy0| {
+        if let Some((cx0, cy0, cx1, cy1)) = clip {
+            if (gx0 + m.w as i32) as f32 <= cx0
+                || gx0 as f32 >= cx1
+                || (gy0 + m.h as i32) as f32 <= cy0
+                || gy0 as f32 >= cy1
+            {
+                return; // glyph entirely outside the clip window
+            }
+        }
+        for gy in 0..m.h {
+            let dy = gy0 + gy as i32;
+            if dy < 0 {
+                continue;
+            }
+            let row = dy as usize * width;
+            if row >= buf.len() {
+                continue;
+            }
+            for gx in 0..m.w {
+                let cov = m.cov[gy * m.w + gx];
+                if cov == 0 {
+                    continue;
+                }
+                let dx = gx0 + gx as i32;
+                if dx < 0 || dx as usize >= width {
+                    continue;
+                }
+                let idx = row + dx as usize;
+                if idx < buf.len() {
+                    let cov = ((cov as u16 * alpha as u16) / 255) as u8;
+                    if cov > 0 {
+                        blend(&mut buf[idx], style.color, cov);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Walk one run's glyphs in pen order and hand each rasterized mask plus its
+/// integer top-left to `f`. `draw_text` (the ink) and `draw_text_shadows`
+/// (the shadow plane) share it, so the letter/word-spacing arithmetic —
+/// which must stay bit-identical to the width layout measured, or painted
+/// ink drifts off the run (wrap decisions, clip windows, text-align,
+/// underlines) — lives in exactly one place.
+fn for_each_glyph<F: FnMut(&Rc<GlyphMask>, i32, i32)>(
+    x0: f32,
+    y0: f32,
+    s: &str,
+    fonts: &Fonts,
+    style: &Style,
+    mut f: F,
+) {
     let scale = PxScale::from(style.size);
     // baseline sits at y0 + ascent (~0.8em for these fonts)
     let baseline = y0 + style.size * 0.8;
     let mut x = x0;
-    // letter/word spacing per glyph — COUPLING: this must stay the exact
-    // arithmetic layout adds to every measured width (layout.rs
-    // `spacing_extra`: ls after EVERY glyph = count × spacing, ws on every
-    // whitespace char), or painted ink drifts off the run width (wrap
-    // decisions, clip windows, text-align, underlines)
     for ch in s.chars() {
-        let gap = if ch.is_whitespace() { style.word_spacing } else { 0.0 }
-            + style.letter_spacing;
+        let gap = if ch.is_whitespace() { style.word_spacing } else { 0.0 } + style.letter_spacing;
         // same font choice as measure() so widths match what's drawn
         let font = fonts.pick_font_for(ch, style);
         let scaled = font.as_scaled(scale);
@@ -6173,47 +6228,160 @@ fn draw_text(
         let advance = scaled.h_advance(id);
         // cached coverage (rasterized once per glyph per subpixel offset)
         if let Some(m) = fonts.glyph_mask(&font, id, scale, x, baseline) {
-            let gx0 = x.floor() as i32 + m.ox;
-            let gy0 = baseline.floor() as i32 + m.oy;
-            if let Some((cx0, cy0, cx1, cy1)) = clip {
-                if (gx0 + m.w as i32) as f32 <= cx0
-                    || gx0 as f32 >= cx1
-                    || (gy0 + m.h as i32) as f32 <= cy0
-                    || gy0 as f32 >= cy1
-                {
-                    x += advance + gap;
-                    continue; // glyph entirely outside the clip window
-                }
+            f(&m, x.floor() as i32 + m.ox, baseline.floor() as i32 + m.oy);
+        }
+        x += advance + gap;
+    }
+}
+
+/// Paint this run's `text-shadow` layers: stamp the glyph coverage into a
+/// small plane, box-blur it once per layer (three passes ≈ a Gaussian with
+/// σ = blur/2, the CSS definition of the blur radius) and composite at the
+/// layer's offset — clipped like the glyphs, UNDER the run's own ink.
+/// Layers are emitted in reverse so layer 0 (topmost in CSS) paints last.
+/// shortcut: offsets are rounded to whole pixels (no sub-pixel shadow
+/// position) and the plane is clamped to the buffer, so blur that runs off
+/// the edge is cut with the viewport.
+fn draw_text_shadows(
+    buf: &mut [u32],
+    width: usize,
+    x0: f32,
+    y0: f32,
+    s: &str,
+    fonts: &Fonts,
+    style: &Style,
+    alpha: u8,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
+    let mut ink: Vec<(std::rc::Rc<GlyphMask>, i32, i32)> = Vec::new();
+    for_each_glyph(x0, y0, s, fonts, style, |m, gx, gy| {
+        ink.push((m.clone(), gx, gy))
+    });
+    if ink.is_empty() {
+        return;
+    }
+    // ink bounds, then the blur halo around them
+    let (mut bx0, mut by0, mut bx1, mut by1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for (m, gx, gy) in &ink {
+        bx0 = bx0.min(*gx);
+        by0 = by0.min(*gy);
+        bx1 = bx1.max(*gx + m.w as i32);
+        by1 = by1.max(*gy + m.h as i32);
+    }
+    let blur_max = style
+        .text_shadow
+        .iter()
+        .flatten()
+        .map(|l| l.blur)
+        .fold(0.0f32, f32::max);
+    // 3 box passes of radius blur/2 spread the ink by ~1.5 × blur
+    let pad = (blur_max * 1.5).ceil() as i32 + 1;
+    // nothing outside the buffer can be drawn — clamp the plane to it
+    let height = buf.len() / width.max(1);
+    let (ox, oy) = ((bx0 - pad).max(0), (by0 - pad).max(0));
+    let (ex, ey) = (
+        (bx1 + pad).min(width as i32),
+        (by1 + pad).min(height as i32),
+    );
+    let (pw, ph) = ((ex - ox).max(0) as usize, (ey - oy).max(0) as usize);
+    if pw == 0 || ph == 0 {
+        return;
+    }
+    let mut plane = vec![0u8; pw * ph];
+    for (m, gx, gy) in &ink {
+        let (sx, sy) = (gx - ox, gy - oy);
+        for my in 0..m.h {
+            let py = sy + my as i32;
+            if py < 0 || py as usize >= ph {
+                continue;
             }
-            for gy in 0..m.h {
-                let dy = gy0 + gy as i32;
-                if dy < 0 {
+            for mx in 0..m.w {
+                let px = sx + mx as i32;
+                if px < 0 || px as usize >= pw {
                     continue;
                 }
-                let row = dy as usize * width;
-                if row >= buf.len() {
+                let i = py as usize * pw + px as usize;
+                plane[i] = plane[i].saturating_add(m.cov[my * m.w + mx]);
+            }
+        }
+    }
+    let mut work = plane.clone();
+    let mut tmp = vec![0u8; plane.len()];
+    for layer in style.text_shadow.iter().flatten().rev() {
+        if layer.blur > 0.0 {
+            work.copy_from_slice(&plane);
+            let r = (layer.blur * 0.5).round().max(1.0) as usize;
+            for _ in 0..3 {
+                box_blur(&mut work, &mut tmp, pw, ph, r);
+            }
+        }
+        let color = if layer.current { style.color } else { layer.color };
+        let la = ((layer.alpha as u16 * alpha as u16) / 255) as u8;
+        if la == 0 {
+            continue;
+        }
+        for y in 0..ph {
+            let dy = oy as f32 + y as f32 + layer.dy;
+            let dy = dy.round() as i32;
+            if dy < 0 || dy as usize >= height {
+                continue;
+            }
+            for x in 0..pw {
+                let cov = work[y * pw + x];
+                if cov == 0 {
                     continue;
                 }
-                for gx in 0..m.w {
-                    let cov = m.cov[gy * m.w + gx];
-                    if cov == 0 {
+                let dx = ox as f32 + x as f32 + layer.dx;
+                let dx = dx.round() as i32;
+                if dx < 0 || dx as usize >= width {
+                    continue;
+                }
+                if let Some((cx0, cy0, cx1, cy1)) = clip {
+                    if (dx as f32) < cx0
+                        || (dx as f32) >= cx1
+                        || (dy as f32) < cy0
+                        || (dy as f32) >= cy1
+                    {
                         continue;
                     }
-                    let dx = gx0 + gx as i32;
-                    if dx < 0 || dx as usize >= width {
-                        continue;
-                    }
-                    let idx = row + dx as usize;
-                    if idx < buf.len() {
-                        let cov = ((cov as u16 * alpha as u16) / 255) as u8;
-                        if cov > 0 {
-                            blend(&mut buf[idx], style.color, cov);
-                        }
-                    }
+                }
+                let a = ((cov as u16 * la as u16) / 255) as u8;
+                if a > 0 {
+                    blend(&mut buf[dy as usize * width + dx as usize], color, a);
                 }
             }
         }
-        x += advance + gap;
+    }
+}
+
+/// One horizontal + one vertical box-blur pass over a coverage plane
+/// (clamped at the plane's edges), in place through `tmp`.
+fn box_blur(a: &mut [u8], tmp: &mut [u8], w: usize, h: usize, r: usize) {
+    for y in 0..h {
+        let row = &a[y * w..y * w + w];
+        let out = &mut tmp[y * w..y * w + w];
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r + 1).min(w);
+            let (mut sum, mut n) = (0u32, 0u32);
+            for &v in &row[lo..hi] {
+                sum += v as u32;
+                n += 1;
+            }
+            out[x] = (sum / n.max(1)) as u8;
+        }
+    }
+    for x in 0..w {
+        for y in 0..h {
+            let lo = y.saturating_sub(r);
+            let hi = (y + r + 1).min(h);
+            let (mut sum, mut n) = (0u32, 0u32);
+            for yy in lo..hi {
+                sum += tmp[yy * w + x] as u32;
+                n += 1;
+            }
+            a[y * w + x] = (sum / n.max(1)) as u8;
+        }
     }
 }
 
@@ -6687,6 +6855,77 @@ mod tests {
         draw_text(&mut cold, w, 2.0, 4.0, "Hamburgefonstiv 123", &fonts, &style, 255, None);
         assert_eq!(warm, cold);
         assert!(warm.iter().any(|&p| p != 0x00ff_ffff), "text drew no ink");
+    }
+
+    /// Every non-white pixel of a run painted on a white `w`-wide buffer.
+    fn lit(buf: &[u32], w: usize) -> std::collections::HashSet<(i32, i32)> {
+        buf.iter()
+            .enumerate()
+            .filter(|&(_, &p)| p != 0x00ff_ffff)
+            .map(|(i, _)| ((i % w) as i32, (i / w) as i32))
+            .collect()
+    }
+
+    #[test]
+    fn text_shadow_paints_the_glyphs_shifted_under_the_ink() {
+        let fonts = Fonts::load();
+        let (w, h) = (240, 60);
+        let base = Style::new();
+        let run = |style: &Style| {
+            let mut buf = vec![0x00ff_ffffu32; w * h];
+            draw_text(&mut buf, w, 2.0, 4.0, "Ag1", &fonts, style, 255, None);
+            buf
+        };
+        let plain = lit(&run(&base), w);
+        assert!(!plain.is_empty(), "control drew ink");
+        // the shadow's silhouette must be exactly the ink moved by (dx, dy)
+        let mut want = plain.clone();
+        for (x, y) in &plain {
+            want.insert((x + 5, y + 5));
+        }
+        let layer = |color: u32, current: bool| css::TextShadow {
+            dx: 5.0,
+            dy: 5.0,
+            blur: 0.0,
+            color,
+            alpha: 255,
+            current,
+        };
+        // a hard shadow is the ink shifted by the offsets, and the glyph ink
+        // still paints on top of it
+        let mut style = base;
+        style.text_shadow = [Some(layer(0xff0000, false)), None];
+        let hard = run(&style);
+        assert_eq!(lit(&hard, w), want, "shadow = ink shifted by the offsets");
+        // the glyph ink paints on top: some pixel ends up dark (a red shadow
+        // pixel can never be dark on white, so only the ink can make one)
+        assert!(
+            hard.iter().any(|&p| {
+                p & 0xff < 100 && (p >> 8) & 0xff < 100 && (p >> 16) & 0xff < 100
+            }),
+            "glyph ink still painted over the shadow"
+        );
+        // `currentcolor` (no colour given) paints in the run's own colour:
+        // the same shifted silhouette, and never the layer's stored colour
+        let mut style = base;
+        style.color = 0x0000ff;
+        style.text_shadow = [Some(layer(0xff0000, true)), None];
+        let cur = run(&style);
+        assert_eq!(lit(&cur, w), want, "currentcolor shadow painted too");
+        assert!(
+            !cur.iter().any(|&p| p == 0x00ff_0000),
+            "the stored colour is ignored while `current` is set"
+        );
+        // blur spreads the shadow past the offset silhouette
+        let mut style = base;
+        style.text_shadow = [Some(css::TextShadow { blur: 8.0, ..layer(0xff0000, false) }), None];
+        let blurred = lit(&run(&style), w);
+        assert!(
+            blurred.len() > want.len(),
+            "blur spreads ink: {} vs {}",
+            blurred.len(),
+            want.len()
+        );
     }
 
 

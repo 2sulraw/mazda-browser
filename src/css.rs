@@ -1000,6 +1000,27 @@ pub struct Shadow {
     pub alpha: u8,
 }
 
+/// One `text-shadow` layer: offset, blur and colour. `current` (or a colour
+/// that was never given) means `currentcolor`, resolved to the run's own
+/// colour at paint time — the [`Shadow::color`] `Option` idea, spelled as a
+/// flag because the packed alpha sits beside it.
+/// shortcut: at most TWO layers per run (`Style::text_shadow` is a fixed
+/// array so `Style` stays `Copy`), and there is no spread (text shadows do
+/// not have one).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TextShadow {
+    pub dx: f32,
+    pub dy: f32,
+    /// blur radius in px (0 = hard edge)
+    pub blur: f32,
+    /// 0xRRGGBB — only read when `current` is false
+    pub color: u32,
+    /// shadow opacity 0-255
+    pub alpha: u8,
+    /// true = `currentcolor`: paint in the run's own colour
+    pub current: bool,
+}
+
 impl Default for BoxStyle {
     fn default() -> Self {
         BoxStyle {
@@ -1743,6 +1764,7 @@ const KNOWN: &[&str] = &[
     "text-transform",
     "letter-spacing",
     "word-spacing",
+    "text-shadow",
     "text-indent",
     "list-style-type",
     "list-style-position",
@@ -3069,6 +3091,10 @@ fn apply_decl(
                     .unwrap_or(style.deco_offset)
             };
         }
+        // `text-shadow: none | <color>? <length>{2,3} [, …]` — the layer
+        // list (capped at two, see `TextShadow`); `none` and anything
+        // unparseable clear to the inherited value
+        "text-shadow" => style.text_shadow = parse_text_shadows(&d.1, dark, vp),
         "line-height" => {
             // unitless = multiplier of font-size; px/em/rem/%/vw absolute (of
             // size); `normal` = the layout default
@@ -6211,6 +6237,25 @@ fn parse_shadow(v: &str, dark: bool, vp: (f32, f32)) -> Option<Shadow> {
         color: color.map(|c| c.0),
         alpha: color.map(|c| c.1).unwrap_or(255),
     })
+}
+
+/// `text-shadow` value → at most two layers, first = topmost (paint order
+/// is reversed by the painter). Shares the `box-shadow` tokenizer — the
+/// grammar is the same minus `spread`/`inset` — and drops every layer past
+/// two (see [`TextShadow`]).
+fn parse_text_shadows(v: &str, dark: bool, vp: (f32, f32)) -> [Option<TextShadow>; 2] {
+    let mut out: [Option<TextShadow>; 2] = [None, None];
+    for (i, s) in parse_box_shadows(v, dark, vp).into_iter().take(2).enumerate() {
+        out[i] = Some(TextShadow {
+            dx: s.dx,
+            dy: s.dy,
+            blur: s.blur,
+            color: s.color.unwrap_or(0),
+            alpha: s.alpha,
+            current: s.color.is_none(),
+        });
+    }
+    out
 }
 
 // ---------- selector parsing (once per sheet) ----------
@@ -11001,6 +11046,67 @@ mod tests {
         };
         let carried = sheet.resolve(&dom, by_attr(&dom, "class", "e"), parent, None).style;
         assert_eq!(carried.letter_spacing, 5.0, "inherit reads the base style");
+    }
+
+    #[test]
+    fn text_shadow_parses_layers_none_and_the_two_layer_cap() {
+        let sheet = parse(
+            ".a { text-shadow: 1px 2px red } \
+             .b { text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5) } \
+             .c { text-shadow: 3px 4px } \
+             .d { text-shadow: none } \
+             .e { text-shadow: 1px 1px #111111, 2px 2px #222222, 3px 3px #333333 } \
+             .f { text-shadow: bogus } \
+             .g { } .h { text-shadow: none }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div>",
+        );
+        let ts = |c: &str| {
+            sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None)
+                .style
+                .text_shadow
+        };
+        let a = ts("a");
+        assert!(a[1].is_none(), "one layer only");
+        let a0 = a[0].expect("layer 0");
+        assert_eq!((a0.dx, a0.dy, a0.blur), (1.0, 2.0, 0.0), "offsets, no blur");
+        assert_eq!((a0.color, a0.alpha), (0xff0000, 255), "colour kept");
+        assert!(!a0.current, "an explicit colour is not currentcolor");
+        let b0 = ts("b")[0].expect("layer 0");
+        assert_eq!(b0.blur, 2.0, "third length is the blur");
+        assert_eq!(b0.color, 0x000000, "rgba() colour");
+        assert!(
+            (b0.alpha as i32 - 127).abs() <= 1,
+            "alpha from the 0.5 alpha, got {}",
+            b0.alpha
+        );
+        let c0 = ts("c")[0].expect("layer 0");
+        assert!(c0.current, "no colour → currentcolor");
+        assert!(ts("d").iter().all(Option::is_none), "`none` clears");
+        let e = ts("e");
+        assert!(e[0].is_some() && e[1].is_some(), "two layers kept");
+        assert_eq!(e[1].unwrap().dx, 2.0, "third layer dropped (cap)");
+        assert!(ts("f").iter().all(Option::is_none), "garbage → none");
+        assert!(
+            Style::new().text_shadow.iter().all(Option::is_none),
+            "initial value is none"
+        );
+        // inherited: a child that says nothing keeps the parent's layers,
+        // one that says `none` clears them
+        let parent = Style {
+            text_shadow: ts("a"),
+            ..Style::new()
+        };
+        let carried = sheet.resolve(&dom, by_attr(&dom, "class", "g"), parent, None).style;
+        assert_eq!(carried.text_shadow[0].map(|s| s.dx), Some(1.0), "inherited");
+        let cleared = sheet.resolve(&dom, by_attr(&dom, "class", "h"), parent, None).style;
+        assert!(
+            cleared.text_shadow.iter().all(Option::is_none),
+            "`none` on the child wins"
+        );
     }
 
     #[test]
