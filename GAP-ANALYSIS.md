@@ -446,7 +446,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 852 self-authored unit tests (856 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 854 self-authored unit tests (858 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -473,14 +473,23 @@ waves 67-74 took the top visual items off it (individual `translate`/`scale`,
 the `font` shorthand, the `filter` colour functions, the `place-items`/
 `place-self` alignment shorthands, `background-clip`, `text-shadow`,
 `grid-auto-flow`, then `backdrop-filter`).
-The DOM/JS half is
-still open.
+Wave 75 did the JS half: the same flag now ranks unresolved JavaScript names
+in two buckets (missing globals vs reads on engine-built wrappers), 512
+distinct names each with an over-cap tally. First census: nextjs.org 61
+globals / 58 members (top globals `process` ×6, `Reflect` ×5; top members a
+page-built `Symbol(…)_<n>` key ×8, `@@iterator` ×4, `deleteAll` ×4 — the
+page-built keys and the one-shot environment probes sit on top, so the
+actionable queue starts below them), MDN 1/0, Wikipedia 2/1, Hacker News 0/1
+(`innerHTML` as a read on element wrappers), rust-lang.org 1/0. The ranked
+lists are now the JS work queue: ES2024 Set methods, Map `emplace`/`upsert`,
+Array `find`/`findIndex`/`flat`/`flatMap`, `Object.isExtensible`/
+`getOwnPropertySymbols`, `reportError`, and the `Reflect` global.
 
 ### 8.2 Priority by reference impact and RAM cost
 
 | Priority | Work | Why | Reference impact | RAM cost | Effort |
 |---|---|---|---|---|---|
-| P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands | all six | negligible (dev-only) | CSS done, JS next |
+| P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands; wave 75 ships the JS half (ranked `[js-miss]` global/member buckets) | all six | negligible (dev-only) | done (wave 66 CSS, wave 75 JS) |
 | P0 (done) | Shrink JS AST/env/object types (waves 63-64: `Obj` 88 to 64 B, `Param` 144 to 40 B, `Stmt` 192 to 72 B, `Closure` 112 to 96 B) | directly serves the success metric; wave 44 saved 36 MB on one workload and waves 63-64 cut ~5 MB off nextjs.org | all | negative (saves) | done |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
 | P2 | `mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |

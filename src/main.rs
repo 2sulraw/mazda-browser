@@ -3033,6 +3033,7 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
                 }
             };
             css::dump_misses(); // no-op unless MAZDA_MISS=1
+            js::dump_misses(); // no-op unless MAZDA_MISS=1
             eprintln!(
                 "[nav] worker finished {url} in {:.0} ms",
                 t0.elapsed().as_secs_f64() * 1000.0

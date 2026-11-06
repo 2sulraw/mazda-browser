@@ -2872,3 +2872,89 @@ fn js_allocation_units_stay_compact() {
         std::mem::size_of::<Closure>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// observed-miss census (MAZDA_MISS)
+// ---------------------------------------------------------------------------
+//
+// These drive the pure local-state helpers (`miss_bucket`, `record_js_miss`,
+// `report_js_bucket`) rather than the process-wide census, so parallel tests
+// cannot race on the shared mutex or depend on the env gate.
+
+#[test]
+fn miss_bucket_classifies_host_shapes() {
+    let e = JsEngine::new();
+    // the global object itself: a read that resolved nowhere is a missing global
+    assert_eq!(miss_bucket(&e, &e.global_obj), Some("global"));
+    // a plain script object's undefined read is normal JS, not a gap
+    let plain = Val::new_object();
+    let Val::Obj(p) = &plain else {
+        panic!("new_object is an object")
+    };
+    assert_eq!(miss_bucket(&e, p), None);
+    // element wrapper: `__node` marker + method natives
+    let el = Val::new_object();
+    el.set("__node", Val::Num(1.0));
+    el.set("click", Val::Native(0));
+    let Val::Obj(w) = &el else {
+        panic!("new_object is an object")
+    };
+    assert_eq!(miss_bucket(&e, w), Some("member"));
+    // singleton wrapper (document/navigator/...): built from natives alone
+    let solo = Val::new_object();
+    solo.set("getElementById", Val::Native(0));
+    let Val::Obj(s) = &solo else {
+        panic!("new_object is an object")
+    };
+    assert_eq!(miss_bucket(&e, s), Some("member"));
+    // live collection kind answers through the embedder every time
+    let live = Rc::new(RefCell::new(Obj {
+        kind: ObjKind::Live(LiveSpec {
+            family: 0,
+            root: 0,
+            arg: "".into(),
+        }),
+        props: Vec::new(),
+        proto: None,
+    }));
+    assert_eq!(miss_bucket(&e, &live), Some("member"));
+}
+
+#[test]
+fn js_miss_report_ranks_caps_and_excludes() {
+    // an empty bucket with nothing over the cap prints no section
+    let empty = std::collections::HashMap::new();
+    assert_eq!(report_js_bucket("global", &empty, 0), "");
+    // rank by frequency then name; the two exclusions never record
+    let mut m = JsMisses::default();
+    record_js_miss(&mut m, "global", "b");
+    record_js_miss(&mut m, "global", "a");
+    record_js_miss(&mut m, "global", "a");
+    record_js_miss(&mut m, "global", "undefined");
+    record_js_miss(&mut m, "global", "#new.target");
+    record_js_miss(&mut m, "member", "scrollTop");
+    let report = report_js_bucket("global", &m.global, m.over_global);
+    let lines: Vec<&str> = report.lines().collect();
+    assert_eq!(lines[0], "[js-miss] 2 distinct missing global names");
+    assert_eq!(lines[1], "[js-miss] global 2 a");
+    assert_eq!(lines[2], "[js-miss] global 1 b");
+    assert!(!report.contains("undefined"));
+    assert!(!report.contains("#new.target"));
+    // the member bucket is its own section
+    let mreport = report_js_bucket("member", &m.member, m.over_member);
+    assert!(mreport.contains("[js-miss] member 1 scrollTop"));
+    // past the cap: seen names keep counting, new names tally the over-counter
+    let mut big = JsMisses::default();
+    for i in 0..JS_MISS_CAP {
+        record_js_miss(&mut big, "member", &format!("k{i}"));
+    }
+    record_js_miss(&mut big, "member", "k0");
+    record_js_miss(&mut big, "member", "newname");
+    assert_eq!(big.member.len(), JS_MISS_CAP);
+    assert_eq!(big.member["k0"], 2);
+    assert_eq!(big.over_member, 1);
+    let cap_report = report_js_bucket("member", &big.member, big.over_member);
+    assert!(cap_report.contains(&format!(
+        "[js-miss] member: 1 further distinct names over the {JS_MISS_CAP} cap not recorded"
+    )));
+}

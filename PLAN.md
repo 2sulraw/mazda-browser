@@ -1756,6 +1756,61 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 74 (`backdrop-filter`) | a local frosted-glass page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `backdrop-filter` blurs what is already painted behind a box. The value parser (`parse_backdrop`) keeps only the largest `blur()` radius (`blur()` with no argument = 0), accepts the other filter functions without effect (`drop-shadow`/`url`/`grayscale`/… parse but contribute nothing — the mirror image of `filter: blur()`), and an unknown function or malformed token drops the whole declaration so an earlier value survives; `none`/`initial`/`unset` clears it. `BoxStyle.backdrop` holds the radius (0 = none), and `KNOWN` gains the name. Paint is a phase split driven by new `BackdropGroup` records — DFS-contiguous spans over the five paint channels plus the clip-intersected border-box region, recorded exactly like `StickyGroup` and remapped through `zsort` (a split-z subtree disables the group instead of blurring the wrong pixels). Each `want_fixed` pass now: phase 1 paints everything except the deferred spans, `blur_backdrops` snapshots each region (clamp-to-edge), runs three box passes of radius ≈ blur over the three colour planes and writes the blurred pixels back inside the rounded border box, then phase 2 paints the withheld subtree sharp on top. Pages without the property record no groups, so phase 1 is the plain paint and phase 2 never runs — output stays byte-identical. A local page verifies a sticky frosted nav (blur 6px) and a frosted rounded panel (blur 8px) laid over a hard repeating-gradient edge: the stripes blur to a soft gradient inside the panel, stay sharp outside it, and the panel's own text is sharp; the capture matches. Dropped-name counts: 84 on nextjs.org (was 85, `backdrop-filter` gone), 12 MDN, 29 Wikipedia, 3 Hacker News, 9 rust-lang.org — zero new misses, no `backdrop-filter` miss anywhere. References keep identical geometry: nextjs 7578px / 569 runs / 146 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 101 MB, HN 1695 / 720 / 75 MB, rust-lang 5800 / 483 / 87 MB; suite **852** default / **856** `engine-b + woff2` |
 
+| 2026-11-06 | wave 75 (JS observed-miss instrumentation) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org (no local page — nothing paints differently) | The JS half of the wave-66 P0 ships: `MAZDA_MISS=1` now also ranks names the JS engine could not resolve, in two buckets. `global` = a bare identifier that resolved nowhere (`env_get` falling through to `undefined`) plus reads on the `window` object itself; `member` = a read that came back `undefined` on an object the engine built — classified by `miss_bucket`, which counts the global object, any object with an own `__node` marker or a native method/accessor (element wrappers, the document/navigator/location/history/storage singletons built from natives alone, and native-backed built-ins such as `Object`/`Math`), and `Live`/`Style` kinds, while a plain script object's undefined read records nothing — that is ordinary JavaScript (feature detection on your own object). Two exclusions keep the census honest: the name `undefined` (it reads as itself by definition, bare or as `window.undefined`) and `#`-prefixed keys (engine internal slots such as `#new.target`). Each bucket keeps 512 distinct names with counts; past the cap already-seen names keep counting and a running `over_*` tally reports how many distinct names were dropped, so a page synthesizing `window['k'+i]` cannot grow the census without bound. `js::dump_misses()` runs beside `css::dump_misses()` after every navigation and prints each bucket ranked by frequency then name (`[js-miss] {n} distinct missing {bucket} names` … `[js-miss] {bucket} {count} {name}`). Engine A only — the hooks live in `env_get`/`get_member_impl`, engine B resolves its own lookups — and off by default: recording is one cached-bool branch at each hook, nothing allocated. The two new tests drive pure local-state helpers (`miss_bucket`, `record_js_miss`, `report_js_bucket`) so parallel tests never race the process-wide census. Suite **854** default / **858** `engine-b + woff2`. Reference runs with `MAZDA_MISS=1` keep byte-identical geometry and CSS counts: nextjs 7578px / 569 runs / 146.4 MB, MDN 2773 / 641 / 84.7 MB, Wikipedia 24673 / 10951 / 101.0 MB, HN 1695 / 720 / 76.0 MB, rust-lang 5800 / 483 / 82.5 MB; `[css-miss]` 84 / 12 / 29 / 3 / 9 unchanged. First JS census: nextjs 61 distinct missing globals (top: `process` 6, `Reflect` 5, `__REACT_DEVTOOLS_GLOBAL_HOOK__` 3, `reportError` 3) and 58 members (top: a page-built `Symbol(…)_<n>` key 8, `@@iterator` 4, `deleteAll` 4, `_reactRetry`/`find`/`getOwnPropertySymbols`/`isExtensible` 3); MDN 1 global (`trustedTypes`) / 0 members, Wikipedia 2 (`requestIdleCallback`, `RLQ`) / 1 (`timing`), HN 0 / 1 (`innerHTML`), rust-lang 1 (`exports`) / 0 |
+
+### Wave 75 findings
+
+- **Two buckets because `undefined` means two different things.** An
+  undefined read on a plain script object is ordinary JavaScript — `if
+  (!obj.foo)`, optional chains and `typeof` guards fire constantly — so
+  recording it would drown the census in noise no engine change could fix.
+  `miss_bucket` therefore counts only the global object (a name that
+  resolved nowhere) and objects the engine built: an own `__node` marker,
+  any native method/accessor (the singleton wrappers are built from natives
+  alone, and native-backed built-ins classify the same way), or a
+  `Live`/`Style` kind. Style objects answer upstream through `style_get`
+  and never reach the hook — their arm in `miss_bucket` is defensive. The
+  `undefined` name and `#`-prefixed internal slots are excluded at record
+  time, so neither bucket can report them.
+- **Feature detection is inherently ambiguous, so rank beats presence.**
+  nextjs's global bucket is mostly an environment-sniffing bundle:
+  `process` ×6, `Reflect` ×5, `__REACT_DEVTOOLS_GLOBAL_HOOK__` ×3,
+  `reportError` ×3, `Deno`/`Bun`/`ActiveXObject`, `MessageChannel`/
+  `setImmediate` task-queue shims and ~30 DOM constructor names ×1 each
+  (`NodeList`, `NamedNodeMap`, `IntersectionObserver`, …) — probes that are
+  *meant* to fail on a browser. Frequency is what separates those from real
+  gaps: `Reflect` ×5 is a genuine missing global, `NodeList` ×1 is a probe.
+- **The top member reads are page-built keys, not implementable gaps.**
+  nextjs's highest-ranked member names are
+  `Symbol(Symbol.iterator)_6.654735974936529` (×8), `@@iterator` (×4) and
+  `deleteAll` (×4). The odd `_6.65…` keys are constructed at runtime by the
+  page — the literal never appears in the cached source — and no engine path
+  appends such a suffix (every `format!`/concat site was searched): three
+  keys share one fractional part with different integer parts, i.e. one
+  page-side float combined with an integer counter, stringified by the
+  engine's ordinary number formatting. They are genuine misses (a computed
+  key read on a wrapper, resolved to `undefined`) but nothing the engine
+  could add is named that, so the actionable queue starts below them.
+- **The ranked member list is the new JS queue.** Confirmed absent from the
+  source: ES2024 Set methods (`union`/`intersection`/`difference`/
+  `isSubsetOf`/`isSupersetOf`/`isDisjointFrom`/`deleteAll`/`addAll`), Map
+  helpers (`emplace`/`upsert`), Array extras (`find`/`findIndex`/`flat`/
+  `flatMap`/`at`/`copyWithin`/`fill`), `codePointAt`,
+  `Object.isExtensible`/`getOwnPropertySymbols`, `Math.clz32`,
+  `reportError` and the `Reflect` global. `innerHTML` as a *read* is HN's
+  only miss: element wrappers expose only the `setInnerHTML` native, so
+  `el.innerHTML` resolves to `undefined`. Array/Set method names read on
+  wrappers (`filter`/`reduce`/`some`/`every`/`entries`/`values`) show pages
+  treating DOM collections as arrays — the live-collection wrappers are the
+  likely base. The other four sites are near-clean: MDN 1/0, Wikipedia 2/1,
+  HN 0/1, rust-lang 1/0 (globals/members).
+- **Measured, and it costs nothing.** With `MAZDA_MISS=1` all five
+  references keep byte-identical geometry and run counts (nextjs 7578/569,
+  MDN 2773/641, Wikipedia 24673/10951, HN 1695/720, rust-lang 5800/483) and
+  the CSS census is unchanged (84/12/29/3/9), so the hooks moved no
+  behavior; RAM is within run-to-run noise (146.4 vs 146 MB on nextjs).
+  Suite **854** default / **858** `engine-b + woff2`.
+
 ### Wave 74 findings
 
 - **The whole feature is record-gated.** `backdrop-filter` costs pages

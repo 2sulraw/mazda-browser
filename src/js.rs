@@ -1969,7 +1969,15 @@ impl JsEngine {
                 None => break,
             }
         }
-        obj_get_own(&self.global_obj, name)
+        let v = obj_get_own(&self.global_obj, name);
+        // MAZDA_MISS census: an identifier that resolved NOWHERE (no binding,
+        // no global-object property) reads as `undefined` — a name the page
+        // expected and the engine does not have. Gate first: this is the
+        // hottest read path in the interpreter.
+        if js_miss_enabled() && v.is_undefined() {
+            note_js_miss("global", name);
+        }
+        v
     }
 
     /// Assignment: walks the chain; const bindings throw; unknown names are
@@ -2887,7 +2895,12 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             }
             // prototype walk with accessor interception: an own OR inherited
             // `Val::Acc` property invokes its getter (receiver = `base`)
-            Ok(chain_get(e, base, o.clone(), key)?.unwrap_or(Val::Undefined))
+            let got = chain_get(e, base, o.clone(), key)?;
+            if got.is_none() {
+                // MAZDA_MISS census: a host read that resolved nowhere
+                note_member_miss(e, &o, key);
+            }
+            Ok(got.unwrap_or(Val::Undefined))
         }
     }
 }
@@ -2944,6 +2957,161 @@ fn chain_get(
         }
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Observed JS misses (`MAZDA_MISS=1`, dev-only) — the JS half of `css.rs`'s
+// census: a read that falls through to `undefined` on the global object or a
+// host wrapper is a name the page wanted and the engine does not have.
+// Two buckets: `global` (bare identifiers that resolved nowhere + reads on
+// the `window` object) and `member` (reads on embedder-built wrappers).
+// Off by default — every recording call is one `OnceLock` load and a branch;
+// nothing is allocated.
+// ---------------------------------------------------------------------------
+
+/// Distinct names kept per bucket. A page can synthesize unbounded distinct
+/// keys (`window['k' + i]`), so past the cap only counts for already-seen
+/// names keep growing.
+const JS_MISS_CAP: usize = 512;
+
+#[derive(Default)]
+struct JsMisses {
+    global: std::collections::HashMap<String, u32>,
+    member: std::collections::HashMap<String, u32>,
+    /// distinct names skipped per bucket after [`JS_MISS_CAP`]
+    over_global: u32,
+    over_member: u32,
+}
+
+fn js_miss_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAZDA_MISS").is_some())
+}
+
+fn js_misses() -> &'static std::sync::Mutex<JsMisses> {
+    static MISSES: std::sync::OnceLock<std::sync::Mutex<JsMisses>> = std::sync::OnceLock::new();
+    MISSES.get_or_init(|| std::sync::Mutex::new(JsMisses::default()))
+}
+
+/// One bucket's record: bump the count, or admit a new name while under the
+/// cap (past it, new names are tallied in `over` instead of allocated).
+fn add_js_miss(counts: &mut std::collections::HashMap<String, u32>, over: &mut u32, name: &str) {
+    if let Some(n) = counts.get_mut(name) {
+        *n += 1;
+        return;
+    }
+    if counts.len() >= JS_MISS_CAP {
+        *over += 1;
+        return;
+    }
+    counts.insert(name.to_string(), 1);
+}
+
+/// Record one miss. `bucket` is [`miss_bucket`]'s answer; the two exclusions
+/// are names that are not gaps — `undefined` reads as itself by definition
+/// (both bare and as `window.undefined`), and `#`-prefixed keys are the
+/// engine's internal slots (`#new.target`), not page-facing names.
+fn note_js_miss(bucket: &str, name: &str) {
+    if let Ok(mut m) = js_misses().lock() {
+        record_js_miss(&mut m, bucket, name);
+    }
+}
+
+/// Pure record (exclusions + bucket dispatch) — tests drive this on local
+/// state; the process-wide census would race across parallel tests.
+fn record_js_miss(m: &mut JsMisses, bucket: &str, name: &str) {
+    if name == "undefined" || name.starts_with('#') {
+        return;
+    }
+    match bucket {
+        "global" => add_js_miss(&mut m.global, &mut m.over_global, name),
+        _ => add_js_miss(&mut m.member, &mut m.over_member, name),
+    }
+}
+
+/// Classify a read that resolved nowhere (the `get_member` fallthrough):
+/// the global object's own misses are missing globals, a wrapper the
+/// embedder built is a missing DOM/JS member, and a plain script object's
+/// undefined read is normal JS that records nothing. Host shapes: a
+/// `__node` marker (element wrappers), any native method (the singleton
+/// wrappers — document, navigator, location, history, storage — are built
+/// from natives alone), or a live-collection kind. `None` = not counted.
+/// Pure classification — the env gate lives at the call sites.
+fn miss_bucket(e: &JsEngine, o: &Rc<RefCell<Obj>>) -> Option<&'static str> {
+    if Rc::ptr_eq(o, &e.global_obj) {
+        return Some("global");
+    }
+    let b = o.borrow();
+    // Style objects answer upstream (through `style_get`, never `undefined`)
+    // but a Live collection that missed there falls through to here
+    if matches!(b.kind, ObjKind::Live(_) | ObjKind::Style(_)) {
+        return Some("member");
+    }
+    let host = b.props.iter().any(|(k, v)| {
+        k.as_ref() == "__node"
+            || matches!(v, Val::Native(_))
+            || matches!(
+                v,
+                Val::Acc(a)
+                    if matches!(a.getter, Some(Val::Native(_)))
+                        || matches!(a.setter, Some(Val::Native(_)))
+            )
+    });
+    host.then_some("member")
+}
+
+/// Gate + classify + record for a `get_member` fallthrough.
+fn note_member_miss(e: &JsEngine, o: &Rc<RefCell<Obj>>, key: &str) {
+    if !js_miss_enabled() {
+        return;
+    }
+    if let Some(b) = miss_bucket(e, o) {
+        note_js_miss(b, key);
+    }
+}
+
+/// Counts sorted by frequency, then name (deterministic output).
+fn ranked_js(counts: &std::collections::HashMap<String, u32>) -> Vec<(&str, u32)> {
+    let mut v: Vec<(&str, u32)> = counts.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    v
+}
+
+/// One bucket's report section (pure — exercised directly by tests).
+fn report_js_bucket(bucket: &str, counts: &std::collections::HashMap<String, u32>, over: u32) -> String {
+    if counts.is_empty() && over == 0 {
+        return String::new();
+    }
+    let mut s = format!("[js-miss] {} distinct missing {bucket} names\n", counts.len());
+    if over > 0 {
+        s.push_str(&format!(
+            "[js-miss] {bucket}: {over} further distinct names over the {JS_MISS_CAP} cap not recorded\n"
+        ));
+    }
+    for (name, n) in ranked_js(counts) {
+        s.push_str(&format!("[js-miss] {bucket} {n} {name}\n"));
+    }
+    s
+}
+
+/// The cumulative observed-miss table as text (empty when nothing recorded).
+fn js_miss_report() -> String {
+    let Ok(m) = js_misses().lock() else {
+        return String::new();
+    };
+    report_js_bucket("global", &m.global, m.over_global)
+        + &report_js_bucket("member", &m.member, m.over_member)
+}
+
+/// Print the cumulative observed-miss table (no-op unless `MAZDA_MISS` is set).
+pub fn dump_misses() {
+    if !js_miss_enabled() {
+        return;
+    }
+    let report = js_miss_report();
+    if !report.is_empty() {
+        eprint!("{report}");
+    }
 }
 
 /// member m.resolve on a `ObjKind::Regex` value (see `get_member`)
