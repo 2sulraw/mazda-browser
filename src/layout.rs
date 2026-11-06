@@ -4,8 +4,8 @@
 //! `block()`); upgrade when a real CSS engine lands (Phase 1b+).
 
 use crate::css::{
-    content_text, decl, marker_text, Align, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide, Clear,
-    Cursor, Dir, Display, Filter, Float, Gradient, Justify, Len, ObjFit, Pos, PseudoEl, Sheet,
+    content_text, decl, marker_text, Align, BgClip, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide,
+    Clear, Cursor, Dir, Display, Filter, Float, Gradient, Justify, Len, ObjFit, Pos, PseudoEl, Sheet,
     TableRole, Track, TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
@@ -2794,6 +2794,53 @@ fn collect_paint(
             None => n.style.color,
         };
         let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
+        // `background-clip` box in layout coords: the colour and gradient
+        // layers paint up to this rect instead of the border box (the image
+        // layer has its own padding-box geometry and crops further at line
+        // `place()`/the placeholder pass)
+        let bg_box = match n.bx.bg_clip {
+            BgClip::Border => (n.x, n.y, n.w, n.h),
+            BgClip::Padding => (
+                n.x + bl,
+                n.y + bt,
+                (n.w - bl - br).max(0.0),
+                (n.h - bt - bb).max(0.0),
+            ),
+            BgClip::Content => {
+                let (pl, pr) = (
+                    resolve_len(n.bx.pad[3], n.w),
+                    resolve_len(n.bx.pad[1], n.w),
+                );
+                let (pt, pb) = (
+                    resolve_len(n.bx.pad[0], n.w),
+                    resolve_len(n.bx.pad[2], n.w),
+                );
+                (
+                    n.x + bl + pl,
+                    n.y + bt + pt,
+                    (n.w - bl - pl - br - pr).max(0.0),
+                    (n.h - bt - pt - bb - pb).max(0.0),
+                )
+            }
+        };
+        // a rounded ring still fills the border box with the border colour;
+        // the colour layer then paints INSIDE the ring — at the padding box
+        // (the border area belongs to the ring, pre-existing shortcut) or at
+        // the content box when `background-clip: content-box` asks for more
+        let border_max = bt.max(br).max(bb).max(bl);
+        let (inner_bg, inner_r) = match n.bx.bg_clip {
+            BgClip::Content => {
+                let pad_max = resolve_len(n.bx.pad[0], n.w)
+                    .max(resolve_len(n.bx.pad[1], n.w))
+                    .max(resolve_len(n.bx.pad[2], n.w))
+                    .max(resolve_len(n.bx.pad[3], n.w));
+                (bg_box, (r - border_max - pad_max).max(0.0))
+            }
+            BgClip::Border | BgClip::Padding => (
+                (n.x + bl, n.y + bt, (n.w - bl - br).max(0.0), (n.h - bt - bb).max(0.0)),
+                (r - border_max).max(0.0),
+            ),
+        };
         // this box's effective filter (own + ancestors) — applied to every
         // primitive it emits; text reads it through the already-filtered
         // `style.color`
@@ -2862,20 +2909,12 @@ fn collect_paint(
             });
         }
         if let Some(c) = n.bx.bg.filter(|_| !masked) {
-            let mut rects = vec![(n.x, n.y, n.w, n.h, c, r)];
+            let mut rects = vec![(bg_box.0, bg_box.1, bg_box.2, bg_box.3, c, r)];
             if ring {
                 // rounded ring: fill the border-box with the border color,
                 // then the background inset over it (inner radius ≈ r − border)
-                rects[0].4 = bc;
-                let inner = (r - bt.max(br).max(bb).max(bl)).max(0.0);
-                rects.push((
-                    n.x + bl,
-                    n.y + bt,
-                    (n.w - bl - br).max(0.0),
-                    (n.h - bt - bb).max(0.0),
-                    c,
-                    inner,
-                ));
+                rects[0] = (n.x, n.y, n.w, n.h, bc, r);
+                rects.push((inner_bg.0, inner_bg.1, inner_bg.2, inner_bg.3, c, inner_r));
             }
             for (x, y, w, h, color, rad) in rects {
                 let (x, y, w, h) = m.map_rect((x, y, w, h));
@@ -2889,11 +2928,11 @@ fn collect_paint(
         // the gradient layer paints directly above this box's background
         // color (and below its children). It rides the rect channel with a
         // sentinel color so z-order / sticky / transforms stay shared.
-        // shortcut: painted over the border box (no background-origin or
-        // background-clip), one layer only, and a rounded border ring is
+        // shortcut: painted over the `background-clip` box (no
+        // background-origin), one layer only, and a rounded border ring is
         // covered by the gradient.
         if let Some(g) = n.bx.bg_gradient.clone().filter(|_| !masked) {
-            let (x, y, w, h) = m.map_rect((n.x, n.y, n.w, n.h));
+            let (x, y, w, h) = m.map_rect(bg_box);
             if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
                 let g = match f {
                     Some(f) => filter_gradient(&g, f),
@@ -3042,12 +3081,37 @@ fn collect_paint(
             if masked && ch.is_bg {
                 continue;
             }
+            // `background-clip: content-box` also crops the background IMAGE
+            // (the placeholder itself is still sized/positioned against the
+            // padding box, so % sizes and offsets resolve as they should)
+            let clip = if ch.is_bg && n.bx.bg_clip == BgClip::Content {
+                let (pl, pr) = (
+                    resolve_len(n.bx.pad[3], n.w),
+                    resolve_len(n.bx.pad[1], n.w),
+                );
+                let (pt, pb) = (
+                    resolve_len(n.bx.pad[0], n.w),
+                    resolve_len(n.bx.pad[2], n.w),
+                );
+                let w = m.map_win((
+                    n.x + bl + pl,
+                    n.y + bt + pt,
+                    n.x + n.w - br - pr,
+                    n.y + n.h - bb - pb,
+                ));
+                Some(match content_clip {
+                    Some(c) => clip_intersect(c, w),
+                    None => w,
+                })
+            } else {
+                content_clip
+            };
             collect_paint(
                 ch,
                 fixed,
                 m,
                 z,
-                content_clip,
+                clip,
                 (n.y, n.y + n.h),
                 out,
                 out_g,
@@ -10423,6 +10487,52 @@ mod tests {
         assert!((n.children[1].y - expect).abs() < 0.01, "b2.y={} expect={}", n.children[1].y, expect);
         assert_eq!(l.runs.len(), 2);
         assert!((l.runs[1].y - expect).abs() < 0.01, "second run y={}", l.runs[1].y);
+    }
+
+    #[test]
+    fn background_clip_shrinks_the_colour_and_gradient_layers() {
+        // 100px box, 2px border, 8px padding: the clip box is
+        // border 100 → padding 96 → content 80 (starting at x = 10)
+        let dom = crate::html::parse(
+            r#"<div id=p>x</div><div id=a>x</div><div id=b>x</div><div id=g>x</div>"#,
+        );
+        let sheet = crate::css::parse(
+            "#p{width:100px;min-height:40px;padding:8px;border:2px solid;background:#111111}\
+             #a{width:100px;min-height:40px;padding:8px;border:2px solid;background:#222222;\
+                background-clip:padding-box}\
+             #b{width:100px;min-height:40px;padding:8px;border:2px solid;background:#333333;\
+                background-clip:content-box}\
+             #g{width:100px;min-height:40px;padding:8px;border:2px solid;\
+                background:linear-gradient(red,blue);background-clip:padding-box}",
+        );
+        let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let l = layout_tree(&mut root, 400.0, &m4);
+        let at = |c: u32| {
+            l.rects
+                .iter()
+                .find(|r| r.4 == c)
+                .unwrap_or_else(|| panic!("rect for {c:06x}: {:?}", l.rects))
+                .clone()
+        };
+        let p = at(0x111111);
+        assert_eq!((p.0, p.2), (0.0, 100.0), "border box by default");
+        let a = at(0x222222);
+        assert_eq!((a.0, a.2), (2.0, 96.0), "padding box");
+        assert!((p.3 - a.3 - 4.0).abs() < 0.01, "h: {} vs {}", p.3, a.3);
+        let b = at(0x333333);
+        assert_eq!((b.0, b.2), (10.0, 80.0), "content box");
+        assert!((p.3 - b.3 - 20.0).abs() < 0.01, "h: {} vs {}", p.3, b.3);
+        // the gradient layer follows the same clip (sentinel colour)
+        let gi = l
+            .rect_grad
+            .iter()
+            .position(|g| g.is_some())
+            .expect("gradient rect pushed");
+        assert_eq!(
+            (l.rects[gi].0, l.rects[gi].2),
+            (2.0, 96.0),
+            "gradient clipped too"
+        );
     }
 
     #[test]

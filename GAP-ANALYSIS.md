@@ -14,7 +14,7 @@ datasets, then check every contested item against the source.
 > missing is absent from the parser's property table, but may still work through
 > a shorthand. More importantly, the percentages below are *inventory against a
 > spec dataset*, not a quality score and not a roadmap. The project's success
-> metric is steady-state RAM plus six reference captures; §8 is the part that
+> metric is steady-state RAM plus six reference captures; Â§8 is the part that
 > decides what to build next.
 
 ---
@@ -63,8 +63,8 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 167 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
-| CSS selectors | ~30 forms | 159 | ~20-25% | exact list in §4.2 |
+| CSS property names | 168 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS selectors | ~30 forms | 159 | ~20-25% | exact list in Â§4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
 | Web IDL interfaces | ~8 families | 1,251 | <1% | denominator dominated by GPU, audio, XR, workers |
@@ -76,7 +76,7 @@ engine is from scratch.
 The important asymmetry is not 94% versus 16%. It is that the JavaScript
 language core is the strongest layer, the Web API layer is deliberately thin, and
 the CSS number mixes shipping properties with drafts. A general-purpose parity
-target would fight the RAM metric; see §8.
+target would fight the RAM metric; see Â§8.
 
 Removed from the previous draft: the "~12% overall parity" line, which had no
 source in `PLAN.md`.
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 167 |
+| Names in the engine's `KNOWN` table | 168 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~586 |
+| Raw missing (non-vendor) | ~585 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -177,7 +177,7 @@ handled, but the paint model still applies one radius to every corner.
 | Grid & alignment | 10 | `grid-row`, `grid-auto-flow`, `grid-auto-rows` | high |
 | Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
-| Backgrounds | 13 | `background-clip`, `background-origin`, `background-attachment` | medium |
+| Backgrounds | 12 | `background-origin`, `background-attachment`, `background-blend-mode` | medium |
 | Masking & clipping | 13 | `mask-border-*`, `mask-mode`, `mask-composite` | low |
 | Containment, containers & anchors | 13 | `contain`, `container-*`, `anchor-*` | low |
 | Box, display & positioning | 11 | `appearance`, `all`, `float-offset` | medium |
@@ -247,7 +247,7 @@ relevant only when transitions and animations exist.
 - Backgrounds support a single `linear-gradient(...)` or
   `radial-gradient(...)` layer (angles/corner keywords or centre/shape/extent
   sizing, percentage stops, hard stops and alpha); `conic-gradient`,
-  multi-layer stacks, `repeating-*` tiling and `background-clip` are absent.
+  multi-layer stacks, `repeating-*` tiling and `background-origin` are absent.
   No animations or transitions, no `@keyframes`.
 - `@media` only understands width, hover, pointer, orientation, and
   `prefers-color-scheme`.
@@ -287,7 +287,7 @@ relevant only when transitions and animations exist.
   components are accepted but ignored, and `font: inherit`/`unset` plus the
   system keywords are no-ops (they don't revert an earlier same-element
   declaration). `font-size` also accepts the absolute-size keywords
-  (`xx-small`…`xxx-large`, `larger`, `smaller`), and `line-height` accepts
+  (`xx-small`â€¦`xxx-large`, `larger`, `smaller`), and `line-height` accepts
   unitless, px/em/rem/%, viewport units and `normal`.
 - `filter` supports the shorthand colour functions (`grayscale`, `sepia`,
   `saturate`, `hue-rotate`, `invert`, `opacity`, `brightness`, `contrast`)
@@ -296,10 +296,14 @@ relevant only when transitions and animations exist.
   the result is applied per primitive (own background/border/outline/shadow/
   gradient/image and text ink) rather than as a real offscreen group, so
   overlapping children of a filtered parent can show through each other.
-  `background-clip` and `backdrop-filter` are absent.
-  `transform-origin` is honored for the translate/scale composite formed by
+- `background-clip` supports the three box values (`border-box`,
+  `padding-box`, `content-box`) for the colour and gradient layers and crops
+  the background image for `content-box`; `background-clip: text` is not
+  accepted (it needs a glyph-shaped mask this renderer does not have) and
+  `backdrop-filter` is absent.
+- `transform-origin` is honored for the translate/scale composite formed by
   `transform`, `translate` and `scale` (no 3D; `rotate` parses but paints
-  unrotated, and glyph size still does not scale — see the wave 53 notes);
+  unrotated, and glyph size still does not scale â€” see the wave 53 notes);
   `overflow-wrap` / `word-break` now break inside words during line layout,
   `text-overflow: ellipsis` marks a clipped line and `max-height` caps a box
   (see the wave 49-52 notes); `hyphens` is not modeled.
@@ -428,7 +432,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 840 self-authored unit tests (844 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 842 self-authored unit tests (846 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -451,9 +455,10 @@ names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
 `filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
-waves 67-70 took the top visual items off it (individual `translate`/`scale`,
-the `font` shorthand, the `filter` colour functions, then the `place-items`/
-`place-self` alignment shorthands). The DOM/JS half is still open.
+waves 67-71 took the top visual items off it (individual `translate`/`scale`,
+the `font` shorthand, the `filter` colour functions, the `place-items`/
+`place-self` alignment shorthands, then `background-clip`). The DOM/JS half is
+still open.
 
 ### 8.2 Priority by reference impact and RAM cost
 
@@ -462,7 +467,7 @@ the `font` shorthand, the `filter` colour functions, then the `place-items`/
 | P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands | all six | negligible (dev-only) | CSS done, JS next |
 | P0 (done) | Shrink JS AST/env/object types (waves 63-64: `Obj` 88 to 64 B, `Param` 144 to 40 B, `Stmt` 192 to 72 B, `Closure` 112 to 96 B) | directly serves the success metric; wave 44 saved 36 MB on one workload and waves 63-64 cut ~5 MB off nextjs.org | all | negative (saves) | done |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
-| P2 | `background-clip`, `mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
+| P2 | `mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
 | P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
 
@@ -496,11 +501,11 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (167)
+## Appendix A - CSS property names accepted (168)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
-background, background-color, background-image, background-position, background-repeat
+background, background-clip, background-color, background-image, background-position, background-repeat
 background-size, border, border-bottom, border-bottom-color
 border-bottom-left-radius, border-bottom-right-radius, border-bottom-style
 border-bottom-width, border-collapse, border-color, border-left
@@ -564,7 +569,7 @@ Text and typography:
   font-feature-settings, font-kerning, font-size-adjust, font-optical-sizing
 
 Backgrounds and effects:
-  background-clip, background-origin, background-attachment,
+  background-origin, background-attachment,
   background-blend-mode, backdrop-filter, mix-blend-mode, isolation
 
 Transforms and motion:

@@ -290,6 +290,21 @@ pub enum BgRepeat {
     NoRepeat,
 }
 
+/// `background-clip` — how far out of the border box the background
+/// (colour and gradient) paints. `text` (paint the background only inside
+/// the glyphs) is valid CSS but is NOT accepted here: it needs a text-shaped
+/// mask that this renderer does not have, so it stays a dropped declaration
+/// rather than a silent wrong paint.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BgClip {
+    /// the border box (CSS initial)
+    Border,
+    /// stop at the padding edge (no background under the border)
+    Padding,
+    /// stop at the content edge (no background under padding either)
+    Content,
+}
+
 /// One color stop of a [`Gradient`]. `pos` is 0..1 along the gradient line
 /// (positions may sit outside the box's 0..1 span, exactly like CSS).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -334,9 +349,9 @@ pub struct Radial {
 /// Stops are stored in declaration order with positions made non-decreasing
 /// and the first/last defaults pinned to 0.0/1.0; the paint code clamps.
 /// shortcut: one layer only (the first gradient in the value), no
-/// `background-origin`/`background-clip` (painted over the border box),
-/// corner directions ignore the box's aspect ratio, and `repeating-*`
-/// paints one non-repeating pass.
+/// `background-origin` (paint starts at the clip box, i.e. the border box
+/// unless `background-clip` says otherwise), corner directions ignore the
+/// box's aspect ratio, and `repeating-*` paints one non-repeating pass.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Gradient {
     pub dir: (f32, f32),
@@ -781,9 +796,13 @@ pub struct BoxStyle {
     pub bg_repeat: Option<BgRepeat>,
     /// `background: linear-gradient(...)` / `radial-gradient(...)` (also
     /// via `background-image`) — parsed once per declaration and painted
-    /// per-pixel over the box's border box (see [`Gradient`] for the
+    /// per-pixel over the box's clipped box (see [`Gradient`] for the
     /// shortcuts). Painted above the background-color and below children.
     pub bg_gradient: Option<std::sync::Arc<Gradient>>,
+    /// `background-clip` — how far the colour/gradient layer extends out of
+    /// the border box ([`BgClip`]). The image layer always starts at the
+    /// padding box (pre-existing geometry; `Content` crops it further).
+    pub bg_clip: BgClip,
     /// `object-fit` — how a replaced element's content fills its box (see
     /// [`ObjFit`]); initial `fill` = the engine's old exact stretch
     pub obj_fit: ObjFit,
@@ -1027,6 +1046,7 @@ impl Default for BoxStyle {
             bg_pos: [BgPos::Pct(0.0); 2], // top-left
             bg_repeat: None,
             bg_gradient: None,
+            bg_clip: BgClip::Border,
             obj_fit: ObjFit::Fill,
             obj_pos: [BgPos::Pct(50.0); 2], // centered
             aspect_ratio: None,
@@ -1573,6 +1593,7 @@ const KNOWN: &[&str] = &[
     "background-color",
     "background-image",
     "background-size",
+    "background-clip",
     "background-position",
     "background-repeat",
     "object-fit",
@@ -2827,6 +2848,9 @@ fn apply_decl(
                 bx.bg_repeat = rep;
                 bx.bg_pos = pos;
                 bx.bg_size = size;
+                // ...and `background-clip` (the shorthand resets every
+                // background-* longhand it does not carry)
+                bx.bg_clip = BgClip::Border;
             } else if d.0 == "background-image" {
                 if d.1.trim() == "none" {
                     bx.bg_image = None;
@@ -2844,6 +2868,14 @@ fn apply_decl(
         "background-size" => bx.bg_size = parse_bg_size(&d.1, vp),
         "background-position" => bx.bg_pos = parse_bg_pos(&d.1, vp),
         "background-repeat" => bx.bg_repeat = parse_bg_repeat(&d.1),
+        // `background-clip: border-box | padding-box | content-box`; `text`
+        // and anything else keep the earlier value (`BgClip` docs why)
+        "background-clip" => match d.1.trim() {
+            "border-box" => bx.bg_clip = BgClip::Border,
+            "padding-box" => bx.bg_clip = BgClip::Padding,
+            "content-box" => bx.bg_clip = BgClip::Content,
+            _ => {}
+        },
         // replaced-content geometry: the fit mode picks the content rect
         // inside the declared box, the position anchors the letterbox/crop
         "object-fit" => bx.obj_fit = parse_object_fit(&d.1),
@@ -9592,6 +9624,30 @@ mod tests {
             (Align::Stretch, Align::Stretch)
         );
         assert_eq!((bx("k").align_self, bx("k").justify_self), (None, None));
+    }
+
+    #[test]
+    fn background_clip_parses_and_the_shorthand_resets_it() {
+        let sheet = parse(
+            ".a { background-clip: padding-box } .b { background-clip: content-box } \
+             .c { background-clip: border-box } .d { background-clip: text } \
+             .e { background-clip: bogus } \
+             .f { background-clip: content-box; background: red }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("a").bg_clip, BgClip::Padding);
+        assert_eq!(bx("b").bg_clip, BgClip::Content);
+        assert_eq!(bx("c").bg_clip, BgClip::Border);
+        // `text` needs a glyph-shaped mask, so it is NOT accepted (dropped)
+        assert_eq!(bx("d").bg_clip, BgClip::Border, "text keeps the earlier value");
+        assert_eq!(bx("e").bg_clip, BgClip::Border, "bogus keeps the earlier value");
+        // the `background` shorthand resets background-* longhands it omits
+        assert_eq!(bx("f").bg_clip, BgClip::Border, "shorthand reset");
+        assert_eq!(BoxStyle::default().bg_clip, BgClip::Border, "initial value");
     }
 
     #[test]

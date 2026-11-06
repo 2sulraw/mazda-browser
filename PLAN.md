@@ -1748,6 +1748,49 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 70 (`place-items`/`place-self` + grid `align-self`) | a local place-alignment page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | The two alignment shorthands are implemented. `place-items: <align-items> <justify-items>?` sets the container's block- and inline-axis alignment, and `place-self: <align-self> <justify-self>?` sets the per-item overrides; with one value both axes take it, with two the first is block and the second inline. `place-self` treats `auto` as meaningful (it clears an earlier override) and drops the declaration when either value is unknown, so a shorthand never half-applies. Checking the result exposed a real grid bug: the row cross-axis pass read the container's `align-items` only, so a grid item's `align-self` did nothing (the flex path already honoured it). Grid now resolves `align-self` per item before shifting, which is what MDN's `place-self: center start` / `center end` grid arrows rely on. Dropped-name counts fall to 88 on nextjs.org (was 89) and 13 on MDN (15); Wikipedia 29, Hacker News 3 and rust-lang.org 9 are unchanged. References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 85 MB, Wikipedia 24673 / 10951 / 100 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 82 MB; suite **840** default / **844** `engine-b + woff2` |
 
+| 2026-11-06 | wave 71 (`background-clip`) | a local background-clip page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `background-clip` now clips the background: `border-box` (initial, unchanged), `padding-box` stops the colour/gradient at the padding edge and `content-box` stops it at the content edge. The colour and gradient layers are single rects, so the wave computes one `bg_box` and emits it instead of the border box; the background IMAGE keeps its padding-box sizing (`%` sizes/positions resolve where CSS says) and is cropped by passing the content window down to the placeholder child when the clip is `content-box`. A rounded box with a border still paints the ring: the border colour fills the border box and the colour layer paints inside it, with `content-box` moving that inner rect to the content box and shrinking the radius by border + padding (max-inset approximation). `background-clip: text` is deliberately NOT accepted - it needs a glyph-shaped mask this renderer has no place to build, and accepting it would paint a rectangle behind invisible text; it stays a dropped declaration. The `background` shorthand resets `background-clip` with the rest of the background longhands. A local page with a 6px transparent border and 10px padding verifies the three clip boxes: red fills 100px (border box), blue paints 88px at x=6 (padding box), green paints 68px at x=16 (content box) and the gradient follows the same clip; the capture matches. Dropped-name counts: 87 on nextjs.org (was 88), 13 on MDN, 29 on Wikipedia, 3 on Hacker News, 9 on rust-lang.org. References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 100 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 82 MB; suite **842** default / **846** `engine-b + woff2` |
+
+### Wave 71 findings
+
+- **`background-clip` is three boxes, not a paint feature.** The colour and
+  gradient layers already paint through one rect each, so the wave is a
+  `BgClip` enum on `BoxStyle` and one `bg_box` computation in `collect_paint`
+  (border box → padding box → content box). The background IMAGE rides the
+  placeholder child, which is still sized/positioned against the padding box
+  (so `%` sizes and offsets resolve where CSS says) and gets cropped by
+  passing the content window down to that child instead of changing its
+  geometry.
+- **The rounded ring needs a second inset.** With a border and a radius the
+  box already paints a ring: the border colour fills the border box and the
+  colour layer paints inside it at the padding box. `content-box` moves that
+  inner rect to the content box and shrinks the radius by border + padding
+  (CSS shrinks radii per side; this uses the max inset — a documented
+  approximation). Without a ring the clip box is used directly, so
+  `padding-box` on a square box is one fewer rect than before, not a repaint.
+- **`text` is deliberately not accepted.** `background-clip: text` needs the
+  background painted only inside the glyphs; the renderer has no
+  text-shaped mask for a whole layer. Accepting it would silently paint a
+  rectangle behind invisible text, so it stays a dropped declaration (the
+  wave-69 `filter` doc pattern), and `BgClip` says why where the next reader
+  looks.
+- **The `background` shorthand resets it.** CSS resets every background-*
+  longhand the shorthand omits; the arm now sets `bg_clip` back to
+  `border-box` alongside repeat/position/size, otherwise a later
+  `background: red` would keep a stale `content-box`.
+- **Measured.** Local page: a 100px box with 6px transparent border and 10px
+  padding paints its colour at 100 wide (border box), 88 at x = 6
+  (`padding-box`), 68 at x = 16 (`content-box`), and the gradient follows
+  the same clip (sentinel rect at 88 wide). Unit tests pin the parse (three
+  values, `text`/bogus dropped, shorthand reset) and the three rect widths.
+  Dropped-name counts: 87 on nextjs.org (was 88, `background-clip` gone),
+  13 MDN, 29 Wikipedia, 3 Hacker News, 9 rust-lang.org. References keep
+  identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 /
+  84 MB, Wikipedia 24673 / 10951 / 100 MB, HN 1695 / 720 / 76 MB, rust-lang
+  5800 / 483 / 82 MB; suite **842** default / **846** `engine-b + woff2`.
+- **Next in the queue.** `backdrop-filter` (needs the offscreen group wave
+  69 skipped), `text-shadow`, `grid-auto-flow`; transitions only if
+  animation is ever required.
+
 ### Wave 70 findings
 
 - **The shorthand is only worth adding when the longhands already exist.**
