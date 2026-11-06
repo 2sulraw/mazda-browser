@@ -14,7 +14,7 @@ datasets, then check every contested item against the source.
 > missing is absent from the parser's property table, but may still work through
 > a shorthand. More importantly, the percentages below are *inventory against a
 > spec dataset*, not a quality score and not a roadmap. The project's success
-> metric is steady-state RAM plus six reference captures; Â§8 is the part that
+> metric is steady-state RAM plus seven reference captures; Â§8 is the part that
 > decides what to build next.
 
 ---
@@ -88,6 +88,9 @@ source in `PLAN.md`.
 - **142 elements** are defined by the HTML Living Standard.
 - The tokenizer/parser is generic: any unknown tag becomes a normal element, so
   parsing coverage is effectively complete.
+- `<noscript>` content is raw text, because scripting is always enabled: a
+  fallback `<style>` or `<meta http-equiv=refresh>` inside it never takes
+  effect (wave 77, found on google.com).
 - **32 real tag names** have no element-specific code path (the raw diff had 33
   names; `multicol` is a non-standard leftover).
 - Of those 32: 15 are obsolete or removed, 2 need no branch at all, 1 is legacy
@@ -446,7 +449,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 856 self-authored unit tests (860 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 861 self-authored unit tests (865 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -458,7 +461,7 @@ Surface coverage against a full spec dataset is a proxy that rewards
 implementing drafts. Use one of these instead:
 
 1. **Reference-site denominator:** the union of CSS declarations, DOM members,
-   and JavaScript APIs actually touched by the six reference pages. This is the
+   and JavaScript APIs actually touched by the seven reference pages. This is the
    only denominator that directly measures the success criterion.
 2. **Shipping denominator:** features that at least two mainstream engines ship.
    Label single-engine and draft-only features and keep them out of headline
@@ -483,20 +486,29 @@ actionable queue starts below them), MDN 1/0, Wikipedia 2/1, Hacker News 0/1
 (`innerHTML` as a read on element wrappers), rust-lang.org 1/0. The ranked
 lists are the JS work queue; wave 76 took its top global, `Reflect` (nextjs
 globals 61 → 60, members 58 → 67 because core-js's decorator-metadata module
-now probes `Reflect.defineMetadata`/`getMetadata`/…). What remains: those
-metadata methods, ES2024 Set methods, Map `emplace`/`upsert`, Array
-`find`/`findIndex`/`flat`/`flatMap`, `Object.isExtensible`/
-`getOwnPropertySymbols`, `reportError`, and `innerHTML` reads.
+now probes `Reflect.defineMetadata`/`getMetadata`/…), and wave 77 took the
+Array extras (`find`/`findIndex`/`flat`/`flatMap`/`at`/`fill`/`copyWithin` and
+`findLast*`; nextjs members 67 → 61 with no new names). google.com joined the
+reference set in wave 77 and immediately paid for itself: its first capture
+was blank because `<noscript>` content was parsed as elements, so its
+non-JS `<style>` hid the page; with the parser fixed it lays out 1400px /
+28 runs / 95.8 MB at `[css-miss]` 50 / `[js-miss]` 20 globals + 11 members
+(`XMLHttpRequest`, `trustedTypes`, `fonts.timing`, `sendBeacon`, …), and its
+search form is still 968px tall with two undiagnosed black shapes over it (a
+layout/SVG gap). What remains: `Reflect`
+metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
+`Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`
+reads, and google's oversized form / SVG fills.
 
 ### 8.2 Priority by reference impact and RAM cost
 
 | Priority | Work | Why | Reference impact | RAM cost | Effort |
 |---|---|---|---|---|---|
-| P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands; wave 75 ships the JS half (ranked `[js-miss]` global/member buckets) | all six | negligible (dev-only) | done (wave 66 CSS, wave 75 JS) |
+| P0 (done) | Observed-miss instrumentation for CSS names and DOM/JS member reads | replaces speculation with a ranked list; wave 66 ships the CSS half (`MAZDA_MISS=1`) and uses it to add the border longhands; wave 75 ships the JS half (ranked `[js-miss]` global/member buckets) | all seven | negligible (dev-only) | done (wave 66 CSS, wave 75 JS) |
 | P0 (done) | Shrink JS AST/env/object types (waves 63-64: `Obj` 88 to 64 B, `Param` 144 to 40 B, `Stmt` 192 to 72 B, `Closure` 112 to 96 B) | directly serves the success metric; wave 44 saved 36 MB on one workload and waves 63-64 cut ~5 MB off nextjs.org | all | negative (saves) | done |
 | P1 | `form.controlName` shorthand on the form wrapper | some libraries read controls directly off the form | some pages | low | 1 wave |
 | P2 | `mix-blend-mode`, transitions/`@keyframes` | visual fidelity on modern marketing pages | verify against captures | medium | 2-4 waves |
-| P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the six | high | weeks-months |
+| P3 | `<canvas>` 2D, `<iframe>`, `<video>`/`<audio>` | large new subsystems; only if a target page changes | none of the seven | high | weeks-months |
 | P3 | WebGPU, Web Audio, IndexedDB, workers, WebSocket | huge surface, not needed for the captures | none | very high | no |
 
 `<canvas>` is not just an element: it needs a 2D path/text/image API and a pixel
@@ -511,7 +523,7 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 2. **Web conformance suite.** Much heavier: a local server, test driver, async
    tests, and reftests. A curated subset (`css/selectors/`, `dom/nodes/`,
    `html/dom/`) is the only realistic first step. Screenshot diffing against the
-   six reference captures is more aligned with this project.
+   seven reference captures is more aligned with this project.
 3. **Shipping-feature denominator.** Intersect the implemented surface with
    features that at least two mainstream engines ship, to exclude drafts.
 

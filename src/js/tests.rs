@@ -3026,3 +3026,90 @@ fn reflect_object_operations_match_the_operators() {
     err("Reflect.get(null, 'x')");
     err("Reflect.has(1, 'x')");
 }
+
+// ---------------------------------------------------------------------------
+// Array extras
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_find_and_find_last_scan_both_directions() {
+    assert_eq!(num("[1, 2, 3, 4].find(function (x) { return x > 2 })"), 3.0);
+    assert_eq!(
+        num("[1, 2, 3, 4].findIndex(function (x) { return x > 2 })"),
+        2.0
+    );
+    // the index callback arg is the real one, including on a reverse scan
+    assert_eq!(
+        num("[1, 2, 3, 4].findLastIndex(function (x, i) { return i < 3 })"),
+        2.0
+    );
+    assert_eq!(
+        num("[1, 2, 3, 4].findLast(function (x) { return x < 4 })"),
+        3.0
+    );
+    assert!(boolean(
+        "[1, 2].find(function () { return false }) === undefined"
+    ));
+    assert_eq!(
+        num("[1, 2].findIndex(function () { return false })"),
+        -1.0
+    );
+    assert_eq!(
+        num("[1, 2].findLastIndex(function () { return false })"),
+        -1.0
+    );
+}
+
+#[test]
+fn array_at_indexes_from_either_end() {
+    assert_eq!(string("['a', 'b', 'c'].at(0)"), "a");
+    assert_eq!(string("['a', 'b', 'c'].at(-1)"), "c");
+    assert_eq!(string("['a', 'b', 'c'].at(-3)"), "a");
+    assert!(boolean("['a', 'b', 'c'].at(3) === undefined"));
+    assert!(boolean("['a', 'b', 'c'].at(-4) === undefined"));
+}
+
+#[test]
+fn array_fill_and_copy_within_resolve_relative_bounds() {
+    assert_eq!(string("[1, 2, 3].fill(0).join(',')"), "0,0,0");
+    assert_eq!(string("[1, 2, 3, 4].fill(9, 1, 3).join(',')"), "1,9,9,4");
+    assert_eq!(string("[1, 2, 3, 4].fill(9, -2).join(',')"), "1,2,9,9");
+    // fill returns the same array, not a copy
+    assert!(boolean("var a = [1]; a.fill(2) === a"));
+    // copyWithin shifts the source range, overlap-safe
+    assert_eq!(
+        string("[1, 2, 3, 4, 5].copyWithin(0, 3).join(',')"),
+        "4,5,3,4,5"
+    );
+    assert_eq!(
+        string("[1, 2, 3, 4, 5].copyWithin(1, 0, 3).join(',')"),
+        "1,1,2,3,5"
+    );
+    assert!(boolean("var a = [1, 2]; a.copyWithin(0, 1) === a"));
+}
+
+#[test]
+fn array_flat_and_flat_map_respect_depth() {
+    assert_eq!(
+        string("[1, [2, [3, [4]]]].flat().join(',')"),
+        "1,2,3,4"
+    );
+    assert_eq!(
+        string("[1, [2, [3, [4]]]].flat(1).join(',')"),
+        "1,2,3,4"
+    );
+    // depth 1 leaves the deeper array in place; join flattens it textually
+    assert_eq!(num("[1, [2, [3]]].flat(1)[1]"), 2.0);
+    assert!(boolean("[1, [2, [3]]].flat(1)[2] instanceof Array"));
+    assert!(boolean("[1, [2, [3]]].flat(2)[2] === 3"));
+    assert!(boolean("[1, [2]].flat(0)[1] instanceof Array"));
+    assert_eq!(string("[1, 2].flatMap(function (x) { return [x, x] }).join(',')"), "1,1,2,2");
+    // a non-array return is kept as one element, not spread
+    assert_eq!(
+        string("[1, 2].flatMap(function (x) { return x * 2 }).join(',')"),
+        "2,4"
+    );
+    assert_eq!(num("[].flat().length"), 0.0);
+}
+
+

@@ -212,6 +212,15 @@ pub(crate) fn install(e: &mut JsEngine) {
         "reverse",
         "splice",
         "lastIndexOf",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "at",
+        "fill",
+        "copyWithin",
+        "flat",
+        "flatMap",
     ]
     .iter()
     .enumerate()
@@ -1859,6 +1868,15 @@ const A_SORT: u16 = 15;
 const A_REVERSE: u16 = 16;
 const A_SPLICE: u16 = 17;
 const A_LASTINDEXOF: u16 = 18;
+const A_FIND: u16 = 19;
+const A_FINDINDEX: u16 = 20;
+const A_FINDLAST: u16 = 21;
+const A_FINDLASTINDEX: u16 = 22;
+const A_AT: u16 = 23;
+const A_FILL: u16 = 24;
+const A_COPY_WITHIN: u16 = 25;
+const A_FLAT: u16 = 26;
+const A_FLATMAP: u16 = 27;
 const A_ISARRAY: u16 = 100;
 
 /// Own-property check that also understands array indices/length.
@@ -2020,6 +2038,44 @@ fn n_array_call(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result
             }
             Ok(Val::new_array(items))
         }
+    }
+}
+
+/// Flatten `items` into `out` down to `depth` levels. `flat`/`flatMap` share
+/// it; `depth` is clamped to 64 so a nested array built by script cannot
+/// recurse without bound (shortcut: deeper nesting is flattened 64 levels and
+/// keeps the rest as arrays, where the spec would keep going).
+fn flatten_into(items: &[Val], depth: f64, out: &mut Vec<Val>) {
+    for it in items {
+        if depth > 0.0 {
+            let nested = match it {
+                Val::Obj(o) => match &o.borrow().kind {
+                    ObjKind::Array(v) => Some(v.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(v) = nested {
+                flatten_into(&v, depth - 1.0, out);
+                continue;
+            }
+        }
+        out.push(it.clone());
+    }
+}
+
+/// `ToIntegerOrInfinity` for the relative index arguments (`at`/`fill`/
+/// `copyWithin`): negative counts from the end, out of range clamps.
+fn rel_index(v: Option<&Val>, fallback: f64, len: usize) -> usize {
+    let n = match v {
+        None | Some(Val::Undefined) => fallback,
+        Some(v) => v.to_number(),
+    };
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    if n < 0.0 {
+        (len as f64 + n).max(0.0) as usize
+    } else {
+        (n as usize).min(len)
     }
 }
 
@@ -2342,6 +2398,121 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                 acc = e.call(f.clone(), this.clone(), cb_args)?;
             }
             acc
+        }
+        A_FIND | A_FINDINDEX | A_FINDLAST | A_FINDLASTINDEX => {
+            // Predicate callbacks get (element, index, thisArg) like the other
+            // iterators above (shortcut: the engine passes the global object
+            // as both `this` and the third argument, not the array).
+            let f = args.first().cloned().unwrap_or(Val::Undefined);
+            let items = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                }
+            };
+            let this = Val::Obj(e.global_obj.clone());
+            let back = matches!(idx, A_FINDLAST | A_FINDLASTINDEX);
+            let len = items.len();
+            for k in 0..len {
+                let i = if back { len - 1 - k } else { k };
+                let r = e.call(
+                    f.clone(),
+                    this.clone(),
+                    vec![items[i].clone(), Val::Num(i as f64), this.clone()],
+                )?;
+                if r.to_bool() {
+                    return Ok(match idx {
+                        A_FIND | A_FINDLAST => items[i].clone(),
+                        _ => Val::Num(i as f64),
+                    });
+                }
+            }
+            match idx {
+                A_FIND | A_FINDLAST => Val::Undefined,
+                _ => Val::Num(-1.0),
+            }
+        }
+        A_AT => {
+            let items = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                }
+            };
+            let n = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+            let n = if n.is_nan() { 0.0 } else { n.trunc() };
+            let i = if n < 0.0 { items.len() as f64 + n } else { n };
+            if i < 0.0 || i >= items.len() as f64 {
+                Val::Undefined
+            } else {
+                items[i as usize].clone()
+            }
+        }
+        A_FILL => {
+            let value = args.first().cloned().unwrap_or(Val::Undefined);
+            let len = match &o.borrow().kind {
+                ObjKind::Array(items) => items.len() as i64,
+                _ => 0,
+            };
+            let (a, b) = slice_bounds(args.get(1).map_or(0.0, |v| v.to_number()), args.get(2), len);
+            if let ObjKind::Array(slot) = &mut o.borrow_mut().kind {
+                for it in slot.iter_mut().take(b).skip(a) {
+                    *it = value.clone();
+                }
+            }
+            Val::Obj(o.clone())
+        }
+        A_COPY_WITHIN => {
+            let len = match &o.borrow().kind {
+                ObjKind::Array(items) => items.len(),
+                _ => 0,
+            };
+            let target = rel_index(args.first(), 0.0, len);
+            let start = rel_index(args.get(1), 0.0, len);
+            let end = rel_index(args.get(2), len as f64, len);
+            let count = end.saturating_sub(start).min(len - target);
+            if count > 0 {
+                if let ObjKind::Array(slot) = &mut o.borrow_mut().kind {
+                    // snapshot first: the ranges overlap when target > start
+                    let src: Vec<Val> = slot[start..start + count].to_vec();
+                    slot[target..target + count].clone_from_slice(&src);
+                }
+            }
+            Val::Obj(o.clone())
+        }
+        A_FLAT | A_FLATMAP => {
+            let items = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                }
+            };
+            let mut out = Vec::new();
+            if idx == A_FLAT {
+                let depth = args.first().map(|v| v.to_number()).unwrap_or(1.0);
+                let depth = if depth.is_nan() {
+                    1.0
+                } else {
+                    depth.clamp(0.0, 64.0)
+                };
+                flatten_into(&items, depth, &mut out);
+            } else {
+                let f = args.first().cloned().unwrap_or(Val::Undefined);
+                let this = Val::Obj(e.global_obj.clone());
+                let mut mapped = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    mapped.push(e.call(
+                        f.clone(),
+                        this.clone(),
+                        vec![item.clone(), Val::Num(i as f64), this.clone()],
+                    )?);
+                }
+                flatten_into(&mapped, 1.0, &mut out);
+            }
+            Val::new_array(out)
         }
         _ => Val::Undefined,
     })

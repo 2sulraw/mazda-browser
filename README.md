@@ -133,6 +133,7 @@ Measured RSS on Windows 11 with the status-bar meter:
 | Idle window | ~106 MB |
 | Wikipedia article | ~100 MB |
 | MDN reference page | ~80–95 MB |
+| google.com homepage | ~96 MB |
 | Additional tabs | restored from snapshots — no live renderer |
 
 The `glow`/winit GL context sets the floor. The real target is the **shape of the curve**: a
@@ -141,8 +142,8 @@ measured; the full log lives in [PLAN.md](PLAN.md).
 
 ## Status
 
-Mazda is **alpha** — it renders Wikipedia, MDN, Hacker News, rust-lang.org, and nextjs.org, and
-runs real page scripts, but it is not a daily driver.
+Mazda is **alpha** — it renders Wikipedia, MDN, Hacker News, rust-lang.org, nextjs.org, and
+google.com, and runs real page scripts, but it is not a daily driver.
 
 - **In scope:** HTML/CSS/layout, images, fonts, a JavaScript interpreter, forms, tabs
 - **Not yet:** GPU compositing, process sandbox, media playback (`<video>`/`<audio>` render a

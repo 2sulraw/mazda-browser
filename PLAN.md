@@ -1760,6 +1760,67 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 76 (`Reflect`) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org (no local page — nothing paints differently) | The top actionable global from the wave-75 census ships: `Reflect` with all thirteen standard methods (`apply`, `construct`, `defineProperty`, `deleteProperty`, `get`, `getOwnPropertyDescriptor`, `getPrototypeOf`, `has`, `isExtensible`, `ownKeys`, `preventExtensions`, `set`, `setPrototypeOf`). It is routing, not a second implementation: `get`/`set`/`deleteProperty` call `get_member`/`set_member`/`delete_member`, `defineProperty` shares `define_prop`, `ownKeys`/`getOwnPropertyDescriptor`/`getPrototypeOf`/`setPrototypeOf` delegate to the same `n_object` arms the `Object` statics use, and `construct` was extracted from the `new` operator so both build the fresh `this`, set `new.target` (`pending_construct`) and apply the "object result wins" rule — `Reflect.construct` ignores its optional `newTarget` (documented shortcut). `apply`/`construct` take a real array as the argument list (the engine has no array-likes and no `arguments` object) and throw TypeError otherwise. The `in` operator's per-type walk moved into a `has_member` helper that `Reflect.has` shares, so the operator and the meta-API cannot drift. `isExtensible`/`preventExtensions` are constants — there are no integrity levels (`freeze`/`seal` are identity too). Suite **856** default / **860** `engine-b + woff2`; two new tests cover apply/construct/error paths and the object operations against the operator semantics. References keep identical geometry and CSS counts: nextjs 7578px / 569 runs / 146.7 MB, MDN 2773 / 641 / 75-93 MB (two runs — the page's script timing decides how much executes), Wikipedia 24673 / 10951 / 101.2 MB, HN 1695 / 720 / 76.0 MB, rust-lang 5800 / 483 / 82.5 MB; `[css-miss]` 84 / 12 / 29 / 3 / 9 unchanged. The census confirms the fix: nextjs globals 61 → 60 with `Reflect` the only name removed, and exposes the next layer — nine `Reflect` decorator-metadata names (`defineMetadata`, `deleteMetadata`, `getMetadata`, `getMetadataKeys`, `getOwnMetadata`, `getOwnMetadataKeys`, `hasMetadata`, `hasOwnMetadata`, `metadata`) now read as member misses because core-js's metadata module only probes them once `Reflect` exists (nextjs members 58 → 67; the other four sites unchanged) |
 
+| 2026-11-06 | wave 77 (`noscript` raw text + `Array.prototype` extras + google joins the reference set) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org + google.com (new baseline) | google.com became the sixth reference page, and its first capture exposed a real parser bug rather than a CSS one: with scripting enabled, `<noscript>` content must stay TEXT, but the parser built it as elements, so google's fallback `<style>table,div,span,p{display:none}</style>` was collected as a stylesheet and hid the whole page (1 box, 0 runs). `noscript` joined `RAW_TEXT` (alongside `script`/`style`/`textarea`/`title`/`svg`), so its `<style>` and `<meta http-equiv=refresh>` are inert; google then lays out 835 nodes / 115 boxes / 1400px / 28 runs at 95.8 MB, with `[css-miss]` 50 names and `[js-miss]` 20 globals / 11 members. The wave also implements the nine `Array.prototype` methods pages probe (`find`, `findIndex`, `findLast`, `findLastIndex`, `at`, `fill`, `copyWithin`, `flat`, `flatMap`), carried by two helpers: `rel_index` (relative index grammar for `at`/`fill`/`copyWithin` - negative from the end, out-of-range clamps, NaN -> 0) and `flatten_into` (shared by `flat`/`flatMap`, depth clamped to 64 so a script-built nested array cannot recurse without bound; deeper nesting keeps the rest as arrays). `copyWithin` snapshots its source range before writing, `fill` reuses `slice_bounds` and returns the receiver, and the find family follows the engine's existing iterator convention (callback gets element/index/thisArg, `this` is the global object). The census confirms it: nextjs members 67 -> 61 with `at`/`copyWithin`/`fill`/`findIndex`/`flat`/`flatMap` gone and no new names. Suite **861** default / **865** `engine-b + woff2`; five new tests (four array, one parser). The first capture attempt happened during a host-wide TLS outage (every host and tool failed, `curl`/`Invoke-WebRequest`/`git ls-remote` included) and was retaken once egress returned; the five older references keep identical geometry (nextjs 7578/569, MDN 2773/641, Wikipedia 24673/10951, HN 1695/720, rust 5800/483) and CSS counts (84/12/29/3/9). google's new baseline still has large visual gaps: its search form lays out 968px tall and two large black SVG/image fills stretch over the page - a layout/SVG item for wave 78, not a parser one. |
+
+### Wave 77 findings
+
+- **The first google capture was blocked, then the page was blank for a
+  reason worth fixing.** The first attempt failed before any page existed:
+  `[nav] fetch failed ... tls connection init failed: unexpected end of file`,
+  and the engine painted its own "Failed to load" text (29px, 14 runs). That
+  failure was not Google-specific: at the same moment `curl.exe` failed
+  identically for `google.com`, `rust-lang.org`, `example.com`, `baidu.com`,
+  `1.1.1.1` and `github.com` (`schannel: failed to receive handshake`),
+  `Invoke-WebRequest` failed on send, and `git ls-remote` could not reach the
+  repo - ICMP echo and TCP connects still worked, so the host's upstream was
+  dropping HTTP/TLS payload. A 7-minute probe (20 attempts) recorded the
+  outage, and the capture was retaken once egress returned. When it did, google
+  loaded 835 nodes and then laid out **one box**: its `<noscript>` fallback
+  contains `<style>table,div,span,p{display:none}</style>`, and the parser had
+  been building noscript content as elements, so that style hid the page.
+- **`<noscript>` is the fix, and it is a parser rule, not a site hack.**
+  With scripting enabled the HTML parser keeps noscript content as text (only
+  a scripting-disabled parser builds its elements). This engine always runs
+  scripts, so `noscript` now sits in `RAW_TEXT` next to
+  `script`/`style`/`textarea`/`title`/`svg`: the `<style>` is never collected,
+  the `<meta http-equiv=refresh>` inside it never fires, and a page's non-JS
+  fallback stays invisible text. Google then lays out 835 nodes / 115 boxes /
+  1400px / 28 runs at 95.8 MB. A parser test pins the rule (one text child, no
+  `style` element, one real `p`).
+- **Google's baseline is honest about what still looks wrong.** The capture
+  shows the logo, top links, account pill and search field, but the search
+  form lays out 968px tall and two large black shapes (SVG/image fills, not yet
+  diagnosed) stretch over the page: a layout/SVG item for wave 78 (the box dump
+  shows `form h=968` inside an `h=1008` flex section). That is measured, not
+  guessed - the `[box]` dump and the screenshot are the evidence.
+- **The other half of the wave is the Array extras.** With google expected to
+  be a fresh baseline, the wave also took the next self-contained cluster from
+  the wave-75 census: nine `Array.prototype` methods pages probe (`find`,
+  `findIndex`, `findLast`, `findLastIndex`, `at`, `fill`, `copyWithin`,
+  `flat`, `flatMap`). Two helpers keep it small: `rel_index` resolves the
+  relative index grammar once for `at`/`fill`/`copyWithin` (negative counts
+  from the end, out-of-range clamps, NaN -> 0), and `flatten_into` serves both
+  `flat` and `flatMap` with the depth clamped to 64 so a script-built nested
+  array cannot recurse without bound (documented shortcut: deeper nesting
+  keeps the rest as arrays). `copyWithin` snapshots its source range before
+  writing, so overlapping moves are correct; `fill` reuses `slice_bounds` and
+  returns the receiver; the find family follows the existing iterator
+  convention (callback gets element/index/thisArg, `this` is the global
+  object). The census confirms the win: nextjs members 67 -> 61 with `at`,
+  `copyWithin`, `fill`, `findIndex`, `flat` and `flatMap` gone and no new
+  names.
+- **Measured.** Suite **861** default / **865** `engine-b + woff2` (four array
+  tests, one parser test). The five older references keep identical geometry
+  and CSS counts: nextjs 7578px / 569 runs / 146.0-151.4 MB (two runs), MDN 2773 / 641 / 85.8,
+  Wikipedia 24673 / 10951 / 100.9, HN 1695 / 720 / 75.8, rust-lang 5800 / 483
+  / 89.0; `[css-miss]` 84/12/29/3/9 unchanged. google.com's baseline: 1400px /
+  28 runs / 95.8 MB, `[css-miss]` 50 names (transitions 36, `pointer-events`
+  35, animations 30, then `inline-size`/`block-size`/`box-orient`), `[js-miss]`
+  20 globals / 11 members (`XMLHttpRequest`, `trustedTypes`, `fonts.timing`,
+  `sendBeacon`, ...), 7 script errors (Google's closure bundle hits parser
+  limits: `try/catch` with `yield` in a generator and one comma-expression
+  syntax error).
+
 ### Wave 76 findings
 
 - **`Reflect` is glue, not a subsystem.** Every method already had an

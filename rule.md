@@ -11,7 +11,10 @@ serves that.
 - Success = the reference pages render like their captures, with zero script
   errors, at the lowest RAM we can reach.
 - Reference pages: Wikipedia `/wiki/JavaScript`, MDN homepage, nextjs.org,
-  rust-lang.org, Hacker News; example.com is the shell floor.
+  rust-lang.org, Hacker News, google.com homepage; example.com is the shell
+  floor. google.com joined in wave 77 with a first baseline (1400px / 28 runs
+  / 95.8 MB); its oversized search form and two undiagnosed black shapes are
+  known gaps.
 - A feature that does not improve one of those pages must justify itself as
   infrastructure (correctness, safety, or measured RAM) before it is built.
 

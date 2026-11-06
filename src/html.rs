@@ -23,8 +23,13 @@ const VOID: &[&str] = &[
     "source", "track", "wbr",
 ];
 
-/// Elements whose content is raw text (no tags inside).
-const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title", "svg"];
+/// Elements whose content is raw text (no tags inside). `noscript` belongs
+/// here because scripting is always enabled in this engine: per HTML, a
+/// scripting-enabled parser keeps `<noscript>` content as text, so a
+/// `<style>` inside it is never collected and a `<meta http-equiv=refresh>`
+/// inside it never navigates. (Pages use that to hide their non-JS layout -
+/// google.com ships `table,div,span,p{display:none}` in one.)
+const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title", "svg", "noscript"];
 
 /// Interned tag name: `u16` index into `Dom::tags` instead of a per-node String.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -949,6 +954,41 @@ mod tests {
         }
         // body-level visible text is unaffected
         assert_eq!(text_of(&dom), "keep|var x = '<b>';|this");
+    }
+
+    #[test]
+    fn noscript_content_is_inert_because_scripting_is_on() {
+        // google.com ships its non-JS fallback as a <noscript> holding a
+        // <style> that hides the page and a meta refresh to the basic
+        // version. With scripting enabled both must stay text.
+        let dom = parse(
+            "<body><noscript><style>div{display:none}</style><p>fallback</p>\
+             </noscript><p>live</p></body>",
+        );
+        let noscript = (0..dom.nodes.len())
+            .find(|&i| dom.tag(i as u32) == "noscript")
+            .expect("noscript element");
+        let kids = &dom.nodes[noscript].children;
+        assert_eq!(kids.len(), 1, "noscript should own exactly its text");
+        match &dom.nodes[kids[0] as usize].kind {
+            NodeKind::Text(t) => assert!(t.contains("<style>"), "raw text: {t:?}"),
+            _ => panic!("noscript content must be a text node"),
+        }
+        // nothing inside it became an element
+        assert_eq!(
+            (0..dom.nodes.len())
+                .filter(|&i| dom.tag(i as u32) == "style")
+                .count(),
+            0,
+            "the noscript <style> must not be a stylesheet"
+        );
+        assert_eq!(
+            (0..dom.nodes.len())
+                .filter(|&i| dom.tag(i as u32) == "p")
+                .count(),
+            1,
+            "the noscript <p> must not exist"
+        );
     }
 
     #[test]
