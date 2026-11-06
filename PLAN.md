@@ -1754,6 +1754,47 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-06 | wave 73 (`grid-auto-flow`) | a local grid-flow page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | Auto-placed grid items now pack along either axis. `grid-auto-flow: [row|column] || dense` parses (tokens in any order; `dense` is accepted but NOT stored — the sparse cursor here never passes a free cell, since auto items are 1×1 and there are no row spans to leave a hole behind, so dense packing would place items identically; documented on the `GridFlow` enum), an unknown/repeated token drops the whole declaration so an earlier value survives, and `dense` alone means `row dense`. `grid()` keeps the base column count as `nc0` for the placement cursors, and column flow advances the auto cursor row-first, wrapping to the next column at `nr_flow` = explicit rows, else area rows, else one implicit row. Because column flow can place items past the explicit template, the column count is re-derived from the placed spots (`nc = nc0.max(max c1)`) and `tracks` grows `Track::Auto` to match — a no-op in row flow (the cursor never exceeds `nc0`), so every reference row stays byte-identical. A local page verifies row flow over a 2×2 template (a b / c d), column fill (x y z side by side on one row), column wrap at two explicit rows (a c / b d), `dense column` in either token order, and an invalid second value keeping `column`. Dropped-name counts fall to 85 on nextjs.org and 12 on MDN (both had `grid-auto-flow`; Wikipedia 29, Hacker News 3, rust-lang.org 9 unchanged, zero `grid-auto-flow` misses anywhere). References keep identical geometry: nextjs 7578px / 569 runs / 147 MB, MDN 2773 / 641 / 85 MB, Wikipedia 24673 / 10951 / 102 MB, HN 1695 / 720 / 76 MB, rust-lang 5800 / 483 / 83 MB; suite **848** default / **852** `engine-b + woff2` |
 
+| 2026-11-06 | wave 74 (`backdrop-filter`) | a local frosted-glass page + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | `backdrop-filter` blurs what is already painted behind a box. The value parser (`parse_backdrop`) keeps only the largest `blur()` radius (`blur()` with no argument = 0), accepts the other filter functions without effect (`drop-shadow`/`url`/`grayscale`/… parse but contribute nothing — the mirror image of `filter: blur()`), and an unknown function or malformed token drops the whole declaration so an earlier value survives; `none`/`initial`/`unset` clears it. `BoxStyle.backdrop` holds the radius (0 = none), and `KNOWN` gains the name. Paint is a phase split driven by new `BackdropGroup` records — DFS-contiguous spans over the five paint channels plus the clip-intersected border-box region, recorded exactly like `StickyGroup` and remapped through `zsort` (a split-z subtree disables the group instead of blurring the wrong pixels). Each `want_fixed` pass now: phase 1 paints everything except the deferred spans, `blur_backdrops` snapshots each region (clamp-to-edge), runs three box passes of radius ≈ blur over the three colour planes and writes the blurred pixels back inside the rounded border box, then phase 2 paints the withheld subtree sharp on top. Pages without the property record no groups, so phase 1 is the plain paint and phase 2 never runs — output stays byte-identical. A local page verifies a sticky frosted nav (blur 6px) and a frosted rounded panel (blur 8px) laid over a hard repeating-gradient edge: the stripes blur to a soft gradient inside the panel, stay sharp outside it, and the panel's own text is sharp; the capture matches. Dropped-name counts: 84 on nextjs.org (was 85, `backdrop-filter` gone), 12 MDN, 29 Wikipedia, 3 Hacker News, 9 rust-lang.org — zero new misses, no `backdrop-filter` miss anywhere. References keep identical geometry: nextjs 7578px / 569 runs / 146 MB, MDN 2773 / 641 / 84 MB, Wikipedia 24673 / 10951 / 101 MB, HN 1695 / 720 / 75 MB, rust-lang 5800 / 483 / 87 MB; suite **852** default / **856** `engine-b + woff2` |
+
+### Wave 74 findings
+
+- **The whole feature is record-gated.** `backdrop-filter` costs pages
+  without it nothing: no group recorded → the deferred spans come back
+  empty, phase 1 equals the old paint and phase 2 never runs (the render
+  test asserts this half explicitly). The five channel loops moved into
+  one closure whose only change is an `in_spans(…) != one` guard per loop —
+  no other paint behavior moved.
+- **Spans are subtree windows, not sorted lists.** The DFS opens each
+  group's window before the subtree's pushes and closes it after the
+  children recurse, so nested groups produce overlapping spans —
+  `backdrop_spans` sorts and merges them so each channel entry defers
+  exactly once (a naive per-group skip would defer an entry twice and
+  double-blur the region edges). The integer-`z-index` split that forces
+  sticky groups to disable themselves disables a backdrop group the same
+  way: all spans empty, `blur = 0`, the subtree paints in tree order.
+- **Three box passes ≈ the text-shadow recipe, again.** The spec's blur
+  radius is σ, and a single box pass at that radius comes out about twice
+  too sharp, so `blur_backdrops` reuses the three-pass `box_blur` chain
+  (per colour plane, snapshot → blur → rounded-corner write-back) that
+  `text-shadow` already validated. Corner culling copies `paint_solid_rect`'s
+  radius math so the frost follows the border box's rounding.
+- **Measured.** Local capture shows the frosted nav, the soft stripes
+  inside the rounded panel and the sharp edge outside it. Dropped-name
+  counts: 84 nextjs.org (was 85 — `backdrop-filter` was the last of its
+  misses), 12 MDN, 29 Wikipedia, 3 Hacker News, 9 rust-lang.org; the only
+  name-set change vs wave 73 is that removal. References keep identical
+  geometry: nextjs 7578px / 569 runs / 146 MB, MDN 2773 / 641 / 84 MB,
+  Wikipedia 24673 / 10951 / 101 MB, HN 1695 / 720 / 75 MB, rust-lang 5800
+  / 483 / 87 MB; suite **852** default / **856** `engine-b + woff2`.
+- **A 90-second reference run is not the recorded reference.** An extended
+  Wikipedia run kept going past the usual stabilization window and
+  accumulated JS-driven relayouts (351 coalesced scroll events, +7 boxes,
+  a late-injected +13-rule stylesheet) until a final load measured
+  49243px — page JS mutating a long-lived session, not a layout change:
+  the first six loads in that same log all measured the recorded
+  24673px / 10951 runs. The recorded numbers still come from the
+  standard short run.
+
 ### Wave 73 findings
 
 - **The axis is the only thing stored.** `dense` would need a placement

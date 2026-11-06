@@ -642,6 +642,62 @@ fn filter_angle(s: &str) -> Option<f32> {
     }
 }
 
+/// Parse a `backdrop-filter` value → the `blur()` radius in px. The outer
+/// `None` = invalid (drop the declaration, keep an earlier value);
+/// `Some(None)` = `none`/`initial`/`unset` (clear it); `Some(Some(r))` =
+/// the largest blur in the list (0 when the list declares no blur).
+/// shortcut: only `blur()` contributes — the other filter functions are
+/// accepted but inert (exactly mirror-image of `blur()` inside
+/// [`parse_filter`], which skips it for the same reason: no effects
+/// pipeline), and an unknown function / malformed token drops the whole
+/// declaration like any invalid CSS.
+fn parse_backdrop(v: &str) -> Option<Option<f32>> {
+    let t = v.trim();
+    if t.is_empty()
+        || matches!(
+            t.to_ascii_lowercase().as_str(),
+            "none" | "initial" | "inherit" | "unset"
+        )
+    {
+        return Some(None);
+    }
+    let mut r = 0.0f32;
+    for tok in joined_tokens(t) {
+        let (name, arg) = split_filter_fn(&tok)?;
+        if name == "blur" {
+            // `blur()` with no argument is the spec's 0; only a plain
+            // number or px length counts (`8px`, `0.5`) — `%`/keywords
+            // (calc, var leftovers) drop the declaration
+            let a = if arg.is_empty() {
+                0.0
+            } else {
+                arg.strip_suffix("px")
+                    .unwrap_or(arg)
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|n| n.is_finite())?
+            };
+            r = r.max(a.max(0.0));
+        } else if !matches!(
+            name,
+            "drop-shadow"
+                | "url"
+                | "grayscale"
+                | "sepia"
+                | "saturate"
+                | "hue-rotate"
+                | "invert"
+                | "opacity"
+                | "brightness"
+                | "contrast"
+        ) {
+            return None; // unknown function = invalid declaration
+        }
+    }
+    Some(Some(r))
+}
+
 /// `outline` — a ring painted OUTSIDE the border box (never inside, never in
 /// layout). Only "is it drawn", a width, an optional colour and an offset are
 /// modeled: every non-`none` style renders as a solid ring (`dotted`,
@@ -908,6 +964,12 @@ pub struct BoxStyle {
     /// here, so an inner box carries `own.then(ancestor)` and needs no
     /// second field. None = no filter.
     pub filter: Option<std::sync::Arc<Filter>>,
+    /// `backdrop-filter` — blur radius px applied to the already-painted
+    /// region behind this box's border box (0 = none). shortcut: only
+    /// `blur()` contributes — the other filter functions parse but are
+    /// inert here (real pages use `blur()`/`none`; see [`parse_backdrop`]),
+    /// and the blur doesn't scale with the box's transform.
+    pub backdrop: f32,
     /// CSS `float` — out-of-flow box placed at the current line's edge
     /// (layout.rs `block()`)
     pub float: Float,
@@ -1105,6 +1167,7 @@ impl Default for BoxStyle {
             shadows: Vec::new(),
             opacity: 1.0,
             filter: None,
+            backdrop: 0.0,
             float: Float::None,
             clear: Clear::None,
             valign: VAlign::Baseline,
@@ -1657,6 +1720,7 @@ const KNOWN: &[&str] = &[
     "content",
     "opacity",
     "filter",
+    "backdrop-filter",
     "text-align",
     "flex-direction",
     "flex-flow",
@@ -3167,6 +3231,11 @@ fn apply_decl(
         "filter" => {
             if let Some(f) = parse_filter(&d.1) {
                 bx.filter = f.map(std::sync::Arc::new);
+            }
+        }
+        "backdrop-filter" => {
+            if let Some(r) = parse_backdrop(&d.1) {
+                bx.backdrop = r.unwrap_or(0.0);
             }
         }
         // shortcut: hidden/collapse treated as display:none (real CSS keeps
@@ -10603,6 +10672,47 @@ mod tests {
         // grayscale twice = grayscale once (idempotent matrix)
         let twice = fl("n").expect("two grayscales");
         assert_eq!(twice.apply_rgb(0xff_0000), 0x36_3636);
+    }
+
+    #[test]
+    fn backdrop_filter_parses_the_blur_radius_and_none() {
+        let sheet = parse(
+            ".a{backdrop-filter:none}.b{backdrop-filter:blur(8px)}\
+             .c{backdrop-filter:blur(8px) brightness(1.2)}\
+             .d{backdrop-filter:bogus}\
+             .e{backdrop-filter:blur(8px);backdrop-filter:bogus}\
+             .f{backdrop-filter:blur(16px);backdrop-filter:none}\
+             .g{backdrop-filter:blur()}.h{backdrop-filter:blur(2px) grayscale(1)}\
+             .i{backdrop-filter:blur(4px) blur(8px)}\
+             .j{backdrop-filter:drop-shadow(1px 1px 2px red)}\
+             .k{color:red}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div>\
+             <div class=g></div><div class=h></div><div class=i></div>\
+             <div class=j></div><div class=k></div>",
+        );
+        let bd = |cls: &str| {
+            let n = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, n, Style::new(), None).bx.backdrop
+        };
+        // no declaration / none / unsupported-only = the initial 0 (no group)
+        assert_eq!(bd("a"), 0.0, "none clears to the initial value");
+        assert_eq!(bd("k"), 0.0, "undeclared stays at the initial value");
+        assert_eq!(bd("d"), 0.0, "unknown function drops the declaration");
+        assert_eq!(bd("j"), 0.0, "drop-shadow alone contributes no blur");
+        // the blur radius is what the property stores
+        assert_eq!(bd("b"), 8.0);
+        assert_eq!(bd("g"), 0.0, "blur() with no argument is the spec's 0");
+        // the inert functions parse alongside without eating the blur
+        assert_eq!(bd("c"), 8.0, "brightness is accepted but inert here");
+        assert_eq!(bd("h"), 2.0, "grayscale in the list doesn't drop it");
+        // multiple blurs: the largest wins (one blur window per box)
+        assert_eq!(bd("i"), 8.0);
+        // invalid keeps the earlier value; a later none still clears it
+        assert_eq!(bd("e"), 8.0, "invalid declaration keeps the earlier blur");
+        assert_eq!(bd("f"), 0.0, "later none clears the earlier blur");
     }
 
     #[test]

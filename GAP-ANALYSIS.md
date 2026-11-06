@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 170 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 171 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in Â§4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -151,9 +151,9 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 170 |
+| Names in the engine's `KNOWN` table | 171 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~583 |
+| Raw missing (non-vendor) | ~582 |
 | Coverage (non-vendor) | ~22% |
 | Coverage against names shipping in two mainstream engines | ~25-27% |
 
@@ -183,7 +183,7 @@ handled, but the paint model still applies one radius to every corner.
 | Box, display & positioning | 11 | `appearance`, `all`, `float-offset` | medium |
 | Color & theming | 9 | `accent-color`, `caret-color`, `caret-shape` | low-medium |
 | Lists | 6 | `list-style-image`, `marker-*` | low |
-| Filters & compositing | 4 | `backdrop-filter`, `mix-blend-mode` | high for visual parity |
+| Filters & compositing | 3 | `mix-blend-mode` | high for visual parity |
 | Tables | 0 | - | low |
 | Flexbox | 1 | `flex-line-count` | low |
 
@@ -299,8 +299,14 @@ relevant only when transitions and animations exist.
 - `background-clip` supports the three box values (`border-box`,
   `padding-box`, `content-box`) for the colour and gradient layers and crops
   the background image for `content-box`; `background-clip: text` is not
-  accepted (it needs a glyph-shaped mask this renderer does not have) and
-  `backdrop-filter` is absent.
+  accepted (it needs a glyph-shaped mask this renderer does not have).
+- `backdrop-filter` blurs the already-painted pixels behind a box's border
+  box: the subtree's paint entries are deferred between two paint phases,
+  the region is box-blurred (three passes ≈ Gaussian, σ = blur) and the
+  subtree repaints sharp on top. Only `blur()` contributes (the other
+  filter functions parse but are inert), the blur does not scale with the
+  box's transform, and a `position: fixed` descendant paints in the fixed
+  pass without its ancestor's blur.
 - `transform-origin` is honored for the translate/scale composite formed by
   `transform`, `translate` and `scale` (no 3D; `rotate` parses but paints
   unrotated, and glyph size still does not scale â€” see the wave 53 notes);
@@ -440,7 +446,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 848 self-authored unit tests (852 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 852 self-authored unit tests (856 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -463,10 +469,10 @@ names and missing DOM/JS members during a reference run, then rank by frequency
 and visual impact. That turns this document from a wish list into a work queue.
 Wave 66 did the CSS half (`MAZDA_MISS=1`); the ranked output (transitions,
 `filter`/`backdrop-filter`, `place-items`) now orders the CSS queue, and
-waves 67-73 took the top visual items off it (individual `translate`/`scale`,
+waves 67-74 took the top visual items off it (individual `translate`/`scale`,
 the `font` shorthand, the `filter` colour functions, the `place-items`/
-`place-self` alignment shorthands, `background-clip`, `text-shadow`, then
-`grid-auto-flow`).
+`place-self` alignment shorthands, `background-clip`, `text-shadow`,
+`grid-auto-flow`, then `backdrop-filter`).
 The DOM/JS half is
 still open.
 
@@ -511,11 +517,11 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
 
 ---
 
-## Appendix A - CSS property names accepted (170)
+## Appendix A - CSS property names accepted (171)
 
 ```text
 align-content, align-items, align-self, aspect-ratio
-background, background-clip, background-color, background-image, background-position, background-repeat
+backdrop-filter, background, background-clip, background-color, background-image, background-position, background-repeat
 background-size, border, border-bottom, border-bottom-color
 border-bottom-left-radius, border-bottom-right-radius, border-bottom-style
 border-bottom-width, border-collapse, border-color, border-left
@@ -580,7 +586,7 @@ Text and typography:
 
 Backgrounds and effects:
   background-origin, background-attachment,
-  background-blend-mode, backdrop-filter, mix-blend-mode, isolation
+  background-blend-mode, mix-blend-mode, isolation
 
 Transforms and motion:
   transform-style, perspective, perspective-origin, backface-visibility, transition,
@@ -650,7 +656,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 142 names
+# Engine property table: 171 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 

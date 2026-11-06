@@ -1845,6 +1845,43 @@ pub struct StickyGroup {
     pub fixed: bool,
 }
 
+/// One `backdrop-filter` box: the border-box region whose already-painted
+/// pixels get blurred, plus the paint-channel spans its subtree occupies —
+/// recorded exactly like [`StickyGroup`] (DFS-contiguous windows closed
+/// after the children recurse, remapped through [`zsort`]). The render
+/// pass withholds those entries from the normal channel paint, blurs the
+/// region, then paints the subtree on top (see `main.rs::render`).
+///
+/// shortcut: `blur()` doesn't scale with the box's transform (same
+/// shortcut as box-shadow's blur), and a `position: fixed` DESCENDANT of
+/// the box paints in the fixed pass without its ancestor's blur (spans
+/// split across the two passes — rare).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct BackdropGroup {
+    /// (start, end) into `Layout::shadows`
+    pub shadows: (usize, usize),
+    /// (start, end) into `Layout::rects`
+    pub rects: (usize, usize),
+    /// (start, end) into `Layout::images` from layout paint
+    pub imgs: (usize, usize),
+    /// (start, end) into `Layout::images` from the post-layout decode pass
+    /// (empty until `main.rs` fills it)
+    pub imgs_dec: (usize, usize),
+    /// (start, end) into `Layout::runs`
+    pub runs: (usize, usize),
+    /// (start, end) into `Layout::underline_rects`
+    pub uls: (usize, usize),
+    /// the border box in paint coords (x, y, w, h), already clipped to the
+    /// inherited clip window; degenerate (0, 0, 0, 0) = wholly clipped
+    pub rect: (f32, f32, f32, f32),
+    /// border-box corner radius in paint coords (0 = square corners)
+    pub radius: f32,
+    /// `blur()` radius in px — > 0 for every recorded group
+    pub blur: f32,
+    /// inside a `position: fixed` subtree (viewport coordinates, no scroll)
+    pub fixed: bool,
+}
+
 /// One frame's pin offset for one sticky group (see [`StickyGroup`]):
 /// `0.0` while the box's flow top still sits below `scroll + top`
 /// (un-stuck — layout is never touched), then it follows `scroll + top`
@@ -1914,6 +1951,55 @@ fn add_span(v: &mut [f32], (a, b): (usize, usize), d: f32) {
     }
 }
 
+/// true when channel entry `i` falls inside one of the deferred spans
+/// (see [`BackdropGroup`]).
+pub fn in_spans(spans: &[(usize, usize)], i: usize) -> bool {
+    spans.iter().any(|&(a, b)| i >= a && i < b)
+}
+
+/// Per-channel deferred spans for one paint pass: every [`BackdropGroup`]
+/// of this pass's `fixed`ness, in [`Layout`] channel order (shadows,
+/// rects, images, runs, underlines — the images channel takes both the
+/// layout-time and the decoded window). Nested/overlapping subtrees merge
+/// so each entry defers exactly once; a fully-disabled group contributes
+/// nothing. All five vectors are empty on pages without
+/// `backdrop-filter` → phase 1 paints every entry, phase 2 is skipped.
+pub fn backdrop_spans(groups: &[BackdropGroup], want_fixed: bool) -> [Vec<(usize, usize)>; 5] {
+    let mut out: [Vec<(usize, usize)>; 5] = Default::default();
+    for g in groups {
+        if g.fixed != want_fixed || g.blur <= 0.0 {
+            continue;
+        }
+        for (k, sp) in [
+            (0usize, g.shadows),
+            (1, g.rects),
+            (2, g.imgs),
+            (2, g.imgs_dec),
+            (3, g.runs),
+            (4, g.uls),
+        ] {
+            if sp.0 < sp.1 {
+                out[k].push(sp);
+            }
+        }
+    }
+    for v in &mut out {
+        v.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for &(a, b) in v.iter() {
+            match merged.last_mut() {
+                // touching or overlapping (nested) → one run; the ranges
+                // are subtree windows, so a merged run never swallows an
+                // entry that belongs to neither group
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        *v = merged;
+    }
+    out
+}
+
 pub struct Layout {
     pub runs: Vec<PositionedRun>,
     pub height: f32,
@@ -1956,6 +2042,9 @@ pub struct Layout {
     /// [`StickyGroup`]); empty on pages without one. shortcut: boxes
     /// without `top` never pin, so they get no group.
     pub sticky: Vec<StickyGroup>,
+    /// `backdrop-filter` boxes (see [`BackdropGroup`]) — empty on pages
+    /// without the property, which is what keeps their paint byte-identical
+    pub backdrops: Vec<BackdropGroup>,
     /// hover hit-test targets in tree order (element boxes + their own
     /// text runs) — reverse-scanned by [`Layout::hit_hover`]
     pub hover_targets: Vec<HoverTarget>,
@@ -2136,6 +2225,7 @@ pub fn layout_in_forms(
     let mut img_z = Vec::new();
     let mut shadows = Vec::new();
     let mut sticky = Vec::new();
+    let mut backdrops = Vec::new();
     collect_paint(
         root,
         false,
@@ -2152,6 +2242,7 @@ pub fn layout_in_forms(
         &mut img_z,
         &mut shadows,
         &mut sticky,
+        &mut backdrops,
     );
     // stacking levels: each channel paints in (z, tree order) — a stable
     // sort keyed by the stamped levels (identity when no page sets z-index);
@@ -2171,14 +2262,32 @@ pub fn layout_in_forms(
     transform_runs(root, Xf::IDENT, 0, &mut runs, &mut uls, &mut run_z);
     let mm = zsort(&mut runs, &run_z);
     if !sticky.is_empty() {
-        if let Some(m) = rm {
-            remap_sticky_spans(&mut sticky, |g| &mut g.rects, &m);
+        if let Some(m) = rm.as_ref() {
+            remap_spans(&mut sticky, |g| &mut g.rects, m, |g| {
+                g.container_y1 = g.doc_y + g.doc_h
+            });
         }
-        if let Some(m) = im {
-            remap_sticky_spans(&mut sticky, |g| &mut g.imgs, &m);
+        if let Some(m) = im.as_ref() {
+            remap_spans(&mut sticky, |g| &mut g.imgs, m, |g| {
+                g.container_y1 = g.doc_y + g.doc_h
+            });
         }
-        if let Some(m) = mm {
-            remap_sticky_spans(&mut sticky, |g| &mut g.runs, &m);
+        if let Some(m) = mm.as_ref() {
+            remap_spans(&mut sticky, |g| &mut g.runs, m, |g| {
+                g.container_y1 = g.doc_y + g.doc_h
+            });
+        }
+    }
+    // backdrop spans follow their channels through the same permutations
+    if !backdrops.is_empty() {
+        if let Some(m) = rm.as_ref() {
+            remap_spans(&mut backdrops, |g| &mut g.rects, m, disable_backdrop);
+        }
+        if let Some(m) = im.as_ref() {
+            remap_spans(&mut backdrops, |g| &mut g.imgs, m, disable_backdrop);
+        }
+        if let Some(m) = mm.as_ref() {
+            remap_spans(&mut backdrops, |g| &mut g.runs, m, disable_backdrop);
         }
     }
     // form controls: laid rects + focus visuals (caret) + value seeding
@@ -2200,6 +2309,7 @@ pub fn layout_in_forms(
         focused: state.focused,
         form_values,
         sticky,
+        backdrops,
         hover_targets,
     }
 }
@@ -2740,6 +2850,7 @@ fn collect_paint(
     img_z: &mut Vec<i32>,
     shadows: &mut Vec<ShadowRect>,
     sticky: &mut Vec<StickyGroup>,
+    backdrops: &mut Vec<BackdropGroup>,
 ) {
     if !n.is_text {
         // a fully transparent subtree paints nothing. `opacity: 0` already
@@ -2880,6 +2991,32 @@ fn collect_paint(
             })
         } else {
             clip
+        };
+        // `backdrop-filter` box: open its subtree window before any of this
+        // subtree's pushes (the same DFS-contiguity argument as the sticky
+        // group above) — closed after the children recurse. The region is
+        // the border box mapped into paint space and clipped to the
+        // inherited window (a wholly-clipped box records no group: its
+        // entries never paint, so there is nothing to blur).
+        let bd = if n.bx.backdrop > 0.0 {
+            cull_rect(m.map_rect((n.x, n.y, n.w, n.h)), clip).map(|rect| {
+                let i = backdrops.len();
+                backdrops.push(BackdropGroup {
+                    shadows: (shadows.len(), 0),
+                    rects: (out.len(), 0),
+                    imgs: (imgs.len(), 0),
+                    imgs_dec: (0, 0), // filled by main.rs's decode pass
+                    runs: (n.run_range.0 as usize, n.run_range.1 as usize),
+                    uls: (n.ul_range.0 as usize, n.ul_range.1 as usize),
+                    rect,
+                    radius: r * m.sx.abs(),
+                    blur: n.bx.backdrop,
+                    fixed,
+                });
+                i
+            })
+        } else {
+            None
         };
         // box-shadows: spread grows the rect, blur softens it; color
         // resolves to currentcolor when unspecified, alpha from the color
@@ -3126,6 +3263,7 @@ fn collect_paint(
                 img_z,
                 shadows,
                 sticky,
+                backdrops,
             );
         }
         // close the sticky group's window (own entries + every descendant)
@@ -3133,6 +3271,12 @@ fn collect_paint(
             sticky[i].shadows.1 = shadows.len();
             sticky[i].rects.1 = out.len();
             sticky[i].imgs.1 = imgs.len();
+        }
+        // close the backdrop-filter window the same way
+        if let Some(i) = bd {
+            backdrops[i].shadows.1 = shadows.len();
+            backdrops[i].rects.1 = out.len();
+            backdrops[i].imgs.1 = imgs.len();
         }
     }
 }
@@ -3276,32 +3420,47 @@ fn zsort<T>(v: &mut Vec<T>, keys: &[i32]) -> Option<Vec<usize>> {
     Some(map)
 }
 
-/// Remap one channel's sticky-group spans through [`zsort`]'s index map
+/// Remap one channel's subtree spans through [`zsort`]'s index map
 /// so they still cover the same subtree after the channel was re-sorted.
 /// A subtree that kept ONE stacking level lands in one contiguous run
 /// (stable sort) → exact remap. A nested integer `z-index` inside the
-/// sticky box splits the subtree across levels → the run can't be
-/// represented as a span, so the group is DISABLED: its clamp range is
-/// forced to 0, which pins nothing in ANY channel (safe degradation —
-/// shortcut: sticky under a splitting nested z never pins).
-fn remap_sticky_spans(
-    sticky: &mut [StickyGroup],
-    span: impl Fn(&mut StickyGroup) -> &mut (usize, usize),
+/// box splits the subtree across levels → the run can't be represented as
+/// a span, so `fail` disables the group: sticky pins nothing in ANY
+/// channel (its clamp range is forced to 0), a backdrop blurs nothing and
+/// defers nothing (see [`disable_backdrop`]) — safe degradation.
+fn remap_spans<T>(
+    v: &mut [T],
+    span: impl Fn(&mut T) -> &mut (usize, usize),
     map: &[usize],
+    fail: impl Fn(&mut T),
 ) {
-    for g in sticky.iter_mut() {
+    for g in v.iter_mut() {
         let (a, b) = *span(g);
         let ok = a < b
             && b <= map.len()
             && (a..b).all(|i| map[i] == map[a] + (i - a));
         if !ok {
             if a < b {
-                g.container_y1 = g.doc_y + g.doc_h; // room 0 → no pin
+                fail(g);
             }
             continue;
         }
         *span(g) = (map[a], map[a] + (b - a));
     }
+}
+
+/// Disable a backdrop group (see [`remap_spans`]): every span empties out
+/// so no entry defers, and `blur` drops to 0 so the region never blurs —
+/// the subtree paints in tree order exactly like a page without the
+/// property. Idempotent, so a later channel's failure re-runs it safely.
+fn disable_backdrop(g: &mut BackdropGroup) {
+    g.shadows = (0, 0);
+    g.rects = (0, 0);
+    g.imgs = (0, 0);
+    g.imgs_dec = (0, 0);
+    g.runs = (0, 0);
+    g.uls = (0, 0);
+    g.blur = 0.0;
 }
 
 /// Post-layout walk: apply each box's visual transform ([`Xf`]) to the
@@ -7447,6 +7606,7 @@ fn layout_from(
             focused: None,
             form_values: HashMap::new(),
             sticky: Vec::new(),
+            backdrops: Vec::new(),
             hover_targets: Vec::new(),
         },
         x,
@@ -11665,6 +11825,83 @@ mod tests {
         let ti = l.runs.iter().position(|r| r.text == "title").expect("title run");
         assert!(g.runs.0 <= ti && ti < g.runs.1, "run {ti} outside {:?}", g.runs);
         assert_eq!(g.top, 0.0, "top:0 → pins at the viewport top");
+    }
+
+    #[test]
+    fn backdrop_group_spans_cover_subtree_paint() {
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        // a backdrop-filter parent with a background + a text child: both
+        // channels' subtree entries must fall inside the group's spans
+        let mut panel = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                backdrop: 8.0,
+                ..BoxStyle::default()
+            },
+        );
+        panel.bx.bg = Some(0x112233);
+        panel.children = vec![leaf("inside")];
+        // a sibling without the property must not record a group
+        let plain = BoxNode::group(Style::new(), BoxStyle::default());
+        root.children = vec![panel, plain];
+        let l = layout_tree(&mut root, 300.0, &m4);
+        assert_eq!(l.backdrops.len(), 1, "only the backdrop box gets a group");
+        let g = l.backdrops[0];
+        assert_eq!(g.blur, 8.0, "the declared radius travels");
+        assert!(!g.fixed);
+        let ri = l.rects.iter().position(|r| r.4 == 0x112233).expect("bg rect");
+        assert!(
+            g.rects.0 <= ri && ri < g.rects.1,
+            "rect {ri} outside {:?}",
+            g.rects
+        );
+        let ti = l.runs.iter().position(|r| r.text == "inside").expect("run");
+        assert!(g.runs.0 <= ti && ti < g.runs.1, "run {ti} outside {:?}", g.runs);
+        // the region is the border box (no clip, identity transform), so it
+        // lands exactly where the box's own background painted
+        assert_eq!(
+            g.rect,
+            (l.rects[ri].0, l.rects[ri].1, l.rects[ri].2, l.rects[ri].3)
+        );
+    }
+
+    #[test]
+    fn backdrop_spans_merge_nested_groups_and_defer_each_entry_once() {
+        let g = |rects: (usize, usize), blur: f32, fixed: bool| BackdropGroup {
+            shadows: (0, 0),
+            rects,
+            imgs: (0, 0),
+            imgs_dec: (0, 0),
+            runs: (0, 0),
+            uls: (0, 0),
+            rect: (0.0, 0.0, 10.0, 10.0),
+            radius: 0.0,
+            blur,
+            fixed,
+        };
+        let groups = vec![
+            g((0, 10), 8.0, false), // outer subtree
+            g((3, 6), 8.0, false),  // nested inside it → one merged run
+            g((12, 15), 4.0, false), // sibling, disjoint
+            g((20, 25), 0.0, false), // disabled (split-z degrade) → inert
+            g((30, 40), 8.0, true),  // fixed → the other pass's list
+        ];
+        let now = backdrop_spans(&groups, false);
+        assert_eq!(now[1], vec![(0, 10), (12, 15)], "merged + gap kept");
+        assert!(in_spans(&now[1], 4), "a nested entry defers");
+        assert!(!in_spans(&now[1], 11), "the gap between groups doesn't defer");
+        assert!(!in_spans(&now[1], 21), "a disabled group defers nothing");
+        let fixed_pass = backdrop_spans(&groups, true);
+        assert_eq!(fixed_pass[1], vec![(30, 40)], "fixed groups split by pass");
+        // the images channel takes the layout-time AND decoded windows
+        let mut img = g((0, 0), 8.0, false);
+        img.imgs = (5, 8);
+        img.imgs_dec = (100, 103);
+        let s = backdrop_spans(&[img], false);
+        assert_eq!(s[2], vec![(5, 8), (100, 103)]);
+        // no groups → every channel empty (phase 1 paints everything)
+        let none = backdrop_spans(&[], false);
+        assert!(none.iter().all(|v| v.is_empty()));
     }
 
     #[test]

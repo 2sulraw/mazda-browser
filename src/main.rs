@@ -682,6 +682,7 @@ impl App {
                 focused: None,
                 form_values: Default::default(),
                 sticky: Vec::new(),
+                backdrops: Vec::new(),
                 hover_targets: Vec::new(),
             },
             bg: BG,
@@ -2769,6 +2770,9 @@ struct PageWire {
     /// sticky pinning records — the UI thread applies them per frame in
     /// `render` (indexes into the channels above, so they ride along)
     sticky: Vec<layout::StickyGroup>,
+    /// `backdrop-filter` region records — same story as `sticky` (the UI
+    /// thread's `render` withholds the subtree spans and blurs the region)
+    backdrops: Vec<layout::BackdropGroup>,
     /// the cascade's font-family stack table (ids are baked into run styles)
     stacks: Vec<Vec<String>>,
     /// the page's `@font-face` defs so the renderer resolves webfonts too
@@ -2873,6 +2877,7 @@ fn page_to_wire(
             .collect(),
         shadows: p.laid.shadows,
         sticky: p.laid.sticky,
+        backdrops: p.laid.backdrops,
         stacks,
         faces,
         forms: p.laid.forms,
@@ -2921,6 +2926,7 @@ fn wire_to_page(w: PageWire) -> Page {
                 .collect(),
             shadows: w.shadows,
             sticky: w.sticky,
+            backdrops: w.backdrops,
             open_line: false, // paint-only consumer; flow state not needed
             // forms state rides the wire: rects for hit-testing, focus +
             // values for painting the accent border / caret / typed text
@@ -4346,6 +4352,7 @@ fn layout_page(
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
     let mut sticky_next = 0usize; // sticky-group index counter, see decode_images
+    let mut backdrop_next = 0usize; // backdrop-group index counter, same story
     let decodes_before = imgs.decodes;
     let n_px = decode_images(
         &mut root_box,
@@ -4356,6 +4363,7 @@ fn layout_page(
         None,
         false,
         &mut sticky_next,
+        &mut backdrop_next,
         imgs,
         &fonts,
     );
@@ -4559,11 +4567,12 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
 /// that box means `collect_paint` already suppressed its background image —
 /// decoding it would draw what paint deliberately dropped (mask wins).
 ///
-/// `next` counts sticky boxes met in tree order: the walk visits the same
-/// boxes with the same predicate as `collect_paint`'s group recording, so
-/// the index lands on this box's [`layout::StickyGroup`]; each group's
-/// `imgs_dec` span then covers the images its subtree appended here (they
-/// sit past every z-sorted entry, outside the layout-time `imgs` span).
+/// `next` / `next_bd` count sticky / backdrop boxes met in tree order: the
+/// walk visits the same boxes with the same predicates as `collect_paint`'s
+/// group recording, so each index lands on this box's [`layout::StickyGroup`]
+/// / [`layout::BackdropGroup`]; each group's `imgs_dec` span then covers the
+/// images its subtree appended here (they sit past every z-sorted entry,
+/// outside the layout-time `imgs` span).
 fn decode_slot(
     src: &str,
     abs: Option<&str>,
@@ -4838,6 +4847,7 @@ fn decode_images(
     parent_bg: Option<u32>,
     parent_masked: bool,
     next: &mut usize,
+    next_bd: &mut usize,
     cache: &mut ImgCache,
     fonts: &Fonts,
 ) -> usize {
@@ -4851,6 +4861,12 @@ fn decode_images(
             *next += 1;
             i
         });
+    // same again for the backdrop-filter recording
+    let bdg = (!n.is_text && n.bx.backdrop > 0.0).then(|| {
+        let i = *next_bd;
+        *next_bd += 1;
+        i
+    });
     let img0 = laid.images.len();
     let mut count = 0usize;
     // the box's own background image loses to a live mask on the same box:
@@ -4914,10 +4930,15 @@ fn decode_images(
     let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
     let bg = n.bx.bg;
     for c in &mut n.children {
-        count += decode_images(c, base, laid, budget, fixed, bg, masked, next, cache, fonts);
+        count += decode_images(c, base, laid, budget, fixed, bg, masked, next, next_bd, cache, fonts);
     }
     if let Some(i) = grp {
         if let Some(g) = laid.sticky.get_mut(i) {
+            g.imgs_dec = (img0, laid.images.len());
+        }
+    }
+    if let Some(i) = bdg {
+        if let Some(g) = laid.backdrops.get_mut(i) {
             g.imgs_dec = (img0, laid.images.len());
         }
     }
@@ -5937,12 +5958,25 @@ fn render(
     // shift never re-sorts — zsort already ran at layout, so a moved
     // entry keeps its stacking level (sticky-vs-z is approximate)
     let so = layout::sticky_frame(laid, scroll);
-    // two passes: normal content (scrolled) first, then fixed overlays on
-    // top in viewport coordinates (no scroll offset)
-    for want_fixed in [false, true] {
+    // backdrop-filter: a backdrop box's subtree entries are WITHHELD from
+    // the normal channel paint (phase 1), its border-box region is
+    // snapshotted and blurred over what phase 1 painted, then the subtree
+    // paints on top (phase 2). Pages without the property record no groups:
+    // `has_bd` stays false, phase 1 paints every entry and phase 2 never
+    // runs — their output is byte-identical to a build without the feature.
+    let has_bd = !laid.backdrops.is_empty();
+    // one channel pass (shadows → rects → images → runs → underlines);
+    // `one` false = phase 1 paints everything EXCEPT the deferred spans,
+    // `one` true = phase 2 repaints exactly those entries; `bd` holds this
+    // pass's merged deferred spans per channel (all empty without the
+    // property, which makes phase 1 the plain paint and phase 2 a no-op)
+    let paint = |buf: &mut [u32], want_fixed: bool, one: bool, bd: &[Vec<(usize, usize)>; 5]| {
         // box-shadows under everything else in this pass — blurred rounded
         // rects, per-pixel distance falloff over blur/2
         for (i, s) in laid.shadows.iter().enumerate() {
+            if layout::in_spans(&bd[0], i) != one {
+                continue;
+            }
             if s.fixed != want_fixed {
                 continue;
             }
@@ -6006,6 +6040,9 @@ fn render(
         }
         // box backgrounds first (parent-before-child), then text on top
         for (i, &(x, y, w, h, color, rad, fixed)) in laid.rects.iter().enumerate() {
+            if layout::in_spans(&bd[1], i) != one {
+                continue;
+            }
             if fixed != want_fixed {
                 continue;
             }
@@ -6033,6 +6070,9 @@ fn render(
         }
         // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
         for (i, (x, y, w, h, img, fixed, ialpha, filt)) in laid.images.iter().enumerate() {
+            if layout::in_spans(&bd[2], i) != one {
+                continue;
+            }
             if *fixed != want_fixed {
                 continue;
             }
@@ -6069,6 +6109,9 @@ fn render(
             }
         }
         for (i, run) in laid.runs.iter().enumerate() {
+            if layout::in_spans(&bd[3], i) != one {
+                continue;
+            }
             if run.fixed != want_fixed {
                 continue;
             }
@@ -6120,6 +6163,9 @@ fn render(
             );
         }
         for (i, &(x, y, w, h, color, fixed)) in laid.underline_rects.iter().enumerate() {
+            if layout::in_spans(&bd[4], i) != one {
+                continue;
+            }
             if fixed != want_fixed {
                 continue;
             }
@@ -6135,6 +6181,22 @@ fn render(
             };
             let rgb = color & 0x00ff_ffff;
             paint_solid_rect(buf, width, height, sx, sy, w, h.max(1.0), 0.0, rgb, alpha);
+        }
+    };
+    // two passes: normal content (scrolled) first, then fixed overlays on
+    // top in viewport coordinates (no scroll offset); each pass runs the
+    // phase split above — blur only exists between them when a backdrop
+    // group of this pass's fixedness was recorded
+    for want_fixed in [false, true] {
+        let bd: [Vec<(usize, usize)>; 5] = if has_bd {
+            layout::backdrop_spans(&laid.backdrops, want_fixed)
+        } else {
+            Default::default()
+        };
+        paint(buf, want_fixed, false, &bd);
+        if has_bd {
+            blur_backdrops(buf, width, height, laid, &so, scroll, top, want_fixed);
+            paint(buf, want_fixed, true, &bd);
         }
     }
 }
@@ -6348,6 +6410,105 @@ fn draw_text_shadows(
                 let a = ((cov as u16 * la as u16) / 255) as u8;
                 if a > 0 {
                     blend(&mut buf[dy as usize * width + dx as usize], color, a);
+                }
+            }
+        }
+    }
+}
+
+/// `backdrop-filter`: snapshot the already-painted pixels under each
+/// backdrop group's border box (its subtree's entries are still withheld —
+/// see `render`'s phase split), box-blur the three colour planes by the
+/// group's radius, and write the result back REPLACING the backdrop,
+/// clipped to the rounded border box. Only this pass's `fixed`ness runs
+/// here; a disabled group (`blur <= 0`) is skipped like a missing one.
+fn blur_backdrops(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    laid: &Layout,
+    so: &layout::StickyFrame,
+    scroll: f32,
+    top: f32,
+    want_fixed: bool,
+) {
+    if laid.backdrops.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let mut plane: Vec<u8> = Vec::new();
+    let mut tmp: Vec<u8> = Vec::new();
+    for g in &laid.backdrops {
+        if g.fixed != want_fixed || g.blur <= 0.0 {
+            continue;
+        }
+        // the region moves with its sticky box like every entry in its
+        // spans (the subtree's first rect — or run — carries the summed
+        // pin offsets; pages without sticky record 0.0 everywhere)
+        let dy = so
+            .rect
+            .get(g.rects.0)
+            .or_else(|| so.run.get(g.runs.0))
+            .copied()
+            .unwrap_or(0.0);
+        let (x, y, w, h) = g.rect;
+        let y = if g.fixed { y } else { y - scroll } + dy;
+        let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + top + y);
+        let (rw, rh) = (w.max(0.0) as usize, h.max(0.0) as usize);
+        if rw == 0 || rh == 0 {
+            continue;
+        }
+        // 3 box passes of radius ≈ blur track the spec's Gaussian σ = blur
+        // (the text-shadow recipe; a single pass comes out ~2x too sharp)
+        let r = (g.blur.round() as usize).max(1);
+        plane.resize(rw * rh, 0);
+        tmp.resize(rw * rh, 0);
+        for &shift in &[16u32, 8, 0] {
+            // snapshot this plane; samples outside the buffer clamp to its
+            // edge (the same edge treatment box_blur gives its own windows)
+            for dy in 0..rh {
+                let py = (sy as i32 + dy as i32).clamp(0, height as i32 - 1);
+                for dx in 0..rw {
+                    let px = (sx as i32 + dx as i32).clamp(0, width as i32 - 1);
+                    plane[dy * rw + dx] =
+                        ((buf[py as usize * width + px as usize] >> shift) & 0xff) as u8;
+                }
+            }
+            for _ in 0..3 {
+                box_blur(&mut plane, &mut tmp, rw, rh, r);
+            }
+            // write back inside the rounded border box (corner cull like
+            // paint_solid_rect); pixels off-buffer are simply not written
+            for dy in 0..rh {
+                let ly = dy as f32;
+                for dx in 0..rw {
+                    let lx = dx as f32;
+                    if g.radius > 0.5 {
+                        let cx = if lx < g.radius {
+                            g.radius
+                        } else if lx > w - g.radius {
+                            w - g.radius
+                        } else {
+                            lx
+                        };
+                        let cy = if ly < g.radius {
+                            g.radius
+                        } else if ly > h - g.radius {
+                            h - g.radius
+                        } else {
+                            ly
+                        };
+                        if (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) > g.radius * g.radius {
+                            continue;
+                        }
+                    }
+                    let px = sx as i32 + dx as i32;
+                    let py = sy as i32 + dy as i32;
+                    if px < 0 || px >= width as i32 || py < 0 || py >= height as i32 {
+                        continue;
+                    }
+                    let idx = py as usize * width + px as usize;
+                    buf[idx] = (buf[idx] & !(0xffu32 << shift))
+                        | ((plane[dy * rw + dx] as u32) << shift);
                 }
             }
         }
@@ -6928,6 +7089,84 @@ mod tests {
         );
     }
 
+    /// Paint-only layout: a red left half behind, then one deferred subtree
+    /// rect (the backdrop box's own background) — everything else empty.
+    fn bd_page(backdrops: Vec<layout::BackdropGroup>) -> Layout {
+        Layout {
+            runs: Vec::new(),
+            height: 64.0,
+            underline_rects: Vec::new(),
+            rects: vec![
+                // red left half: layout x 0..20 → buffer 12..32 (PADDING)
+                (0.0, 0.0, 20.0, 64.0, 0x00ff_0000, 0.0, false),
+                // the backdrop box's own opaque rect (buffer 18..22 × 16..20)
+                (6.0, 4.0, 4.0, 4.0, 0x0000_ff00, 0.0, false),
+            ],
+            rect_grad: vec![None, None],
+            images: Vec::new(),
+            shadows: Vec::new(),
+            open_line: false,
+            forms: Vec::new(),
+            focused: None,
+            form_values: Default::default(),
+            sticky: Vec::new(),
+            backdrops,
+            hover_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backdrop_filter_blurs_the_region_and_paints_the_subtree_last() {
+        let (w, h) = (64usize, 64usize);
+        let group = layout::BackdropGroup {
+            shadows: (0, 0),
+            rects: (1, 2), // defers only the box's own rect
+            imgs: (0, 0),
+            imgs_dec: (0, 0),
+            runs: (0, 0),
+            uls: (0, 0),
+            // region (4, 2, 32, 40) → buffer (16, 14)..(48, 54); it straddles
+            // the red/white edge at buffer x = 32
+            rect: (4.0, 2.0, 32.0, 40.0),
+            radius: 0.0,
+            blur: 4.0,
+            fixed: false,
+        };
+        let fonts = Fonts::load();
+        let mut buf = vec![0x00ff_ffffu32; w * h];
+        render(
+            &mut buf,
+            w,
+            h,
+            &bd_page(vec![group]),
+            &fonts,
+            0.0,
+            64.0,
+            0.0,
+        );
+        let at = |x: usize, y: usize| buf[y * w + x];
+        // outside the region: the blur never writes there
+        assert_eq!(at(14, 40), 0x00ff_0000, "red left of the region stays sharp");
+        assert_eq!(at(50, 40), 0x00ff_ffff, "white right of the region stays sharp");
+        // inside: the red/white edge at buffer x = 32 got mixed by the blur
+        let edge = at(32, 40);
+        let gch = (edge >> 8) & 0xff;
+        assert!(gch > 0 && gch < 255, "region edge blurred, got {edge:#08x}");
+        // region interior far from the edge: a constant survives the blur
+        assert_eq!(at(17, 30), 0x00ff_0000, "constant interior unchanged");
+        // the deferred subtree rect painted AFTER the blur: exactly its own
+        // colour, with no green bled into the pre-blur snapshot
+        assert_eq!(at(19, 17), 0x0000_ff00, "own rect sharp on top");
+        assert_eq!(at(16, 30), 0x00ff_0000, "own rect absent from the snapshot");
+        // gating: the same channels without a group paint the plain picture
+        // (sharp edge, phase 2 never runs) — the feature is record-gated
+        let mut plain = vec![0x00ff_ffffu32; w * h];
+        render(&mut plain, w, h, &bd_page(Vec::new()), &fonts, 0.0, 64.0, 0.0);
+        assert_eq!(plain[40 * w + 32], 0x00ff_ffff, "no group → no blur");
+        assert_eq!(plain[17 * w + 19], 0x0000_ff00, "own rect still paints");
+        assert_eq!(plain[30 * w + 16], 0x00ff_0000, "no snapshot either");
+    }
+
 
     #[test]
     fn svg_text_paints_ink_over_the_vector_pass() {
@@ -7374,6 +7613,18 @@ mod tests {
                 container_y1: 500.0,
                 fixed: false,
             }],
+            backdrops: vec![layout::BackdropGroup {
+                shadows: (0, 0),
+                rects: (0, 1),
+                imgs: (0, 0),
+                imgs_dec: (0, 0),
+                runs: (0, 1),
+                uls: (0, 1),
+                rect: (1.0, 2.0, 30.0, 14.0),
+                radius: 4.0,
+                blur: 8.0,
+                fixed: false,
+            }],
             hover_targets: vec![layout::HoverTarget {
                 rect: (1.0, 2.0, 30.0, 14.0),
                 node: 7,
@@ -7438,6 +7689,10 @@ mod tests {
         assert_eq!(page.laid.sticky.len(), 1);
         assert_eq!(page.laid.sticky[0].top, 40.0);
         assert_eq!(page.laid.sticky[0].rects, (0, 1));
+        // so do the backdrop-filter region records
+        assert_eq!(page.laid.backdrops.len(), 1);
+        assert_eq!(page.laid.backdrops[0].blur, 8.0);
+        assert_eq!(page.laid.backdrops[0].rects, (0, 1));
         // hover hit-test targets ride the wire (the shell has no box tree)
         assert_eq!(page.laid.hover_targets.len(), 1);
         assert_eq!(page.laid.hover_targets[0].node, 7);
@@ -8505,6 +8760,7 @@ mod tests {
             layout::layout_tree(&mut root, vw, &|s: &str, _: &Style| s.chars().count() as f32 * 8.0);
         let mut budget = IMG_PIXEL_BUDGET;
         let mut next = 0usize;
+        let mut next_bd = 0usize;
         let fonts = Fonts::load();
         decode_images(
             &mut root,
@@ -8515,6 +8771,7 @@ mod tests {
             None,
             false,
             &mut next,
+            &mut next_bd,
             cache,
             &fonts,
         );
