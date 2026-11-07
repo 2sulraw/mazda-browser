@@ -1823,11 +1823,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mazda-sandbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "mazda-shell"
 version = "0.1.0"
 dependencies = [
  "eframe",
  "mazda-ipc",
+ "mazda-sandbox",
  "windows-sys 0.61.2",
 ]
 

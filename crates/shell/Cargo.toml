@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 mazda-ipc = { path = "../ipc" }
+mazda-sandbox = { path = "../sandbox" }
 
 [dependencies.eframe]
 version = "0.37"

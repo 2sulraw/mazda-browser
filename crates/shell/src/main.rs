@@ -22,9 +22,9 @@ use eframe::egui::{
 };
 use mazda_ipc::{Command, Event};
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,8 @@ const ACCENT: Color32 = Color32::from_rgb(0x1A, 0x73, 0xE8);
 // Renderer supervisor
 
 struct Renderer {
-    child: Child,
-    stdin: ChildStdin,
+    proc: mazda_sandbox::Process,
+    stdin: std::fs::File,
     rx: Receiver<Event>,
     exe: PathBuf,
     /// page the supervisor replays after a crash
@@ -73,18 +73,60 @@ struct Renderer {
 
 impl Renderer {
     fn spawn(exe: PathBuf, initial: Option<&str>) -> Option<Self> {
-        let mut cmd = std::process::Command::new(&exe);
-        if let Some(url) = initial {
-            cmd.arg(url);
+        // the renderer never sees the real profile: its frame file and cache
+        // live in this directory, which the sandbox grants it access to
+        let dir = std::env::temp_dir().join(format!("mazda-sandbox-{}", std::process::id()));
+        if mazda_sandbox::prepare_dir(&dir).is_err() {
+            eprintln!("[sandbox] cannot prepare {}", dir.display());
+            return None;
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .ok()?;
-        let stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
+        let tmp = dir.join("tmp");
+        let local = dir.join("localappdata");
+        std::fs::create_dir_all(&tmp).ok()?;
+        std::fs::create_dir_all(&local).ok()?;
+
+        let mut args: Vec<OsString> = Vec::new();
+        if let Some(url) = initial {
+            args.push(url.into());
+        }
+        let env = [
+            ("TMP", tmp.as_os_str().to_owned()),
+            ("TEMP", tmp.as_os_str().to_owned()),
+            ("LOCALAPPDATA", local.as_os_str().to_owned()),
+        ];
+        let memory_mb = std::env::var("MAZDA_RENDERER_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let limits = mazda_sandbox::Limits {
+            memory_mb,
+            allow_network: true,
+        };
+        let sandboxed = std::env::var("MAZDA_SANDBOX").map(|v| v != "off").unwrap_or(true);
+        let child = match if sandboxed {
+            mazda_sandbox::spawn(&exe, &args, &env, &limits)
+        } else {
+            mazda_sandbox::spawn_plain(&exe, &args, &env)
+        } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[sandbox] spawn failed: {e}");
+                return None;
+            }
+        };
+        let (stdin, stdout, stderr, proc) = child.into_parts();
+        eprintln!(
+            "[sandbox] renderer pid {} ({})",
+            proc.id(),
+            if !sandboxed {
+                "MAZDA_SANDBOX=off"
+            } else if mazda_sandbox::available() {
+                "app container + job object"
+            } else {
+                "unavailable on this platform"
+            }
+        );
+
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -99,8 +141,16 @@ impl Renderer {
             // EOF means the renderer is gone; the supervisor decides what next
             let _ = tx.send(Event::Exited);
         });
+        // the renderer's stderr is its diagnostic stream; forward it verbatim
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                eprintln!("{line}");
+            }
+        });
+
         Some(Self {
-            child,
+            proc,
             stdin,
             rx,
             exe,
@@ -110,7 +160,7 @@ impl Renderer {
     }
 
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.proc.id()
     }
 
     fn send(&mut self, cmd: Command) {
@@ -124,8 +174,8 @@ impl Renderer {
         if self.restarts >= MAX_RESTARTS {
             return false;
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.proc.kill();
+        self.proc.wait();
         let Some(mut fresh) = Self::spawn(self.exe.clone(), None) else {
             return false;
         };
@@ -139,8 +189,8 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.send(Command::Quit);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.proc.kill();
+        self.proc.wait();
     }
 }
 

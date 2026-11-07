@@ -314,3 +314,79 @@ cargo build --release --workspace --features mazda-engine/count-alloc
 .\tools\reload-soak.ps1 -Cycles 100 -LiveHeap -Url https://www.google.com
 ```
 
+# P2 — real sandbox, executed (2026-11-08)
+
+Build: `cargo build --release --workspace --offline --features mazda-engine/woff2`.
+Host: Windows 11, standard user (no administrator token).
+
+## What was built
+
+New `crates/sandbox`:
+
+- **Windows**: the renderer runs in an **AppContainer** (`MazdaBrowser.Renderer`)
+  with only the `internetClient` capability. The shell spawns it with
+  `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, which needs
+  no privileges (a standard user can do it) and gives the kernel-built lowbox
+  token. A **Job Object** caps committed memory (`MAZDA_RENDERER_MB`, default
+  512), allows exactly one process, applies UI restrictions (desktop,
+  clipboard, system parameters, global atoms) and kills the renderer when the
+  shell exits (`KILL_ON_JOB_CLOSE`). The child is created suspended, assigned
+  to the job, then resumed, so no allocation or child spawn can outrun the
+  limits.
+- **Access**: `prepare_dir` creates `%TEMP%\mazda-sandbox-<shell pid>` and adds
+  an inheritable package-SID ACE. `TMP`/`TEMP`/`LOCALAPPDATA` point there, so
+  the frame file and cache are writable while `C:\Users\<user>` is not. The
+  AppContainer redirects `%TEMP%` into
+  `localappdata\Packages\mazdabrowser.renderer\AC\Temp`; that path is created
+  up front. The renderer binary gets a read+execute ACE for the package SID.
+- **Linux** (compile-checked, not yet run on a Linux host here):
+  `PR_SET_NO_NEW_PRIVS`, `RLIMIT_AS`, and a seccomp BPF filter that returns
+  `EPERM` for `execve`/`execveat` (threads keep working). Landlock and network
+  namespaces are the next increment.
+- **Probe**: `sandbox-probe` spawns itself through the same code path and
+  checks from the inside; `tools/sandbox-check.ps1` runs it.
+
+Why not `CreateProcessAsUserW`: the account holds no
+`SeAssignPrimaryToken`/`SeIncreaseQuota`, so the call fails with 1314 even for
+a restricted token. AppContainer via `SECURITY_CAPABILITIES` is the route that
+works unprivileged — and it is the stronger isolation anyway.
+
+## Acceptance
+
+`tools/sandbox-check.ps1` (memory cap 96 MB):
+
+```
+PASS home read denied
+PASS child spawn denied
+PASS network ok
+PASS temp writable
+alloc denied
+memory cap enforced
+gate: home read denied, no child process, network ok, memory cap enforced -> PASS
+```
+
+- **Home directory**: reading a canary in `%USERPROFILE%` fails; the
+  AppContainer token has no ACE on the profile.
+- **Child process**: `cmd.exe /c exit 0` fails (job `ActiveProcessLimit = 1`).
+- **Network**: `example.com:443` connects (internetClient capability); the real
+  shell loads Google inside the container.
+- **Memory**: a 224 MB commit in a 96 MB job is refused.
+- **Real shell**: `crash-check.ps1` passes under the sandbox (page loads,
+  renderer killed, supervisor restarts, page restored); example.com renders
+  with system fonts in a screenshot.
+
+### 10 tabs under the sandbox
+
+`tools/measure-tabs.ps1`, ten real sites, one active, one renderer:
+
+| Run | Before (shell+renderer) | After | Peak | Restored | Gate |
+|-----|-------------------------|-------|------|----------|------|
+| 1 | 117.1 MB | 174.5 MB | 238.5 MB | 10/10 | PASS |
+| 2 | 114.6 MB | 181.8 MB | 240.2 MB | 10/10 | PASS |
+
+Shell ~65–79 MB, renderer ~96–103 MB, one `renderer.exe` in both runs. The
+AppContainer and job object add no measurable private bytes; the number is
+unchanged from P1 (174–182 MB vs 180.8 MB), comfortably under the 300 MB
+budget. Tab switches cost 1.3–15 s, dominated by the page fetch (no warm
+cache in a fresh sandbox temp dir), not by the sandbox.
+

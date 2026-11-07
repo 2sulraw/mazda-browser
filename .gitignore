@@ -6,3 +6,5 @@ spike-*.json
 spike-*.png
 soak-*.json
 tabs.json
+tabs-*.json
+*.log
