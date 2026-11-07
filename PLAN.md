@@ -1765,7 +1765,47 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-07 | wave 79 (real em scale + baseline, `rem` and unitless `line-height`, flex `%` limits and content-based shrink, hyphen breaks, declared `height`) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | Text had been laid out and painted at the wrong size all along: ab_glyph's `PxScale` targets the font's HEIGHT (ascent - descent), not the CSS em square, so every run was rasterized at `em/height` (Fira 5/6 = 0.833, Alfa Slab 0.73) and its baseline came from that scaled height. `em_scale` now converts `size x height_unscaled / units_per_em`, and the baseline uses the real font ascent plus CSS half-leading; Chrome canvas `measureText` on the live webfonts is the ground truth (Fira `Install@18` 51.10px, `Governance@18` 96.25px, `empowering@36` 201.82px; Alfa `Rust@18` 44.21px, `@96` 235.78px) and the engine now matches it. Pages whose font sizes were already right grew into their real text instead of looking undersized (nextjs 7578 -> 7906, MDN 2773 -> 2966, Wikipedia 24673 -> 28074). `rem` now resolves against the `<html>` element's computed font-size (the cascade visits `<html>` first and stores it in a CSS thread-local), so rust-lang.org's `html{font-size:62.5%}` + `html{font-size:75%}` = 12px and `body{font-size:1.5rem}` = 18px match Chrome (previously `rem` used the 16px default and the body was 24px); a unitless `line-height` is stored as a factor and resolved against the element's FINAL font-size (`1.6 x 18 = 28.8px`), and the engine's own default font-size moves 15px -> 16px (the UA initial). Flex: a `%` `max-`/`min-width` on an item is pinned against the ROW before anything measures it (it used to be re-resolved against the item's own slot, capping rust's `max-width:50%` columns twice), the automatic minimum size is clamped by `max-`/`min-width` (rust's 512px logos under `max-width:96px` no longer force a 512px shrink floor), and shrink is weighted by the CONTENT base instead of the margin box, so three equal `width:100%` columns stay equal when the middle one carries 48px side margins (285.3px each vs Chrome 288.3px). UAX #14 hyphen break opportunities now split a compound word at the last hyphen that fits, in line layout and in the flex floor's min-content, so `performance-critical` stops forcing an 80px column. A declared px `height` finally sizes an auto block (`.highlight{height:12px}` bars were 0px tall; `%` heights stay ignored). rust-lang.org drops 5344 -> 4113px (Chrome 3841): nav 227 (258), green 527 (510), purple 744 (738), production 416 (379), get-involved 624 (609), thanks 550 (529), purple card widths 187/229/254/287 (190/230/254/287). Suite **875** default / **878** `engine-b + woff2`; eight new tests plus the extended grid `align-content` expectation.
 
-### Wave 79 findings
+| 2026-11-07 | wave 80 (UA margins + sibling margin collapsing, replacing the 0.6em paragraph gap) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | The engine no longer invents spacing: the three synthetic `0.6 x font-size` paragraph gaps are gone, and real CSS margins do the job. Every `margin-*` longhand and shorthand now records which sides a declaration claimed (`decl::MARGIN_TOP/RIGHT/BOTTOM/LEFT`), and `ua_margins` runs at the end of the cascade — after the FINAL font-size is known, because the UA values are em-based — filling only the sides no declaration set. That is what a real UA rule loses to: a reset (`* { margin: 0 }`, or rust-lang.org's `p { margin: 12px 0 30px }`) wins wholesale, while a page that declares nothing gets the browser defaults (`p`/`dl`/`pre`/`address`/`ul`/`ol` 1em block, `blockquote`/`figure` 1em block + 40px inline, `h1` 0.67em, `h2` 0.83em, `h3` 1em, `h4` 1.33em, `h5` 1.67em, `h6` 2.33em, `dd` 40px start, `body` 8px). Ground truth came from headless Chrome's computed margins: rust body 0 / p 12/30 / h2 24/0, Hacker News body 8px on all sides, google body 0 / hr 20/7, nextjs body 0 / p 0/8, MDN body 0 / p 0 / h2 19.92/19.92 / h3 0/16 / figure 16/16 + 40px sides. In `block()` a `prev_mb` carries the previous in-flow sibling's bottom margin without adding it to `y`; the next sibling's gap is `collapse_margins(prev_mb, margin-top)` (two positives take the larger, two negatives the more negative, mixed ones add) and any line-level content resets `prev_mb` to 0. This removes the double counting that dominated real pages: every MediaWiki paragraph (`p { margin: 0.5em 0 }`) had a 25.6px boundary (8 + 8 + 9.6) where Chrome uses 8, so Wikipedia goes 28074 -> 21872px; nextjs 7906 -> 7810 (7258 on the first pre-JS layout), rust-lang.org 4113 -> 3572 (Chrome 3841 — the old synthetic gap overshot by 272, the correction now undershoots by 269, and that remaining section-spacing gap is the next layout target), MDN 2966 -> 2925 (3328), Hacker News 1782 -> 1772 (1217) — now with the UA 8px body inset, matching Chrome, and google.com 539 -> 514. Parent/first/last-child margins deliberately do not collapse through the parent (documented shortcut: the last child's held-back bottom margin is added inside the box, which is also what a BFC requires), and `hr` keeps its hard-break-leaf model with no UA margin. Suite **876** default / **879** `engine-b + woff2` (one new collapse test, ten expected-geometry updates) |
+
+### Wave 80 findings
+
+- **A synthetic paragraph gap double-counts every author margin.** The old
+  block flow summed both siblings' margins and then added `0.6em`, so
+  MediaWiki's `p { margin: 0.5em 0 }` produced 25.6px between paragraphs where
+  Chrome produces 8. Removing the gap and collapsing real margins is what
+  takes Wikipedia 28074 -> 21872px and nextjs 7906 -> 7810px. The gap was
+  never measuring the truth; it was masking missing margin rules.
+- **UA margins belong to the cascade, not to a tag table at layout time.** The
+  values are em-based, so they need the element's FINAL font-size (an author
+  `font-size` may beat the UA one), and they must fill only the sides an
+  author declaration did not set. `decl::MARGIN_*` bits make that exact:
+  rust's `p { margin: 12px 0 30px }` suppresses all four UA sides while
+  Hacker News' unstyled `p` (it has none) would receive the defaults.
+- **Sibling collapsing is the max / min / sum rule.** Two positive margins
+  take the larger, two negatives the more negative, mixed signs add (CSS
+  §8.3.1). `prev_mb` is deliberately not added to `y` when the child is
+  placed — the next sibling owns the collapse — and any text, inline box or
+  float resets it, because line boxes have no margins.
+- **The body's own margin does apply at the root.** `place(root, 0, 0, …)` adds
+  the root's resolved margins, so Hacker News' UA `body { margin: 8px }`
+  insets the page exactly as Chrome does; before this wave the root box's
+  margin was effectively invisible and HN was flush to the viewport.
+- **Parent/child collapsing is a documented approximation.** A first child's
+  top margin and a last child's bottom margin stay inside their parent instead
+  of collapsing through a padding/border-free ancestor. With no parent margin
+  the downstream flow position is the same; the visible differences are a
+  parent background covering the margin and a parent margin adding to it
+  instead of taking the max. Keeping the last child's bottom margin inside the
+  box is also what a BFC/flex item/`overflow` box must do.
+- **`hr` still has no box.** It remains a hard-break leaf with no painted rule,
+  so it takes no UA margins (google's computed `hr` is 20px/7px and only adds
+  blank space in the engine); the `<hr>` paint rule stays in the CSS queue.
+- **The remaining rust-lang.org distance is section spacing, not
+  paragraphs.** At 3572px the page is 269px short of Chrome's 3841px, while
+  the individual sections measured in wave 79 are within ~5%. The 0.6em gap
+  removal overshot in the other direction (4113 -> 3572), so the next spacing
+  work is the section/heading rules that the gap used to approximate, not the
+  paragraph margins this wave fixed.
 
 - **`PxScale` is a font height, not the em square.** ab_glyph 0.2.32 scales by
   `height_unscaled()` (ascent - descent), so passing the CSS size painted Fira

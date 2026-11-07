@@ -1086,6 +1086,15 @@ pub mod decl {
     /// author `vertical-align` — lets an HTML `valign` attribute fill the
     /// property only when CSS left it initial (table cells)
     pub const VALIGN: u32 = 1 << 7;
+    /// author `margin-*` per side: the UA sheet's em-based margins (p, h1-h6,
+    /// ul/ol, blockquote, figure, body, dd) fill only the sides a declaration
+    /// did not set, exactly like a real UA rule loses the cascade.
+    pub const MARGIN_TOP: u32 = 1 << 8;
+    pub const MARGIN_RIGHT: u32 = 1 << 9;
+    pub const MARGIN_BOTTOM: u32 = 1 << 10;
+    pub const MARGIN_LEFT: u32 = 1 << 11;
+    pub const MARGIN: u32 =
+        MARGIN_TOP | MARGIN_RIGHT | MARGIN_BOTTOM | MARGIN_LEFT;
 }
 
 /// One outer `box-shadow`: offset, blur, spread, color. `color: None` =
@@ -1255,6 +1264,39 @@ fn ua_box(tag: &str) -> BoxStyle {
         _ => {}
     }
     b
+}
+
+/// The UA sheet's block margins, in em of the element's own font-size,
+/// applied AFTER the cascade and only to the sides no author declaration set.
+/// A reset like `* { margin: 0 }` therefore wins wholesale, and a lone
+/// `margin-top` suppresses only the UA top margin.
+///
+/// shortcut: `hr` is skipped — it is still modeled as a hard-break leaf with
+/// no rule to paint, so UA margins would only add blank space.
+fn ua_margins(tag: &str, size: f32, bx: &mut BoxStyle) {
+    let (t, r, b, l) = match tag {
+        "body" => (8.0, 8.0, 8.0, 8.0),
+        "p" | "dl" | "pre" | "address" => (1.0, 0.0, 1.0, 0.0),
+        "ul" | "ol" => (1.0, 0.0, 1.0, 0.0),
+        "blockquote" | "figure" => (1.0, 40.0, 1.0, 40.0),
+        "h1" => (0.67, 0.0, 0.67, 0.0),
+        "h2" => (0.83, 0.0, 0.83, 0.0),
+        "h3" => (1.0, 0.0, 1.0, 0.0),
+        "h4" => (1.33, 0.0, 1.33, 0.0),
+        "h5" => (1.67, 0.0, 1.67, 0.0),
+        "h6" => (2.33, 0.0, 2.33, 0.0),
+        "dd" => (0.0, 0.0, 0.0, 40.0),
+        _ => return,
+    };
+    let fill = |bx: &mut BoxStyle, i: usize, bit: u32, em: f32| {
+        if bx.declared & bit == 0 {
+            bx.margin[i] = Len::Px(em * size);
+        }
+    };
+    fill(bx, 0, decl::MARGIN_TOP, t);
+    fill(bx, 1, decl::MARGIN_RIGHT, r);
+    fill(bx, 2, decl::MARGIN_BOTTOM, b);
+    fill(bx, 3, decl::MARGIN_LEFT, l);
 }
 
 /// One pseudo-class the cascade evaluates. `:hover` reads the sheet's
@@ -2372,6 +2414,10 @@ impl Sheet {
                 }
             }
         }
+        // UA margins last: they are em-based, so they need the FINAL
+        // font-size (author `font-size` may win over the UA one), and they
+        // only fill sides the cascade did not declare.
+        ua_margins(dom.tag(node), style.size, &mut bx);
         // The UA default text color (Style::new's black) is scheme-blind, but
         // per CSS UI the canvas-text default follows the USED color scheme:
         // with a declared dark scheme an author-colored-nothing page must get
@@ -3655,6 +3701,7 @@ fn apply_decl(
                 }
             }
             bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
+            bx.declared |= decl::MARGIN;
         }
         "padding" => {
             bx.pad = parse_sides(&d.1, vp);
@@ -3711,6 +3758,7 @@ fn apply_decl(
                 bx.margin[1] = parse_len(end, vp).unwrap_or(Len::Px(0.0));
             }
             bx.margin_x_auto = bx.margin_l_auto && bx.margin_r_auto;
+            bx.declared |= decl::MARGIN_LEFT | decl::MARGIN_RIGHT;
         }
         "margin-block" => {
             let tok = joined_tokens(&d.1);
@@ -3718,9 +3766,16 @@ fn apply_decl(
             let b = tok.get(1).and_then(|s| parse_len(s, vp)).unwrap_or(t);
             bx.margin[0] = t;
             bx.margin[2] = b;
+            bx.declared |= decl::MARGIN_TOP | decl::MARGIN_BOTTOM;
         }
-        "margin-block-start" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
-        "margin-block-end" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
+        "margin-block-start" => {
+            bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::MARGIN_TOP;
+        }
+        "margin-block-end" => {
+            bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::MARGIN_BOTTOM;
+        }
         // `flex: <grow> [<shrink> <basis>]` / `none` (0 0 auto) / `auto`
         // (1 1 auto) / a bare length (1 1 <length>, per spec)
         "flex-grow" => bx.grow = d.1.trim().parse::<f32>().unwrap_or(0.0).max(0.0),
@@ -3787,8 +3842,14 @@ fn apply_decl(
         // longhand auto: per-side flag; `margin_x_auto` (centering) is
         // recomputed so `margin-left: auto; margin-right: auto` still
         // centers regardless of declaration order
-        "margin-top" => bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
-        "margin-bottom" => bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0)),
+        "margin-top" => {
+            bx.margin[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::MARGIN_TOP;
+        }
+        "margin-bottom" => {
+            bx.margin[2] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
+            bx.declared |= decl::MARGIN_BOTTOM;
+        }
         "margin-left" | "margin-inline-start" => {
             if d.1.contains("auto") {
                 bx.margin_l_auto = true;
@@ -3796,6 +3857,7 @@ fn apply_decl(
             } else {
                 bx.margin[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             }
+            bx.declared |= decl::MARGIN_LEFT;
         }
         "margin-right" | "margin-inline-end" => {
             if d.1.contains("auto") {
@@ -3804,6 +3866,7 @@ fn apply_decl(
             } else {
                 bx.margin[1] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             }
+            bx.declared |= decl::MARGIN_RIGHT;
         }
         "padding-top" => {
             bx.pad[0] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));

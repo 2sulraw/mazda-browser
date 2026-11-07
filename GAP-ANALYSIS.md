@@ -278,6 +278,14 @@ relevant only when transitions and animations exist.
   Min-content and the line breaker honour UAX #14 hyphen break opportunities
   (the longest hyphen-free piece is the floor), but `hyphens: auto`
   dictionary/`soft hyphen` hyphenation is still not modeled.
+- Margins: the UA sheet supplies the browser defaults (`p`/`dl`/`pre`/
+  `address`/`ul`/`ol` 1em block, `blockquote`/`figure` 1em block + 40px
+  inline, `h1` 0.67em … `h6` 2.33em, `dd` 40px start, `body` 8px) only on the
+  sides no author declaration claimed, after the cascade and the final
+  font-size are known. Adjacent in-flow siblings collapse (positive max,
+  negative min, mixed sum), but a parent's first/last child margin is kept
+  inside the parent instead of collapsing through a padding/border-free
+  ancestor — `hr` is still a hard-break leaf with no UA margin.
 - Borders: per-side width and colour longhands parse into the existing model,
   which still keeps one colour for all sides and one radius for all corners
   (the last declaration wins); a `transparent` colour keeps the side's width
@@ -474,7 +482,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 875 self-authored unit tests (878 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 876 self-authored unit tests (879 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -534,13 +542,16 @@ resolves against the `<html>` computed font-size, and a unitless
 Chrome's 3841px, google 488 -> 539px (Chrome fits it in the 616px viewport),
 nextjs 7906 (Chrome 10548), MDN 2966 (3328), Hacker News 1782 (1214).
 Wikipedia's 28074px has no Chrome number this wave: headless Chrome served a
-Wikimedia error page. What remains: `Reflect`
+Wikimedia error page. Wave 80 then removed the synthetic 0.6em paragraph gap
+and gave the cascade real UA margins plus sibling collapsing: Wikipedia
+28074 -> 21872px (its `p { margin: 0.5em 0 }` boundaries were 25.6px, now 8),
+nextjs 7906 -> 7810, rust-lang.org 4113 -> 3572 (Chrome 3841 — the remaining
+~269px is section spacing, not paragraph margins), MDN 2966 -> 2925 (3328),
+Hacker News 1782 -> 1772 (1217) with Chrome's 8px body inset, and google
+539 -> 514. What remains: `Reflect`
 metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
 `Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`
-reads, and the spacing gaps that keep rust-lang.org at 4113px against
-Chrome's 3841px — the legacy 0.6em paragraph gap stands in for real UA
-margins (`p`, headings, lists, `blockquote`, `pre`, `hr`, `figure`, `dl`,
-`table`) and margin collapsing, which is the next headline layout fix.
+reads, and the section/heading spacing rules that keep rust-lang.org short.
 
 ### 8.2 Priority by reference impact and RAM cost
 

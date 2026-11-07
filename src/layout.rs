@@ -6018,9 +6018,10 @@ fn line_excl(
 }
 
 /// Block flow: consecutive text leaves become wrapped line segments; child
-/// boxes are placed at the running y. The 0.6*size paragraph gap is added at
-/// block boundaries only - a `<br>` inside the text advances exactly one
-/// line (see [`layout_from`]).
+/// boxes are placed at the running y. Adjacent vertical margins COLLAPSE the
+/// CSS way (two positive margins take the larger, two negative the more
+/// negative, mixed ones add); the engine no longer inserts a synthetic
+/// paragraph gap, UA margins do that job.
 ///
 /// Boxes with `inline` set (UA form-control chrome, author `display:
 /// inline-block`, promoted background/padding/margin inlines) join the
@@ -6033,6 +6034,20 @@ fn line_excl(
 /// it without affecting line height), and a box
 /// wider than its container overflows instead of shrink-wrapping its
 /// content to fit (no min-content measure).
+/// shortcut: only SIBLING margins collapse here. A parent's first/last
+/// child margin stays inside the parent instead of collapsing through it:
+/// with no parent margin the flow position downstream is identical, but a
+/// parent background paints over the margin and a parent margin adds to it
+/// instead of taking the max.
+fn collapse_margins(a: f32, b: f32) -> f32 {
+    if a >= 0.0 && b >= 0.0 {
+        a.max(b)
+    } else if a <= 0.0 && b <= 0.0 {
+        a.min(b)
+    } else {
+        a + b
+    }
+}
 fn block(
     n: &mut BoxNode,
     measure: &dyn Fn(&str, &Style) -> f32,
@@ -6050,6 +6065,10 @@ fn block(
     // n.x); y mirrors line_top + line_h.
     let mut y = n.y;
     let mut cont: Option<(f32, f32, f32)> = None;
+    // bottom margin of the previous in-flow BLOCK, not yet added to `y`:
+    // the next block's top margin collapses with it (max/add) instead of
+    // summing. Any line-level content resets it to 0.
+    let mut prev_mb = 0.0f32;
     // text-indent: the block's FIRST line starts `indent` px right
     // (negative shifts left; % resolves against this block's content
     // width). Consumed by whatever lays that first line — once per block().
@@ -6154,12 +6173,12 @@ fn block(
                 cont = None;
                 y = bottom;
             }
+            prev_mb = 0.0;
         } else if matches!(n.children[i].bx.pos, Pos::Absolute | Pos::Fixed) {
-            // out of flow: sized/placed by position_all (phase 2).
-            // shortcut: closes an open line first — keeps the legacy
-            // paragraph gap for text interrupted by an absolute box
+            // out of flow: sized/placed by position_all (phase 2). Closing an
+            // open line costs no paragraph gap — text lines have no margin.
             if let Some((top, h, _)) = cont.take() {
-                y = top + h + n.style.size * 0.6;
+                y = top + h;
             }
             i += 1;
         } else if n.children[i].is_bg || n.children[i].is_mask {
@@ -6335,14 +6354,15 @@ fn block(
             cx += ml + n.children[i].w + mr;
             y = line_top + line_h;
             cont = Some((line_top, line_h, cx));
+            prev_mb = 0.0;
             i += 1;
         } else {
-            // regular child box: close the open line + paragraph gap first
-            // (a nested block occupies the block's top — text below it is
-            // not the first line, so the indent slot is spent)
+            // regular child box: close the open line first (its height is
+            // already in `y`; a text line has no bottom margin and no
+            // synthetic paragraph gap — UA margins handle spacing)
             indent_left = false;
             if let Some((top, h, _)) = cont.take() {
-                y = top + h + n.style.size * 0.6;
+                y = top + h;
             }
             // `clear` (spec §9.5.2): start below every float this box
             // names — ancestor floats included (they ride in `floats`)
@@ -6361,18 +6381,38 @@ fn block(
                     }
                 }),
             };
-            let adv = place(&mut n.children[i], n.x, y, n.w, measure, runs, uls, &floats);
-            y += adv;
-            if n.children[i].open {
-                // child's trailing break: gap styled by the child itself
-                y += n.children[i].style.size * 0.6;
-            }
+            // Adjacent sibling margins collapse: the gap is
+            // `collapse(previous bottom, this top)`, not their sum. place()
+            // applies the top margin itself, so hand it `top - mt` and the
+            // collapsed gap lands exactly once.
+            let cmt = resolve_len(n.children[i].bx.margin[0], n.w);
+            let cmb = resolve_len(n.children[i].bx.margin[2], n.w);
+            let top = y + collapse_margins(prev_mb, cmt);
+            place(
+                &mut n.children[i],
+                n.x,
+                top - cmt,
+                n.w,
+                measure,
+                runs,
+                uls,
+                &floats,
+            );
+            // the child's own margins are already accounted for: `top` is
+            // its border-box top and `h` its content height
+            y = top + n.children[i].h;
+            prev_mb = cmb;
             i += 1;
         }
     }
     if let Some((top, h, _)) = cont {
         y = top + h;
     }
+    // The last child's bottom margin was held back so a following sibling
+    // could collapse with it. shortcut: it stays INSIDE this box (a real
+    // engine collapses it through a padding/border-free parent instead) —
+    // same downstream flow, and a BFC/clipped box must contain it anyway.
+    y += prev_mb;
     // a block formatting context (flex/grid item, `overflow` ≠ visible)
     // contains its own floats: the box grows down to the lowest float
     if n.bfc || n.bx.clip {
@@ -10167,11 +10207,12 @@ mod tests {
                 .iter()
                 .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5, r.6))
                 .collect::<Vec<_>>(),
+            // `.b` is a <p>: one line down plus its UA 1em (16px) top margin
             vec![
                 (0.0, 0.0, 120.0, 16.0 * 1.35, 0x11_22_33, 0.0, false),
                 (
                     0.0,
-                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0 * 1.35 + 16.0,
                     90.0,
                     16.0 * 1.35,
                     0x44_55_66,
@@ -10192,13 +10233,13 @@ mod tests {
                 (
                     "beta".to_string(),
                     0.0,
-                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0 * 1.35 + 16.0,
                     16.0
                 ),
                 (
                     "bold".to_string(),
                     20.0,
-                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0 * 1.35 + 16.0,
                     16.0
                 ),
             ]
@@ -10675,7 +10716,8 @@ mod tests {
 
     #[test]
     fn block_flow_paragraph_gap() {
-        // two block children: second starts after first's height + 0.6*size gap
+        // two adjacent blocks with no margins: no synthetic gap, the second
+        // starts where the first ends (UA margins come from css.rs)
         let mut n = BoxNode::group(Style::new(), BoxStyle::default());
         let mk_block = |t: &str| {
             let mut b = BoxNode::group(
@@ -10692,8 +10734,35 @@ mod tests {
         let l = layout_tree(&mut n, 100.0, &m4);
         assert_eq!(l.runs.len(), 2);
         let line = 16.0 * 1.35;
-        let expect = line + 16.0 * 0.6;
-        assert!((l.runs[1].y - expect).abs() < 0.01, "y={} expect={}", l.runs[1].y, expect);
+        assert!((l.runs[1].y - line).abs() < 0.01, "y={} expect={}", l.runs[1].y, line);
+    }
+
+    #[test]
+    fn sibling_vertical_margins_collapse() {
+        // 15px bottom against 20px top → 20px gap, not 35 (CSS §8.3.1);
+        // two negatives take the more negative one, mixed ones add
+        let mk = |mt: f32, mb: f32| {
+            let mut b = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    margin: [Len::Px(mt), Len::Px(0.0), Len::Px(mb), Len::Px(0.0)],
+                    ..BoxStyle::default()
+                },
+            );
+            b.children = vec![leaf("x")];
+            b
+        };
+        let line = 16.0 * 1.35;
+        let run_y = |first_mb: f32, second_mt: f32| {
+            let mut n = BoxNode::group(Style::new(), BoxStyle::default());
+            n.children = vec![mk(0.0, first_mb), mk(second_mt, 0.0)];
+            let l = layout_tree(&mut n, 100.0, &m4);
+            l.runs[1].y - line
+        };
+        assert!((run_y(15.0, 20.0) - 20.0).abs() < 0.01, "positive max");
+        assert!((run_y(-15.0, -20.0) + 20.0).abs() < 0.01, "negative min");
+        assert!((run_y(15.0, -20.0) + 5.0).abs() < 0.01, "mixed add");
     }
 
     #[test]
@@ -11145,9 +11214,9 @@ mod tests {
             "inline box y={}",
             n.children[0].children[1].y
         );
-        // b2 starts after b1 + the 0.6em paragraph gap — same geometry as
-        // the pre-float engine
-        let expect = line + 16.0 * 0.6;
+        // b2 starts right after b1 — no paragraph gap, and neither block
+        // declares a margin
+        let expect = line;
         assert!((n.children[1].y - expect).abs() < 0.01, "b2.y={} expect={}", n.children[1].y, expect);
         assert_eq!(l.runs.len(), 2);
         assert!((l.runs[1].y - expect).abs() < 0.01, "second run y={}", l.runs[1].y);
@@ -11325,8 +11394,10 @@ mod tests {
         let span = &p.children[0];
         assert_eq!(span.bx.float, Float::Left, "float parsed through the pipeline");
         assert!(!span.inline, "floated inline blockifies to a block-level box");
+        // the <p> carries the UA 1em top margin (16px), so its content
+        // starts one em down; the float sits at that flow edge
         assert!(
-            (span.x - 0.0).abs() < 0.01 && (span.y - 0.0).abs() < 0.01,
+            (span.x - 0.0).abs() < 0.01 && (span.y - 16.0).abs() < 0.01,
             "float at ({}, {})",
             span.x,
             span.y
@@ -11524,10 +11595,10 @@ mod tests {
         n.children = vec![mk(Len::Px(0.0)), mk(Len::Px(15.0))];
         let l = layout_tree(&mut n, 100.0, &m4);
         let line = 16.0 * 1.35;
-        let gap = 16.0 * 0.6; // block-boundary paragraph gap
-        // second block: first line + gap + 15px margin-top
+        // second block: first line + its own 15px margin-top (the first
+        // block declares no bottom margin, so nothing absorbs it)
         assert!(
-            (l.runs[1].y - (line + gap + 15.0)).abs() < 0.01,
+            (l.runs[1].y - (line + 15.0)).abs() < 0.01,
             "y={}",
             l.runs[1].y
         );
@@ -12011,8 +12082,7 @@ mod tests {
         root.children = vec![first, second];
         let l = layout_tree(&mut root, 300.0, &m4);
         let line = 16.0 * 1.35;
-        let gap = 16.0 * 0.6;
-        assert!((l.images[0].1 - (line + gap)).abs() < 0.01, "img y={}", l.images[0].1);
+        assert!((l.images[0].1 - line).abs() < 0.01, "img y={}", l.images[0].1);
     }
 
     // ---- position (relative / absolute / fixed) ----
@@ -12040,9 +12110,9 @@ mod tests {
         let abs = pos_box(Pos::Absolute, [Some(Len::Px(10.0)), None, None, Some(Len::Px(20.0))], vec![leaf("abs")]);
         root.children = vec![flow, abs];
         let l = layout_tree(&mut root, 300.0, &m4);
-        // out-of-flow: contributes nothing to the parent's height
-        // (flow line + trailing paragraph gap after the child's open line)
-        let flow_h = 16.0 * 1.35 + 16.0 * 0.6;
+        // out-of-flow: contributes nothing to the parent's height (the flow
+        // line is the whole height — no synthetic paragraph gap)
+        let flow_h = 16.0 * 1.35;
         assert!((root.h - flow_h).abs() < 0.01, "root.h={} (flow only)", root.h);
         let abs_run = l.runs.iter().find(|r| r.text == "abs").expect("abs run");
         let flow_run = l.runs.iter().find(|r| r.text == "flowtxt").expect("flow run");
@@ -12083,10 +12153,10 @@ mod tests {
         root.children = vec![rel, inner];
         let l = layout_tree(&mut root, 300.0, &m4);
         // relative stays in flow: the sibling still starts at flow position
-        // (two lines + a trailing paragraph gap after each open child line)
+        // (two lines, no synthetic gap between them)
         let line = 16.0 * 1.35;
-        let h = line * 2.0 + 16.0 * 0.6 * 2.0;
-        assert!((root.h - h).abs() < 0.01, "h={} = two lines + gaps", root.h);
+        let h = line * 2.0;
+        assert!((root.h - h).abs() < 0.01, "h={} = two lines", root.h);
         let moved = l.runs.iter().find(|r| r.text == "moved").expect("run");
         assert!((moved.x - 7.0).abs() < 0.01, "x={}", moved.x);
         assert!((moved.y - 5.0).abs() < 0.01, "y={}", moved.y);
@@ -14482,11 +14552,12 @@ line</textarea></div>"#,
                 .iter()
                 .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5, r.6))
                 .collect::<Vec<_>>(),
+            // `.b` is a <p>: one line down plus its UA 1em (16px) top margin
             vec![
                 (0.0, 0.0, 120.0, 16.0 * 1.35, 0x11_22_33, 0.0, false),
                 (
                     0.0,
-                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0 * 1.35 + 16.0,
                     90.0,
                     16.0 * 1.35,
                     0x44_55_66,
@@ -14507,13 +14578,13 @@ line</textarea></div>"#,
                 (
                     "beta".to_string(),
                     0.0,
-                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0 * 1.35 + 16.0,
                     16.0
                 ),
                 (
                     "bold".to_string(),
                     20.0,
-                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0 * 1.35 + 16.0,
                     16.0
                 ),
             ]
@@ -15157,8 +15228,8 @@ line</textarea></div>"#,
             .collect();
         assert_eq!(
             dump,
-            vec![("plain".into(), 0.0, 0.0), ("text".into(), 24.0, 0.0)],
-            "a plain <p> keeps its flush-left geometry"
+            vec![("plain".into(), 0.0, 16.0), ("text".into(), 24.0, 16.0)],
+            "a plain <p> is flush left and starts under its UA 1em top margin"
         );
     }
 }
