@@ -197,14 +197,7 @@ fn pat_part_leaves(pp: &super::parser::PatPart) -> Vec<Rc<str>> {
 }
 
 fn make_closure(_e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, is_arrow: bool) -> Val {
-    Val::Func(Rc::new(Closure {
-        def: f.clone(),
-        env: env.clone(),
-        this: None,
-        is_arrow,
-        props: RefCell::new(Vec::new()),
-        proto: RefCell::new(None),
-    }))
+    Val::Func(new_closure(f.clone(), env.clone(), None, is_arrow))
 }
 
 /// Run a function body to completion (used by plain calls and the async
@@ -577,14 +570,7 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
 /// helper: build a closure Val from an FnDef (accessors etc.)
 fn make_val_closure(e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, arrow: bool) -> Val {
     let _ = e;
-    Val::Func(Rc::new(Closure {
-        def: f.clone(),
-        env: env.clone(),
-        this: None,
-        is_arrow: arrow,
-        props: RefCell::new(Vec::new()),
-        proto: RefCell::new(None),
-    }))
+    Val::Func(new_closure(f.clone(), env.clone(), None, arrow))
 }
 
 /// helper: `Err(JsError::Throw(v))` -> Some(v) without consuming
@@ -821,16 +807,16 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
 /// snapshot), Sets/Maps (hidden payload props) and user `@@iterator`
 /// results; anything else throws a clear TypeError.
 pub(crate) fn make_iterator(source: Val, kind: IterKind) -> Val {
-    Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Iterator(Box::new(IterState {
+    Val::Obj(new_obj(
+        ObjKind::Iterator(Box::new(IterState {
             source,
             kind,
             index: 0,
             done: false,
         })),
-        props: Vec::new(),
-        proto: None,
-    })))
+        Vec::new(),
+        None,
+    ))
 }
 
 /// The raw sequence slot `i` (for Map sources this is the `[k, v]` pair).
@@ -1086,16 +1072,12 @@ fn tagged_args(e: &mut JsEngine, env: &Rc<Env>, segs: &[TplSeg]) -> Result<Vec<V
             TplSeg::Expr(x) => vals.push(eval_expr(e, env, x)?),
         }
     }
-    let raw = Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Array(cooked.clone()),
-        props: Vec::new(),
-        proto: None,
-    })));
-    let strings = Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Array(cooked),
-        props: vec![(Rc::from("raw"), raw)],
-        proto: None,
-    })));
+    let raw = Val::Obj(new_obj(ObjKind::Array(cooked.clone()), Vec::new(), None));
+    let strings = Val::Obj(new_obj(
+        ObjKind::Array(cooked),
+        vec![(Rc::from("raw"), raw)],
+        None,
+    ));
     let mut out = Vec::with_capacity(vals.len() + 1);
     out.push(strings);
     out.extend(vals);
@@ -1485,14 +1467,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             Ok(o)
         }
         ExprKind::Func(f) => {
-            let c = Rc::new(Closure {
-                def: f.clone(),
-                env: env.clone(),
-                this: None,
-                is_arrow: false,
-                props: RefCell::new(Vec::new()),
-                proto: RefCell::new(None),
-            });
+            let c = new_closure(f.clone(), env.clone(), None, false);
             // a named function expression binds its own name inside its scope
             // (`let f = function fact() { fact() }`); declarations already
             // bind the name in the enclosing env, so this child env is
@@ -1500,14 +1475,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             // so the bound name sees the self-binding too.
             if !f.name.is_empty() {
                 let fenv = Env::child(env);
-                let c = Rc::new(Closure {
-                    def: f.clone(),
-                    env: fenv.clone(),
-                    this: None,
-                    is_arrow: false,
-                    props: RefCell::new(Vec::new()),
-                    proto: RefCell::new(None),
-                });
+                let c = new_closure(f.clone(), fenv.clone(), None, false);
                 fenv.declare(f.name.clone(), Val::Func(c.clone()), false);
                 return Ok(Val::Func(c));
             }
@@ -1517,14 +1485,12 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             // lexical this captured at creation; the body is hoisted at
             // CALL time into the fresh call env (see `call_inner`)
             let lexical_this = e.env_get(env, "this");
-            Ok(Val::Func(Rc::new(Closure {
-                def: f.clone(),
-                env: env.clone(),
-                this: Some(Box::new(lexical_this)),
-                is_arrow: true,
-                props: RefCell::new(Vec::new()),
-                proto: RefCell::new(None),
-            })))
+            Ok(Val::Func(new_closure(
+                f.clone(),
+                env.clone(),
+                Some(Box::new(lexical_this)),
+                true,
+            )))
         }
         ExprKind::Seq(list) => {
             let mut last = Val::Undefined;
@@ -1553,14 +1519,14 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
         }
         ExprKind::Regex { pattern, flags } => {
             let compiled = e.regex_from_literal(pattern.clone(), flags.clone())?;
-            Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-                kind: ObjKind::Regex(ReInst {
+            Ok(Val::Obj(new_obj(
+                ObjKind::Regex(ReInst {
                     re: compiled,
                     last_index: std::cell::Cell::new(0.0),
                 }),
-                props: Vec::new(),
-                proto: None,
-            }))))
+                Vec::new(),
+                None,
+            )))
         }
         ExprKind::Yield(_) => Err(JsError::throw(
             "SyntaxError: yield is only valid inside generator functions",
@@ -1694,11 +1660,7 @@ pub(crate) fn construct(e: &mut JsEngine, f: Val, argvals: Vec<Val>) -> Result<V
     let fresh = match &f {
         Val::Func(c) => {
             let proto = ensure_prototype(c);
-            Val::Obj(Rc::new(RefCell::new(Obj {
-                kind: ObjKind::Plain,
-                props: Vec::new(),
-                proto: Some(proto),
-            })))
+            Val::Obj(new_obj(ObjKind::Plain, Vec::new(), Some(proto)))
         }
         _ => Val::new_object(),
     };
@@ -1727,11 +1689,11 @@ pub(crate) fn ensure_prototype(c: &Rc<Closure>) -> Rc<RefCell<Obj>> {
             return o.clone();
         }
     }
-    let proto = Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Plain,
-        props: vec![(Rc::from("constructor"), Val::Func(c.clone()))],
-        proto: None,
-    }));
+    let proto = new_obj(
+        ObjKind::Plain,
+        vec![(Rc::from("constructor"), Val::Func(c.clone()))],
+        None,
+    );
     c.props
         .borrow_mut()
         .push((Rc::from("prototype"), Val::Obj(proto.clone())));
@@ -2636,14 +2598,7 @@ pub(crate) fn call_method(
                         // the wrapped function's own frame supplies the source
                         src: 0,
                     });
-                    Ok(Val::Func(Rc::new(Closure {
-                        def,
-                        env: Env::root(),
-                        this: None,
-                        is_arrow: false,
-                        props: RefCell::new(Vec::new()),
-                        proto: RefCell::new(None),
-                    })))
+                    Ok(Val::Func(new_closure(def, Env::root(), None, false)))
                 }
                 _ => unreachable!(),
             }

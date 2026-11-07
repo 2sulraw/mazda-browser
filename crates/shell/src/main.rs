@@ -1,41 +1,83 @@
-//! Phase S browser shell: a thin eframe window over a separate renderer
-//! process.
+//! P1 browser shell: the trusted side of the process split.
 //!
-//! It owns the window and the input, spawns `renderer`, forwards scroll/click
-//! over stdin, and paints the frame the renderer mapped into shared memory.
-//! The point of this binary is to measure the split, not to be the final UI.
+//! It owns the window, the tabs and the input; it supervises exactly one
+//! `renderer` process, forwards commands over stdin and paints the
+//! double-buffered frame the renderer publishes in shared memory.
+//!
+//! Tabs are shell state: a tab is a URL, a label and a scroll offset. Only the
+//! active tab has a page in the renderer, so the other nine are hibernated by
+//! construction — there is no engine heap to unload. Switching tabs replays
+//! the tab's DOM snapshot in the same renderer process.
+//!
+//! If the renderer dies, it is restarted and the active tab is replayed from
+//! its snapshot. A small memory governor samples the renderer and reclaims it
+//! (restart + snapshot restore) when it goes over budget.
+//!
+//! For measurement the shell also accepts line commands on stdin:
+//! `tab <n>`, `open <url>`, `close <n>`, `reload`, `status`, `quit`. It answers
+//! on stdout with `[tabs]`, `[page]`, `[gov]` and `[status]` lines.
 
-use eframe::egui;
+use eframe::egui::{
+    self, Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, ViewportCommand,
+};
+use mazda_ipc::{Command, Event};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-enum Ev {
-    Frame {
-        path: String,
-        w: usize,
-        h: usize,
-        seq: u32,
-    },
-    Title(String),
-    Nav(String),
-    Error(String),
-    Exited,
-}
+/// How many times a renderer may be restarted for crashes before the shell
+/// gives up. Reset by every successful page (`title` event), so a crash loop
+/// on one broken page cannot spin forever. Governor reclaims do not count.
+const MAX_RESTARTS: u32 = 5;
+const GOVERNOR_PERIOD: Duration = Duration::from_secs(3);
+const RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+
+// Custom chrome. The window has no OS decorations: the titlebar, tabs and
+// window buttons are ours, so the tab strip can live where the title goes.
+const TITLE_H: f32 = 40.0;
+const TOOLBAR_H: f32 = 44.0;
+const STATUS_H: f32 = 22.0;
+const WIN_BTN_W: f32 = 46.0;
+const LOGO_W: f32 = 44.0;
+
+const TITLE_BG: Color32 = Color32::from_rgb(0xDE, 0xE1, 0xE6);
+const TOOLBAR_BG: Color32 = Color32::from_rgb(0xF1, 0xF3, 0xF4);
+const STATUS_BG: Color32 = Color32::from_rgb(0xF1, 0xF3, 0xF4);
+const TAB_ACTIVE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+const TAB_HOVER: Color32 = Color32::from_rgb(0xD0, 0xD4, 0xD9);
+const TAB_CLOSE_HOVER: Color32 = Color32::from_rgb(0xC2, 0xC6, 0xCB);
+const WIN_HOVER: Color32 = Color32::from_rgb(0xCB, 0xD0, 0xD6);
+const CLOSE_RED: Color32 = Color32::from_rgb(0xE8, 0x11, 0x23);
+const PILL_BG: Color32 = Color32::from_rgb(0xE6, 0xE9, 0xED);
+const PILL_HOVER: Color32 = Color32::from_rgb(0xD8, 0xDC, 0xE1);
+const BORDER: Color32 = Color32::from_rgb(0xCF, 0xD3, 0xD8);
+const TEXT: Color32 = Color32::from_rgb(0x20, 0x21, 0x24);
+const MUTED: Color32 = Color32::from_rgb(0x5F, 0x63, 0x68);
+const ACCENT: Color32 = Color32::from_rgb(0x1A, 0x73, 0xE8);
+
+// ---------------------------------------------------------------------------
+// Renderer supervisor
 
 struct Renderer {
     child: Child,
-    stdin: std::process::ChildStdin,
-    rx: Receiver<Ev>,
+    stdin: ChildStdin,
+    rx: Receiver<Event>,
+    exe: PathBuf,
+    /// page the supervisor replays after a crash
+    url: String,
+    restarts: u32,
 }
 
 impl Renderer {
-    fn spawn(url: &str) -> Option<Self> {
-        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let exe = dir.join(if cfg!(windows) { "renderer.exe" } else { "renderer" });
-        let mut child = Command::new(exe)
-            .arg(url)
+    fn spawn(exe: PathBuf, initial: Option<&str>) -> Option<Self> {
+        let mut cmd = std::process::Command::new(&exe);
+        if let Some(url) = initial {
+            cmd.arg(url);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -47,51 +89,166 @@ impl Renderer {
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                let ev = if let Some(rest) = line.strip_prefix("frame ") {
-                    let mut it = rest.split_whitespace();
-                    let path = it.next().unwrap_or("").to_string();
-                    let w = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let h = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let _doc_h: f32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                    let seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    Ev::Frame { path, w, h, seq }
-                } else if let Some(t) = line.strip_prefix("title ") {
-                    Ev::Title(t.to_string())
-                } else if let Some(n) = line.strip_prefix("nav ") {
-                    Ev::Nav(n.to_string())
-                } else if let Some(e) = line.strip_prefix("error ") {
-                    Ev::Error(e.to_string())
-                } else {
+                let Some(ev) = Event::decode(&line) else {
                     continue;
                 };
                 if tx.send(ev).is_err() {
                     break;
                 }
             }
-            let _ = tx.send(Ev::Exited);
+            // EOF means the renderer is gone; the supervisor decides what next
+            let _ = tx.send(Event::Exited);
         });
-        Some(Self { child, stdin, rx })
+        Some(Self {
+            child,
+            stdin,
+            rx,
+            exe,
+            url: initial.unwrap_or("").to_string(),
+            restarts: 0,
+        })
     }
 
-    fn send(&mut self, cmd: &str) {
-        let _ = writeln!(self.stdin, "{cmd}");
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn send(&mut self, cmd: Command) {
+        let _ = writeln!(self.stdin, "{}", cmd.encode());
         let _ = self.stdin.flush();
+    }
+
+    /// Restart the renderer without an initial load; the caller sends the
+    /// resize + restore commands once it knows the current viewport.
+    fn restart(&mut self) -> bool {
+        if self.restarts >= MAX_RESTARTS {
+            return false;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let Some(mut fresh) = Self::spawn(self.exe.clone(), None) else {
+            return false;
+        };
+        fresh.url = self.url.clone();
+        fresh.restarts = self.restarts + 1;
+        *self = fresh;
+        true
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        let _ = self.send("quit");
+        let _ = self.send(Command::Quit);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tabs
+
+struct Tab {
+    url: String,
+    label: String,
+    scroll: f32,
+}
+
+impl Tab {
+    fn new(url: &str) -> Self {
+        let url = url.trim().to_string();
+        Self {
+            label: short_title(&url),
+            url,
+            scroll: 0.0,
+        }
+    }
+}
+
+/// Short tab-label from a URL: host minus `www.`, or `New tab`.
+fn short_title(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let h = host.strip_prefix("www.").unwrap_or(host);
+    if h.is_empty() {
+        "New tab".into()
+    } else {
+        h.to_string()
+    }
+}
+
+/// Accept bare hosts and `host/path` the way an address bar should.
+fn normalize(input: &str) -> String {
+    let s = input.trim();
+    if s.is_empty() || s.contains("://") || s.starts_with("about:") || s.starts_with("data:") {
+        return s.to_string();
+    }
+    if s.starts_with("localhost") || s.parse::<std::net::IpAddr>().is_ok() {
+        return format!("http://{s}");
+    }
+    if s.contains('.') && !s.contains(' ') {
+        return format!("https://{s}");
+    }
+    s.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Control channel (stdin) — used by the measurement tools
+
+enum Ctl {
+    Tab(usize),
+    Open(String),
+    Close(usize),
+    Reload,
+    Status,
+    Quit,
+}
+
+impl Ctl {
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let rest = rest.trim();
+        match head {
+            "tab" => rest.parse().ok().map(Ctl::Tab),
+            "open" if !rest.is_empty() => Some(Ctl::Open(rest.to_string())),
+            "close" => rest.parse().ok().map(Ctl::Close),
+            "reload" => Some(Ctl::Reload),
+            "status" => Some(Ctl::Status),
+            "quit" => Some(Ctl::Quit),
+            _ => None,
+        }
+    }
+}
+
+fn spawn_control() -> Receiver<Ctl> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines().map_while(Result::ok) {
+            let Some(c) = Ctl::parse(&line) else { continue };
+            if tx.send(c).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+// ---------------------------------------------------------------------------
+// Shell
+
 struct Shell {
     r: Renderer,
+    tabs: Vec<Tab>,
+    active: usize,
     map: Option<mazda_ipc::FrameMap>,
     map_path: String,
     tex: Option<egui::TextureHandle>,
+    /// reusable RGBA scratch buffer for texture uploads
+    rgba: Vec<u8>,
     seq: u32,
     scroll: f32,
     /// time the last scroll command was written; a frame arriving after it
@@ -102,145 +259,1061 @@ struct Shell {
     err: Option<String>,
     /// content size last sent to the renderer
     size: (usize, usize),
+    /// set after a restart: replay this page once the new renderer is sized
+    pending_restore: Option<String>,
+    /// scroll to apply when the next `title` lands (tab switch / restore)
+    pending_scroll: Option<f32>,
+    /// a page load is in flight
+    loading: bool,
+    url_edit: String,
+    url_focused: bool,
+    focus_url: bool,
+    ctl: Receiver<Ctl>,
+    /// Requests written to the renderer, oldest first. The renderer answers
+    /// one `title`/`nav` per request in order, so an event belongs to the
+    /// front entry even when the user switched tabs while it was in flight.
+    /// Without this, a slow load's title landed on whichever tab was active
+    /// when it finished (the one-tab lag measured by `measure-tabs.ps1`).
+    inflight: VecDeque<(usize, String)>,
+    // governor
+    budget_mb: f64,
+    last_sample: Instant,
+    last_mb: f64,
+    over: u32,
+    last_reclaim: Instant,
 }
 
 impl Shell {
-    fn new(url: &str) -> Option<Self> {
-        let r = Renderer::spawn(url)?;
+    fn new(tabs: Vec<Tab>, active: usize) -> Option<Self> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let exe = dir.join(if cfg!(windows) { "renderer.exe" } else { "renderer" });
+        let mut tabs = tabs;
+        if tabs.is_empty() {
+            tabs.push(Tab::new(""));
+        }
+        let active = active.min(tabs.len() - 1);
+        let start = tabs[active].url.clone();
+        let r = Renderer::spawn(exe, (!start.is_empty()).then_some(start.as_str()))?;
+        let budget_mb = std::env::var("MAZDA_BUDGET_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(280.0);
+        let url_edit = tabs[active].url.clone();
+        let mut inflight = VecDeque::new();
+        if !start.is_empty() {
+            // `Renderer::spawn` already asked for this page
+            inflight.push_back((active, start.clone()));
+        }
         Some(Self {
             r,
+            tabs,
+            active,
+            inflight,
             map: None,
             map_path: String::new(),
             tex: None,
+            rgba: Vec::new(),
             seq: 0,
             scroll: 0.0,
             sent: None,
             lat: Vec::new(),
-            title: url.to_string(),
+            title: String::new(),
             err: None,
             size: (0, 0),
+            pending_restore: None,
+            pending_scroll: None,
+            loading: !url_edit.is_empty(),
+            url_edit,
+            url_focused: false,
+            focus_url: false,
+            ctl: spawn_control(),
+            budget_mb,
+            last_sample: Instant::now(),
+            last_mb: 0.0,
+            over: 0,
+            // allow the first reclaim immediately (tests set a tiny budget)
+            last_reclaim: Instant::now() - RECLAIM_COOLDOWN,
         })
+    }
+
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn save_scroll(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.scroll = self.scroll;
+        }
+    }
+
+    /// Load `url` in the active tab (fresh fetch).
+    fn navigate(&mut self, url: String) {
+        self.navigate_tab(self.active, url);
+    }
+
+    /// Load `url` in tab `tab`. Events come back in request order, so the
+    /// request is queued for [`Shell::drain`] to attribute correctly even if
+    /// the user switches away before the page finishes.
+    fn navigate_tab(&mut self, tab: usize, url: String) {
+        let url = normalize(&url);
+        if url.is_empty() {
+            return;
+        }
+        let active = tab == self.active;
+        if active {
+            self.save_scroll();
+        }
+        if let Some(t) = self.tabs.get_mut(tab) {
+            t.url = url.clone();
+            t.label = short_title(&url);
+            t.scroll = 0.0;
+        }
+        if active {
+            self.url_edit = url.clone();
+            self.scroll = 0.0;
+            self.pending_scroll = None;
+            self.loading = true;
+            self.err = None;
+            self.tex = None;
+            self.r.url = url.clone();
+            self.title.clear();
+            println!("[nav] {url}");
+        }
+        self.inflight.push_back((tab, url.clone()));
+        self.r.send(Command::Load(url));
+    }
+
+    /// Switch to tab `i`, replaying its snapshot in the renderer.
+    fn select_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() || i == self.active {
+            return;
+        }
+        self.save_scroll();
+        self.active = i;
+        let (url, scroll) = {
+            let t = &self.tabs[i];
+            (t.url.clone(), t.scroll)
+        };
+        self.url_edit = url.clone();
+        self.scroll = scroll;
+        self.pending_scroll = None;
+        self.loading = false;
+        self.err = None;
+        self.tex = None;
+        self.title.clear();
+        self.r.url = url.clone();
+        if url.is_empty() {
+            self.pending_scroll = None;
+        } else {
+            self.loading = true;
+            self.inflight.push_back((i, url.clone()));
+            self.r.send(Command::Restore(url.clone()));
+            self.pending_scroll = Some(scroll);
+        }
+        println!(
+            "[tabs] active={} n={} url={}",
+            self.active,
+            self.tabs.len(),
+            url
+        );
+    }
+
+    fn new_tab(&mut self) {
+        self.save_scroll();
+        self.tabs.push(Tab::new(""));
+        let i = self.tabs.len() - 1;
+        self.active = i;
+        self.scroll = 0.0;
+        self.pending_scroll = None;
+        self.loading = false;
+        self.tex = None;
+        self.url_edit.clear();
+        self.focus_url = true;
+        println!("[tabs] active={} n={} url=", self.active, self.tabs.len());
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(i);
+        if self.tabs.is_empty() {
+            self.tabs.push(Tab::new(""));
+        }
+        let was_active = i == self.active;
+        if i < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+        if was_active {
+            let (url, scroll) = {
+                let t = &self.tabs[self.active];
+                (t.url.clone(), t.scroll)
+            };
+            self.url_edit = url.clone();
+            self.scroll = scroll;
+            self.tex = None;
+            self.r.url = url.clone();
+            if url.is_empty() {
+                self.loading = false;
+                self.pending_scroll = None;
+            } else {
+                self.loading = true;
+                self.title.clear();
+                self.inflight.push_back((self.active, url.clone()));
+                self.r.send(Command::Restore(url));
+                self.pending_scroll = Some(scroll);
+            }
+        }
+        println!(
+            "[tabs] active={} n={} url={}",
+            self.active,
+            self.tabs.len(),
+            self.active_tab().url
+        );
+    }
+
+    fn reload(&mut self) {
+        let url = self.active_tab().url.clone();
+        if !url.is_empty() {
+            self.navigate(url);
+        }
+    }
+
+    fn apply_pending_scroll(&mut self) {
+        if let Some(s) = self.pending_scroll.take() {
+            if s > 0.0 {
+                self.scroll = s;
+                self.r.send(Command::Scroll(s));
+            }
+        }
     }
 
     fn drain(&mut self) {
         while let Ok(ev) = self.r.rx.try_recv() {
             match ev {
-                Ev::Frame { path, w, h, seq } => {
+                Event::Frame {
+                    path, width, height, seq, ..
+                } => {
                     if seq == self.seq {
                         continue;
                     }
+                    let path = path.display().to_string();
                     if path != self.map_path {
                         self.map = mazda_ipc::FrameMap::open(std::path::Path::new(&path)).ok();
                         self.map_path = path;
                         self.tex = None;
                     }
                     if let Some(m) = self.map.as_ref() {
-                        if m.dims() == (w, h) {
+                        if m.dims() == (width, height) {
                             self.seq = seq;
                             // the pixels changed: re-upload on the next frame
                             self.tex = None;
                             if let Some(t0) = self.sent.take() {
                                 self.lat.push(t0.elapsed().as_secs_f32() * 1000.0);
+                                // keep the p50 display bounded in a long session
+                                if self.lat.len() > 512 {
+                                    self.lat.remove(0);
+                                }
                             }
                         }
                     }
                 }
-                Ev::Title(t) => self.title = t,
-                Ev::Nav(url) => {
-                    self.scroll = 0.0;
-                    self.r.send(&format!("load {url}"));
+                Event::Title(t) => {
+                    self.r.restarts = 0;
+                    // the renderer answers requests in order: this title
+                    // belongs to the oldest request, not necessarily to the
+                    // tab the user is looking at now
+                    let owner = self
+                        .inflight
+                        .pop_front()
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.active);
+                    if let Some(tab) = self.tabs.get_mut(owner) {
+                        tab.url = t.clone();
+                        tab.label = short_title(&t);
+                    }
+                    if owner == self.active {
+                        self.loading = false;
+                        self.err = None;
+                        self.title = t.clone();
+                        self.r.url = t.clone();
+                        if !self.url_focused {
+                            self.url_edit = t.clone();
+                        }
+                        self.apply_pending_scroll();
+                    }
+                    println!("[page] tab={owner} {t}");
                 }
-                Ev::Error(e) => self.err = Some(e),
-                Ev::Exited => {
-                    self.err = Some("renderer exited".into());
-                    break;
+                Event::Nav(url) => {
+                    // a script navigation belongs to the page that caused it;
+                    // the request it replaces will not emit a title
+                    let owner = self
+                        .inflight
+                        .pop_front()
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.active);
+                    self.navigate_tab(owner, url);
+                }
+                Event::Error(e) => {
+                    let owner = self
+                        .inflight
+                        .pop_front()
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.active);
+                    if owner == self.active {
+                        self.loading = false;
+                        self.err = Some(e.clone());
+                    }
+                    println!("[error] tab={owner} {e}");
+                }
+                Event::Exited => {
+                    if self.r.restart() {
+                        self.err = Some(format!(
+                            "renderer crashed — restoring from snapshot ({}/{})",
+                            self.r.restarts, MAX_RESTARTS
+                        ));
+                        println!("[supervisor] restart {}", self.r.restarts);
+                        self.map = None;
+                        self.map_path.clear();
+                        self.tex = None;
+                        self.seq = 0;
+                        // the restarted renderer never saw the old commands
+                        self.inflight.clear();
+                        // force a resize (and then the restore) next frame
+                        self.size = (0, 0);
+                        let url = self.active_tab().url.clone();
+                        self.pending_restore = (!url.is_empty()).then_some(url);
+                        self.pending_scroll = Some(self.scroll);
+                        self.loading = !self.pending_restore.is_none();
+                    } else {
+                        self.err = Some("renderer exited; restart limit reached".into());
+                        println!("[supervisor] gave up after {} restarts", MAX_RESTARTS);
+                        break;
+                    }
                 }
             }
+        }
+    }
+
+    /// Restart the renderer to give its heap back, then replay the active tab
+    /// from its snapshot. This is the governor's only real lever while one
+    /// renderer serves every tab.
+    fn reclaim(&mut self) {
+        if !self.r.restart() {
+            self.err = Some("memory governor could not restart the renderer".into());
+            return;
+        }
+        // a reclaim is not a crash: it must not eat the crash budget
+        self.r.restarts = 0;
+        self.map = None;
+        self.map_path.clear();
+        self.tex = None;
+        self.seq = 0;
+        self.size = (0, 0);
+        self.inflight.clear();
+        let url = self.active_tab().url.clone();
+        self.pending_restore = (!url.is_empty()).then_some(url);
+        self.pending_scroll = Some(self.scroll);
+        self.loading = true;
+        println!("[gov] reclaimed renderer");
+    }
+
+    fn govern(&mut self) {
+        if self.last_sample.elapsed() < GOVERNOR_PERIOD {
+            return;
+        }
+        self.last_sample = Instant::now();
+        let Some(mb) = process_private_mb(self.r.pid()) else {
+            return;
+        };
+        self.last_mb = mb;
+        if mb > self.budget_mb {
+            self.over += 1;
+            if self.over >= 2 && !self.loading && self.last_reclaim.elapsed() > RECLAIM_COOLDOWN {
+                self.over = 0;
+                self.last_reclaim = Instant::now();
+                println!("[gov] renderer {mb:.1} MB > budget {:.0} MB", self.budget_mb);
+                self.reclaim();
+            }
+        } else {
+            self.over = 0;
+        }
+    }
+
+    fn control(&mut self, ctx: &egui::Context) {
+        while let Ok(c) = self.ctl.try_recv() {
+            match c {
+                Ctl::Tab(i) => self.select_tab(i),
+                Ctl::Open(url) => {
+                    self.save_scroll();
+                    self.tabs.push(Tab::new(&url));
+                    self.active = self.tabs.len() - 1;
+                    self.tex = None;
+                    self.scroll = 0.0;
+                    self.pending_scroll = None;
+                    self.loading = true;
+                    self.title.clear();
+                    self.r.url = self.tabs[self.active].url.clone();
+                    self.inflight
+                        .push_back((self.active, self.r.url.clone()));
+                    self.r.send(Command::Load(self.tabs[self.active].url.clone()));
+                    println!(
+                        "[tabs] active={} n={} url={}",
+                        self.active,
+                        self.tabs.len(),
+                        self.active_tab().url
+                    );
+                }
+                Ctl::Close(i) => self.close_tab(i),
+                Ctl::Reload => self.reload(),
+                Ctl::Status => {
+                    let shell = process_private_mb(std::process::id()).unwrap_or(0.0);
+                    println!(
+                        "[status] tabs={} active={} url={} shell_private={:.1} renderer_private={:.1}",
+                        self.tabs.len(),
+                        self.active,
+                        self.active_tab().url,
+                        shell,
+                        self.last_mb
+                    );
+                }
+                Ctl::Quit => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            ctx.request_repaint();
         }
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
         let Some(m) = self.map.as_ref() else { return };
         let (w, h) = m.dims();
-        let px = m.pixels();
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for p in px.chunks_exact(4) {
-            rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
-        }
-        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+        let Some(hdr) = m.copy_rgba(&mut self.rgba) else {
+            return;
+        };
+        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
         self.tex = Some(ctx.load_texture("page", img, egui::TextureOptions::LINEAR));
+        self.seq = hdr.seq;
     }
 }
 
 impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain();
+        self.govern();
+        self.control(ui.ctx());
 
-        // the renderer paints at the content size, so tell it when it changes
-        let rect = ui.max_rect();
+        // actions collected from the chrome, applied after painting so the
+        // tab list can be borrowed while the widgets are built
+        let mut select = None;
+        let mut close = None;
+        let mut open_new = false;
+        let mut go = None;
+        let mut reload = false;
+
+        let full = ui.max_rect();
+        let title_rect = Rect::from_min_size(full.min, egui::vec2(full.width(), TITLE_H));
+        let toolbar_rect = Rect::from_min_size(
+            egui::pos2(full.left(), title_rect.bottom()),
+            egui::vec2(full.width(), TOOLBAR_H),
+        );
+        let status_rect = Rect::from_min_size(
+            egui::pos2(full.left(), full.bottom() - STATUS_H),
+            egui::vec2(full.width(), STATUS_H),
+        );
+        let page_rect = Rect::from_min_max(
+            egui::pos2(full.left(), toolbar_rect.bottom()),
+            egui::pos2(full.right(), status_rect.top()),
+        );
+
+        let painter = ui.painter().clone();
+        painter.rect_filled(title_rect, 0.0, TITLE_BG);
+        painter.rect_filled(toolbar_rect, 0.0, TOOLBAR_BG);
+        painter.rect_filled(status_rect, 0.0, STATUS_BG);
+        painter.line_segment(
+            [
+                egui::pos2(full.left(), toolbar_rect.bottom() - 0.5),
+                egui::pos2(full.right(), toolbar_rect.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, BORDER),
+        );
+
+        // ---- window controls (rightmost, like a native titlebar) -------
+        let win_left = title_rect.right() - WIN_BTN_W * 3.0;
+        let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        let win_min = win_button(ui, title_rect, win_left, "win-min");
+        let win_max = win_button(ui, title_rect, win_left + WIN_BTN_W, "win-max");
+        let win_close = win_button(ui, title_rect, win_left + WIN_BTN_W * 2.0, "win-close");
+
+        // ---- draggable strip: logo area and the gap right of the tabs ---
+        let logo_rect = Rect::from_min_size(
+            title_rect.min,
+            egui::vec2(LOGO_W, title_rect.height()),
+        );
+        let drag_logo = ui.interact(logo_rect, ui.id().with("drag-logo"), Sense::click_and_drag());
+        if drag_logo.drag_started() {
+            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+
+        // logo mark
+        let mark = Rect::from_center_size(
+            egui::pos2(logo_rect.center().x, title_rect.center().y),
+            egui::vec2(22.0, 22.0),
+        );
+        painter.rect_filled(mark, 6.0, ACCENT);
+        painter.text(
+            mark.center(),
+            Align2::CENTER_CENTER,
+            "M",
+            FontId::proportional(13.0),
+            Color32::WHITE,
+        );
+
+        // ---- tabs -------------------------------------------------------
+        let tabs_left = title_rect.left() + LOGO_W;
+        let tabs_right = win_left - 4.0;
+        let plus_w = 30.0;
+        let avail = (tabs_right - tabs_left - plus_w).max(1.0);
+        let n = self.tabs.len().max(1) as f32;
+        let tab_w = (avail / n).clamp(58.0, 240.0);
+        let mut x = tabs_left;
+        for (i, t) in self.tabs.iter().enumerate() {
+            if x >= tabs_right - 8.0 {
+                break;
+            }
+            let r = Rect::from_min_max(
+                egui::pos2(x, title_rect.top() + 6.0),
+                egui::pos2((x + tab_w).min(tabs_right), title_rect.bottom() + 1.0),
+            );
+            let resp = ui.interact(r, ui.id().with(("tab", i)), Sense::click_and_drag());
+            let active = i == self.active;
+            let hovered = resp.hovered();
+            let rounding = CornerRadius {
+                nw: 8,
+                ne: 8,
+                sw: 0,
+                se: 0,
+            };
+            if active {
+                painter.rect_filled(r, rounding, TAB_ACTIVE);
+            } else if hovered {
+                painter.rect_filled(r, rounding, TAB_HOVER);
+            }
+
+            // close button: always on the active tab, on hover otherwise
+            let close_center = egui::pos2(r.right() - 13.0, r.center().y);
+            let close_rect = Rect::from_center_size(close_center, egui::vec2(19.0, 19.0));
+            let close_resp =
+                ui.interact(close_rect, ui.id().with(("tab-close", i)), Sense::click());
+            // narrow tabs spend too much of their label on a permanent close
+            // button: reserve it for the hovered tab instead
+            let narrow = r.width() < 86.0;
+            let show_close = (active && !narrow) || hovered || close_resp.hovered();
+            if show_close {
+                if close_resp.hovered() {
+                    painter.circle_filled(close_center, 9.0, TAB_CLOSE_HOVER);
+                }
+                draw_x(
+                    &painter,
+                    close_center,
+                    3.6,
+                    if close_resp.hovered() { TEXT } else { MUTED },
+                );
+            }
+
+            let label = if t.url.is_empty() {
+                "New tab".to_string()
+            } else {
+                t.label.clone()
+            };
+            let font = FontId::proportional(12.5);
+            let max_text = (r.width() - if show_close { 36.0 } else { 18.0 }).max(6.0);
+            let shown = elide(ui, &label, &font, max_text);
+            painter.text(
+                egui::pos2(r.left() + 11.0, r.center().y),
+                Align2::LEFT_CENTER,
+                shown,
+                font,
+                if active { TEXT } else { MUTED },
+            );
+
+            if close_resp.clicked() || resp.middle_clicked() {
+                close = Some(i);
+            } else if resp.clicked() {
+                select = Some(i);
+            }
+            if resp.drag_started() {
+                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+            x += tab_w;
+        }
+
+        // new-tab button
+        let plus_x = x.min(tabs_right - plus_w);
+        let plus_rect = Rect::from_min_size(
+            egui::pos2(plus_x + 2.0, title_rect.top() + 6.0),
+            egui::vec2(26.0, title_rect.height() - 9.0),
+        );
+        let plus_resp = ui.interact(plus_rect, ui.id().with("new-tab"), Sense::click());
+        if plus_resp.hovered() {
+            painter.rect_filled(plus_rect, 7.0, TAB_HOVER);
+        }
+        let pc = plus_rect.center();
+        painter.line_segment(
+            [egui::pos2(pc.x - 6.0, pc.y), egui::pos2(pc.x + 6.0, pc.y)],
+            Stroke::new(1.5, TEXT),
+        );
+        painter.line_segment(
+            [egui::pos2(pc.x, pc.y - 6.0), egui::pos2(pc.x, pc.y + 6.0)],
+            Stroke::new(1.5, TEXT),
+        );
+        if plus_resp.clicked() {
+            open_new = true;
+        }
+
+        // gap between the plus button and the window controls is a drag area
+        let gap = Rect::from_min_max(
+            egui::pos2((plus_x + plus_w).min(tabs_right), title_rect.top()),
+            egui::pos2(win_left, title_rect.bottom()),
+        );
+        if gap.width() > 4.0 {
+            let drag_gap = ui.interact(gap, ui.id().with("drag-gap"), Sense::click_and_drag());
+            if drag_gap.drag_started() {
+                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+            if drag_gap.double_clicked() || drag_logo.double_clicked() {
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+            }
+        }
+
+        // window buttons: paint hover state, then the glyph
+        if win_min.hovered() {
+            painter.rect_filled(win_min.rect, 0.0, WIN_HOVER);
+        }
+        if win_max.hovered() {
+            painter.rect_filled(win_max.rect, 0.0, WIN_HOVER);
+        }
+        if win_close.hovered() {
+            painter.rect_filled(win_close.rect, 0.0, CLOSE_RED);
+        }
+        let glyph = if win_close.hovered() {
+            Color32::WHITE
+        } else {
+            TEXT
+        };
+        draw_min(&painter, win_min.rect.center(), glyph);
+        draw_max(
+            &painter,
+            win_max.rect.center(),
+            glyph,
+            maximized,
+            if win_max.hovered() { WIN_HOVER } else { TITLE_BG },
+        );
+        draw_x(&painter, win_close.rect.center(), 5.0, glyph);
+        if win_min.clicked() {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::Minimized(true));
+        }
+        if win_max.clicked() {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+        }
+        if win_close.clicked() {
+            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        // ---- toolbar: reload + address pill ----------------------------
+        let reload_rect = Rect::from_center_size(
+            egui::pos2(toolbar_rect.left() + 28.0, toolbar_rect.center().y),
+            egui::vec2(34.0, 34.0),
+        );
+        let reload_resp = ui.interact(reload_rect, ui.id().with("reload"), Sense::click());
+        if reload_resp.hovered() {
+            painter.circle_filled(reload_rect.center(), 16.0, PILL_HOVER);
+        }
+        draw_reload(
+            &painter,
+            reload_rect.center(),
+            6.5,
+            if reload_resp.hovered() { TEXT } else { MUTED },
+        );
+        if reload_resp.clicked() {
+            reload = true;
+        }
+
+        let pill = Rect::from_min_max(
+            egui::pos2(reload_rect.right() + 10.0, toolbar_rect.top() + 7.0),
+            egui::pos2(toolbar_rect.right() - 12.0, toolbar_rect.bottom() - 7.0),
+        );
+        painter.rect_filled(pill, 16.0, PILL_BG);
+        draw_globe(
+            &painter,
+            egui::pos2(pill.left() + 17.0, pill.center().y),
+            6.0,
+            if self.loading { ACCENT } else { MUTED },
+        );
+
+        let text_rect = Rect::from_min_max(
+            egui::pos2(pill.left() + 31.0, pill.top() + 1.0),
+            egui::pos2(pill.right() - 36.0, pill.bottom() - 1.0),
+        );
+        let url_resp = ui.put(
+            text_rect,
+            egui::TextEdit::singleline(&mut self.url_edit)
+                .frame(egui::Frame::NONE)
+                .hint_text("Search or enter address"),
+        );
+        self.url_focused = url_resp.has_focus();
+        if self.focus_url {
+            url_resp.request_focus();
+            self.focus_url = false;
+        }
+        if url_resp.has_focus() {
+            painter.rect_stroke(
+                pill,
+                16.0,
+                Stroke::new(1.5, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let enter = url_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        let go_rect = Rect::from_center_size(
+            egui::pos2(pill.right() - 19.0, pill.center().y),
+            egui::vec2(28.0, 28.0),
+        );
+        let go_resp = ui.interact(go_rect, ui.id().with("go"), Sense::click());
+        if go_resp.hovered() {
+            painter.circle_filled(go_rect.center(), 13.0, PILL_HOVER);
+        }
+        painter.text(
+            go_rect.center(),
+            Align2::CENTER_CENTER,
+            "→",
+            FontId::proportional(16.0),
+            if go_resp.hovered() { ACCENT } else { MUTED },
+        );
+        if go_resp.clicked() || enter {
+            go = Some(self.url_edit.clone());
+        }
+
+        // ---- keyboard: the usual browser chords ------------------------
+        let mut k_new = false;
+        let mut k_close = false;
+        let mut k_reload = false;
+        let mut k_focus = false;
+        let mut k_next = 0i32;
+        let mut k_select = None;
+        ui.input(|i| {
+            if !i.modifiers.command {
+                return;
+            }
+            if i.key_pressed(egui::Key::T) {
+                k_new = true;
+            }
+            if i.key_pressed(egui::Key::W) {
+                k_close = true;
+            }
+            if i.key_pressed(egui::Key::R) {
+                k_reload = true;
+            }
+            if i.key_pressed(egui::Key::L) {
+                k_focus = true;
+            }
+            if i.key_pressed(egui::Key::Tab) {
+                k_next = if i.modifiers.shift { -1 } else { 1 };
+            }
+            let digits = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ];
+            for (n, key) in digits.iter().enumerate() {
+                if i.key_pressed(*key) {
+                    k_select = Some(n);
+                }
+            }
+        });
+
+        // apply chrome actions before touching the page
+        if let Some(i) = close {
+            self.close_tab(i);
+        }
+        if let Some(i) = select {
+            self.select_tab(i);
+        }
+        if open_new {
+            self.new_tab();
+        }
+        if reload || k_reload {
+            self.reload();
+        }
+        if let Some(url) = go {
+            self.navigate(url);
+        }
+        if k_new {
+            self.new_tab();
+        }
+        if k_close {
+            self.close_tab(self.active);
+        }
+        if k_focus {
+            self.focus_url = true;
+        }
+        if k_next != 0 {
+            let n = self.tabs.len() as i32;
+            let next = (self.active as i32 + k_next).rem_euclid(n) as usize;
+            self.select_tab(next);
+        }
+        if let Some(n) = k_select {
+            if n < self.tabs.len() {
+                self.select_tab(n);
+            }
+        }
+
+        // ---- page -------------------------------------------------------
+        let page = !self.active_tab().url.is_empty();
         let size = (
-            rect.width().max(1.0).round() as usize,
-            rect.height().max(1.0).round() as usize,
+            page_rect.width().max(1.0).round() as usize,
+            page_rect.height().max(1.0).round() as usize,
         );
         if size != self.size {
             self.size = size;
-            self.r.send(&format!("resize {} {}", size.0, size.1));
+            self.r.send(Command::Resize {
+                width: size.0 as u32,
+                height: size.1 as u32,
+            });
+        }
+        // after a crash: the new renderer is sized, now replay the tab
+        if let Some(url) = self.pending_restore.take() {
+            self.inflight.push_back((self.active, url.clone()));
+            self.r.send(Command::Restore(url));
         }
 
-        // input -> renderer
-        let wheel = ui.input(|i| i.smooth_scroll_delta().y);
+        if page && self.seq != 0 && self.tex.is_none() {
+            self.upload(ui.ctx());
+        }
+        if page {
+            if let Some(t) = &self.tex {
+                painter.image(
+                    t.id(),
+                    page_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        } else {
+            painter.rect_filled(page_rect, 0.0, Color32::from_gray(248));
+            painter.text(
+                page_rect.center(),
+                Align2::CENTER_CENTER,
+                "New tab — type an address",
+                FontId::proportional(18.0),
+                MUTED,
+            );
+        }
+
+        // loading hint: a thin accent line under the toolbar
+        if self.loading {
+            let clip = Rect::from_min_size(
+                page_rect.left_top(),
+                egui::vec2(page_rect.width(), 2.0),
+            );
+            painter.rect_filled(clip, 0.0, ACCENT);
+        }
+
+        // input -> renderer (only over the page, never over the chrome)
+        let hover = ui.input(|i| i.pointer.hover_pos());
+        let over_page = hover.map(|p| page_rect.contains(p)).unwrap_or(false);
+        let wheel = if over_page {
+            ui.input(|i| i.smooth_scroll_delta().y)
+        } else {
+            0.0
+        };
         let click = ui.input(|i| {
             i.pointer
                 .primary_clicked()
                 .then(|| i.pointer.interact_pos())
                 .flatten()
+                .filter(|p| page_rect.contains(*p))
         });
-        if wheel != 0.0 {
+        if wheel != 0.0 && page {
             self.scroll = (self.scroll - wheel).max(0.0);
-            self.r.send(&format!("scroll {:.1}", self.scroll));
+            self.r.send(Command::Scroll(self.scroll));
             self.sent = Some(Instant::now());
         }
-        if let Some(p) = click {
-            self.r.send(&format!("click {:.1} {:.1}", p.x, p.y));
+        if let Some(p) = click.filter(|_| page) {
+            self.r.send(Command::Click {
+                x: p.x - page_rect.min.x,
+                y: p.y - page_rect.min.y,
+            });
         }
 
-        if self.seq != 0 && self.tex.is_none() {
-            self.upload(ui.ctx());
-        }
-
-        if let Some(t) = &self.tex {
-            let rect = ui.max_rect();
-            ui.painter().image(
-                t.id(),
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
-
-        // status overlay (the spike's only chrome)
-        let mut status = self.title.clone();
-        if let Some(e) = &self.err {
-            status = format!("{status}  ·  {e}");
+        // ---- status bar -------------------------------------------------
+        let left = if let Some(e) = &self.err {
+            format!("⚠ {e}")
+        } else if self.loading {
+            format!("Loading…  {}", self.active_tab().url)
+        } else if !self.title.is_empty() {
+            self.title.clone()
+        } else {
+            self.active_tab().url.clone()
+        };
+        let status_font = FontId::proportional(11.5);
+        let left = elide(ui, &left, &status_font, status_rect.width() * 0.62);
+        painter.text(
+            egui::pos2(status_rect.left() + 12.0, status_rect.center().y),
+            Align2::LEFT_CENTER,
+            left,
+            status_font.clone(),
+            if self.err.is_some() { CLOSE_RED } else { MUTED },
+        );
+        let mut right = format!("{}/{} tabs", self.active + 1, self.tabs.len());
+        if self.last_mb > 0.0 {
+            right.push_str(&format!("   {:.0} MB", self.last_mb));
         }
         if !self.lat.is_empty() {
             let mut v = self.lat.clone();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let p50 = v[v.len() / 2];
-            let p95 = v[(v.len() * 95 / 100).min(v.len() - 1)];
-            status = format!("{status}  ·  scroll p50 {p50:.1} ms · p95 {p95:.1} ms");
+            right.push_str(&format!("   p50 {p50:.1} ms"));
         }
-        ui.painter().text(
-            egui::pos2(8.0, 6.0),
-            egui::Align2::LEFT_TOP,
-            status,
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_rgb(20, 20, 20),
+        painter.text(
+            egui::pos2(status_rect.right() - 12.0, status_rect.center().y),
+            Align2::RIGHT_CENTER,
+            right,
+            status_font,
+            MUTED,
         );
 
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(8));
+        ui.ctx().request_repaint_after(Duration::from_millis(8));
     }
+}
+
+/// Truncate `text` with an ellipsis so it fits in `max_w`.
+fn elide(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let width = |s: &str| {
+        ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut n = chars.len();
+    while n > 0 {
+        let s: String = chars[..n].iter().collect::<String>() + "…";
+        if width(&s) <= max_w {
+            return s;
+        }
+        n -= 1;
+    }
+    "…".to_string()
+}
+
+fn win_button(ui: &mut egui::Ui, title: Rect, x: f32, id: &str) -> egui::Response {
+    let r = Rect::from_min_size(
+        egui::pos2(x, title.top()),
+        egui::vec2(WIN_BTN_W, title.height()),
+    );
+    ui.interact(r, ui.id().with(id), Sense::click())
+}
+
+fn draw_x(p: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    p.line_segment(
+        [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(c.x + s, c.y - s), egui::pos2(c.x - s, c.y + s)],
+        stroke,
+    );
+}
+
+fn draw_min(p: &egui::Painter, c: egui::Pos2, color: Color32) {
+    p.line_segment(
+        [egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)],
+        Stroke::new(1.3, color),
+    );
+}
+
+fn draw_max(p: &egui::Painter, c: egui::Pos2, color: Color32, restored: bool, bg: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    if restored {
+        let back = Rect::from_center_size(
+            egui::pos2(c.x + 1.5, c.y - 1.5),
+            egui::vec2(8.0, 8.0),
+        );
+        p.rect_stroke(back, 1.0, stroke, egui::StrokeKind::Inside);
+        let front = Rect::from_center_size(
+            egui::pos2(c.x - 1.5, c.y + 1.5),
+            egui::vec2(8.0, 8.0),
+        );
+        p.rect_filled(front, 1.0, bg);
+        p.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Inside);
+    } else {
+        let r = Rect::from_center_size(c, egui::vec2(9.0, 9.0));
+        p.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Inside);
+    }
+}
+
+fn draw_reload(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
+    use std::f32::consts::TAU;
+    let start = -0.28 * TAU;
+    let end = 0.72 * TAU;
+    let n = 20;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = start + (end - start) * i as f32 / n as f32;
+            egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, Stroke::new(1.6, color)));
+    // arrow head at the open end
+    let a = end;
+    let tip = egui::pos2(c.x + (r + 2.0) * a.cos(), c.y + (r + 2.0) * a.sin());
+    let back = egui::pos2(c.x + (r - 3.5) * a.cos(), c.y + (r - 3.5) * a.sin());
+    let nx = -a.sin();
+    let ny = a.cos();
+    p.line_segment(
+        [tip, egui::pos2(back.x + 2.5 * nx, back.y + 2.5 * ny)],
+        Stroke::new(1.6, color),
+    );
+    p.line_segment(
+        [tip, egui::pos2(back.x - 2.5 * nx, back.y - 2.5 * ny)],
+        Stroke::new(1.6, color),
+    );
+}
+
+fn draw_globe(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
+    let stroke = Stroke::new(1.2, color);
+    p.circle_stroke(c, r, stroke);
+    p.line_segment(
+        [
+            egui::pos2(c.x - r, c.y),
+            egui::pos2(c.x + r, c.y),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x, c.y - r),
+            egui::pos2(c.x, c.y + r),
+        ],
+        Stroke::new(1.0, color),
+    );
 }
 
 impl Drop for Shell {
@@ -260,23 +1333,89 @@ impl Drop for Shell {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Private bytes of another process (governor)
+
+#[cfg(windows)]
+fn process_private_mb(pid: u32) -> Option<f64> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = GetProcessMemoryInfo(h, &mut c, c.cb) != 0;
+        CloseHandle(h);
+        ok.then(|| c.PagefileUsage as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_private_mb(pid: u32) -> Option<f64> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kb: f64 = s.lines().find_map(|l| {
+        let rest = l.strip_prefix("VmRSS:")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })?;
+    Some(kb / 1024.0)
+}
+
+// ---------------------------------------------------------------------------
+
 fn main() -> eframe::Result {
-    let url = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .unwrap_or_else(|| "about:blank".to_string());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut urls: Vec<String> = Vec::new();
+    let mut active = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tabs" => {
+                i += 1;
+                if let Some(list) = args.get(i) {
+                    urls = list.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            "--active" => {
+                i += 1;
+                active = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            a if !a.starts_with("--") => urls.push(a.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let tabs: Vec<Tab> = if urls.is_empty() {
+        vec![Tab::new("")]
+    } else {
+        urls.iter().map(|u| Tab::new(u)).collect()
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Mazda (Phase S)")
-            .with_inner_size([1000.0, 700.0]),
+            .with_title("Mazda")
+            .with_inner_size([1120.0, 760.0])
+            .with_min_inner_size([900.0, 560.0])
+            // the titlebar, tabs and window buttons are drawn by the shell
+            .with_decorations(false)
+            .with_resizable(true),
         ..Default::default()
     };
     eframe::run_native(
-        "Mazda (Phase S)",
+        "Mazda",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            let mut visuals = egui::Visuals::light();
+            visuals.override_text_color = Some(TEXT);
+            visuals.selection.bg_fill = ACCENT;
+            cc.egui_ctx.set_visuals(visuals);
             Ok(Box::new(
-                Shell::new(&url).expect("failed to spawn renderer"),
+                Shell::new(tabs, active).expect("failed to spawn renderer"),
             ))
         }),
     )

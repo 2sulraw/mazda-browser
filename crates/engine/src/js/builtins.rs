@@ -1621,11 +1621,7 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 Some(Val::Obj(p)) => Some(p.clone()),
                 _ => None,
             };
-            Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-                kind: ObjKind::Plain,
-                props: Vec::new(),
-                proto,
-            }))))
+            Ok(Val::Obj(new_obj(ObjKind::Plain, Vec::new(), proto)))
         }
         O_PROP_NAMES => {
             let o = args.first().cloned().unwrap_or(Val::Undefined);
@@ -1978,11 +1974,7 @@ fn need_array(e: &mut JsEngine, this: &Val) -> Result<Rc<RefCell<Obj>>, JsError>
             };
             if let Some(spec) = live {
                 let items = e.live_values.map(|f| f(&spec)).unwrap_or_default();
-                return Ok(Rc::new(RefCell::new(Obj {
-                    kind: ObjKind::Array(items),
-                    props: Vec::new(),
-                    proto: None,
-                })));
+                return Ok(new_obj(ObjKind::Array(items), Vec::new(), None));
             }
             Err(JsError::throw("TypeError: array method on non-array"))
         }
@@ -2563,11 +2555,11 @@ fn n_error_ctor(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<
             }
         }
     }
-    Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Error(Rc::new(ErrorData { name, msg })),
-        props: Vec::new(),
+    Ok(Val::Obj(new_obj(
+        ObjKind::Error(Rc::new(ErrorData { name, msg })),
+        Vec::new(),
         proto,
-    }))))
+    )))
 }
 
 /// `Error.prototype.toString`: `Name: message`, or just the name when the
@@ -2715,14 +2707,7 @@ fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<V
             _ => None,
         })
         .ok_or_else(|| JsError::throw("SyntaxError: invalid function body"))?;
-    Ok(Val::Func(Rc::new(Closure {
-        def,
-        env: e.global_env.clone(),
-        this: None,
-        is_arrow: false,
-        props: RefCell::new(Vec::new()),
-        proto: RefCell::new(None),
-    })))
+    Ok(Val::Func(new_closure(def, e.global_env.clone(), None, false)))
 }
 
 fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
@@ -3246,14 +3231,14 @@ fn n_regexp(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Va
         }
         Err(other) => return Err(other),
     };
-    Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Regex(ReInst {
+    Ok(Val::Obj(new_obj(
+        ObjKind::Regex(ReInst {
             re,
             last_index: Cell::new(0.0),
         }),
-        props: Vec::new(),
-        proto: None,
-    }))))
+        Vec::new(),
+        None,
+    )))
 }
 
 // -- end regex helper stub
@@ -3285,11 +3270,7 @@ const P_VALUES: u16 = 11;
 
 /// A fresh plain object pointing at `proto`.
 fn proto_instance(proto: Option<Rc<RefCell<Obj>>>) -> Val {
-    Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Plain,
-        props: Vec::new(),
-        proto,
-    })))
+    Val::Obj(new_obj(ObjKind::Plain, Vec::new(), proto))
 }
 
 /// The serialized query of a URLSearchParams value.
@@ -3702,11 +3683,11 @@ const T_SLICE: u16 = 2;
 const T_JOIN: u16 = 3;
 
 fn new_arraybuffer(data: Vec<u8>) -> Val {
-    Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::ArrayBuffer(Rc::new(RefCell::new(data))),
-        props: Vec::new(),
-        proto: None,
-    })))
+    Val::Obj(new_obj(
+        ObjKind::ArrayBuffer(Rc::new(RefCell::new(data))),
+        Vec::new(),
+        None,
+    ))
 }
 
 fn make_view(
@@ -3716,16 +3697,16 @@ fn make_view(
     offset: usize,
     len: usize,
 ) -> Val {
-    Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::TypedArray(Box::new(TypedArray {
+    Val::Obj(new_obj(
+        ObjKind::TypedArray(Box::new(TypedArray {
             kind,
             buf,
             offset,
             len,
         })),
-        props: Vec::new(),
-        proto: e.typed_proto.clone(),
-    })))
+        Vec::new(),
+        e.typed_proto.clone(),
+    ))
 }
 
 /// Allocate a fresh zero-filled buffer and wrap a view of `kind` over it.
@@ -4252,14 +4233,14 @@ const A_STATIC_ABORT: u16 = 9;
 const A_SIGNAL_CTOR: u16 = 10;
 
 fn abort_error(e: &JsEngine) -> Val {
-    Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Error(Rc::new(ErrorData {
+    Val::Obj(new_obj(
+        ObjKind::Error(Rc::new(ErrorData {
             name: Rc::from("AbortError"),
             msg: Rc::from("This operation was aborted"),
         })),
-        props: Vec::new(),
-        proto: e.error_proto.clone(),
-    })))
+        Vec::new(),
+        e.error_proto.clone(),
+    ))
 }
 
 fn make_signal(e: &JsEngine, aborted: bool, reason: Val) -> Val {

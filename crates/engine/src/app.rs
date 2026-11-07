@@ -460,12 +460,15 @@ fn headless_paint(
     *seq = seq.wrapping_add(1);
     f.write(*seq, &pixels);
     println!(
-        "frame {} {} {} {:.2} {}",
-        path.display(),
-        pw,
-        ph,
-        page.laid.height,
-        seq
+        "{}",
+        mazda_ipc::Event::Frame {
+            path,
+            width: pw,
+            height: ph,
+            doc_height: page.laid.height,
+            seq: *seq,
+        }
+        .encode()
     );
 }
 
@@ -496,20 +499,38 @@ pub fn run_headless() {
     use std::io::BufRead;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let url = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let mut url: Option<String> = None;
     let once = args.iter().any(|a| a == "--once");
     let mut pw = 1000usize;
     let mut ph = 670usize;
-    if let Some(i) = args.iter().position(|a| a == "--size") {
-        if let Some((w, h)) = args.get(i + 1).and_then(|s| s.split_once('x')) {
-            pw = w.parse().unwrap_or(pw);
-            ph = h.parse().unwrap_or(ph);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--once" => {}
+            "--size" => {
+                if let Some((w, h)) = args.get(i + 1).and_then(|s| s.split_once('x')) {
+                    pw = w.parse().unwrap_or(pw);
+                    ph = h.parse().unwrap_or(ph);
+                }
+                // skip the value: `1000x670` is not a URL
+                i += 1;
+            }
+            a if a.starts_with("--") => {}
+            a => url = Some(a.to_string()),
         }
+        i += 1;
     }
 
     let mut frame: Option<mazda_ipc::FrameMap> = None;
     let mut seq = 0u32;
     let mut fonts = Fonts::load();
+    // the settings page can turn site webfonts off; the headless harness uses
+    // the same switch (`MAZDA_FONTS=b`) for the reload-soak bisection.
+    let fonts_choice = if std::env::var("MAZDA_FONTS").ok().as_deref() == Some("b") {
+        FontsChoice::B
+    } else {
+        FontsChoice::A
+    };
 
     // the same loader thread the shell uses: fetch → DOM → script → layout
     let (jobs_tx, jobs_rx) = mpsc::channel();
@@ -548,6 +569,7 @@ pub fn run_headless() {
     let mut page: Option<Page> = None;
     let mut scroll = 0.0f32;
     let mut nav_id = 0u64;
+    let mut prev_counters = crate::js::heap_counters();
 
     if let Some(url) = url {
         nav_id += 1;
@@ -557,7 +579,7 @@ pub fn run_headless() {
             max_w: page_w(pw),
             vh: page_h(ph),
             engine: EngineChoice::A,
-            fonts: FontsChoice::A,
+            fonts: fonts_choice,
             restore: false,
         });
     }
@@ -566,13 +588,13 @@ pub fn run_headless() {
         match msg {
             HeadlessMsg::Done(done) => {
                 if done.panicked {
-                    println!("error pipeline panic");
+                    println!("{}", mazda_ipc::Event::Error("pipeline panic".into()).encode());
                     continue;
                 }
                 if let Some(nav) = done.nav {
                     if !done.nav_done {
                         // script navigation: the shell decides whether to load
-                        println!("nav {nav}");
+                        println!("{}", mazda_ipc::Event::Nav(nav).encode());
                         continue;
                     }
                 }
@@ -590,21 +612,40 @@ pub fn run_headless() {
                 if let Some(p) = page.as_ref() {
                     headless_paint(p, &fonts, pw, ph, scroll, &mut frame, &mut seq);
                 }
-                println!("title {title}");
+                println!("{}", mazda_ipc::Event::Title(title).encode());
+                if cfg!(feature = "count-alloc") {
+                    // live Rust heap with the page just painted: a slope over
+                    // reloads is retained memory, a flat line is allocator
+                    // slack catching up (or nothing at all)
+                    let c = crate::js::heap_counters();
+                    eprintln!(
+                        "[mem] live heap: {:.1} MB (peak {:.1} MB) · freed +{} obj, +{} fn, +{} env, {} env live",
+                        crate::live_alloc_bytes() as f64 / (1024.0 * 1024.0),
+                        crate::peak_alloc_bytes() as f64 / (1024.0 * 1024.0),
+                        c.objs_freed.wrapping_sub(prev_counters.objs_freed),
+                        c.closures_freed.wrapping_sub(prev_counters.closures_freed),
+                        c.envs_freed.wrapping_sub(prev_counters.envs_freed),
+                        c.envs_live,
+                    );
+                    prev_counters = c;
+                    let buckets: Vec<String> = crate::alloc_buckets()
+                        .into_iter()
+                        .filter(|(_, b)| *b > 0)
+                        .map(|(n, b)| format!("{n}:{:.2}", b as f64 / (1024.0 * 1024.0)))
+                        .collect();
+                    eprintln!("[mem] buckets MB: {}", buckets.join(" "));
+                }
                 if once {
                     break;
                 }
             }
             HeadlessMsg::Cmd(line) => {
-                let mut it = line.split_whitespace();
-                match it.next() {
-                    Some("quit") => break,
-                    Some("load") => {
-                        // the URL is the rest of the line (data: URLs have spaces)
-                        let Some(url) = line.split_once(' ').map(|(_, r)| r.trim().to_string())
-                        else {
-                            continue;
-                        };
+                let Some(cmd) = mazda_ipc::Command::decode(&line) else {
+                    continue;
+                };
+                match cmd {
+                    mazda_ipc::Command::Quit => break,
+                    mazda_ipc::Command::Load(url) => {
                         nav_id += 1;
                         scroll = 0.0;
                         let _ = jobs_tx.send(LoadReq::Load {
@@ -613,16 +654,26 @@ pub fn run_headless() {
                             max_w: page_w(pw),
                             vh: page_h(ph),
                             engine: EngineChoice::A,
-                            fonts: FontsChoice::A,
+                            fonts: fonts_choice,
                             restore: false,
                         });
                     }
-                    Some("resize") => {
-                        let w = it.next().and_then(|s| s.parse().ok());
-                        let h = it.next().and_then(|s| s.parse().ok());
-                        let (Some(w), Some(h)) = (w, h) else { continue };
-                        pw = w;
-                        ph = h;
+                    mazda_ipc::Command::Restore(url) => {
+                        nav_id += 1;
+                        scroll = 0.0;
+                        let _ = jobs_tx.send(LoadReq::Load {
+                            id: nav_id,
+                            url,
+                            max_w: page_w(pw),
+                            vh: page_h(ph),
+                            engine: EngineChoice::A,
+                            fonts: fonts_choice,
+                            restore: true,
+                        });
+                    }
+                    mazda_ipc::Command::Resize { width, height } => {
+                        pw = width as usize;
+                        ph = height as usize;
                         frame = None;
                         if let Some(p) = page.as_ref() {
                             nav_id += 1;
@@ -639,8 +690,7 @@ pub fn run_headless() {
                             headless_paint(p, &fonts, pw, ph, scroll, &mut frame, &mut seq);
                         }
                     }
-                    Some("scroll") => {
-                        let y = it.next().and_then(|s| s.parse().ok()).unwrap_or(scroll);
+                    mazda_ipc::Command::Scroll(y) => {
                         if let Some(p) = page.as_ref() {
                             let max = (p.laid.height - page_h(ph)).max(0.0);
                             scroll = y.clamp(0.0, max);
@@ -651,16 +701,13 @@ pub fn run_headless() {
                             });
                         }
                     }
-                    Some("click") => {
-                        let x = it.next().and_then(|s| s.parse().ok());
-                        let y = it.next().and_then(|s| s.parse().ok());
-                        if let (Some(x), Some(y), Some(p)) = (x, y, page.as_ref()) {
+                    mazda_ipc::Command::Click { x, y } => {
+                        if let Some(p) = page.as_ref() {
                             if let Some(href) = headless_link_at(p, x, y, scroll) {
-                                println!("nav {href}");
+                                println!("{}", mazda_ipc::Event::Nav(href).encode());
                             }
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -4023,14 +4070,30 @@ fn settle_load(
         hover: None,
         imgs: ImgCache::default(),
     };
+    #[cfg(feature = "count-alloc")]
+    let heap_mb = || crate::live_alloc_bytes() as f64 / (1024.0 * 1024.0);
+    #[cfg(feature = "count-alloc")]
+    let h0 = heap_mb();
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
-    let turn = scripts.run_scripts(&mut kp.dom);
+    let turn = if no_js() {
+        // diagnostic switch (reload soak): skip script execution entirely
+        runtime::Turn {
+            dirty: false,
+            nav: None,
+            prevent_default: false,
+            form_nav: None,
+        }
+    } else {
+        scripts.run_scripts(&mut kp.dom)
+    };
     if turn.dirty {
         // inline scripts mutated the DOM before the first layout — the
         // layout below already sees the mutated tree
         eprintln!("[js] scripts mutated the DOM before layout");
     }
+    #[cfg(feature = "count-alloc")]
+    let h1 = heap_mb();
     kp.scripts = Some(scripts);
     let (page, form_names) = layout_page(
         &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
@@ -4039,10 +4102,19 @@ fn settle_load(
         None,
         &mut kp.imgs,
     );
+    #[cfg(feature = "count-alloc")]
+    let h2 = heap_mb();
     let stacks = fonts.stacks.borrow().clone();
     let out_faces = collect_out_faces(fonts);
     let wire = page_to_wire(page, stacks, out_faces, form_names);
+    #[cfg(feature = "count-alloc")]
+    let h3 = heap_mb();
     *kept = Some(kp);
+    #[cfg(feature = "count-alloc")]
+    eprintln!(
+        "[mem] phase dom={h0:.1} js={h1:.1} layout={h2:.1} wire={h3:.1} keep={:.1} MB",
+        heap_mb()
+    );
     (Some(wire), turn.nav, turn.form_nav)
 }
 
@@ -4813,6 +4885,11 @@ enum SheetSrc {
 /// space even when the pixels will never decode. No budget here: headers cost
 /// no pixels — the budget is charged at decode time against display size.
 fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
+    if no_images() {
+        // diagnostic switch (reload soak): no image fetch/decode at all
+        n.img = None;
+        return (0, 0);
+    }
     let mut probed = 0usize;
     let mut skipped = 0usize;
     if let Some(layout::ImgSlot::Pending(src)) = &n.img {
@@ -7255,6 +7332,20 @@ fn working_set_mb() -> f64 {
         }
     }
     0.0
+}
+
+/// Diagnostic switches for the reload soak. `MAZDA_NO_JS` skips script
+/// execution and `MAZDA_NO_IMG` skips image fetch/decode, so a memory slope
+/// can be attributed to the page's scripts, its images, or the core pipeline.
+/// Both default off and cost one cached environment lookup.
+fn no_js() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAZDA_NO_JS").is_some())
+}
+
+fn no_images() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAZDA_NO_IMG").is_some())
 }
 
 #[cfg(test)]

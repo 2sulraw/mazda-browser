@@ -71,3 +71,5 @@ features = ["glow", "default_fonts", "x11", "wayland", "clipboard"]
 [features]
 engine-b = ["dep:boa_engine"]
 woff2 = ["dep:wuff"]
+# diagnostic: counting global allocator (see `live_alloc_bytes`)
+count-alloc = []

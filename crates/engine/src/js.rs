@@ -528,6 +528,31 @@ impl std::fmt::Debug for Closure {
     }
 }
 
+// Diagnostic object accounting (`count-alloc`): count destructions only, so a
+// leaking cycle shows up as a per-reload drop delta that decays to zero while
+// the live heap keeps climbing.
+#[cfg(feature = "count-alloc")]
+pub(crate) static OBJ_FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "count-alloc")]
+pub(crate) static CLOSURE_FREED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "count-alloc")]
+pub(crate) static ENV_FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "count-alloc")]
+impl Drop for Obj {
+    fn drop(&mut self) {
+        OBJ_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "count-alloc")]
+impl Drop for Closure {
+    fn drop(&mut self) {
+        CLOSURE_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Val {
     pub fn is_undefined(&self) -> bool {
         matches!(self, Val::Undefined)
@@ -582,19 +607,11 @@ impl Val {
     }
 
     pub fn new_object() -> Val {
-        Val::Obj(Rc::new(RefCell::new(Obj {
-            kind: ObjKind::Plain,
-            props: Vec::new(),
-            proto: None,
-        })))
+        Val::Obj(new_obj(ObjKind::Plain, Vec::new(), None))
     }
 
     pub fn new_array(items: Vec<Val>) -> Val {
-        Val::Obj(Rc::new(RefCell::new(Obj {
-            kind: ObjKind::Array(items),
-            props: Vec::new(),
-            proto: None,
-        })))
+        Val::Obj(new_obj(ObjKind::Array(items), Vec::new(), None))
     }
 
     /// Engine-free own-property read on object values (embedder helper; no
@@ -964,6 +981,91 @@ impl JsError {
 pub struct Env {
     parent: Option<Rc<Env>>,
     bindings: RefCell<Vec<Binding>>,
+    /// page that owns this scope: lets `JsEngine::drop` clear exactly its own
+    /// page's environments (see `clear_page_envs`).
+    page: u64,
+}
+
+thread_local! {
+    /// Every environment, object and function created on this worker thread,
+    /// tagged with the page that owns it. Only `Weak` refs are held, so the
+    /// registries cannot keep a page alive by themselves.
+    static LIVE_ENVS: RefCell<Vec<(u64, std::rc::Weak<Env>)>> =
+        const { RefCell::new(Vec::new()) };
+    static LIVE_OBJS: RefCell<Vec<(u64, std::rc::Weak<RefCell<Obj>>)>> =
+        const { RefCell::new(Vec::new()) };
+    static LIVE_FNS: RefCell<Vec<(u64, std::rc::Weak<Closure>)>> =
+        const { RefCell::new(Vec::new()) };
+    /// next page id handed to a `JsEngine`
+    static NEXT_PAGE: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// page tag for allocations made right now (0 before the first engine)
+    static CUR_PAGE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Start a new page: every later allocation is tagged with this id and will
+/// be swept by that page's `JsEngine::drop`.
+fn page_start() -> u64 {
+    let page = NEXT_PAGE.with(|p| {
+        let v = p.get();
+        p.set(v + 1);
+        v
+    });
+    CUR_PAGE.with(|c| c.set(page));
+    // drop entries whose owners are already gone; entries of the *previous*
+    // page are still alive here (the new page is built before the old one is
+    // dropped), so this must never prune by page id
+    LIVE_ENVS.with(|r| r.borrow_mut().retain(|(_, w)| w.strong_count() > 0));
+    LIVE_OBJS.with(|r| r.borrow_mut().retain(|(_, w)| w.strong_count() > 0));
+    LIVE_FNS.with(|r| r.borrow_mut().retain(|(_, w)| w.strong_count() > 0));
+    page
+}
+
+fn current_page() -> u64 {
+    CUR_PAGE.with(|c| c.get())
+}
+
+/// A fresh plain object, registered with the current page for cycle sweeping.
+pub(crate) fn new_obj(
+    kind: ObjKind,
+    props: Vec<(Rc<str>, Val)>,
+    proto: Option<Rc<RefCell<Obj>>>,
+) -> Rc<RefCell<Obj>> {
+    let o = Rc::new(RefCell::new(Obj { kind, props, proto }));
+    let page = current_page();
+    LIVE_OBJS.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() % 8192 == 8191 {
+            r.retain(|(_, w)| w.strong_count() > 0);
+        }
+        r.push((page, Rc::downgrade(&o)));
+    });
+    o
+}
+
+/// A fresh closure, registered with the current page (see [`new_obj`]).
+pub(crate) fn new_closure(
+    def: Rc<FnDef>,
+    env: Rc<Env>,
+    this: Option<Box<Val>>,
+    is_arrow: bool,
+) -> Rc<Closure> {
+    let c = Rc::new(Closure {
+        def,
+        env,
+        this,
+        is_arrow,
+        props: RefCell::new(Vec::new()),
+        proto: RefCell::new(None),
+    });
+    let page = current_page();
+    LIVE_FNS.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() % 8192 == 8191 {
+            r.retain(|(_, w)| w.strong_count() > 0);
+        }
+        r.push((page, Rc::downgrade(&c)));
+    });
+    c
 }
 
 struct Binding {
@@ -972,19 +1074,156 @@ struct Binding {
     is_const: bool,
 }
 
+#[cfg(feature = "count-alloc")]
+impl Drop for Env {
+    fn drop(&mut self) {
+        ENV_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Destruction counters for the JS object graph (`count-alloc` builds only).
+/// A per-reload delta that decays toward zero means objects of that kind are
+/// stuck in reference cycles; a steady delta means they are collected.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeapCounters {
+    pub objs_freed: usize,
+    pub closures_freed: usize,
+    pub envs_freed: usize,
+    /// environments still alive (strong count > 0) on this thread
+    pub envs_live: usize,
+    /// objects/functions still alive (strong count > 0) on this thread
+    pub objs_live: usize,
+    pub fns_live: usize,
+}
+
+pub fn heap_counters() -> HeapCounters {
+    #[cfg(feature = "count-alloc")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let envs_live = LIVE_ENVS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.retain(|(_, w)| w.strong_count() > 0);
+            r.len()
+        });
+        let objs_live = LIVE_OBJS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.retain(|(_, w)| w.strong_count() > 0);
+            r.len()
+        });
+        let fns_live = LIVE_FNS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.retain(|(_, w)| w.strong_count() > 0);
+            r.len()
+        });
+        HeapCounters {
+            objs_freed: OBJ_FREED.load(Relaxed),
+            closures_freed: CLOSURE_FREED.load(Relaxed),
+            envs_freed: ENV_FREED.load(Relaxed),
+            envs_live,
+            objs_live,
+            fns_live,
+        }
+    }
+    #[cfg(not(feature = "count-alloc"))]
+    {
+        HeapCounters::default()
+    }
+}
+
+fn register_env(env: &Rc<Env>) {
+    LIVE_ENVS.with(|r| {
+        let mut r = r.borrow_mut();
+        // drop dead entries periodically so a long page does not grow the
+        // registry with every scope it ever created
+        if r.len() % 4096 == 4095 {
+            r.retain(|(_, w)| w.strong_count() > 0);
+        }
+        r.push((env.page, Rc::downgrade(env)));
+    });
+}
+
+/// Break every reference cycle owned by `page`, then forget its registry
+/// entries. Called from `JsEngine::drop`.
+///
+/// `Rc` cannot collect cycles, and page scripts create plenty of them:
+/// `a.b = b; b.a = a`, `f.prototype.constructor = f`, handlers stored on the
+/// object they close over, ... Clearing *all* bindings, object properties and
+/// function properties of the page leaves no edge pointing back into the
+/// graph, so the whole page heap unwinds at once. Values that a discarded
+/// page still owns are dead by definition: nothing can observe them again.
+fn clear_page_graph(page: u64) {
+    LIVE_ENVS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|(p, w)| {
+            if *p != page {
+                return w.strong_count() > 0;
+            }
+            if let Some(env) = w.upgrade() {
+                if let Ok(mut b) = env.bindings.try_borrow_mut() {
+                    b.clear();
+                }
+            }
+            false
+        });
+    });
+    LIVE_OBJS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|(p, w)| {
+            if *p != page {
+                return w.strong_count() > 0;
+            }
+            if let Some(o) = w.upgrade() {
+                if let Ok(mut o) = o.try_borrow_mut() {
+                    o.props.clear();
+                    o.proto = None;
+                }
+            }
+            false
+        });
+    });
+    LIVE_FNS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|(p, w)| {
+            if *p != page {
+                return w.strong_count() > 0;
+            }
+            if let Some(c) = w.upgrade() {
+                if let Ok(mut props) = c.props.try_borrow_mut() {
+                    props.clear();
+                }
+                if let Ok(mut proto) = c.proto.try_borrow_mut() {
+                    *proto = None;
+                }
+            }
+            false
+        });
+    });
+}
+
 impl Env {
+    /// Root scope of the current page (bound functions, tests).
     pub fn root() -> Rc<Env> {
-        Rc::new(Env {
+        Self::with_page(current_page())
+    }
+
+    fn with_page(page: u64) -> Rc<Env> {
+        let env = Rc::new(Env {
             parent: None,
             bindings: RefCell::new(Vec::new()),
-        })
+            page,
+        });
+        register_env(&env);
+        env
     }
 
     pub fn child(parent: &Rc<Env>) -> Rc<Env> {
-        Rc::new(Env {
+        let env = Rc::new(Env {
             parent: Some(parent.clone()),
             bindings: RefCell::new(Vec::new()),
-        })
+            page: parent.page,
+        });
+        register_env(&env);
+        env
     }
 
     fn declare(&self, name: Rc<str>, v: Val, is_const: bool) {
@@ -1119,6 +1358,8 @@ pub(crate) enum ComboMode {
 
 pub struct JsEngine {
     pub(crate) global_env: Rc<Env>,
+    /// environment page tag: `drop` sweeps every scope of this page
+    page: u64,
     pub(crate) global_obj: Rc<RefCell<Obj>>,
     /// shared prototype for every array (lazy-attached on first access)
     pub(crate) array_proto: Option<Rc<RefCell<Obj>>>,
@@ -1259,6 +1500,64 @@ pub struct JsEngine {
 
 pub(crate) const REGEX_CACHE_MAX: usize = 512;
 
+impl Drop for JsEngine {
+    /// Break the `Rc` cycles rooted at the global object/environment.
+    ///
+    /// A page's functions capture their environment (`Closure::env`), and the
+    /// global environment's bindings hold those functions: env → binding →
+    /// closure → env. `Rc` cannot collect that, so without this hook every
+    /// navigation/reload leaked the consumed page's whole engine heap (the
+    /// reload soak measured ~40 KB per reload before this).
+    ///
+    /// Only the roots are cleared. A self-contained cycle inside a nested
+    /// function scope (a local `function f(){ return f; }`) is still
+    /// unreachable garbage; tracing it would need a real GC, and the leak
+    /// budget is set against what pages actually do.
+    fn drop(&mut self) {
+        // clear every scope, object and function this page created: page
+        // scripts build plenty of `Rc` cycles (`a.b = b; b.a = a`,
+        // `f.prototype.constructor = f`, ...) that plain refcounting cannot
+        // collect, and a heavy site leaked megabytes per reload without this.
+        clear_page_graph(self.page);
+        if let Ok(mut b) = self.global_env.bindings.try_borrow_mut() {
+            b.clear();
+        }
+        if let Ok(mut o) = self.global_obj.try_borrow_mut() {
+            o.props.clear();
+            o.proto = None;
+            o.kind = ObjKind::Plain;
+        }
+        self.native_props.clear();
+        self.timers.clear();
+        self.microtasks.clear();
+        self.promise_slots.clear();
+        self.promise_statics = None;
+        self.module_loader = None;
+        self.regex_cache.clear();
+        self.pending_construct = None;
+        // prototypes can hold constructor methods whose closures capture the
+        // global env; release the table entries as well as the roots
+        self.array_proto = None;
+        self.object_proto = None;
+        self.promise_proto = None;
+        self.url_proto = None;
+        self.params_proto = None;
+        self.set_proto = None;
+        self.map_proto = None;
+        self.weakmap_proto = None;
+        self.weakset_proto = None;
+        self.text_encoder_proto = None;
+        self.text_decoder_proto = None;
+        self.arraybuffer_proto = None;
+        self.typed_proto = None;
+        self.data_view_proto = None;
+        self.abort_signal_proto = None;
+        self.abort_controller_proto = None;
+        self.function_proto = None;
+        self.error_proto = None;
+    }
+}
+
 /// Canonical `Rc<str>` for property names. Every object property insert used
 /// to allocate its own copy of the key: a React render creates the same
 /// handful of names across thousands of objects, so a heavy page paid one
@@ -1319,13 +1618,12 @@ impl JsEngine {
         // one page's property names are not the next page's; drop the old
         // table so a long session keeps interning the CURRENT page's keys
         clear_key_intern();
+        let page = page_start();
+        let global_env = Env::with_page(page);
         let mut e = JsEngine {
-            global_env: Env::root(),
-            global_obj: Rc::new(RefCell::new(Obj {
-                kind: ObjKind::Plain,
-                props: Vec::new(),
-                proto: None,
-            })),
+            global_env,
+            page,
+            global_obj: new_obj(ObjKind::Plain, Vec::new(), None),
             array_proto: None,
             object_proto: None,
             natives: Vec::new(),
@@ -2012,11 +2310,11 @@ const PROTO_WALK_CAP: usize = 100; // prototype cycle guard
 
 /// fresh pending promise object
 pub(crate) fn new_promise_obj() -> Rc<RefCell<Obj>> {
-    Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Promise(Box::new(PromiseState::default())),
-        props: Vec::new(),
-        proto: None,
-    }))
+    new_obj(
+        ObjKind::Promise(Box::new(PromiseState::default())),
+        Vec::new(),
+        None,
+    )
 }
 
 impl JsEngine {

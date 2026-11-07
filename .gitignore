@@ -4,3 +4,5 @@ spike-out.txt
 spike-err.txt
 spike-*.json
 spike-*.png
+soak-*.json
+tabs.json

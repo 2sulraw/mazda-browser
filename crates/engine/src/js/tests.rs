@@ -3,6 +3,57 @@
 
 use super::*;
 
+/// A page's engine must release its global environment when it is dropped.
+/// Functions installed on the global object capture the global env, so an
+/// unbroken `Rc` cycle would leak the whole engine heap on every navigation
+/// (the reload-soak test caught exactly that: ~40 KB per reload).
+#[test]
+fn dropping_the_engine_releases_the_global_env() {
+    let mut e = JsEngine::new();
+    // a global function captures the global env -> env -> binding -> closure
+    e.exec("function f() { return f; }").unwrap();
+    let weak_env = Rc::downgrade(&e.global_env);
+    let weak_obj = Rc::downgrade(&e.global_obj);
+    drop(e);
+    assert!(
+        weak_env.upgrade().is_none(),
+        "global env leaked through the closure cycle"
+    );
+    assert!(
+        weak_obj.upgrade().is_none(),
+        "global object leaked through the closure cycle"
+    );
+}
+
+/// Page scripts also build cycles that never touch an environment binding:
+/// `a.b = b; b.a = a`, or a function that stores itself on its own property.
+/// `Rc` cannot collect those, so `JsEngine::drop` must clear the page's
+/// object and function edges too, not only scope bindings.
+#[test]
+fn dropping_the_engine_releases_object_cycles() {
+    let mut e = JsEngine::new();
+    e.exec(
+        "var a = {}; var b = { a: a }; a.b = b; \
+         function f() { return f; } f.self = f; a.f = f;",
+    )
+    .unwrap();
+    let a = match e.get_global("a") {
+        Val::Obj(o) => o,
+        v => panic!("expected object, got {v:?}"),
+    };
+    let f = match e.get_global("f") {
+        Val::Func(c) => c,
+        v => panic!("expected function, got {v:?}"),
+    };
+    let weak_a = Rc::downgrade(&a);
+    let weak_f = Rc::downgrade(&f);
+    drop(a);
+    drop(f);
+    drop(e);
+    assert!(weak_a.upgrade().is_none(), "object cycle leaked");
+    assert!(weak_f.upgrade().is_none(), "function self-cycle leaked");
+}
+
 fn run(src: &str) -> Val {
     let mut e = JsEngine::new();
     e.exec(src).unwrap_or_else(|err| panic!("exec failed: {}\nsrc: {}", err, src))

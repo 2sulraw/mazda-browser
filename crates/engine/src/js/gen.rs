@@ -186,11 +186,7 @@ pub(crate) fn gen_object(e: &mut JsEngine, def: &Rc<FnDef>, env: &Rc<Env>) -> Re
         }
     };
     let vm = Rc::new(RefCell::new(vm));
-    Ok(Val::Obj(Rc::new(RefCell::new(Obj {
-        kind: ObjKind::Generator(vm),
-        props: Vec::new(),
-        proto: None,
-    }))))
+    Ok(Val::Obj(new_obj(ObjKind::Generator(vm), Vec::new(), None)))
 }
 
 // ---------------------------------------------------------------------------
