@@ -270,15 +270,24 @@ relevant only when transitions and animations exist.
 - Flex: `wrap-reverse` does not reverse the cross axis. A `width: %` item's
   basis is the percentage resolved against the row (no intrinsic floor), so
   several `width:100%` siblings shrink evenly via `flex-shrink`; absolute
-  min/max widths still clamp after shrink.
+  min/max widths still clamp after shrink. A `%` `max-`/`min-width` on an item
+  is pinned against the row before measuring (it is not re-resolved against
+  the item's own slot), the automatic minimum size is clamped by
+  `max-`/`min-width`, and shrink is weighted by the content base rather than
+  the margin box, so equal columns stay equal when one carries side margins.
+  Min-content and the line breaker honour UAX #14 hyphen break opportunities
+  (the longest hyphen-free piece is the floor), but `hyphens: auto`
+  dictionary/`soft hyphen` hyphenation is still not modeled.
 - Borders: per-side width and colour longhands parse into the existing model,
   which still keeps one colour for all sides and one radius for all corners
   (the last declaration wins); a `transparent` colour keeps the side's width
   but paints nothing; style words collapse to a solid border;
   dashed/dotted text decorations are approximated; inner shadows are dropped.
 - `%` `min-height` / `max-height` resolve against width, not container
-  height; an auto block still ignores a plain `height` (only `min-height`,
-  `max-height`, `aspect-ratio` and replaced boxes pin it).
+  height, and a `%` `height` is still ignored (the engine does not track the
+  containing block's height). A px-resolved `height` now sets an auto block's
+  used content height (content taller than it overflows), which is what
+  `.highlight { height: 12px }` bars need.
 - `line-clamp` keeps the first N text line boxes, adds a trailing marker and
   shrinks the box; it still lays out as block flow (a vendor-prefixed
   `display: box` is an unknown display value), counts nested
@@ -301,6 +310,13 @@ relevant only when transitions and animations exist.
   declaration). `font-size` also accepts the absolute-size keywords
   (`xx-small`â€¦`xxx-large`, `larger`, `smaller`), and `line-height` accepts
   unitless, px/em/rem/%, viewport units and `normal`.
+- Text is sized by the CSS em square, not the font's ascent-to-descent height:
+  glyphs are scaled by `size × height_unscaled / units_per_em` and the
+  baseline is the real ascent plus CSS half-leading. `rem` resolves against
+  the `<html>` element's computed `font-size` (not a fixed UA default), and a
+  unitless `line-height` is a factor applied to the element's final
+  font-size. `em` on a property resolves against the element's own
+  font-size.
 - `filter` supports the shorthand colour functions (`grayscale`, `sepia`,
   `saturate`, `hue-rotate`, `invert`, `opacity`, `brightness`, `contrast`)
   collapsed into one affine RGB matrix plus an alpha multiplier. `blur`,
@@ -458,7 +474,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 866 self-authored unit tests (870 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 875 self-authored unit tests (878 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -506,11 +522,25 @@ floor/cap, and transparent borders painted as currentColor — taking it from
 1400px to 488px / 28 runs / 92.3 MB (Chrome: 525px), form 56px, icons
 36/24/20px; `[css-miss]` 50 and `[js-miss]` 20 globals + 11 members
 (`XMLHttpRequest`, `trustedTypes`, `fonts.timing`, `sendBeacon`, …) are
-unchanged. What remains: `Reflect`
+unchanged. Wave 79 fixed the text itself: `ab_glyph`'s `PxScale` targets the
+font height, not the em square, so every run had been laid out and painted at
+`em/height` (Fira 5/6, Alfa 0.73); `em_scale` now uses
+`size × height_unscaled / units_per_em` with a real-ascent baseline, `rem`
+resolves against the `<html>` computed font-size, and a unitless
+`line-height` is a factor of the final font-size. Chrome canvas
+`measureText` on the live webfonts is the ground truth (`Install@18`
+51.10px, `Governance@18` 96.25px, `empowering@36` 201.82px; Alfa `Rust@18`
+44.21px) and the engine matches. rust-lang.org drops 5344 -> 4113px against
+Chrome's 3841px, google 488 -> 539px (Chrome fits it in the 616px viewport),
+nextjs 7906 (Chrome 10548), MDN 2966 (3328), Hacker News 1782 (1214).
+Wikipedia's 28074px has no Chrome number this wave: headless Chrome served a
+Wikimedia error page. What remains: `Reflect`
 metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
 `Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`
-reads, and the flex/grid gaps that keep rust-lang.org at 5344px against
-Chrome's 3841px.
+reads, and the spacing gaps that keep rust-lang.org at 4113px against
+Chrome's 3841px — the legacy 0.6em paragraph gap stands in for real UA
+margins (`p`, headings, lists, `blockquote`, `pre`, `hr`, `figure`, `dl`,
+`table`) and margin collapsing, which is the next headline layout fix.
 
 ### 8.2 Priority by reference impact and RAM cost
 

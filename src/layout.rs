@@ -193,7 +193,8 @@ pub struct Style {
 impl Style {
     pub const fn new() -> Self {
         Style {
-            size: 15.0,
+            // the CSS initial `font-size: medium` = the browser default 16px
+            size: 16.0,
             bold: false,
             italic: false,
             color: 0x00_00_00_00, // UA default = black (matches every browser)
@@ -225,6 +226,10 @@ impl Style {
     pub fn line_height(&self) -> f32 {
         if self.lh > 0.0 {
             self.lh
+        } else if self.lh < 0.0 {
+            // a unitless `line-height` inherits as the FACTOR, not as px
+            // (CSS Inline): resolve it against this element's own font-size
+            self.size * -self.lh
         } else {
             self.size * 1.35
         }
@@ -3788,7 +3793,7 @@ fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
         // and the button overflowed the header. Border-box by default;
         // content-box adds padding+border (same rule as place()).
         if let Some(Len::Px(p)) = n.bx.width {
-            return if n.bx.content_box {
+            let mut w = if n.bx.content_box {
                 p + resolve_len(n.bx.pad[3], avail)
                     + resolve_len(n.bx.pad[1], avail)
                     + resolve_len(n.bx.border[3], avail)
@@ -3796,6 +3801,13 @@ fn min_content_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
             } else {
                 p
             };
+            if let Some(m) = n.bx.max_width {
+                w = w.min(resolve_len(m, avail));
+            }
+            if let Some(m) = n.bx.min_width {
+                w = w.max(resolve_len(m, avail));
+            }
+            return w;
         }
     }
     content_min_w(n, avail, measure)
@@ -3811,8 +3823,11 @@ fn content_min_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
         if n.hard_break {
             0.0
         } else {
+            // a hyphen is a break opportunity (UAX #14), so the minimum is
+            // the longest hyphen-free piece — same rule as `push_words`
             n.text
                 .split_whitespace()
+                .flat_map(|w| w.split_inclusive('-'))
                 .map(|w| measure(w, &n.style))
                 .fold(0.0f32, f32::max)
         }
@@ -3867,11 +3882,23 @@ fn content_min_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
     if n.is_text {
         return content;
     }
-    content
+    let mut w = content
         + resolve_len(n.bx.pad[3], avail)
         + resolve_len(n.bx.pad[1], avail)
         + resolve_len(n.bx.border[3], avail)
-        + resolve_len(n.bx.border[1], avail)
+        + resolve_len(n.bx.border[1], avail);
+    // `max-`/`min-width` bound the USED width, so they bound the intrinsic
+    // minimum too (same reasoning as `natural_w`): rust-lang.org's purple
+    // cards each hold a 512px logo scaled down by `max-width:96px`, and the
+    // unclamped file width became the card's flex shrink floor — four
+    // `width:100%` cards could then never shrink into their row.
+    if let Some(m) = n.bx.max_width {
+        w = w.min(resolve_len(m, avail));
+    }
+    if let Some(m) = n.bx.min_width {
+        w = w.max(resolve_len(m, avail));
+    }
+    w
 }
 
 /// Resolved table geometry shared by the width pass (`place`) and the
@@ -4407,6 +4434,19 @@ fn place(
                 None if n.bx.content_box => n.w / r,
                 None => (w / r - v_extra).max(0.0),
             };
+        }
+        // A declared absolute `height` sets the used CONTENT height; content
+        // taller than it overflows (CSS). Blocks used to ignore plain
+        // heights entirely, so rust-lang.org's `.highlight { height:12px }`
+        // rules bars collapsed to 0px and every section header came out short.
+        // shortcut: only px-resolved lengths — a `%` height belongs to the
+        // containing block's HEIGHT, which this engine doesn't track (guessing
+        // from the width turned `html, body { height:100% }` into a
+        // viewport-wide box).
+        if n.bx.aspect_ratio.is_none() {
+            if let Some(Len::Px(h)) = n.bx.height {
+                n.h = as_content_h(h, n.bx.content_box, v_extra).max(0.0);
+            }
         }
     }
     // line-clamp: keep only the first N text line boxes of this flow, end
@@ -6355,6 +6395,22 @@ fn flex_row(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut V
         n.open = false;
         return;
     }
+    // `%` `max-`/`min-width` on an item resolves against the flex container's
+    // content width, so pin those to that row width as px before anything
+    // measures or places the item. `place()` resolves a percentage against the
+    // container it is handed — the item's slot — so left symbolic it capped
+    // the box a second time: rust-lang.org's two `max-width:50%` columns got
+    // ~472px slots and each painted ~236px wide, doubling the section height.
+    for it in &items {
+        let Item::Grp(i) = it else { continue };
+        let c = &mut n.children[*i];
+        if let Some(Len::Pct(p)) = c.bx.max_width {
+            c.bx.max_width = Some(Len::Px(p / 100.0 * n.w));
+        }
+        if let Some(Len::Pct(p)) = c.bx.min_width {
+            c.bx.min_width = Some(Len::Px(p / 100.0 * n.w));
+        }
+    }
     let gap = n.bx.gap_col;
     let gaps = gap * (k as f32 - 1.0).max(0.0);
     let mut widths: Vec<f32> = items.iter().map(|it| item_natural(n, it, n.w, measure)).collect();
@@ -6540,7 +6596,25 @@ fn shrink_row(
     measure: &dyn Fn(&str, &Style) -> f32,
 ) {
     let k = items.len();
-    let base: Vec<f32> = widths.to_vec();
+    // flex-shrink is weighted by the item's CONTENT base, not its margin box:
+    // an item with wide side margins must not give up more content than its
+    // siblings. rust-lang.org's three green columns are equal `width:100%`
+    // items, the middle one carrying 48px side margins; weighting by the
+    // outer width shrank it ~65px harder and left the other two wider.
+    let inner: Vec<f32> = items
+        .iter()
+        .enumerate()
+        .map(|(j, it)| match it {
+            Item::Grp(i) => {
+                let c = &n.children[*i];
+                (widths[j]
+                    - resolve_len(c.bx.margin[3], n.w)
+                    - resolve_len(c.bx.margin[1], n.w))
+                .max(0.0)
+            }
+            Item::Text(..) => widths[j],
+        })
+        .collect();
     let factor: Vec<f32> = items
         .iter()
         .map(|it| match it {
@@ -6558,7 +6632,7 @@ fn shrink_row(
         }
         let total: f32 = (0..k)
             .filter(|&j| widths[j] > floor[j] + 0.01)
-            .map(|j| factor[j] * base[j])
+            .map(|j| factor[j] * inner[j])
             .sum();
         if total <= 0.0 {
             break;
@@ -6569,7 +6643,7 @@ fn shrink_row(
             if room <= 0.01 || factor[j] <= 0.0 {
                 continue;
             }
-            let take = (overflow * factor[j] * base[j] / total).min(room);
+            let take = (overflow * factor[j] * inner[j] / total).min(room);
             widths[j] -= take;
             moved += take;
         }
@@ -7228,6 +7302,27 @@ fn fit_prefix(text: &str, style: &Style, avail: f32, measure: &dyn Fn(&str, &Sty
     end_of(ok)
 }
 
+/// Byte length of the longest prefix of `text` that ends in `-` and fits in
+/// `avail` px, or 0 when none does. UAX #14 makes every hyphen a break
+/// opportunity, so a real line breaker splits a compound word there instead
+/// of moving (or overflowing) the whole token. Greedy, like every other break
+/// this engine takes: the LAST hyphen that still fits wins.
+fn hyphen_cut(text: &str, avail: f32, style: &Style, measure: &dyn Fn(&str, &Style) -> f32) -> usize {
+    let mut best = 0;
+    for (i, c) in text.char_indices() {
+        if c != '-' {
+            continue;
+        }
+        let end = i + 1;
+        if measure(&text[..end], style) + spacing_extra(&text[..end], style) <= avail + 0.01 {
+            best = end;
+        } else {
+            break;
+        }
+    }
+    best
+}
+
 fn layout_from(
     atoms: &[Atom],
     x0: f32,
@@ -7458,11 +7553,20 @@ fn layout_from(
         // last float digit (a letter-spaced, uppercased pill measured 96.31454
         // and its words summed to 96.31454 + 1e-5), and `>` on that would
         // split "WIDELY AVAILABLE" onto two lines inside its own pill
-        if x > line_x0 && x + ww > line_max + 0.01 && w.style.ws.wrap() {
-            y += line_height;
-            x = 0.0;
-            line_x0 = 0.0; // wrapped line starts at the box edge (indent is first-line only)
-            line_height = 0.0;
+        let mut hy = 0usize; // pending hyphen break (UAX #14), 0 = none
+        if x + ww > line_max + 0.01 && w.style.ws.wrap() {
+            // A hyphen is a break opportunity, so a compound that does not
+            // fit splits at the last hyphen that does instead of moving the
+            // whole token down (or, at line start, overflowing). Without
+            // this, "performance-critical" was one unbreakable token and
+            // therefore a flex item's minimum width.
+            hy = hyphen_cut(rest, line_max - x, &w.style, measure);
+            if hy == 0 && x > line_x0 {
+                y += line_height;
+                x = 0.0;
+                line_x0 = 0.0; // wrapped line starts at the box edge (indent is first-line only)
+                line_height = 0.0;
+            }
         }
         after_br = false; // real content ends the <br> run
         if line_height == 0.0 && !flt.is_empty() {
@@ -7493,12 +7597,14 @@ fn layout_from(
             let can_cut = x + ww > line_max + 0.01
                 && w.style.ws.wrap()
                 && w.style.breaks_inside_words();
-            let mut cut = if can_cut {
+            let mut cut = if hy > 0 {
+                hy
+            } else if can_cut {
                 fit_prefix(rest, &w.style, line_max - x, measure)
             } else {
                 0
             };
-            if can_cut && cut == 0 {
+            if hy == 0 && can_cut && cut == 0 {
                 if x > line_x0 {
                     // nothing more fits here: continue on a fresh line
                     y += line_height;
@@ -7512,6 +7618,7 @@ fn layout_from(
                 // the loop always makes progress (the old overflow result)
                 cut = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(rest.len());
             }
+            let hy_break = hy > 0 && cut == hy;
             let piece = if cut == 0 { rest } else { &rest[..cut] };
             let pw = if cut == 0 {
                 ww
@@ -7571,6 +7678,25 @@ fn layout_from(
             rest = &rest[piece.len()..];
             if rest.is_empty() {
                 break;
+            }
+            if hy_break {
+                // the word broke at a hyphen: its remainder continues on
+                // THIS line. If that remainder does not fit either, take
+                // another hyphen break, else wrap it like any word.
+                hy = 0;
+                ww = measure(rest, &w.style) + spacing_extra(rest, &w.style);
+                if x + ww > line_max + 0.01 && w.style.ws.wrap() {
+                    hy = hyphen_cut(rest, line_max - x, &w.style, measure);
+                    if hy == 0 && x > line_x0 {
+                        y += line_height;
+                        x = 0.0;
+                        line_x0 = 0.0;
+                        line_height = 0.0;
+                        // the fresh line has more room: retry a hyphen break
+                        hy = hyphen_cut(rest, line_max - x, &w.style, measure);
+                    }
+                }
+                continue;
             }
             // the remainder moved to the next line
             y += line_height;
@@ -7728,6 +7854,52 @@ mod tests {
         assert!(l.height > l.runs[0].style.line_height());
     }
 
+    /// UAX #14 gives a break opportunity AFTER a hyphen, so a hyphenated
+    /// compound may wrap there even though it is one "word". Without it the
+    /// whole compound was one unbreakable token (and a flex item's minimum).
+    #[test]
+    fn hyphen_gives_a_line_break_opportunity() {
+        let atoms = vec![mk_atom("aaa-bbb-ccc", false)];
+        // 4px per char: pieces are 16, 16 and 12px wide
+        let l = layout(&atoms, 20.0, &m4);
+        assert!(l.runs.len() >= 2, "expected a break after a hyphen");
+        let joined: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "aaa-bbb-ccc", "no characters lost or duplicated");
+        for r in &l.runs {
+            assert!(
+                r.x + r.width <= 20.0 + 0.001,
+                "piece overflows: {:?}",
+                r.text
+            );
+        }
+    }
+
+    #[test]
+    fn flex_floor_takes_a_hyphen_break_opportunity() {
+        // rust-lang.org's green columns: each is `width:100%` and its longest
+        // word is "performance-critical". The hyphen break opportunity makes
+        // the automatic minimum the longer PIECE (48px at 4px/char), not the
+        // 80px token, so the three columns can shrink to share the row.
+        let col = || {
+            let mut c = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    width: Some(Len::Pct(100.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            c.children = vec![leaf("performance-critical")];
+            c
+        };
+        let mut row = flex_row(vec![col(), col(), col()], BoxStyle::default());
+        layout_tree(&mut row, 150.0, &m4);
+        let sum: f32 = row.children.iter().map(|c| c.w).sum();
+        assert!((sum - 150.0).abs() < 1.0, "columns share the row: {sum}");
+        for c in &row.children {
+            assert!(c.w >= 47.5, "never below the hyphen-free piece: {}", c.w);
+        }
+    }
+
     /// `word-break: break-all` enables the same in-word cut; `keep-all` and
     /// `white-space: nowrap` do not.
     #[test]
@@ -7825,7 +7997,7 @@ mod tests {
         ];
         let l = layout_tree(&mut n, 200.0, &m4);
         assert_eq!(l.runs.len(), 2);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         assert!(
             (l.runs[1].y - line).abs() < 0.01,
             "y={} = exactly one line, no 0.6*size gap",
@@ -7849,7 +8021,7 @@ mod tests {
         );
         n.children = vec![leaf("aaa bbb ccc ddd eee")];
         let l = layout_tree(&mut n, 200.0, &m4);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         assert!(
             (n.h - line * 2.0).abs() < 0.01,
             "h={} = two lines, not three",
@@ -7886,7 +8058,7 @@ mod tests {
             n.children.push(leaf("b"));
             n
         };
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         for (brs, lines) in [(2usize, 2.0f32), (3, 3.0)] {
             let mut n = mk(brs);
             let l = layout_tree(&mut n, 200.0, &m4);
@@ -8148,7 +8320,7 @@ mod tests {
         );
         let l = layout_tree(&mut root, 200.0, &m4);
         // 3 lines at default 15px × 1.35 line-height
-        let content_h = 3.0 * 15.0 * 1.35;
+        let content_h = 3.0 * 16.0 * 1.35;
         assert!((root.h - content_h).abs() < 0.01, "h={} content={}", root.h, content_h);
         assert_eq!(l.runs[0].y, 0.0, "first line stays at top");
     }
@@ -8228,6 +8400,35 @@ mod tests {
     }
 
     #[test]
+    fn flex_row_pct_max_width_resolves_against_the_row() {
+        // rust-lang.org's "Get involved" columns: two `max-width:50%` flex
+        // items side by side must each occupy half the row. The percentage
+        // used to be re-resolved against the item's own slot by place(),
+        // halving it twice (~236px boxes in ~472px slots).
+        let col = |label: &str| {
+            let mut c = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    max_width: Some(Len::Pct(50.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            c.children = vec![leaf(label)];
+            c
+        };
+        let mut row = flex_row(
+            vec![
+                col("a very wide left column that overflows half the row"),
+                col("a very wide right column that overflows half the row"),
+            ],
+            BoxStyle::default(),
+        );
+        layout_tree(&mut row, 400.0, &m4);
+        assert!((row.children[0].w - 200.0).abs() < 0.5, "left w={}", row.children[0].w);
+        assert!((row.children[1].w - 200.0).abs() < 0.5, "right w={}", row.children[1].w);
+    }
+
+    #[test]
     fn flex_row_pct_width_siblings_split_the_row() {
         // rust-lang.org's "Why Rust?" row: three `width:100%` columns side by
         // side. Each basis is the full row, so the overflow is split by
@@ -8247,6 +8448,50 @@ mod tests {
         layout_tree(&mut row, 300.0, &m4);
         for c in &row.children {
             assert!((c.w - 100.0).abs() < 0.5, "each column takes a third: w={}", c.w);
+        }
+    }
+
+    #[test]
+    fn flex_row_pct_width_items_shrink_past_an_oversized_child() {
+        // rust-lang.org's purple cards: four `width:100%; max-width:34em`
+        // columns, each holding a logo whose intrinsic width (512px) is cut
+        // down by `max-width:96px`. The logo's uncapped file width used to be
+        // the card's automatic minimum size, so the cards could not shrink
+        // and painted 512px each — the last ones off the right edge.
+        let card = || {
+            let mut logo = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    max_width: Some(Len::Px(96.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            logo.img = Some(ImgSlot::Probed {
+                src: std::rc::Rc::from("logo"),
+                w: 512,
+                h: 512,
+            });
+            let mut c = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    width: Some(Len::Pct(100.0)),
+                    max_width: Some(Len::Px(544.0)),
+                    ..BoxStyle::default()
+                },
+            );
+            c.children = vec![logo, leaf("a sentence that is far wider than one card")];
+            c
+        };
+        let mut row = flex_row((0..4).map(|_| card()).collect(), BoxStyle::default());
+        layout_tree(&mut row, 960.0, &m4);
+        for (i, c) in row.children.iter().enumerate() {
+            assert!((c.w - 240.0).abs() < 1.0, "card {i} w={} (want 240)", c.w);
+            assert!(
+                (c.x - 240.0 * i as f32).abs() < 1.0,
+                "card {i} x={} (want {})",
+                c.x,
+                240.0 * i as f32
+            );
         }
     }
 
@@ -8336,7 +8581,7 @@ mod tests {
         let l = layout_tree(&mut root, 60.0, &m4);
         assert_eq!(l.runs.len(), 2);
         assert_eq!(l.runs[0].width, 40.0, "natural width kept");
-        assert_eq!(l.runs[0].y, l.runs[1].y - 15.0 * 1.35 - 5.0, "second line + gap");
+        assert_eq!(l.runs[0].y, l.runs[1].y - 16.0 * 1.35 - 5.0, "second line + gap");
         assert_eq!(l.runs[1].x, 0.0, "wrapped item starts at line start");
     }
 
@@ -8476,7 +8721,7 @@ mod tests {
             },
         );
         let l = layout_tree(&mut root, 200.0, &m4);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         // <br> advances exactly one line (no paragraph gap) - the tall item
         // is two lines tall; the short item shifts to the row bottom
         let short = l.runs.iter().find(|r| r.text == "aa").unwrap();
@@ -8510,7 +8755,7 @@ mod tests {
         n.children = vec![boxed("a"), boxed("b")];
         let l = layout_tree(&mut n, 100.0, &m4);
         assert_eq!(l.runs.len(), 2);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         assert!((l.runs[1].y - (line + 10.0)).abs() < 0.01, "y={}", l.runs[1].y);
     }
 
@@ -8543,7 +8788,7 @@ mod tests {
         assert_eq!(l.runs[1].x, 30.0);
         assert_eq!(l.runs[2].x, 60.0);
         assert_eq!(l.runs[3].x, 0.0);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         assert!(l.runs[3].y >= line, "second row below first: {}", l.runs[3].y);
     }
 
@@ -8853,7 +9098,7 @@ mod tests {
         );
         n.children = vec![tall, short];
         let l = layout_tree(&mut n, 200.0, &m4);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         let s = l.runs.iter().find(|r| r.text == "aa").unwrap();
         assert!((s.y - line * 0.5).abs() < 0.01, "centered: y={}", s.y);
     }
@@ -9584,7 +9829,7 @@ mod tests {
         };
         let (y0, y1, h) = build(Justify::Normal);
         assert_eq!((y0, y1), (0.0, 20.0), "normal packs at the start");
-        assert_eq!(h, 40.0, "start does not grow the box past its content");
+        assert_eq!(h, 300.0, "the declared height is the box height");
         let (y0, y1, h) = build(Justify::Center);
         assert_eq!((y0, y1), (130.0, 150.0), "centre: (300-40)/2");
         assert_eq!(h, 300.0, "centre honours the declared height");
@@ -9918,10 +10163,21 @@ mod tests {
         );
         let l = layout_tree(&mut root, 400.0, &m4);
         assert_eq!(
-            l.rects,
+            l.rects
+                .iter()
+                .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5, r.6))
+                .collect::<Vec<_>>(),
             vec![
-                (0.0, 0.0, 120.0, 20.25, 0x11_22_33, 0.0, false),
-                (0.0, 29.25, 90.0, 20.25, 0x44_55_66, 0.0, false),
+                (0.0, 0.0, 120.0, 16.0 * 1.35, 0x11_22_33, 0.0, false),
+                (
+                    0.0,
+                    16.0 * 1.35 + 16.0 * 0.6,
+                    90.0,
+                    16.0 * 1.35,
+                    0x44_55_66,
+                    0.0,
+                    false
+                ),
             ]
         );
         let runs: Vec<(String, f32, f32, f32)> = l
@@ -9933,8 +10189,18 @@ mod tests {
             runs,
             vec![
                 ("alpha".to_string(), 0.0, 0.0, 20.0),
-                ("beta".to_string(), 0.0, 29.25, 16.0),
-                ("bold".to_string(), 20.0, 29.25, 16.0),
+                (
+                    "beta".to_string(),
+                    0.0,
+                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0
+                ),
+                (
+                    "bold".to_string(),
+                    20.0,
+                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0
+                ),
             ]
         );
     }
@@ -10364,6 +10630,50 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_px_height_sets_the_block_height() {
+        // rust-lang.org's `.highlight { height: 12px }`: a decorative bar's
+        // explicit height used to be ignored, so every section header's
+        // highlight collapsed to 0px and lost its space.
+        let mut bar = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                height: Some(Len::Px(12.0)),
+                ..BoxStyle::default()
+            },
+        );
+        bar.children = vec![leaf("a line of text far taller than twelve pixels")];
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        root.children = vec![bar];
+        let l = layout_tree(&mut root, 400.0, &m4);
+        assert_eq!(root.children[0].h, 12.0);
+        assert!(!l.runs.is_empty(), "the content still lays out (it overflows)");
+    }
+
+    #[test]
+    fn a_percentage_height_stays_ignored() {
+        // shortcut documented in place(): a `%` height belongs to the
+        // containing block's height, which the engine doesn't track — the
+        // width-based guess turned `html, body { height: 100% }` into a
+        // viewport-wide box.
+        let mut bar = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                height: Some(Len::Pct(100.0)),
+                ..BoxStyle::default()
+            },
+        );
+        bar.children = vec![leaf("one line")];
+        let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+        root.children = vec![bar];
+        layout_tree(&mut root, 400.0, &m4);
+        assert!(
+            root.children[0].h < 100.0,
+            "content height, not 100% of the width: {}",
+            root.children[0].h
+        );
+    }
+
+    #[test]
     fn block_flow_paragraph_gap() {
         // two block children: second starts after first's height + 0.6*size gap
         let mut n = BoxNode::group(Style::new(), BoxStyle::default());
@@ -10381,8 +10691,8 @@ mod tests {
         n.children = vec![mk_block("one"), mk_block("two")];
         let l = layout_tree(&mut n, 100.0, &m4);
         assert_eq!(l.runs.len(), 2);
-        let line = 15.0 * 1.35;
-        let expect = line + 15.0 * 0.6;
+        let line = 16.0 * 1.35;
+        let expect = line + 16.0 * 0.6;
         assert!((l.runs[1].y - expect).abs() < 0.01, "y={} expect={}", l.runs[1].y, expect);
     }
 
@@ -10443,7 +10753,7 @@ mod tests {
             root.children[1].y
         );
         // every line whose y-span meets the float's clears its rect …
-        let lh = 15.0 * 1.35;
+        let lh = 16.0 * 1.35;
         let mut beside = 0;
         for r in &l.runs {
             if r.y < f.y + f.h && r.y + lh > f.y {
@@ -10488,7 +10798,7 @@ mod tests {
         assert!((f.y - 0.0).abs() < 0.01, "float y={}", f.y);
         assert!((f.w - 100.0).abs() < 0.01 && (f.h - 50.0).abs() < 0.01, "float {}x{}", f.w, f.h);
         // lines beside the float end before its left edge
-        let lh = 15.0 * 1.35;
+        let lh = 16.0 * 1.35;
         for r in &l.runs {
             if r.y < f.y + f.h && r.y + lh > f.y {
                 assert!(
@@ -10782,7 +11092,7 @@ mod tests {
         let mut mid = mk(VAlign::Middle);
         layout_tree(&mut base, 300.0, &m4);
         layout_tree(&mut mid, 300.0, &m4);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         let base_y = base.children[1].y;
         let mid_y = mid.children[1].y;
         // default/baseline = the old centering: (line_h − box_h)/2
@@ -10827,7 +11137,7 @@ mod tests {
         b2.children = vec![leaf("two")];
         n.children = vec![b1, b2];
         let l = layout_tree(&mut n, 100.0, &m4);
-        let line = 15.0 * 1.35;
+        let line = 16.0 * 1.35;
         // b1: one text line with the inline box centered in it
         assert!((n.children[0].h - line).abs() < 0.01, "b1.h={}", n.children[0].h);
         assert!(
@@ -10837,7 +11147,7 @@ mod tests {
         );
         // b2 starts after b1 + the 0.6em paragraph gap — same geometry as
         // the pre-float engine
-        let expect = line + 15.0 * 0.6;
+        let expect = line + 16.0 * 0.6;
         assert!((n.children[1].y - expect).abs() < 0.01, "b2.y={} expect={}", n.children[1].y, expect);
         assert_eq!(l.runs.len(), 2);
         assert!((l.runs[1].y - expect).abs() < 0.01, "second run y={}", l.runs[1].y);
@@ -11048,7 +11358,7 @@ mod tests {
         // content starts at left padding; box height = line + top + bottom pad
         assert!((l.runs[0].x - 20.0).abs() < 0.01, "x={}", l.runs[0].x);
         assert!((l.runs[0].y - 10.0).abs() < 0.01, "y={}", l.runs[0].y);
-        assert!((n.h - (15.0 * 1.35 + 20.0)).abs() < 0.01, "h={}", n.h);
+        assert!((n.h - (16.0 * 1.35 + 20.0)).abs() < 0.01, "h={}", n.h);
         // border-box width unchanged
         assert!((n.w - 200.0).abs() < 0.01);
     }
@@ -11085,7 +11395,7 @@ mod tests {
         let l = layout_tree(&mut n, 100.0, &m4);
         assert!((l.runs[0].x - 4.0).abs() < 0.01, "x={}", l.runs[0].x);
         assert!((l.runs[0].y - 2.0).abs() < 0.01, "y={}", l.runs[0].y);
-        assert!((n.h - (15.0 * 1.35 + 4.0)).abs() < 0.01, "h={}", n.h);
+        assert!((n.h - (16.0 * 1.35 + 4.0)).abs() < 0.01, "h={}", n.h);
         assert!((n.w - 100.0).abs() < 0.01, "border-box width unchanged");
     }
 
@@ -11135,7 +11445,7 @@ mod tests {
         let l3 = layout_tree(&mut t, 50.0, &m4);
         assert_eq!(l3.rects.len(), 1, "background only: {:?}", l3.rects);
         assert_eq!(l3.rects[0].4, 0x123456, "no border-colour rect");
-        assert!((t.h - (15.0 * 1.35 + 16.0)).abs() < 0.01, "8px borders still size the box: h={}", t.h);
+        assert!((t.h - (16.0 * 1.35 + 16.0)).abs() < 0.01, "8px borders still size the box: h={}", t.h);
     }
 
     #[test]
@@ -11213,8 +11523,8 @@ mod tests {
         let mut n = BoxNode::group(Style::new(), BoxStyle::default());
         n.children = vec![mk(Len::Px(0.0)), mk(Len::Px(15.0))];
         let l = layout_tree(&mut n, 100.0, &m4);
-        let line = 15.0 * 1.35;
-        let gap = 15.0 * 0.6; // block-boundary paragraph gap
+        let line = 16.0 * 1.35;
+        let gap = 16.0 * 0.6; // block-boundary paragraph gap
         // second block: first line + gap + 15px margin-top
         assert!(
             (l.runs[1].y - (line + gap + 15.0)).abs() < 0.01,
@@ -11269,7 +11579,7 @@ mod tests {
         assert_eq!(color, 0x112233);
         assert!((x - 0.0).abs() < 0.01 && (y - 0.0).abs() < 0.01);
         assert!((w - 100.0).abs() < 0.01, "w={}", w);
-        assert!((h - (15.0 * 1.35 + 10.0)).abs() < 0.01, "h={}", h);
+        assert!((h - (16.0 * 1.35 + 10.0)).abs() < 0.01, "h={}", h);
         assert!((rad - 8.0).abs() < 0.01, "radius={}", rad);
     }
 
@@ -11700,8 +12010,8 @@ mod tests {
         let second = img_box(BoxStyle::default());
         root.children = vec![first, second];
         let l = layout_tree(&mut root, 300.0, &m4);
-        let line = 15.0 * 1.35;
-        let gap = 15.0 * 0.6;
+        let line = 16.0 * 1.35;
+        let gap = 16.0 * 0.6;
         assert!((l.images[0].1 - (line + gap)).abs() < 0.01, "img y={}", l.images[0].1);
     }
 
@@ -11732,7 +12042,7 @@ mod tests {
         let l = layout_tree(&mut root, 300.0, &m4);
         // out-of-flow: contributes nothing to the parent's height
         // (flow line + trailing paragraph gap after the child's open line)
-        let flow_h = 15.0 * 1.35 + 15.0 * 0.6;
+        let flow_h = 16.0 * 1.35 + 16.0 * 0.6;
         assert!((root.h - flow_h).abs() < 0.01, "root.h={} (flow only)", root.h);
         let abs_run = l.runs.iter().find(|r| r.text == "abs").expect("abs run");
         let flow_run = l.runs.iter().find(|r| r.text == "flowtxt").expect("flow run");
@@ -11757,7 +12067,7 @@ mod tests {
         let l = layout_in(&mut root, 300.0, 100.0, &m4);
         let run = l.runs.iter().find(|r| r.text == "abcd").expect("run");
         let bw = 16.0; // 4 chars × 4px
-        let bh = 15.0 * 1.35;
+        let bh = 16.0 * 1.35;
         assert!((run.x - (300.0 - 10.0 - bw)).abs() < 0.01, "x={}", run.x);
         assert!((run.y - (100.0 - 10.0 - bh)).abs() < 0.01, "y={}", run.y);
         let abs_n = &root.children[0];
@@ -11774,8 +12084,8 @@ mod tests {
         let l = layout_tree(&mut root, 300.0, &m4);
         // relative stays in flow: the sibling still starts at flow position
         // (two lines + a trailing paragraph gap after each open child line)
-        let line = 15.0 * 1.35;
-        let h = line * 2.0 + 15.0 * 0.6 * 2.0;
+        let line = 16.0 * 1.35;
+        let h = line * 2.0 + 16.0 * 0.6 * 2.0;
         assert!((root.h - h).abs() < 0.01, "h={} = two lines + gaps", root.h);
         let moved = l.runs.iter().find(|r| r.text == "moved").expect("run");
         assert!((moved.x - 7.0).abs() < 0.01, "x={}", moved.x);
@@ -11791,7 +12101,7 @@ mod tests {
         let l = layout_in(&mut root, 300.0, 100.0, &m4);
         let run = l.runs.iter().find(|r| r.text == "bar").expect("run");
         assert!(run.fixed, "run inside fixed subtree is marked fixed");
-        let bh = 15.0 * 1.35;
+        let bh = 16.0 * 1.35;
         assert!((run.y - (100.0 - bh)).abs() < 0.01, "y={} = vh - h", run.y);
     }
 
@@ -11840,7 +12150,7 @@ mod tests {
         root.children = vec![flow, hidden];
         let l = layout_in(&mut root, 300.0, 100.0, &m4);
         let run = l.runs.iter().find(|r| r.text == "skip").expect("skip run");
-        let total_h = 15.0 * 1.35;
+        let total_h = 16.0 * 1.35;
         assert!(
             run.y + total_h <= 0.0,
             "top:-9999px lays off-canvas: run.y={} (h={total_h})",
@@ -12332,7 +12642,7 @@ mod tests {
             assert!(sel.bx.border[0] == Len::Px(1.0), "UA border");
             assert!(sel.bx.bg.is_some(), "UA background");
             // one line: the box does not stack the paragraph into 3+ lines
-            let line = 15.0 * 1.35;
+            let line = 16.0 * 1.35;
             assert!(
                 root.h < line * 2.0,
                 "h={} stays a single line",
@@ -14168,10 +14478,21 @@ line</textarea></div>"#,
         );
         let l = layout_tree(&mut root, 400.0, &m4);
         assert_eq!(
-            l.rects,
+            l.rects
+                .iter()
+                .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5, r.6))
+                .collect::<Vec<_>>(),
             vec![
-                (0.0, 0.0, 120.0, 20.25, 0x11_22_33, 0.0, false),
-                (0.0, 29.25, 90.0, 20.25, 0x44_55_66, 0.0, false),
+                (0.0, 0.0, 120.0, 16.0 * 1.35, 0x11_22_33, 0.0, false),
+                (
+                    0.0,
+                    16.0 * 1.35 + 16.0 * 0.6,
+                    90.0,
+                    16.0 * 1.35,
+                    0x44_55_66,
+                    0.0,
+                    false
+                ),
             ]
         );
         let runs: Vec<(String, f32, f32, f32)> = l
@@ -14183,8 +14504,18 @@ line</textarea></div>"#,
             runs,
             vec![
                 ("alpha".to_string(), 0.0, 0.0, 20.0),
-                ("beta".to_string(), 0.0, 29.25, 16.0),
-                ("bold".to_string(), 20.0, 29.25, 16.0),
+                (
+                    "beta".to_string(),
+                    0.0,
+                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0
+                ),
+                (
+                    "bold".to_string(),
+                    20.0,
+                    16.0 * 1.35 + 16.0 * 0.6,
+                    16.0
+                ),
             ]
         );
     }
@@ -14651,7 +14982,7 @@ line</textarea></div>"#,
             ("aa".into(), 0.0, 0.0, 8.0),
             ("bb".into(), 12.0, 0.0, 8.0),
             ("cc".into(), 24.0, 0.0, 8.0),
-            ("dd".into(), 0.0, 15.0 * 1.35, 8.0),
+            ("dd".into(), 0.0, 16.0 * 1.35, 8.0),
         ];
         assert_eq!(
             dump, want,

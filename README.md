@@ -131,9 +131,9 @@ Measured RSS on Windows 11 with the status-bar meter:
 | Scenario | RSS |
 |---|---:|
 | Idle window | ~106 MB |
-| Wikipedia article | ~100 MB |
+| Wikipedia article | ~106 MB |
 | MDN reference page | ~80–95 MB |
-| google.com homepage | ~92 MB |
+| google.com homepage | ~95 MB |
 | Additional tabs | restored from snapshots — no live renderer |
 
 The `glow`/winit GL context sets the floor. The real target is the **shape of the curve**: a

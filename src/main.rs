@@ -4314,22 +4314,24 @@ fn layout_page(
     sheet.scope_vars(dom, html_el);
     fonts.begin_page(owned_faces);
 
+    // cascade <html> FIRST: its computed font-size is the root of `rem` (see
+    // css::ROOT_PX), so it must be known before the body's subtree resolves
+    // lengths. Reset to the 16px initial value first so a previous page's
+    // root can't leak into this one (the cell is per-thread).
+    css::set_root_px(16.0);
+    let html_st = sheet.resolve(dom, html_el, Style::new(), dom.attr(html_el, "style"));
+    css::set_root_px(html_st.style.size);
+
     // cascade over the body element itself: page bg + initial inherited style
     // (spec: the canvas background comes from <body> if it has one, else
     // <html>'s — body wins per the HTML spec)
     let mut body = sheet.resolve(dom, root, Style::new(), dom.attr(root, "style"));
-    let bg = body
-        .bg
-        .or_else(|| sheet.resolve(dom, html_el, Style::new(), dom.attr(html_el, "style")).bg)
-        .unwrap_or(BG);
+    let bg = body.bg.or(html_st.bg).unwrap_or(BG);
     // `cursor` inherits down the DOM at box-build time (layout.rs threads
     // the effective value from box to box) — <html> is body's only
     // ancestor, so seed body's undeclared cursor from its cascade
     if body.bx.cursor.is_none() {
-        body.bx.cursor = sheet
-            .resolve(dom, html_el, Style::new(), dom.attr(html_el, "style"))
-            .bx
-            .cursor;
+        body.bx.cursor = html_st.bx.cursor;
     }
 
     let mut root_box = layout::build_scoped(dom, root, body.style, body.bx, &sheet, body.vars.as_ref());
@@ -4655,7 +4657,6 @@ fn paint_svg_text(img: &mut image::ImageData, runs: &[svg::TextRun], fonts: &Fon
         let mut style = Style::new();
         style.size = run.size as f32;
         style.color = run.color;
-        let scale = PxScale::from(style.size);
         // advances come from the SAME picker the glyph blit uses, so the
         // positions stay in step with the rasterized ink
         let adv: Vec<f32> = run
@@ -4663,7 +4664,8 @@ fn paint_svg_text(img: &mut image::ImageData, runs: &[svg::TextRun], fonts: &Fon
             .chars()
             .map(|ch| {
                 let font = fonts.pick_font_for(ch, &style);
-                font.as_scaled(scale).h_advance(font.glyph_id(ch))
+                font.as_scaled(em_scale(&font, style.size))
+                    .h_advance(font.glyph_id(ch))
             })
             .collect();
         let total: f32 = adv.iter().sum();
@@ -4682,7 +4684,6 @@ fn paint_svg_text(img: &mut image::ImageData, runs: &[svg::TextRun], fonts: &Fon
                         width,
                         fonts,
                         &style,
-                        scale,
                         ch,
                         x,
                         run.y as f32,
@@ -4722,7 +4723,6 @@ fn paint_svg_text(img: &mut image::ImageData, runs: &[svg::TextRun], fonts: &Fon
                                 width,
                                 fonts,
                                 &style,
-                                scale,
                                 ch,
                                 (p.0 + n.0 * run.dy) as f32,
                                 (p.1 + n.1 * run.dy) as f32,
@@ -4741,7 +4741,6 @@ fn paint_svg_text(img: &mut image::ImageData, runs: &[svg::TextRun], fonts: &Fon
                             width,
                             fonts,
                             &style,
-                            scale,
                             ch,
                             (p.0 + n.0 * run.dy) as f32,
                             (p.1 + n.1 * run.dy) as f32,
@@ -4785,7 +4784,6 @@ fn blit_glyph(
     width: usize,
     fonts: &Fonts,
     style: &Style,
-    scale: PxScale,
     ch: char,
     x: f32,
     baseline: f32,
@@ -4793,6 +4791,7 @@ fn blit_glyph(
 ) {
     let font = fonts.pick_font_for(ch, style);
     let id = font.glyph_id(ch);
+    let scale = em_scale(&font, style.size);
     let Some(m) = fonts.glyph_mask(&font, id, scale, x, baseline) else { return };
     let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
     if a == 0 {
@@ -5885,13 +5884,27 @@ impl Fonts {
     }
 
     fn measure(&self, text: &str, style: &Style) -> f32 {
-        let scale = PxScale::from(style.size);
         text.chars()
             .map(|c| {
                 let f = self.pick_font_for(c, style);
+                let scale = em_scale(&f, style.size);
                 f.as_scaled(scale).h_advance(f.glyph_id(c))
             })
             .sum()
+    }
+}
+
+/// ab_glyph's `PxScale` is "make the font's HEIGHT (ascent − descent) this
+/// many pixels", but CSS `font-size` is the EM size, so handing `style.size`
+/// straight in laid text out at `em / height` of its real width — Fira Sans
+/// (height 1200 units, em 1000) came out 5/6 wide, Alfa Slab One 0.73. Both
+/// advances and glyph rasters go through this conversion so they stay in step.
+fn em_scale(font: &FontVec, size: f32) -> PxScale {
+    let upem = font.units_per_em().unwrap_or(0.0);
+    if upem > 0.0 {
+        PxScale::from(size * font.height_unscaled() / upem)
+    } else {
+        PxScale::from(size)
     }
 }
 
@@ -6278,14 +6291,24 @@ fn for_each_glyph<F: FnMut(&Rc<GlyphMask>, i32, i32)>(
     style: &Style,
     mut f: F,
 ) {
-    let scale = PxScale::from(style.size);
-    // baseline sits at y0 + ascent (~0.8em for these fonts)
-    let baseline = y0 + style.size * 0.8;
+    // baseline = the font's real ascent below the line box top, after the
+    // half-leading CSS centres the em box with: the old flat `0.8em` guess sat
+    // text several px high on every line whose `line-height` exceeded 1em.
+    let first = s.chars().next().unwrap_or(' ');
+    let baseline = {
+        let m = fonts.pick_font_for(first, style);
+        let upem = m.units_per_em().unwrap_or(0.0);
+        let em = if upem > 0.0 { style.size / upem } else { 1.0 };
+        let asc = m.ascent_unscaled() * em;
+        let desc = -m.descent_unscaled() * em;
+        y0 + (style.line_height() - asc - desc) * 0.5 + asc
+    };
     let mut x = x0;
     for ch in s.chars() {
         let gap = if ch.is_whitespace() { style.word_spacing } else { 0.0 } + style.letter_spacing;
         // same font choice as measure() so widths match what's drawn
         let font = fonts.pick_font_for(ch, style);
+        let scale = em_scale(&font, style.size);
         let scaled = font.as_scaled(scale);
         let id = font.glyph_id(ch);
         let advance = scaled.h_advance(id);
@@ -6930,6 +6953,29 @@ fn working_set_mb() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn em_scale_treats_the_css_size_as_the_em_square() {
+        // ab_glyph divides `PxScale` by the font's HEIGHT (ascent − descent),
+        // not its em, so `PxScale::from(18.0)` laid Fira Sans out at 5/6 of the
+        // requested size. `em_scale` must reproduce the em-square advance that
+        // a CSS `font-size` means.
+        let fonts = Fonts::load();
+        let style = Style::new();
+        let font = fonts.pick_font_for('A', &style);
+        let upem = font.units_per_em().expect("units per em");
+        let (size, id) = (18.0f32, font.glyph_id('A'));
+        let want = font.h_advance_unscaled(id) * size / upem;
+        let got = font.as_scaled(em_scale(&font, size)).h_advance(id);
+        assert!((got - want).abs() < 0.01, "got {got} want {want}");
+        // the unadjusted scale is measurably different for a font whose
+        // ascent−descent ≠ em (every desktop face here)
+        let naive = font.as_scaled(PxScale::from(size)).h_advance(id);
+        assert!(
+            (naive - want).abs() > 0.05,
+            "fixture font has height == em; pick another: naive={naive} want={want}"
+        );
+    }
 
     #[test]
     fn session_round_trips_caps_and_rejects_garbage() {

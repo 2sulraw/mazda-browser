@@ -1763,6 +1763,68 @@ curve matters more than the baseline (near-flat as tabs grow).
 | 2026-11-06 | wave 77 (`noscript` raw text + `Array.prototype` extras + google joins the reference set) | nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org + google.com (new baseline) | google.com became the sixth reference page, and its first capture exposed a real parser bug rather than a CSS one: with scripting enabled, `<noscript>` content must stay TEXT, but the parser built it as elements, so google's fallback `<style>table,div,span,p{display:none}</style>` was collected as a stylesheet and hid the whole page (1 box, 0 runs). `noscript` joined `RAW_TEXT` (alongside `script`/`style`/`textarea`/`title`/`svg`), so its `<style>` and `<meta http-equiv=refresh>` are inert; google then lays out 835 nodes / 115 boxes / 1400px / 28 runs at 95.8 MB, with `[css-miss]` 50 names and `[js-miss]` 20 globals / 11 members. The wave also implements the nine `Array.prototype` methods pages probe (`find`, `findIndex`, `findLast`, `findLastIndex`, `at`, `fill`, `copyWithin`, `flat`, `flatMap`), carried by two helpers: `rel_index` (relative index grammar for `at`/`fill`/`copyWithin` - negative from the end, out-of-range clamps, NaN -> 0) and `flatten_into` (shared by `flat`/`flatMap`, depth clamped to 64 so a script-built nested array cannot recurse without bound; deeper nesting keeps the rest as arrays). `copyWithin` snapshots its source range before writing, `fill` reuses `slice_bounds` and returns the receiver, and the find family follows the engine's existing iterator convention (callback gets element/index/thisArg, `this` is the global object). The census confirms it: nextjs members 67 -> 61 with `at`/`copyWithin`/`fill`/`findIndex`/`flat`/`flatMap` gone and no new names. Suite **861** default / **865** `engine-b + woff2`; five new tests (four array, one parser). The first capture attempt happened during a host-wide TLS outage (every host and tool failed, `curl`/`Invoke-WebRequest`/`git ls-remote` included) and was retaken once egress returned; the five older references keep identical geometry (nextjs 7578/569, MDN 2773/641, Wikipedia 24673/10951, HN 1695/720, rust 5800/483) and CSS counts (84/12/29/3/9). google's new baseline still has large visual gaps: its search form lays out 968px tall and two large black SVG/image fills stretch over the page - a layout/SVG item for wave 78, not a parser one. |
 | 2026-11-07 | wave 78 (SVG intrinsic sizing, flex `%` basis, transparent borders) | google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News + rust-lang.org | google.com's three visible defects were all sizing/paint rules, not site quirks. (1) `svg::probe` treated `viewBox` numbers as pixels, so `viewBox="0 -960 960 960"` icons became 960x960; a viewBox is user space and now contributes only its RATIO — width/height attributes win, a missing axis follows the ratio, and a viewBox-only root gets `width: 100%` of its containing block (`svg::fills_width`, applied in layout) with the height from the ratio. Ground truth came from headless Chrome on a local page (no window, no input): `<svg>` without viewBox 300x150; viewBox-only 600x600 in a 600px block and 24x12 for 2:1 in 24px; `width="80"` + 2:1 viewBox 80x40; `height="30"` 60x30; a 20px flex button holding `svg{width:100%}` 20x20. (2) A flex item's `width: %` basis was floored by its intrinsic width and capped against its siblings, so a 20px icon button's SVG became 300px and three `width:100%` columns (rust-lang's "Why Rust?" row) each collapsed to 0; the percentage is now the definite basis with no floor and no cap, and the existing `shrink_row` pass splits the overflow the way `flex-shrink: 1` does (each of the three takes a third). (3) `border: Npx solid transparent` painted currentColor, so google's `border-bottom: 8px solid transparent` drew a 444x8 black bar; `BoxStyle.btransparent` keeps the side's width (it still sizes the box) and drops only the paint. A fourth, related fix: a replaced element's intrinsic width is now clamped by `max-width`/`min-width` (rust-lang's 512px logos under `max-width:128px` laid out 512px wide and tall). google.com goes 1400px -> 488px (Chrome measures 525px for the same markup), form 56px, icons 36x36 / 24x24 / 20x20, and the capture shows a clean homepage. Suite **866** default / **870** `engine-b + woff2`; five new tests plus the extended border-paint snapshot. The other references keep their geometry except rust-lang (5800 -> 5344: the image ratios are now real), and CSS counts 84/12/29/3/9/50 are unchanged. |
 
+| 2026-11-07 | wave 79 (real em scale + baseline, `rem` and unitless `line-height`, flex `%` limits and content-based shrink, hyphen breaks, declared `height`) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | Text had been laid out and painted at the wrong size all along: ab_glyph's `PxScale` targets the font's HEIGHT (ascent - descent), not the CSS em square, so every run was rasterized at `em/height` (Fira 5/6 = 0.833, Alfa Slab 0.73) and its baseline came from that scaled height. `em_scale` now converts `size x height_unscaled / units_per_em`, and the baseline uses the real font ascent plus CSS half-leading; Chrome canvas `measureText` on the live webfonts is the ground truth (Fira `Install@18` 51.10px, `Governance@18` 96.25px, `empowering@36` 201.82px; Alfa `Rust@18` 44.21px, `@96` 235.78px) and the engine now matches it. Pages whose font sizes were already right grew into their real text instead of looking undersized (nextjs 7578 -> 7906, MDN 2773 -> 2966, Wikipedia 24673 -> 28074). `rem` now resolves against the `<html>` element's computed font-size (the cascade visits `<html>` first and stores it in a CSS thread-local), so rust-lang.org's `html{font-size:62.5%}` + `html{font-size:75%}` = 12px and `body{font-size:1.5rem}` = 18px match Chrome (previously `rem` used the 16px default and the body was 24px); a unitless `line-height` is stored as a factor and resolved against the element's FINAL font-size (`1.6 x 18 = 28.8px`), and the engine's own default font-size moves 15px -> 16px (the UA initial). Flex: a `%` `max-`/`min-width` on an item is pinned against the ROW before anything measures it (it used to be re-resolved against the item's own slot, capping rust's `max-width:50%` columns twice), the automatic minimum size is clamped by `max-`/`min-width` (rust's 512px logos under `max-width:96px` no longer force a 512px shrink floor), and shrink is weighted by the CONTENT base instead of the margin box, so three equal `width:100%` columns stay equal when the middle one carries 48px side margins (285.3px each vs Chrome 288.3px). UAX #14 hyphen break opportunities now split a compound word at the last hyphen that fits, in line layout and in the flex floor's min-content, so `performance-critical` stops forcing an 80px column. A declared px `height` finally sizes an auto block (`.highlight{height:12px}` bars were 0px tall; `%` heights stay ignored). rust-lang.org drops 5344 -> 4113px (Chrome 3841): nav 227 (258), green 527 (510), purple 744 (738), production 416 (379), get-involved 624 (609), thanks 550 (529), purple card widths 187/229/254/287 (190/230/254/287). Suite **875** default / **878** `engine-b + woff2`; eight new tests plus the extended grid `align-content` expectation.
+
+### Wave 79 findings
+
+- **`PxScale` is a font height, not the em square.** ab_glyph 0.2.32 scales by
+  `height_unscaled()` (ascent - descent), so passing the CSS size painted Fira
+  at 5/6 and Alfa Slab at 0.73 of its true size, and the baseline inherited the
+  same error. Every run was therefore measured and rasterized small. The fix is
+  one conversion (`size × height_unscaled / units_per_em`) plus a baseline from
+  the real ascent and CSS half-leading. Ground truth was headless Chrome's
+  `measureText` on the live webfonts after `document.fonts.load(...)`:
+  `Install@18` 51.10px, `Governance@18` 96.25px, `empowering@36` 201.82px,
+  Alfa `Rust@18` 44.21px, `@96` 235.78px. This is a correctness fix that makes
+  already-correct pages taller: nextjs 7578 -> 7906, MDN 2773 -> 2966,
+  Wikipedia 24673 -> 28074.
+- **`rem` belongs to `<html>`, not to the UA default.** rust-lang.org sets
+  `html { font-size: 62.5% }` and later `75%`, so the root is 12px and
+  `body { font-size: 1.5rem }` is 18px — Chrome confirms 12/18/18 for
+  html/body/nav. With `rem` pinned to 16px the body was 24px and every line
+  was too long and too tall. The cascade now resolves `<html>` first and
+  publishes its computed size to a CSS thread-local that `parse_size` reads;
+  `1em` on a synthetic div still reports 18px, so the cascade is consistent.
+- **A unitless `line-height` is a factor of the FINAL font-size.** It was
+  stored as a negative factor and resolved against a stale size, so
+  `line-height: 1.6` at 18px did not give 28.8px. `Style::line_height()` now
+  multiplies by the element's resolved size, matching Chrome's 28.8px on
+  body/nav/cards and 45px for the 36px h2.
+- **A flex item's `%` limit resolves against the row, exactly once.**
+  `max-width:50%` was left symbolic for `place()`, which resolved it against
+  the item's own slot: two 50% columns each got ~472px slots and painted
+  ~236px, doubling the section height. The flex pass now pins `%`
+  `max-`/`min-width` to the row width as px before measuring.
+- **Shrink is weighted by content, not by the margin box.** Three equal
+  `width:100%` items, the middle one with 48px side margins, gave the middle
+  item a bigger shrink weight and left the other two wider. Using the content
+  base (outer width minus margins) makes all three 285.3px, against Chrome's
+  288.3px; the purple cards come out 187/229/254/287 against 190/230/254/287.
+- **`max-width` clamps the automatic minimum size.** rust's purple cards hold
+  512px logos under `max-width:96px`; the uncapped file width became each
+  card's shrink floor, so four `width:100%` cards could never fit their row.
+  `content_min_w` and the declared-px branch of `min_content_w` now clamp by
+  `max-`/`min-width` before the floor is taken.
+- **A hyphen is a break opportunity (UAX #14).** `performance-critical` was
+  one unbreakable token, so its 80px width was a column's min-content. The
+  line breaker now takes the last hyphen that fits (falling back to a normal
+  wrap when none does), min-content is the longest hyphen-free piece, and a
+  break inside a word does not consume a line when the remainder still fits.
+  Automatic (`hyphens: auto`) dictionary hyphenation remains unimplemented.
+- **A declared px `height` sizes an auto block; `%` does not.** Section
+  headers use `.highlight { height: 12px }`; the engine ignored plain heights,
+  so the bars were 0px and every header came out short. A px-resolved height
+  now sets the used content height (overflowing content still lays out), while
+  a `%` height stays ignored because the engine does not track the containing
+  block's height.
+- **Measured.** Suite **875** default / **878** `engine-b + woff2`. rust-lang
+  4113px / 485 runs / 78-83 MB (Chrome 3841), google 539 / 28 / 91-98 (Chrome
+  fits it in the 616px viewport), nextjs 7906 / 571 / 151.4 (10548), MDN 2966
+  / 643 / 89.8 (3328), Hacker News 1782 / 720 / 76-81 (1214), Wikipedia 28074 /
+  10956 / 105.7 (Chrome unavailable: a Wikimedia error page). rust's remaining
+  272px is mostly spacing: the legacy 0.6em paragraph gap still stands in for
+  real UA margins and margin collapsing, which is the next headline fix.
+
 ### Wave 78 findings
 
 - **A `viewBox` is a coordinate system, not a pixel size.** google's icon set

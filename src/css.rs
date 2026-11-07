@@ -27,6 +27,26 @@
 use crate::html::{Dom, NodeKind};
 use crate::layout::{DecoStyle, Fam, ListPos, ListStyleType, Ow, Style, Tt, Wb, Ws};
 
+thread_local! {
+    /// The `<html>` element's used font-size: `rem` is "root em" (CSS Values
+    /// 4), so it resolves against this, not a fixed 16px. main.rs cascades
+    /// `<html>` first and stores the result here before the body's subtree is
+    /// built. A site that scales its whole type ramp from
+    /// `html { font-size: 12px }` (rust-lang.org) was laid out 4/3 too large.
+    /// Tests (and any other thread) see the 16px initial value.
+    static ROOT_PX: std::cell::Cell<f32> = const { std::cell::Cell::new(16.0) };
+}
+
+/// Set the root font-size `rem` resolves against (see [`ROOT_PX`]). A
+/// non-positive size is invalid CSS and keeps the 16px default.
+pub fn set_root_px(px: f32) {
+    ROOT_PX.with(|c| c.set(if px > 0.0 { px } else { 16.0 }));
+}
+
+fn root_px() -> f32 {
+    ROOT_PX.with(|c| c.get())
+}
+
 pub type Decl = (String, String);
 
 /// A resolved length. `%` stays symbolic — the container width isn't known
@@ -5297,7 +5317,7 @@ fn m_unit(b: &[u8], s: &str, i: &mut usize, n: f32, ctx: &MathCtx) -> Option<Mat
         "" => return MathVal { px: n, pct: 0.0, num: true }.finite(), // multiplier
         "px" => n,
         "em" => n * ctx.em,
-        "rem" => n * 16.0,
+        "rem" => n * root_px(),
         "vh" | "lvh" | "svh" | "dvh" => n / 100.0 * vp.1,
         "vw" | "lvw" | "svw" | "dvw" => n / 100.0 * vp.0,
         "vmin" => n / 100.0 * vp.0.min(vp.1),
@@ -5581,7 +5601,7 @@ fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
         }
     }
     if let Some(n) = v.strip_suffix("rem") {
-        return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
+        return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * root_px()));
     }
     if let Some(n) = v.strip_suffix("em") {
         return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
@@ -5857,7 +5877,7 @@ fn parse_size(v: &str, current: f32, vp: (f32, f32)) -> Option<f32> {
         return n.trim().parse().ok();
     }
     if let Some(n) = v.strip_suffix("rem") {
-        return n.trim().parse::<f32>().ok().map(|f| f * 16.0); // root = 16px
+        return n.trim().parse::<f32>().ok().map(|f| f * root_px());
     }
     if let Some(n) = v.strip_suffix("em") {
         return n.trim().parse::<f32>().ok().map(|f| f * current);
@@ -5998,8 +6018,13 @@ fn parse_line_height(v: &str, size: f32, vp: (f32, f32)) -> f32 {
         return 0.0;
     }
     if let Ok(n) = t.parse::<f32>() {
-        // unitless multiplier (1.5, 1.75, ...); values >= 10 are nonsense
-        return if n > 0.0 && n < 10.0 { n * size } else { 0.0 };
+        // unitless multiplier (1.5, 1.75, ...); values >= 10 are nonsense.
+        // Stored NEGATIVE = "factor × the element's final font-size" (see
+        // Style::line_height): the cascade may apply `line-height: 1.25`
+        // before a higher-specificity `font-size`, and resolving it here
+        // against the then-current size baked in the wrong height
+        // (rust-lang.org's h2 carried the 4.2rem size's 84px line).
+        return if n > 0.0 && n < 10.0 { -n } else { 0.0 };
     }
     parse_size(t, size, vp).map(|px| px.max(0.0)).unwrap_or(0.0)
 }
@@ -7647,6 +7672,33 @@ mod tests {
     }
 
     #[test]
+    fn rem_and_unitless_line_height_follow_the_final_font_size() {
+        // rust-lang.org scales from `html { font-size: 12px }`, and its hero
+        // h2 has `header h2{font-size:4.2rem; line-height:1.25}` overridden
+        // by the higher-specificity class `.f1-ns{font-size:3rem}`. `rem`
+        // must use the 12px root (36px type, not 48), and the unitless 1.25
+        // must resolve against that FINAL size (45px line, not the 84px
+        // baked while the element still read 4.2rem).
+        let sheet = parse_for(
+            "header h2 { font-size: 4.2rem; line-height: 1.25 } \
+             .f2{font-size:2.25rem} \
+             @media screen and (min-width:30em){.f1-ns{font-size:3rem}}",
+            1000.0,
+        );
+        let dom = dom_of("<header><h2 class='f2 f1-ns'>x</h2></header>");
+        // main.rs cascades <html> and stores its size before the subtree
+        set_root_px(12.0);
+        let st = style_for_tag(&sheet, &dom, "h2");
+        set_root_px(16.0);
+        assert_eq!(st.size, 36.0, "3rem of a 12px root");
+        assert!(
+            (st.line_height() - 45.0).abs() < 0.01,
+            "lh={} (want 1.25 × 36)",
+            st.line_height()
+        );
+    }
+
+    #[test]
     fn width_auto_resets_an_earlier_width() {
         // `w-full sm:w-auto`: the breakpoint's `auto` must clear the 100%,
         // not fall through to it (react.dev's hero buttons were full width)
@@ -8279,7 +8331,7 @@ mod tests {
         );
         let dom = dom_of("<p></p>");
         let s = style_for_tag(&sheet, &dom, "p");
-        assert_eq!(s.size, 30.0); // 2em of 15px default
+        assert_eq!(s.size, 32.0); // 2em of the 16px default
         assert!(s.bold && s.italic && s.fam == Fam::Mono && s.underline);
     }
 
@@ -8744,8 +8796,8 @@ mod tests {
         let dom = dom_of("<div id=w><h1>x</h1></div>");
         let parent = sheet.resolve(&dom, by_attr(&dom, "id", "w"), Style::new(), None);
         let h1 = sheet.resolve(&dom, by_tag(&dom, "h1"), parent.style, None);
-        // parent: 15 * 1.62 = 24.3; h1 inherit must keep exactly that
-        assert!((parent.style.size - 24.3).abs() < 0.01, "parent {}", parent.style.size);
+        // parent: 16 * 1.62 = 25.92; h1 inherit must keep exactly that
+        assert!((parent.style.size - 25.92).abs() < 0.01, "parent {}", parent.style.size);
         assert_eq!(h1.style.size, parent.style.size, "inherit keeps parent size");
     }
 
@@ -9378,7 +9430,7 @@ mod tests {
         // invalid math drops the declaration → initial value
         let bad = sheet.resolve(&dom, by_attr(&dom, "class", "bad"), Style::new(), None);
         assert_eq!(bad.bx.width, None, "min(10px, bogus) dropped");
-        assert_eq!(bad.style.size, 15.0, "invalid font-size keeps the initial 15px");
+        assert_eq!(bad.style.size, 16.0, "invalid font-size keeps the initial 16px");
         assert_eq!(bad.bx.pad, [Len::Px(0.0); 4], "invalid clamp drops padding");
     }
 
@@ -9902,7 +9954,11 @@ mod tests {
         assert!(card.bx.margin_x_auto, "`margin: 8px auto` → auto");
         assert_eq!(card.bx.margin[0], Len::Px(8.0));
         assert_eq!(card.bx.bg, Some(0x222222));
-        assert!((card.style.lh - 1.6 * 15.0).abs() < 0.01, "lh={}", card.style.lh);
+        assert!(
+            (card.style.line_height() - 1.6 * 16.0).abs() < 0.01,
+            "lh={}",
+            card.style.line_height()
+        );
 
         // rem = 16px root
         let hd_style = Style::new();
@@ -10470,7 +10526,8 @@ mod tests {
         );
         let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
         let a = get("a");
-        assert_eq!((a.size, a.lh), (20.0, 30.0), "size and 1.5 line-height");
+        assert_eq!((a.size, a.lh), (20.0, -1.5), "size and 1.5 line-height");
+        assert!((a.line_height() - 30.0).abs() < 0.01);
         assert!(a.italic && a.bold, "style and weight");
         assert_eq!(a.fam, Fam::Serif);
         let b = get("b");
@@ -10481,7 +10538,8 @@ mod tests {
         assert_eq!(b.fam, Fam::Sans);
         let c = get("c");
         assert!((c.size - 20.0).abs() < 0.01, "2vw of the test viewport");
-        assert_eq!(c.lh, 40.0, "unitless multiplier against the shorthand size");
+        assert_eq!(c.lh, -2.0, "unitless multiplier against the shorthand size");
+        assert!((c.line_height() - 40.0).abs() < 0.01);
         assert_eq!(c.fam, Fam::Mono);
         assert!(!c.italic, "variant is accepted but ignored");
         let d = get("d");
@@ -10490,7 +10548,8 @@ mod tests {
         assert_eq!((e.size, e.bold, e.italic, e.lh), (16.0, false, false, 0.0));
         // whitespace around the slash is still the line-height separator
         let f = get("f");
-        assert_eq!((f.size, f.lh), (20.0, 40.0));
+        assert_eq!((f.size, f.lh), (20.0, -2.0));
+        assert!((f.line_height() - 40.0).abs() < 0.01);
     }
 
     #[test]
@@ -10563,8 +10622,8 @@ mod tests {
         let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
         assert_eq!(get("a").size, 13.0);
         assert_eq!(get("b").size, 18.0);
-        assert!((get("c").size - 18.0).abs() < 0.01, "15 * 1.2");
-        assert!((get("d").size - 12.5).abs() < 0.01, "15 / 1.2");
+        assert!((get("c").size - 19.2).abs() < 0.01, "16 * 1.2");
+        assert!((get("d").size - 13.333).abs() < 0.01, "16 / 1.2");
         assert_eq!(get("e").size, 16.0);
         assert_eq!(get("f").lh, 24.0, "line-height accepts rem");
         assert_eq!(get("g").lh, 0.0, "normal = layout default");
@@ -11262,7 +11321,7 @@ mod tests {
         );
         let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).style;
         assert_eq!(get("a").letter_spacing, 2.0, "px kept");
-        assert_eq!(get("b").letter_spacing, 7.5, "0.5em × 15px initial size");
+        assert_eq!(get("b").letter_spacing, 8.0, "0.5em × 16px initial size");
         assert_eq!(get("c").letter_spacing, 0.0, "normal → 0");
         assert_eq!(get("d").letter_spacing, 0.0, "% invalid for tracking → initial");
         // inherit keeps whatever the base style carries (initial 0 here)
