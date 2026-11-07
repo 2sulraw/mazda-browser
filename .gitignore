@@ -2,4 +2,5 @@
 *.bin
 spike-out.txt
 spike-err.txt
-spike-mem.json
+spike-*.json
+spike-*.png

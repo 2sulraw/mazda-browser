@@ -49,7 +49,12 @@ Single-process reference (the pre-split app):
 
 ```powershell
 .\tools\mem-harness.ps1 -Url https://example.com
+.\tools\measure-sites.ps1          # Google, GitHub, YouTube: old vs split + scroll latency
 ```
+
+Reference sites: **Google, GitHub, YouTube** — heavy, real-world pages used
+for memory and latency work; `example.com` / Wikipedia stay as the light
+sanity set.
 
 Headless one-frame render (no window; useful for CI and profiling):
 

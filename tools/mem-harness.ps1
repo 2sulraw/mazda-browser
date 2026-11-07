@@ -8,7 +8,13 @@
 # Usage:
 #   .\tools\mem-harness.ps1
 #   .\tools\mem-harness.ps1 -Url https://en.wikipedia.org/wiki/Web_browser
+#   .\tools\mem-harness.ps1 -Url https://github.com -SettleSeconds 85
 #   .\tools\mem-harness.ps1 -Json .\spike-mem.json
+#
+# The heavy reference sites load slowly (the engine fetches resources
+# sequentially): Google ~18 s, YouTube ~40 s, GitHub ~65 s cold. Give them a
+# matching -SettleSeconds. For all three plus the old-single-process
+# comparison and scroll latency, use tools/measure-sites.ps1 instead.
 
 param(
     [string]$ShellExe = (Join-Path $PSScriptRoot '..\target\release\shell.exe'),

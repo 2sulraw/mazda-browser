@@ -3,9 +3,32 @@
 Date: 2026-11-07
 Build: `cargo build --release --workspace --features mazda-engine/woff2`
 Host: Windows, single 1000×700 window
-Measured by: `tools/mem-harness.ps1` (private bytes + working set) and a
-direct stdin/stdout driver for scroll latency (input command → renderer frame
-published → shell received).
+Measured by: `tools/measure-sites.ps1` (settled private bytes, load peak,
+working set) and a direct stdin/stdout driver for scroll latency (command →
+renderer frame published → reader got it). Light pages via
+`tools/mem-harness.ps1`.
+
+## Reference sites
+
+**Heavy set (primary): Google, GitHub, YouTube.** Large DOMs, deep
+stylesheets, many images, script-heavy bootstraps. Every memory/latency wave
+reports all three.
+
+**Light set:** `example.com` and Wikipedia — fast, stable, good for
+regressions.
+
+Render fidelity today, stated honestly:
+
+| Site | What the engine renders now |
+|---|---|
+| Google | complete homepage (logo, search box, footer, Dutch locale) |
+| YouTube | server shell: header, skeleton cards, black thumbnails |
+| GitHub | header only; main content area empty |
+
+YouTube and GitHub boot their UI from JavaScript, and that bootstrap does not
+complete in engine A yet. They are still the right memory targets: the DOM,
+CSS, images and network traffic are real. Closing the render gap is engine
+work (P3/P5), not memory work.
 
 ## What was built
 
@@ -20,68 +43,91 @@ published → shell received).
 
 ## Headline
 
-**The split is effectively free.** The shell shed roughly as much memory as the
-renderer added, and the round trip is ~1 ms at p50.
+**On heavy sites the split is neutral-to-cheaper in settled memory, and it
+cuts the load peak.**
 
-| Scenario | Old single process | New split (shell + renderer) | Delta |
+| Site | Old settled | Old peak | New settled (shell + renderer) | New peak | Δ settled |
+|---|---:|---:|---:|---:|---:|
+| Google | 91.5 MB | 91.6 MB | **86.6 MB** (64.0 + 22.6) | 86.6 MB | **−4.9 MB** |
+| GitHub | 120.8 MB | 167.9 MB | **117.3 MB** (61.6 + 55.7) | 155.4 MB | **−3.5 MB** |
+| YouTube | 91.7 MB | 119.0 MB | **90.4 MB** (63.9 + 26.5) | 92.6 MB | **−1.3 MB** |
+
+Working set (the old project's published metric):
+
+| Site | Old WS | New WS | Δ |
 |---|---:|---:|---:|
-| `example.com` — private | 68.6 MB | **64.8 MB** (61.3 + 3.5) | **−3.8 MB** |
-| `example.com` — working set | 70.0 MB | **76.5 MB** (64.7 + 11.8) | +6.5 MB |
-| Wikipedia — private | 83.9 MB | **78.2 MB** (59.5 + 18.7) | **−5.7 MB** |
-| Wikipedia — working set | 87.4 MB | **91.8 MB** (65.9 + 25.9) | +4.4 MB |
+| Google | 91.5 MB | 99.9 MB | +8.4 MB |
+| GitHub | 112.8 MB | 123.8 MB | +11.0 MB |
+| YouTube | 91.2 MB | 99.4 MB | +8.2 MB |
+
+Light set, same build:
+
+| Scenario | Old single process | New split | Δ private |
+|---|---:|---:|---:|
+| `example.com` private | 68.6 MB | **64.8 MB** (61.3 + 3.5) | **−3.8 MB** |
+| Wikipedia private | 83.9 MB | **78.2 MB** (59.5 + 18.7) | **−5.7 MB** |
 
 Why: the trusted shell no longer owns the DOM/layout/image heap. It holds one
-BGRA texture; the renderer owns the page. Moving the engine out *reduces* the
-private commit even though it adds a process.
+BGRA frame; the renderer owns the page. Moving the engine out removes a copy
+of the page from the shell process, so settled private bytes go down even
+though a process is added. The peak drops more (12–26 MB on GitHub and
+YouTube) because the single process also carries its UI-side page copy and
+paint buffers at the same moment as the load.
+
+## Method (why the numbers are trustworthy)
+
+- **Settled** = six consecutive 5 s samples within `max(3 MB, 2 %)`.
+  **Peak** = highest sample over the same window.
+- A fixed sleep is the wrong instrument here. GitHub's single process is flat
+  for ~20 s during a fetch pause at ~166 MB and then drops; a 20 s window
+  reports 166 MB, the 30 s window reports 120.8 MB. Fixed sleeps also caught
+  mid-load readings anywhere from 111 to 176 MB.
+- With the 30 s window the split repeated within 0.2 MB (117.1, 117.2,
+  117.3 MB on GitHub across three passes).
+- Private bytes and working set are both reported: the plan's budgets are
+  private bytes, the old project's published table is RSS/working set.
 
 ## Numbers against the gates
 
 | # | Metric | Measured | Gate | Verdict |
 |---|---|---:|---:|---|
-| S1 | Shell floor (private / WS) | **58.1 / 64.9 MB** (data page) | ≤ 130 MB | pass |
-| S2 | 1 tab total — `example.com` (private / WS) | **64.8 / 76.5 MB** | ≤ 220 MB | pass |
-| S2b | 1 tab total — Wikipedia (private / WS) | **78.2 / 91.8 MB** | ≤ 220 MB | pass |
+| S1 | Shell floor (private / WS) | **58.1 / 64.9 MB** idle; 61.6–66.4 MB on heavy sites | ≤ 130 MB | pass |
+| S2 | 1 tab — Wikipedia (private / WS) | **78.2 / 91.8 MB** | ≤ 220 MB | pass |
+| S2b | 1 tab — Google | **86.6 / 99.9 MB** | ≤ 220 MB | pass |
+| S2c | 1 tab — GitHub | **117.3 / 123.8 MB** | ≤ 220 MB | pass |
+| S2d | 1 tab — YouTube | **90.4 / 99.4 MB** | ≤ 220 MB | pass |
 | S3 | 10 tabs, 1 active | not built yet (spike shell has no tabs) | ≤ 280 MB | n/a |
-| S4 | Split cost vs single process | **−4 to −6 MB private, +4 to +7 MB WS** | ≤ 50 MB | **pass** |
-| S5 | Scroll latency p50 / p95 / max | **1.01 / 2.03 / 3.03 ms** (release, 40 samples) | p95 ≤ 16 ms | **pass** |
+| S4 | Split cost vs single process | **−1.3 to −4.9 MB settled** on heavy sites (−3.8 to −5.7 light); worst repeat +0.6 MB | ≤ 50 MB | **pass** |
+| S5 | Scroll latency p50 / p95 | worst **3.03 / 4.26 ms** (YouTube); Google 1.59/3.19, GitHub 1.66/4.13; light 1.01/2.03 | p95 ≤ 16 ms | **pass** |
 | S6 | Click latency | < 5 ms (same path) | ≤ 5 ms | pass |
 | S7 | Crash recovery | not built yet (supervisor is P1) | ≤ 1 s | n/a |
 | S8 | 100 reload cycles | not run yet | ≤ +5% | n/a |
 | S9 | Test parity | **892 engine + 3 IPC pass** | all pass | pass |
 | S10 | Render parity | engine unchanged; same `render()` | same diff % | pass by construction |
 
-### Notes on measurement
-
-- The first run after a fresh build reported a much higher shell number
-  (~114 MB). Repeated runs with the same binary settle at ~60 MB; the first
-  reading was a warm-up artifact (pipeline/shader allocation). Every number
-  above is from a settled run and was reproduced at least twice.
-- Private bytes and working set are both reported because the old project's
-  published table is RSS while the plan's budgets are private bytes.
-- The renderer's own commit is 3.5 MB for `example.com` and 18.7 MB for
-  Wikipedia, including the page's DOM/layout/images.
-- The shell floor is `eframe`/`glow`, unchanged from the old app. The engine
-  is no longer part of that floor.
-
-## What this means
-
-1. **Continue.** P1 (real IPC, snapshots, supervisor, 10-tab governor) is
-   justified: the isolation costs almost nothing at the memory level.
-2. **The shell floor is now the dominant cost** (~59 MB private, ~65 MB WS).
-   It is still the single biggest lever, but it is no longer urgent: the
-   current total already beats the old single-process app on private bytes.
-3. **Do not swap the shell yet.** The deferred `winit`+`softbuffer` experiment
-   remains the next big win if a later total breaks the envelope.
-
 ## Decision gate
 
 | Gate | Result |
 |---|---|
-| S4 ≤ 50 MB | **pass** (−4 to −6 MB private) |
-| S5 p95 ≤ 16 ms | **pass** (2.03 ms) |
-| S1 ≤ 130 MB | **pass** (64.9 MB WS) |
+| S4 ≤ 50 MB | **pass** (−1.3 to −4.9 MB settled) |
+| S5 p95 ≤ 16 ms | **pass** (4.26 ms worst) |
+| S1 ≤ 130 MB | **pass** (64.9 MB WS idle) |
 
 **Verdict: continue to P1.**
+
+## What this means
+
+1. **Continue.** P1 (real IPC, snapshots, supervisor, 10-tab governor) is
+   justified: isolation costs nothing at the memory level and lowers the peak.
+2. **The shell floor is the dominant cost** (~60 MB private, ~65 MB WS). It is
+   the biggest remaining lever, but not urgent: the total already beats the
+   single-process app.
+3. **The split is also a stability win.** The renderer's footprint repeats to
+   within 0.2 MB; the single process needs a careful settle window to measure
+   at all. That matters once a memory governor has to make eviction decisions.
+4. **Heavy sites belong in every wave.** They found the real gaps (JS
+   bootstrap, CSS depth) that the light set hides, while confirming memory is
+   not the problem.
 
 ## Not done in this spike (and why)
 
@@ -101,7 +147,14 @@ private commit even though it adds a process.
 
 ```powershell
 cargo build --release --workspace --features mazda-engine/woff2
+.\tools\measure-sites.ps1 -Json spike-heavy.json
+.\tools\measure-sites.ps1 -Only GitHub -Repeat 2
 .\tools\mem-harness.ps1 -Url https://example.com -Json spike-mem.json
-.\tools\mem-harness.ps1 -Url https://en.wikipedia.org/wiki/Web_browser
 .\target\release\renderer.exe --once https://example.com
 ```
+
+`measure-sites.ps1` runs Google, GitHub and YouTube against both the old
+single-process binary (`C:\Mazda Browser\target\release\mazda.exe`) and the
+split, waits for each to plateau, records peak and settled memory, and
+measures scroll latency by driving the renderer directly. It warms up the
+shell first so the first-launch shader allocation does not skew the result.
