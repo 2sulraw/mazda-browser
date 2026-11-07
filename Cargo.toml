@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/ipc", "crates/renderer", "crates/shell"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# the page rasterizer is per-pixel CPU work: at opt-level 0 one scroll frame
+# costs ~90 ms, which makes scrolling feel stuck
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,13 @@
+[package]
+name = "mazda-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "renderer"
+path = "src/main.rs"
+
+[dependencies]
+mazda-engine = { path = "../engine" }
+mazda-ipc = { path = "../ipc" }

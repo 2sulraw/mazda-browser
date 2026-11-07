@@ -1,0 +1,5 @@
+/target
+*.bin
+spike-out.txt
+spike-err.txt
+spike-mem.json

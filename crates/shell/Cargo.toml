@@ -1,0 +1,17 @@
+[package]
+name = "mazda-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]
+mazda-ipc = { path = "../ipc" }
+
+[dependencies.eframe]
+version = "0.37"
+default-features = false
+features = ["glow", "default_fonts", "x11", "wayland", "clipboard"]
