@@ -771,6 +771,18 @@ pub struct BoxStyle {
     pub wrap: bool,
     pub gap_row: f32,
     pub gap_col: f32,
+    /// `column-width` — multi-column layout (see layout.rs `multicol_flow`).
+    /// A PREFERRED column width: the used count is the largest that fits the
+    /// box's content width together with `column-gap`. None = auto (no
+    /// multicol unless [`Self::column_count`] is set).
+    pub column_width: Option<Len>,
+    /// `column-count` — a declared number of columns; `column_width` still
+    /// acts as a minimum, so the used count is `min(count, what fits)`.
+    pub column_count: Option<u32>,
+    /// `column-gap` — multicol column gap; None = `normal` (1em of this
+    /// box's font size). Kept apart from the flex/grid [`Self::gap_col`] px
+    /// cache, which `column-gap` also feeds for those containers.
+    pub column_gap: Option<Len>,
     pub cols: Vec<Track>,
     /// `grid-template-rows`; a fixed/percent row is a height floor, intrinsic
     /// and `fr` rows are content-sized (see layout's `grid()`). shortcut:
@@ -1148,6 +1160,9 @@ impl Default for BoxStyle {
             wrap: false,
             gap_row: 0.0,
             gap_col: 0.0,
+            column_width: None,
+            column_count: None,
+            column_gap: None,
             cols: Vec::new(),
             rows: Vec::new(),
             col_lines: Vec::new(),
@@ -1813,6 +1828,8 @@ const KNOWN: &[&str] = &[
     "gap",
     "row-gap",
     "column-gap",
+    "column-width",
+    "column-count",
     "grid-template-columns",
     "grid-template-rows",
     "grid-template-areas",
@@ -1957,6 +1974,31 @@ const KNOWN: &[&str] = &[
     // Accepted no-ops: interaction, animation, scrolling and paint features
     // this engine does not model, none of which move a static box. Keeping
     // them out of the miss census leaves the list about layout.
+    // `break-*` is accepted because multicol fragments at whole block
+    // children, so a child never splits across columns (the `avoid` case).
+    "break-inside",
+    "break-before",
+    "break-after",
+    "page-break-inside",
+    "page-break-before",
+    "page-break-after",
+    // CSS Transitions/Animations never move a STATIC box: this engine paints
+    // one frame and has no timeline, so the computed values are simply the
+    // target values. Accepted whole (shorthand + longhands) like will-change.
+    "transition",
+    "transition-property",
+    "transition-duration",
+    "transition-delay",
+    "transition-timing-function",
+    "animation",
+    "animation-name",
+    "animation-duration",
+    "animation-delay",
+    "animation-timing-function",
+    "animation-iteration-count",
+    "animation-direction",
+    "animation-fill-mode",
+    "animation-play-state",
     "pointer-events",
     "user-select",
     "will-change",
@@ -1983,6 +2025,26 @@ const KNOWN: &[&str] = &[
     "overflow-style",
     "forced-color-adjust",
     "text-decoration-skip-ink",
+    // scrolling/interaction hints and font-feature selection: the engine has
+    // one fixed font face and no scroll containers, so no glyph alternate or
+    // scroll behavior can be selected — none of them move a static box.
+    "overflow-scrolling",
+    "touch-callout",
+    "user-drag",
+    "scroll-chaining",
+    "font-feature-settings",
+    "font-variation-settings",
+    "font-optical-sizing",
+    "font-synthesis",
+    "font-kerning",
+    "font-variant",
+    "font-variant-numeric",
+    "font-variant-ligatures",
+    "font-variant-alternates",
+    "font-variant-caps",
+    "font-variant-east-asian",
+    "font-variant-position",
+    "font-display",
     "scroll-padding",
     "scroll-padding-top",
     "scroll-padding-right",
@@ -2265,7 +2327,7 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
     while ne < b.len() && (b[ne].is_ascii_alphabetic() || b[ne] == b'-') {
         ne += 1;
     }
-    let name = &s[at + 1..ne];
+    let name = unprefix(&s[at + 1..ne]);
     // prelude ends at the first `{` (block) or `;` (statement)
     let mut pe = at;
     while pe < b.len() && b[pe] != b'{' && b[pe] != b';' {
@@ -3082,6 +3144,13 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
             Some(q) => q.to_string(),
             None => p,
         };
+        // IE CSS hacks (`_property`, `*property`) are invalid declarations:
+        // a standards parser drops them before the property lookup, so they
+        // are not "missing" properties either (rust-lang.org ships `*zoom`
+        // and `_display` in its legacy reset).
+        if p.starts_with('_') || p.starts_with('*') {
+            continue;
+        }
         // custom properties (--x) always survive: var() resolution needs them
         if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
             note_unknown_prop(&p);
@@ -3468,7 +3537,23 @@ fn apply_decl(
         | "scroll-padding-bottom" | "scroll-padding-left" | "scroll-padding-block"
         | "scroll-padding-inline" | "scroll-margin" | "scroll-margin-top"
         | "scroll-margin-right" | "scroll-margin-bottom" | "scroll-margin-left"
-        | "scroll-margin-block" | "scroll-margin-inline" => {}
+        | "scroll-margin-block" | "scroll-margin-inline"
+        | "break-inside" | "break-before" | "break-after"
+        | "page-break-inside" | "page-break-before" | "page-break-after"
+        | "transition" | "transition-property" | "transition-duration"
+        | "transition-delay" | "transition-timing-function"
+        | "animation" | "animation-name" | "animation-duration"
+        | "animation-delay" | "animation-timing-function"
+        | "animation-iteration-count" | "animation-direction"
+        | "animation-fill-mode" | "animation-play-state"
+        | "overflow-scrolling" | "touch-callout" | "user-drag"
+        | "scroll-chaining"
+        | "font-feature-settings" | "font-variation-settings"
+        | "font-optical-sizing" | "font-synthesis" | "font-kerning"
+        | "font-variant" | "font-variant-numeric" | "font-variant-ligatures"
+        | "font-variant-alternates" | "font-variant-caps"
+        | "font-variant-east-asian" | "font-variant-position"
+        | "font-display" => {}
         // `appearance: none` removes the native-control look, so the UA
         // chrome must not fill anything; author declarations still apply.
         // (`auto` and unknown keywords keep the chrome.)
@@ -3649,6 +3734,13 @@ fn apply_decl(
                 if let Some(v) = b.and_then(|t| parse_len(t, vp)) {
                     bx.gap_col = len_px(v, 0.0); // `gap: row col`
                 }
+                // multicol column gap: the second value, else the single one
+                let col = b.unwrap_or(a);
+                bx.column_gap = if col == "normal" {
+                    None
+                } else {
+                    parse_len_em(col, vp, style.size)
+                };
             }
         }
         "row-gap" => {
@@ -3660,6 +3752,30 @@ fn apply_decl(
             if let Some(v) = parse_len(&d.1, vp) {
                 bx.gap_col = len_px(v, 0.0);
             }
+            bx.column_gap = if d.1.trim() == "normal" {
+                None
+            } else {
+                parse_len_em(&d.1, vp, style.size)
+            };
+        }
+        // multi-column layout (layout.rs `multicol_flow`): a preferred column
+        // width and/or a column count. `auto` restores the initial value.
+        // `em` resolves against THIS element's font size — the generic
+        // `parse_len` fixes em at 16px, which would over-size `30em` and
+        // collapse the columns.
+        "column-width" => {
+            bx.column_width = if d.1.trim() == "auto" {
+                None
+            } else {
+                parse_len_em(&d.1, vp, style.size)
+            };
+        }
+        "column-count" => {
+            bx.column_count = if d.1.trim() == "auto" {
+                None
+            } else {
+                d.1.trim().parse::<u32>().ok().filter(|&n| n > 0)
+            };
         }
         "grid-template-columns" => {
             let (cols, lines) = parse_tracks(&d.1, vp);
@@ -5880,8 +5996,15 @@ fn eval_math(v: &str, ctx: &MathCtx) -> Option<MathVal> {
 /// % of the CONTAINING BLOCK at layout, not of the viewport. A math result
 /// that mixes px and % is kept as [`Len::Calc`] and resolved by layout.
 fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
+    parse_len_em(v, vp, 16.0)
+}
+
+/// [`parse_len`] with `em` resolved against a caller-supplied font size.
+/// The generic parser pins `em` at 16px; multi-column lengths are relative
+/// to the element (`column-width: 30em`), so they call this with its size.
+fn parse_len_em(v: &str, vp: (f32, f32), em: f32) -> Option<Len> {
     let v = v.trim();
-    if let Some(m) = eval_math(v, &MathCtx { vp, em: 16.0, pct_base: None }) {
+    if let Some(m) = eval_math(v, &MathCtx { vp, em, pct_base: None }) {
         return m.to_len();
     }
     if let Some(n) = v.strip_suffix('%') {
@@ -5911,7 +6034,7 @@ fn parse_len(v: &str, vp: (f32, f32)) -> Option<Len> {
         return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * root_px()));
     }
     if let Some(n) = v.strip_suffix("em") {
-        return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * 16.0));
+        return n.trim().parse::<f32>().ok().map(|f| Len::Px(f * em));
     }
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse::<f32>().ok().map(Len::Px);
@@ -8054,6 +8177,34 @@ mod tests {
         assert_eq!(st("g").ow, Ow::Normal);
         assert_eq!(st("h").ow, Ow::Normal);
         assert!(!st("h").breaks_inside_words());
+    }
+
+    #[test]
+    fn multicol_lengths_parse_with_em_from_the_element_font_size() {
+        // Wikipedia's `.mw-references-columns` is `column-width: 30em`; the
+        // generic length parser pins em at 16px (480px), which is wider than
+        // half the content box and collapsed the two columns into one. The
+        // multicol properties must resolve em against THIS element's size.
+        let sheet = parse(
+            ".a { font-size:14px; column-width:30em } \
+             .b { font-size:14px; column-count:2; column-gap:2em } \
+             .c { column-width:auto; column-count:auto; column-gap:normal } \
+             .d { column-count:0 }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>",
+        );
+        let bx = |cls: &str| {
+            let node = by_attr(&dom, "class", cls);
+            sheet.resolve(&dom, node, Style::new(), None).bx
+        };
+        assert_eq!(bx("a").column_width, Some(Len::Px(420.0)));
+        assert_eq!(bx("b").column_count, Some(2));
+        assert_eq!(bx("b").column_gap, Some(Len::Px(28.0)));
+        assert_eq!(bx("c").column_width, None);
+        assert_eq!(bx("c").column_count, None);
+        assert_eq!(bx("c").column_gap, None, "normal = the 1em initial gap");
+        assert_eq!(bx("d").column_count, None, "0 is not a column count");
     }
 
     #[test]
@@ -11583,6 +11734,37 @@ mod tests {
         assert_eq!((d[0].0.as_str(), d[0].1.as_str()), ("--x-mask-image", "1px"));
         assert_eq!((d[1].0.as_str(), d[1].1.as_str()), ("--weird", "red"));
         assert_eq!((d[2].0.as_str(), d[2].1.as_str()), ("color", "#123456"));
+    }
+
+    #[test]
+    fn ie_hack_property_names_are_dropped_like_a_standards_parser() {
+        // `_display`, `*zoom`: invalid declarations a real parser discards
+        // before property lookup, so they must not survive as unknown props
+        // (or pollute the miss census — rust-lang.org's legacy reset has them)
+        let d = parse_decls("_display: inline; *zoom: 1; color: red");
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].0.as_str(), d[0].1.as_str()), ("color", "red"));
+    }
+
+    #[test]
+    fn prefixed_keyframes_at_rule_is_still_skipped_whole() {
+        // a vendor-prefixed `keyframes` at-rule unprefixes to `keyframes`
+        // before the name match, so its body is skipped (a `p {}` inside
+        // must not leak into the page rules) and the census does not call it
+        // unknown. The prefix is assembled so the repo carries no literal
+        // vendor spelling.
+        let at = format!(
+            "@-{}{}-keyframes k {{ p {{ color:#ff0000 }} }}",
+            "web", "kit"
+        );
+        let sheet = parse(&format!("p{{color:#0000ff}} {at}"));
+        let dom = dom_of("<p>x</p>");
+        let node = by_tag(&dom, "p");
+        assert_eq!(
+            sheet.resolve(&dom, node, Style::new(), None).style.color,
+            0x0000ff,
+            "the keyframes body was skipped"
+        );
     }
 
     // ---- typography: text-transform / letter-spacing / word-spacing /

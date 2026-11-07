@@ -177,11 +177,11 @@ handled, but the paint model still applies one radius to every corner.
 | Other / miscellaneous | 217 | `bookmark-label`, `block-step-align`, `corner-*`, `cue` | ignore: drafts, print, speech |
 | Text & typography | 60 | `hyphens` | high: frequent in real CSS |
 | Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low frequency; wave 81 maps the horizontal-tb/ltr subset to physical |
-| Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required |
+| Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required; wave 82 accepts them as no-ops (one static frame) |
 | Borders & outlines | 18 | `border-image-*`, `border-block-*`, `border-inline-*` | medium: common in resets |
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
-| Paged & multi-column | 31 | `break-*`, `column-*` | low |
-| Fonts | 22 | `font-variant-*`, `font-kerning`, `font-stretch` | medium |
+| Paged & multi-column | 31 | `break-*`, `column-*` | wave 82 implements `column-width`/`column-count`/`column-gap` and accepts `break-*` |
+| Fonts | 22 | `font-variant-*`, `font-kerning`, `font-stretch` | medium; wave 82 accepts font-feature/font-variant selection as no-ops (fixed face) |
 | Grid & alignment | 9 | `grid-row`, `grid-auto-rows` | high |
 | Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
@@ -297,6 +297,22 @@ relevant only when transitions and animations exist.
   `background-position-x`/`-y` replace one axis. Interaction-only properties
   (`pointer-events`, `user-select`, scroll margins/padding, …) are accepted
   no-ops.
+- Multi-column layout implements `column-width`/`column-count`/`column-gap`
+  for a box whose in-flow content is regular block children: the used count
+  comes from `column-count` (else the width that fits), the column width
+  splits the remaining space, and whole block children are balanced across
+  the columns by a measure-then-place pass. A multicol wrapper whose only
+  in-flow content is one plain block is flattened through it (Wikipedia's
+  `div.mw-references-columns > ol.references`); the wrapper decides the column
+  count from its own width, while the child's width (minus its margins) sizes
+  the columns. Text/inline/float/out-of-flow/
+  marker content falls back to single-column flow, and a child is never split
+  across a column boundary (so `break-inside: avoid` is implicit; the
+  `break-*`/`page-break-*` properties are accepted). `em` in these lengths
+  resolves against the element's font size. Animation/transition properties
+  are accepted no-ops (the engine paints one static frame), as are font
+  feature selection (`font-feature-settings`, `font-variant-*`,
+  `font-optical-sizing`, `font-synthesis`, …) and vendor scrolling hints.
 - Borders: per-side width and colour longhands parse into the existing model,
   which still keeps one colour for all sides and one radius for all corners
   (the last declaration wins); a `transparent` colour keeps the side's width
@@ -493,7 +509,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 879 self-authored unit tests (882 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 885 self-authored unit tests (889 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -568,7 +584,19 @@ to their physical left/right/top/bottom properties before the `KNOWN` gate
 `background-position-x`/`-y` replace one axis. The `MAZDA_MISS` census fell
 from 50 to 16 distinct dropped properties on google, 84 to 43 on nextjs and
 12 to 4 on MDN; heights barely move (MDN 2925 -> 2926, the rest unchanged)
-because the declarations sit on icons and decorative boxes. What remains:
+because the declarations sit on icons and decorative boxes. Wave 82 then
+implemented CSS multi-column (`column-width`/`column-count`/`column-gap`)
+with wrapper flattening, so Wikipedia's references render in two 431px
+columns (121 citations split 60/61) and the page goes 21872 -> 21525px. The
+saving is modest because halving the column width reflows each citation onto
+more lines — the text area is conserved; the change matches Chrome's column
+rendering rather than buying vertical space. Accepting inert
+animation/font-feature/vendor properties, dropping IE hack names
+(`_property`/`*property`) and unprefixing at-rule names (a vendor-prefixed
+`@keyframes`)
+cut the census to Wikipedia 21 -> 10, rust 4 -> 0, Hacker News 3 -> 0,
+google 16 -> 3, nextjs 43 -> 20 and MDN 4 -> 1 distinct dropped properties.
+What remains:
 `Reflect`
 metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
 `Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`

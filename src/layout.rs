@@ -6053,6 +6053,165 @@ fn collapse_margins(a: f32, b: f32) -> f32 {
         a + b
     }
 }
+
+/// Indices of the regular block children a multi-column flow can distribute
+/// into columns. None when the box holds anything that cannot be fragmented
+/// as a whole block (text, inline boxes, floats, out-of-flow boxes, markers):
+/// the caller then falls back to single-column normal flow. Whitespace-only
+/// text and background/mask placeholders are skipped (they carry no content).
+fn multicol_items(n: &BoxNode) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for (i, c) in n.children.iter().enumerate() {
+        if c.is_bg || c.is_mask {
+            continue;
+        }
+        if c.is_text {
+            if c.text.trim().is_empty() && !c.hard_break {
+                continue;
+            }
+            return None;
+        }
+        if c.is_marker || c.inline {
+            return None;
+        }
+        if !matches!(c.bx.pos, Pos::Static) || c.bx.float != Float::None {
+            return None;
+        }
+        out.push(i);
+    }
+    Some(out)
+}
+
+/// A plain block box (not a flex/grid/table container, not inline/float/
+/// out-of-flow): the shape a multicol wrapper is flattened through.
+fn is_plain_block(c: &BoxNode) -> bool {
+    !c.is_text
+        && !c.inline
+        && !c.is_bg
+        && !c.is_mask
+        && !c.is_marker
+        && c.bx.float == Float::None
+        && matches!(c.bx.pos, Pos::Static)
+        && matches!(c.bx.display, Display::Auto | Display::Block)
+        && c.bx.table == TableRole::None
+}
+
+/// CSS Multi-column Layout for a block container whose in-flow content is
+/// the listed regular block children (see [`multicol_items`]).
+///
+/// Resolves the used column count/width from `column-count`/`column-width`/
+/// `column-gap`, measures each child once at the column width, balances the
+/// children greedily against an even target height, then re-places them in
+/// their columns (the measure pass' runs/rects are truncated first).
+///
+/// Returns false when fewer than two columns fit, so the caller runs the
+/// ordinary single-column flow (a 1-column multicol box is the full width).
+///
+/// shortcut: children are never SPLIT across a column boundary — a block
+/// child always stays whole, so `break-inside: avoid` is implicit and a
+/// single tall child can leave a column very uneven; balancing is greedy,
+/// not the spec's fill-and-remeasure algorithm.
+fn multicol_flow(
+    n: &mut BoxNode,
+    items: &[usize],
+    measure: &dyn Fn(&str, &Style) -> f32,
+    runs: &mut Vec<PositionedRun>,
+    uls: &mut Vec<UR>,
+) -> bool {
+    let avail = n.w;
+    if avail <= 1.0 || items.len() < 2 {
+        return false;
+    }    // `column-gap: normal` = 1em (the multicol initial value)
+    let gap = match n.bx.column_gap {
+        Some(l) => resolve_len(l, avail),
+        None => n.style.size,
+    }
+    .max(0.0);
+    let cw = n.bx.column_width.map(|l| resolve_len(l, avail));
+    let mut ncols = match (n.bx.column_count, cw) {
+        (Some(c), _) => c as usize,
+        (None, Some(w)) if w > 0.0 => ((avail + gap) / (w + gap)).floor() as usize,
+        _ => 1,
+    }
+    .max(1);
+    // a declared count still yields to `column-width` as a minimum width
+    if let (Some(_), Some(w)) = (n.bx.column_count, cw) {
+        if w > 0.0 {
+            let fit = (((avail + gap) / (w + gap)).floor() as usize).max(1);
+            ncols = ncols.min(fit);
+        }
+    }
+    if ncols < 2 {
+        return false;
+    }
+    let col_w = (avail - gap * (ncols - 1) as f32) / ncols as f32;
+    if col_w <= 1.0 {
+        return false;
+    }
+
+    // Measure pass: each child's outer advance at the column width. Heights
+    // depend only on width (no floats/percent heights in the distributable
+    // set), so measuring them all at one origin is enough; the runs/rects
+    // laid here are discarded and the real placement follows.
+    let base = runs.len();
+    let ubase = uls.len();
+    let mut adv = Vec::with_capacity(items.len());
+    for &ci in items {
+        let a = place(&mut n.children[ci], n.x, n.y, col_w, measure, runs, uls, &[]);
+        adv.push(a.max(0.0));
+    }
+    runs.truncate(base);
+    uls.truncate(ubase);
+
+    // Balance: greedy fill against an even target height. A child starts a
+    // new column once the current one already holds something and the child
+    // would overflow the target (the last column absorbs the remainder).
+    let total: f32 = adv.iter().sum();
+    let target = (total / ncols as f32).max(1.0);
+    let mut col_of = vec![0usize; items.len()];
+    let mut heights = vec![0.0f32; ncols];
+    let mut k = 0usize;
+    for (j, a) in adv.iter().enumerate() {
+        if k + 1 < ncols && heights[k] > 0.0 && heights[k] + a > target {
+            k += 1;
+        }
+        col_of[j] = k;
+        heights[k] += a;
+    }
+
+    // Place pass: real geometry per column, replicating block()'s sibling
+    // margin collapse within each column (columns don't collapse into each
+    // other).
+    let mut bottoms = vec![n.y; ncols];
+    let mut prev_mb = vec![0.0f32; ncols];
+    for (j, &ci) in items.iter().enumerate() {
+        let k = col_of[j];
+        let x = n.x + k as f32 * (col_w + gap);
+        let cmt = resolve_len(n.children[ci].bx.margin[0], col_w);
+        let cmb = resolve_len(n.children[ci].bx.margin[2], col_w);
+        let top = bottoms[k] + collapse_margins(prev_mb[k], cmt);
+        place(
+            &mut n.children[ci],
+            x,
+            top - cmt,
+            col_w,
+            measure,
+            runs,
+            uls,
+            &[],
+        );
+        bottoms[k] = top + n.children[ci].h;
+        prev_mb[k] = cmb;
+    }
+    let mut h = 0.0f32;
+    for k in 0..ncols {
+        h = h.max(bottoms[k] + prev_mb[k] - n.y);
+    }
+    n.h = h.max(0.0);
+    n.open = false;
+    true
+}
+
 fn block(
     n: &mut BoxNode,
     measure: &dyn Fn(&str, &Style) -> f32,
@@ -6063,6 +6222,58 @@ fn block(
     // have no effect on flex/grid items or out-of-flow boxes)
     flt: &[Flt],
 ) {
+    // CSS Multi-column Layout (see `multicol_flow`). Two shapes:
+    //  - a multicol wrapper whose only in-flow content is one plain block
+    //    (Wikipedia's `div.mw-references-columns > ol.references`): flatten
+    //    by handing the spec to that child, so its own children become the
+    //    column items and no extra box remains;
+    //  - a multicol box holding regular block children: distribute them.
+    // Anything else falls back to ordinary single-column flow.
+    if n.bx.column_width.is_some() || n.bx.column_count.is_some() {
+        if let Some(items) = multicol_items(n) {
+            if items.len() == 1 {
+                let ci = items[0];
+                let flatten = is_plain_block(&n.children[ci])
+                    && multicol_items(&n.children[ci]).is_some_and(|g| !g.is_empty());
+                if flatten {
+                    let c = &mut n.children[ci];
+                    if c.bx.column_width.is_none() && c.bx.column_count.is_none() {
+                        // Column COUNT is decided on the multicol container's
+                        // width (the wrapper), then handed to the child as a
+                        // count: the child's own width (which its margins
+                        // reduce) sizes the columns, and re-deriving the count
+                        // from that narrower width would lose a column.
+                        let gap = match n.bx.column_gap {
+                            Some(l) => resolve_len(l, n.w),
+                            None => n.style.size,
+                        }
+                        .max(0.0);
+                        let ncols = match (
+                            n.bx.column_count,
+                            n.bx.column_width.map(|l| resolve_len(l, n.w)),
+                        ) {
+                            (Some(k), _) => k as usize,
+                            (None, Some(w)) if w > 0.0 => {
+                                (((n.w + gap) / (w + gap)).floor() as usize).max(1)
+                            }
+                            _ => 1,
+                        };
+                        c.bx.column_count = Some(ncols as u32);
+                        c.bx.column_width = None;
+                        c.bx.column_gap = n.bx.column_gap;
+                    }
+                    // the child keeps its own width resolution: an auto block
+                    // already fills this box's content area minus its margins
+                    // (the `ol` here carries a left margin, and forcing the
+                    // full width pushed its second column past the container)
+                    n.bx.column_width = None;
+                    n.bx.column_count = None;
+                }
+            } else if !items.is_empty() && multicol_flow(n, &items, measure, runs, uls) {
+                return;
+            }
+        }
+    }
     // everything visible here: ancestor floats + any this block places
     let mut floats: Vec<Flt> = flt.to_vec();
     // y = bottom of the last closed content. While `cont` is Some, the
@@ -15236,5 +15447,118 @@ line</textarea></div>"#,
             vec![("plain".into(), 0.0, 16.0), ("text".into(), 24.0, 16.0)],
             "a plain <p> is flush left and starts under its UA 1em top margin"
         );
+    }
+
+    #[test]
+    fn multicol_count_splits_block_children_into_columns() {
+        // two 100px columns (210 - 10 gap) of 20px rows: 4 rows balance 2+2.
+        // Without multicol the box is a single 80px stack.
+        let mut root = boxes_of(
+            r#"<div style="width:210px;column-count:2;column-gap:10px">
+                 <div style="height:20px"></div><div style="height:20px"></div>
+                 <div style="height:20px"></div><div style="height:20px"></div>
+               </div>"#,
+            "",
+        );
+        layout_tree(&mut root, 300.0, &m4);
+        let m = &root.children[0];
+        assert_eq!(m.w, 210.0);
+        assert_eq!(m.h, 40.0, "two balanced columns of two rows");
+        // markup whitespace stays as text leaves between the block rows
+        let kids: Vec<&BoxNode> = m.children.iter().filter(|c| !c.is_text).collect();
+        assert_eq!(kids.len(), 4);
+        assert_eq!(kids[0].w, 100.0, "each row fills one 100px column");
+        let x0 = kids[0].x;
+        assert_eq!(kids[1].x, x0, "second row stays in column 1");
+        assert_eq!(kids[2].x - x0, 110.0, "third row starts column 2");
+        assert_eq!(kids[3].x - x0, 110.0, "fourth row stays in column 2");
+        assert_eq!(kids[2].y, kids[0].y, "column 2 starts at the same top");
+    }
+
+    #[test]
+    fn multicol_wrapper_flattens_through_a_single_block_child() {
+        // Wikipedia shape: a multicol div around one unclassed block (its
+        // `div.mw-references-columns > ol.references`). The spec moves to the
+        // child, which is widened to the wrapper so its children — not the
+        // wrapper's nonexistent siblings — become the column items.
+        let mut root = boxes_of(
+            r#"<div style="width:210px;column-width:90px">
+                 <div>
+                   <div style="height:20px"></div><div style="height:20px"></div>
+                   <div style="height:20px"></div><div style="height:20px"></div>
+                 </div>
+               </div>"#,
+            "",
+        );
+        layout_tree(&mut root, 300.0, &m4);
+        let outer = &root.children[0];
+        let inner = outer
+            .children
+            .iter()
+            .find(|c| !c.is_text)
+            .expect("the wrapped block child");
+        assert_eq!(inner.w, 210.0, "flattened child spans the multicol box");
+        let rows: Vec<&BoxNode> = inner.children.iter().filter(|c| !c.is_text).collect();
+        assert!(
+            rows[2].x - rows[0].x >= 100.0,
+            "the third row starts a second column"
+        );
+        assert_eq!(outer.h, 40.0, "wrapper height = tallest column");
+    }
+
+    #[test]
+    fn multicol_flattened_child_keeps_its_margins_inside_the_wrapper() {
+        // The flattened child must not be forced to the wrapper's full width:
+        // Wikipedia's `ol.references` carries a left margin, and pinning the
+        // border box to the wrapper width pushed its second column 51px past
+        // the container. Auto width already subtracts that margin. The column
+        // COUNT still comes from the wrapper (210 + 16 gap fits two 90px
+        // columns) even though the child is only 160px wide.
+        let mut root = boxes_of(
+            r#"<div style="width:210px;column-width:90px">
+                 <div style="margin-left:50px">
+                   <div style="height:20px"></div><div style="height:20px"></div>
+                   <div style="height:20px"></div><div style="height:20px"></div>
+                 </div>
+               </div>"#,
+            "",
+        );
+        layout_tree(&mut root, 300.0, &m4);
+        let outer = &root.children[0];
+        let inner = outer
+            .children
+            .iter()
+            .find(|c| !c.is_text)
+            .expect("the wrapped block child");
+        assert_eq!(inner.x - outer.x, 50.0, "child keeps its left margin");
+        assert_eq!(inner.w, 160.0, "auto width = wrapper content minus margin");
+        let rows: Vec<&BoxNode> = inner.children.iter().filter(|c| !c.is_text).collect();
+        assert!(
+            rows[2].x > rows[0].x,
+            "the wrapper's width still yields two columns"
+        );
+        let max_right = rows.iter().map(|r| r.x + r.w).fold(0.0f32, f32::max);
+        assert!(
+            max_right <= outer.x + outer.w,
+            "columns stay inside the wrapper"
+        );
+    }
+
+    #[test]
+    fn multicol_with_direct_text_falls_back_to_one_column() {
+        // a non-fragmentable child (text) must not be squeezed into the first
+        // column — the box lays out as ordinary full-width flow
+        let mut root = boxes_of(
+            r#"<div style="width:210px;column-count:2">hello world</div>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let m = &root.children[0];
+        assert_eq!(m.w, 210.0);
+        assert!(
+            l.runs.iter().all(|r| r.x < 100.0),
+            "text stays in one full-width flow"
+        );
+        assert_eq!(m.h, l.runs[0].style.line_height(), "a single line");
     }
 }

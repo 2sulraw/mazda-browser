@@ -1769,6 +1769,44 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-07 | wave 81 (logical CSS properties, `text-wrap`, `appearance`, axis background positions, accepted no-op census) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | The largest remaining layout-miss cluster was logical CSS: `inline-size`/`block-size`, `inset-inline-start`, `margin-before`, `border-inline-start-width` and the two-sided shorthands were dropped by the `KNOWN` gate even though the engine already had every physical property they alias. A new `logical_physical` table renames the one-sided names BEFORE the gate (writing-mode is assumed `horizontal-tb`, direction ltr: inline = left/right, block = top/bottom), including the legacy `before`/`after`/`start`/`end` spellings that browser-prefixed declarations unprefix into — that is exactly google.com's `margin-before` cluster. `inset-inline`/`inset-block`, `border-inline`/`border-block` and their `-width`/`-style`/`-color` longhands cannot be a 1:1 rename (they touch two sides), so `apply_decl` expands them: 1 value = both sides, 2 = start then end. `text-wrap: nowrap` now sets the inherited no-wrap mode (only `nowrap` is modeled; `wrap`/`balance`/`pretty` are hints), `appearance: none` suppresses the native-control chrome entirely (`BoxStyle::appearance_none`, checked at the top of `control_chrome`), and `background-position-x`/`-y` replace one axis while keeping the other. The miss census also gained a curated accepted-no-op list for properties with no static-layout effect in this engine (pointer-events, user-select, will-change, contain, backface-visibility, scroll-margin/padding, overscroll/touch/scrollbar/scroll-snap, legacy box-orient/pack/align, font smoothing, text-size-adjust, …), so the census now ranks real layout work. Distinct dropped properties: google 50 -> 16, nextjs 84 -> 43, MDN 12 -> 4; rust/HN/Wikipedia were already free of logical names and stay at 9/3/29. Geometry barely moves because the affected declarations sit on icons and decorative boxes: MDN 2925 -> 2926, google 514, nextjs 7810 (7258 pre-JS), rust 3572, Hacker News 1772, Wikipedia 21872 — unchanged. Suite **879** default / **882** `engine-b + woff2` (three new tests) |
 
+| 2026-11-07 | wave 82 (multi-column layout, inert animation/font-feature properties, IE-hack and prefixed at-rule parsing) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | The last large layout feature in the census ships: CSS multi-column. `column-width`, `column-count` and `column-gap` land on `BoxStyle`, and `layout.rs`'s `multicol_flow` resolves the used count (`column-count`, else the floor of `(available + gap) / (column-width + gap)`), splits the remaining width into equal columns, measures every distributable block child once at the column width, balances them greedily against an even target height, then re-places them per column (the measure pass' runs/rects are truncated first). Columns are a formatting context: only whole block children are fragmented — text, inline boxes, floats, out-of-flow boxes and markers make the box fall back to ordinary single-column flow, which also makes `break-inside: avoid` implicit (those properties are now accepted, along with the legacy `page-break-*`). The Wikipedia shape needed one extra step: `div.mw-references-columns` wraps a single `ol.references`, so a multicol box whose only in-flow content is one plain block transfers its spec to that child, letting the list's own `li` children become the column items. Critically, multicol lengths resolve `em` against the ELEMENT's font size: the generic `parse_len` pins em at 16px, making `column-width: 30em` 480px and collapsing Wikipedia's 928px wrapper to one column; `parse_len_em` (a thin wrapper the old function now calls at 16px) reads the element's size, so 30em at 14px is 420px and two 457px columns fit. The census also learned that animation/transition (`transition*`, `animation*`), font-feature selection (`font-feature-settings`, `font-variant-*`, `font-optical-sizing`, `font-synthesis`, `font-kerning`, `font-variation-settings`, `font-display`) and vendor scrolling/interaction hints (`overflow-scrolling`, `touch-callout`, `user-drag`, `scroll-chaining`) have no effect on a static box in this engine and are accepted whole. Two parser correctness fixes: IE hack names (`_property`, `*property`) are invalid declarations and are dropped before the `KNOWN` gate, and at-rule names are unprefixed, so a vendor-prefixed `@keyframes` is recognized as `keyframes` and skipped whole instead of being counted as an unknown at-rule. Geometry: Wikipedia 21872 -> 21525 (the references wrapper 4347 -> 4000, 121 citations split 60/61 into two 431px columns whose right edge lands on the container) — much less than a naive "total height / 2" estimate, because halving the column width makes each citation wrap onto more lines, conserving the text area; rust 3572 -> 3503, google 514, Hacker News 1772, nextjs 7762 post-JS (7210 pre-JS), MDN 2926. Distinct dropped properties: Wikipedia 21 -> 10, rust 4 -> 0, Hacker News 3 -> 0, google 16 -> 3, nextjs 43 -> 20, MDN 4 -> 1. Suite **885** default / **889** `engine-b + woff2` (six new tests) |
+
+### Wave 82 findings
+
+- **Multi-column does not halve a prose page.** The recon estimate assumed
+  each citation kept its single-column height; in reality a 431px column
+  wraps the same text onto roughly twice as many lines, so the total text
+  area is conserved and Wikipedia only drops 347px (4347 -> 4000 for the
+  references block). The win is matching Chrome's two-column rendering and
+  closing the property gap, not a vertical-space shortcut.
+- **Multicol lengths are element-relative.** `column-width: 30em` must use
+  the element's font size, not `parse_len`'s fixed 16px. At 16px the value
+  is 480px and 928px fits only one column; at 14px it is 420px and two
+  columns fit. The fix is a `parse_len_em` helper that `parse_len` delegates
+  to, so no caller loses behavior.
+- **Real pages wrap the list.** MediaWiki's multicol element is a `div`
+  around a single `ol`, so distributing the div's children would find no
+  siblings. Flattening through one plain block child — transfer the spec,
+  leaving the child's own width resolution (and its left margin) intact —
+  reuses the same distribution path and handles nested wrappers recursively.
+- **Fragmentation is per whole block child.** Only regular block children
+  are distributed; any text/inline/float/out-of-flow/marker content falls
+  back to single-column flow. This makes `break-inside: avoid` automatic and
+  keeps the measure-then-place pass cheap (a regular block's height depends
+  only on its width), at the cost of never splitting a tall child.
+- **Measure passes must not leak.** `place()` appends runs and underline
+  rects, so the measure pass truncates both vectors back to their starting
+  lengths before the real per-column placement. Re-placing a child is safe
+  because `place()` overwrites its geometry and the page rebuilds the box
+  tree for every layout.
+- **The remaining census is now the real feature queue.** With inert
+  animation/font-feature/vendor properties accepted and IE hacks/prefixed
+  at-rules parsed correctly, what is left is bidi (`direction`,
+  `unicode-bidi`), counters (`counter-reset`/`increment`, `@counter-style`),
+  `@container`/`@property`, grid row/auto placement, and a handful of
+  typographic details (`tab-size`, `quotes`, `list-style-image`,
+  `mix-blend-mode`).
+
 ### Wave 81 findings
 
 - **Logical properties are the cheapest real CSS win available.** Every
