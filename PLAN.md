@@ -1767,6 +1767,33 @@ curve matters more than the baseline (near-flat as tabs grow).
 
 | 2026-11-07 | wave 80 (UA margins + sibling margin collapsing, replacing the 0.6em paragraph gap) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | The engine no longer invents spacing: the three synthetic `0.6 x font-size` paragraph gaps are gone, and real CSS margins do the job. Every `margin-*` longhand and shorthand now records which sides a declaration claimed (`decl::MARGIN_TOP/RIGHT/BOTTOM/LEFT`), and `ua_margins` runs at the end of the cascade — after the FINAL font-size is known, because the UA values are em-based — filling only the sides no declaration set. That is what a real UA rule loses to: a reset (`* { margin: 0 }`, or rust-lang.org's `p { margin: 12px 0 30px }`) wins wholesale, while a page that declares nothing gets the browser defaults (`p`/`dl`/`pre`/`address`/`ul`/`ol` 1em block, `blockquote`/`figure` 1em block + 40px inline, `h1` 0.67em, `h2` 0.83em, `h3` 1em, `h4` 1.33em, `h5` 1.67em, `h6` 2.33em, `dd` 40px start, `body` 8px). Ground truth came from headless Chrome's computed margins: rust body 0 / p 12/30 / h2 24/0, Hacker News body 8px on all sides, google body 0 / hr 20/7, nextjs body 0 / p 0/8, MDN body 0 / p 0 / h2 19.92/19.92 / h3 0/16 / figure 16/16 + 40px sides. In `block()` a `prev_mb` carries the previous in-flow sibling's bottom margin without adding it to `y`; the next sibling's gap is `collapse_margins(prev_mb, margin-top)` (two positives take the larger, two negatives the more negative, mixed ones add) and any line-level content resets `prev_mb` to 0. This removes the double counting that dominated real pages: every MediaWiki paragraph (`p { margin: 0.5em 0 }`) had a 25.6px boundary (8 + 8 + 9.6) where Chrome uses 8, so Wikipedia goes 28074 -> 21872px; nextjs 7906 -> 7810 (7258 on the first pre-JS layout), rust-lang.org 4113 -> 3572 (Chrome 3841 — the old synthetic gap overshot by 272, the correction now undershoots by 269, and that remaining section-spacing gap is the next layout target), MDN 2966 -> 2925 (3328), Hacker News 1782 -> 1772 (1217) — now with the UA 8px body inset, matching Chrome, and google.com 539 -> 514. Parent/first/last-child margins deliberately do not collapse through the parent (documented shortcut: the last child's held-back bottom margin is added inside the box, which is also what a BFC requires), and `hr` keeps its hard-break-leaf model with no UA margin. Suite **876** default / **879** `engine-b + woff2` (one new collapse test, ten expected-geometry updates) |
 
+| 2026-11-07 | wave 81 (logical CSS properties, `text-wrap`, `appearance`, axis background positions, accepted no-op census) | rust-lang.org + google.com + nextjs.org + MDN homepage + Wikipedia `/wiki/JavaScript` + Hacker News | The largest remaining layout-miss cluster was logical CSS: `inline-size`/`block-size`, `inset-inline-start`, `margin-before`, `border-inline-start-width` and the two-sided shorthands were dropped by the `KNOWN` gate even though the engine already had every physical property they alias. A new `logical_physical` table renames the one-sided names BEFORE the gate (writing-mode is assumed `horizontal-tb`, direction ltr: inline = left/right, block = top/bottom), including the legacy `before`/`after`/`start`/`end` spellings that browser-prefixed declarations unprefix into — that is exactly google.com's `margin-before` cluster. `inset-inline`/`inset-block`, `border-inline`/`border-block` and their `-width`/`-style`/`-color` longhands cannot be a 1:1 rename (they touch two sides), so `apply_decl` expands them: 1 value = both sides, 2 = start then end. `text-wrap: nowrap` now sets the inherited no-wrap mode (only `nowrap` is modeled; `wrap`/`balance`/`pretty` are hints), `appearance: none` suppresses the native-control chrome entirely (`BoxStyle::appearance_none`, checked at the top of `control_chrome`), and `background-position-x`/`-y` replace one axis while keeping the other. The miss census also gained a curated accepted-no-op list for properties with no static-layout effect in this engine (pointer-events, user-select, will-change, contain, backface-visibility, scroll-margin/padding, overscroll/touch/scrollbar/scroll-snap, legacy box-orient/pack/align, font smoothing, text-size-adjust, …), so the census now ranks real layout work. Distinct dropped properties: google 50 -> 16, nextjs 84 -> 43, MDN 12 -> 4; rust/HN/Wikipedia were already free of logical names and stay at 9/3/29. Geometry barely moves because the affected declarations sit on icons and decorative boxes: MDN 2925 -> 2926, google 514, nextjs 7810 (7258 pre-JS), rust 3572, Hacker News 1772, Wikipedia 21872 — unchanged. Suite **879** default / **882** `engine-b + woff2` (three new tests) |
+
+### Wave 81 findings
+
+- **Logical properties are the cheapest real CSS win available.** Every
+  physical property they alias already existed, so one parse-time rename
+  turns a whole family of dropped declarations into working layout without
+  touching the cascade or layout code. The one-sided names map before the
+  `KNOWN` gate; only the two-sided shorthands need real expansion in
+  `apply_decl`.
+- **`before`/`after`/`start`/`end` are the legacy alias spellings.** The
+  prefix stripper turns `-*-margin-before` into `margin-before`, which is
+  why google.com's census showed names no current spec uses. Mapping them to
+  `block-start`/`inline-end` recovers those declarations.
+- **`text-wrap` is line breaking, not whitespace handling.** `nowrap` shares
+  the inherited `Ws` mode with `white-space: nowrap`; a later `wrap`/`balance`
+  cannot restore wrapping without a second flag, documented as a shortcut.
+- **`appearance: none` must suppress every chrome property.** Filling only
+  the border would leave the UA fill, padding, radius and min-height behind;
+  the early return in `control_chrome` is what makes an author-reset control
+  look like a plain box.
+- **The remaining census is honest.** After this wave the top names are
+  animation/transition (no static-layout effect), `@container`/`@property`
+  at-rules, counters, bidi, multi-column, grid row placement and font
+  shaping — the real layout queue rather than aliases of implemented
+  properties.
+
 ### Wave 80 findings
 
 - **A synthetic paragraph gap double-counts every author margin.** The old

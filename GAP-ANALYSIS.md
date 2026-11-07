@@ -176,7 +176,7 @@ handled, but the paint model still applies one radius to every corner.
 |---|---:|---|---|
 | Other / miscellaneous | 217 | `bookmark-label`, `block-step-align`, `corner-*`, `cue` | ignore: drafts, print, speech |
 | Text & typography | 60 | `hyphens` | high: frequent in real CSS |
-| Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low: low frequency here |
+| Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low frequency; wave 81 maps the horizontal-tb/ltr subset to physical |
 | Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required |
 | Borders & outlines | 18 | `border-image-*`, `border-block-*`, `border-inline-*` | medium: common in resets |
 | Scrolling | 33 | `scroll-behavior`, `scrollbar-*`, `overscroll-behavior` | low: static captures |
@@ -285,7 +285,18 @@ relevant only when transitions and animations exist.
   font-size are known. Adjacent in-flow siblings collapse (positive max,
   negative min, mixed sum), but a parent's first/last child margin is kept
   inside the parent instead of collapsing through a padding/border-free
-  ancestor — `hr` is still a hard-break leaf with no UA margin.
+  ancestor - `hr` is still a hard-break leaf with no UA margin.
+- Logical properties: `inline-size`/`block-size`, their min/max forms,
+  `inset-inline-*`/`inset-block-*`, `margin`/`padding`/`border` `-before`/
+  `-after`/`-start`/`-end` aliases and the two-sided `inset-inline`,
+  `inset-block`, `border-inline`/`border-block` (+ width/style/color)
+  shorthands map to physical left/right/top/bottom. Only horizontal-tb with
+  `direction: ltr` is modeled; writing modes and bidi are still absent.
+- `text-wrap: nowrap` shares the inherited no-wrap mode with
+  `white-space: nowrap`; `appearance: none` suppresses UA control chrome;
+  `background-position-x`/`-y` replace one axis. Interaction-only properties
+  (`pointer-events`, `user-select`, scroll margins/padding, …) are accepted
+  no-ops.
 - Borders: per-side width and colour longhands parse into the existing model,
   which still keeps one colour for all sides and one radius for all corners
   (the last declaration wins); a `transparent` colour keeps the side's width
@@ -482,7 +493,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 876 self-authored unit tests (879 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 879 self-authored unit tests (882 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -548,7 +559,17 @@ and gave the cascade real UA margins plus sibling collapsing: Wikipedia
 nextjs 7906 -> 7810, rust-lang.org 4113 -> 3572 (Chrome 3841 — the remaining
 ~269px is section spacing, not paragraph margins), MDN 2966 -> 2925 (3328),
 Hacker News 1782 -> 1772 (1217) with Chrome's 8px body inset, and google
-539 -> 514. What remains: `Reflect`
+539 -> 514. Wave 81 then closed the logical-property cluster: `inline-size`/
+`block-size`, `inset-inline-start`, the legacy `margin-before`/`start`/`end`
+spellings and the two-sided `inset-inline`/`border-block` shorthands now map
+to their physical left/right/top/bottom properties before the `KNOWN` gate
+(horizontal-tb + ltr only), `text-wrap: nowrap` joins the no-wrap mode,
+`appearance: none` suppresses native-control chrome, and
+`background-position-x`/`-y` replace one axis. The `MAZDA_MISS` census fell
+from 50 to 16 distinct dropped properties on google, 84 to 43 on nextjs and
+12 to 4 on MDN; heights barely move (MDN 2925 -> 2926, the rest unchanged)
+because the declarations sit on icons and decorative boxes. What remains:
+`Reflect`
 metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
 `Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`
 reads, and the section/heading spacing rules that keep rust-lang.org short.

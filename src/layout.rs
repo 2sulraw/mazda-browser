@@ -415,6 +415,11 @@ fn style_for(tag: &str, base: Style) -> Style {
 /// `background:none`) always wins over the UA chrome, and a color-less
 /// `border:1px solid` renders currentcolor instead of the UA gray.
 fn control_chrome(bx: &mut BoxStyle, min_h: f32, default_w: Option<f32>) {
+    // `appearance: none`: the author opted out of the native look, so no
+    // chrome property is filled (declared values already won below anyway).
+    if bx.appearance_none {
+        return;
+    }
     if bx.declared & decl::BORDER == 0 {
         bx.border = [Len::Px(1.0); 4];
     }

@@ -1056,6 +1056,10 @@ pub struct BoxStyle {
     /// FIRST row (declared cell `width`s, equal shares for the rest), and
     /// later rows never widen a column.
     pub table_fixed: bool,
+    /// `appearance: none` — the author asked for a plain box, so
+    /// `control_chrome` (layout.rs) must not fill the native-control border,
+    /// fill, padding, radius, min-height or width.
+    pub appearance_none: bool,
     /// Bitmask of [`decl`] flags: which box properties the author CSS
     /// actually declared. Lets UA control chrome (`control_chrome` in
     /// layout.rs) fill only the properties the author left initial, so an
@@ -1218,6 +1222,7 @@ impl Default for BoxStyle {
             border_collapse: false,
             border_spacing: [Len::Px(0.0); 2],
             table_fixed: false,
+            appearance_none: false,
             declared: 0,
             content: None,
         }
@@ -1930,6 +1935,68 @@ const KNOWN: &[&str] = &[
     "stroke-width",
     "stroke-linejoin",
     "stroke-linecap",
+    // logical-axis shorthands (writing-mode is assumed horizontal-tb and
+    // direction ltr). The single-sided logical names never reach this table:
+    // [`logical_physical`] renames them before the gate.
+    "inset-inline",
+    "inset-block",
+    "border-inline",
+    "border-block",
+    "border-inline-width",
+    "border-inline-style",
+    "border-inline-color",
+    "border-block-width",
+    "border-block-style",
+    "border-block-color",
+    // line breaking only (`text-wrap: nowrap`)
+    "text-wrap",
+    // native-control chrome opt-out
+    "appearance",
+    "background-position-x",
+    "background-position-y",
+    // Accepted no-ops: interaction, animation, scrolling and paint features
+    // this engine does not model, none of which move a static box. Keeping
+    // them out of the miss census leaves the list about layout.
+    "pointer-events",
+    "user-select",
+    "will-change",
+    "contain",
+    "backface-visibility",
+    "tap-highlight-color",
+    "text-size-adjust",
+    "font-smoothing",
+    "osx-font-smoothing",
+    "scroll-behavior",
+    "scroll-snap-type",
+    "scroll-snap-align",
+    "scrollbar-width",
+    "scrollbar-gutter",
+    "scrollbar-color",
+    "overscroll-behavior",
+    "overscroll-behavior-x",
+    "overscroll-behavior-y",
+    "touch-action",
+    "resize",
+    "box-orient",
+    "box-pack",
+    "box-align",
+    "overflow-style",
+    "forced-color-adjust",
+    "text-decoration-skip-ink",
+    "scroll-padding",
+    "scroll-padding-top",
+    "scroll-padding-right",
+    "scroll-padding-bottom",
+    "scroll-padding-left",
+    "scroll-padding-block",
+    "scroll-padding-inline",
+    "scroll-margin",
+    "scroll-margin-top",
+    "scroll-margin-right",
+    "scroll-margin-bottom",
+    "scroll-margin-left",
+    "scroll-margin-block",
+    "scroll-margin-inline",
 ];
 
 /// Observed CSS misses (`MAZDA_MISS=1`, dev-only): property names dropped by
@@ -2938,6 +3005,67 @@ fn split_decls(block: &str) -> Vec<&str> {
     out
 }
 
+/// Physical counterpart of a logical property name. This engine only lays
+/// out `writing-mode: horizontal-tb` / `direction: ltr`, so the inline axis
+/// is left/right and the block axis is top/bottom. `before`/`after`/
+/// `start`/`end` are the legacy spellings browsers still accept for
+/// `block-start`/`block-end`/`inline-start`/`inline-end`.
+///
+/// Mapping happens BEFORE the [`KNOWN`] gate, so only the physical name has
+/// to be in that table. The two-sided shorthands (`inset-inline`,
+/// `border-block`, …) can't be a 1:1 rename and are handled in
+/// [`apply_decl`].
+fn logical_physical(p: &str) -> Option<&'static str> {
+    Some(match p {
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "min-block-size" => "min-height",
+        "max-inline-size" => "max-width",
+        "max-block-size" => "max-height",
+        "inset-inline-start" => "left",
+        "inset-inline-end" => "right",
+        "inset-block-start" => "top",
+        "inset-block-end" => "bottom",
+        "margin-before" | "margin-block-start" => "margin-top",
+        "margin-after" | "margin-block-end" => "margin-bottom",
+        "margin-start" | "margin-inline-start" => "margin-left",
+        "margin-end" | "margin-inline-end" => "margin-right",
+        "padding-before" | "padding-block-start" => "padding-top",
+        "padding-after" | "padding-block-end" => "padding-bottom",
+        "padding-start" | "padding-inline-start" => "padding-left",
+        "padding-end" | "padding-inline-end" => "padding-right",
+        "border-before" | "border-block-start" => "border-top",
+        "border-after" | "border-block-end" => "border-bottom",
+        "border-start" | "border-inline-start" => "border-left",
+        "border-end" | "border-inline-end" => "border-right",
+        "border-before-width" | "border-block-start-width" => "border-top-width",
+        "border-after-width" | "border-block-end-width" => "border-bottom-width",
+        "border-start-width" | "border-inline-start-width" => "border-left-width",
+        "border-end-width" | "border-inline-end-width" => "border-right-width",
+        "border-before-color" | "border-block-start-color" => "border-top-color",
+        "border-after-color" | "border-block-end-color" => "border-bottom-color",
+        "border-start-color" | "border-inline-start-color" => "border-left-color",
+        "border-end-color" | "border-inline-end-color" => "border-right-color",
+        "border-before-style" | "border-block-start-style" => "border-top-style",
+        "border-after-style" | "border-block-end-style" => "border-bottom-style",
+        "border-start-style" | "border-inline-start-style" => "border-left-style",
+        "border-end-style" | "border-inline-end-style" => "border-right-style",
+        // scroll-margin/scroll-padding are accepted no-ops (no scroll
+        // anchoring yet), but their logical spellings should not show up as
+        // unknown properties
+        "scroll-margin-before" | "scroll-margin-block-start" => "scroll-margin-top",
+        "scroll-margin-after" | "scroll-margin-block-end" => "scroll-margin-bottom",
+        "scroll-margin-start" | "scroll-margin-inline-start" => "scroll-margin-left",
+        "scroll-margin-end" | "scroll-margin-inline-end" => "scroll-margin-right",
+        "scroll-padding-before" | "scroll-padding-block-start" => "scroll-padding-top",
+        "scroll-padding-after" | "scroll-padding-block-end" => "scroll-padding-bottom",
+        "scroll-padding-start" | "scroll-padding-inline-start" => "scroll-padding-left",
+        "scroll-padding-end" | "scroll-padding-inline-end" => "scroll-padding-right",
+        _ => return None,
+    })
+}
+
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
 pub fn parse_decls(block: &str) -> Vec<Decl> {
     let mut out = Vec::new();
@@ -2949,6 +3077,11 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         // a prefixed spelling strips to its bare property before the gate
         // (`--custom` properties pass through `unprefix` untouched)
         let p = unprefix(&p).to_string();
+        // logical → physical alias (see [`logical_physical`])
+        let p = match logical_physical(&p) {
+            Some(q) => q.to_string(),
+            None => p,
+        };
         // custom properties (--x) always survive: var() resolution needs them
         if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
             note_unknown_prop(&p);
@@ -3042,6 +3175,14 @@ fn apply_decl(
         // padding box (size/position resolve in layout.rs `place()`)
         "background-size" => bx.bg_size = parse_bg_size(&d.1, vp),
         "background-position" => bx.bg_pos = parse_bg_pos(&d.1, vp),
+        // single-axis longhands keep the other axis: parse the value with a
+        // neutral second token and take only the requested component
+        "background-position-x" => {
+            bx.bg_pos[0] = parse_bg_pos(&format!("{} center", d.1), vp)[0];
+        }
+        "background-position-y" => {
+            bx.bg_pos[1] = parse_bg_pos(&format!("center {}", d.1), vp)[1];
+        }
         "background-repeat" => bx.bg_repeat = parse_bg_repeat(&d.1),
         // `background-clip: border-box | padding-box | content-box`; `text`
         // and anything else keep the earlier value (`BgClip` docs why)
@@ -3313,6 +3454,25 @@ fn apply_decl(
         // the box in flow — usually fine, sites use it on off-screen
         // measurement clones)
         "visibility" => return matches!(d.1.as_str(), "hidden" | "collapse"),
+        // accepted no-ops (see the KNOWN table comment): none of these move
+        // a static box in this engine
+        "pointer-events" | "user-select" | "will-change" | "contain"
+        | "backface-visibility" | "tap-highlight-color" | "text-size-adjust"
+        | "font-smoothing" | "osx-font-smoothing" | "scroll-behavior"
+        | "scroll-snap-type" | "scroll-snap-align" | "scrollbar-width"
+        | "scrollbar-gutter" | "scrollbar-color" | "overscroll-behavior"
+        | "overscroll-behavior-x" | "overscroll-behavior-y" | "touch-action"
+        | "resize" | "box-orient" | "box-pack" | "box-align"
+        | "overflow-style" | "forced-color-adjust" | "text-decoration-skip-ink"
+        | "scroll-padding" | "scroll-padding-top" | "scroll-padding-right"
+        | "scroll-padding-bottom" | "scroll-padding-left" | "scroll-padding-block"
+        | "scroll-padding-inline" | "scroll-margin" | "scroll-margin-top"
+        | "scroll-margin-right" | "scroll-margin-bottom" | "scroll-margin-left"
+        | "scroll-margin-block" | "scroll-margin-inline" => {}
+        // `appearance: none` removes the native-control look, so the UA
+        // chrome must not fill anything; author declarations still apply.
+        // (`auto` and unknown keywords keep the chrome.)
+        "appearance" => bx.appearance_none = d.1.trim() == "none",
         "text-align" => {
             style.text_align = match d.1.as_str() {
                 "center" => 1,
@@ -3329,6 +3489,15 @@ fn apply_decl(
                 "pre-wrap" => Ws::PreWrap,
                 "pre-line" => Ws::PreLine,
                 _ => Ws::Normal,
+            }
+        }
+        // `text-wrap: nowrap` is the inherited no-wrap mode. shortcut: only
+        // `nowrap` is modeled — `wrap`/`balance`/`pretty` are hints, and a
+        // reset from nowrap back to wrapping would need a separate flag from
+        // `white-space` (they share [`Ws`]).
+        "text-wrap" => {
+            if d.1.split_whitespace().next() == Some("nowrap") {
+                style.ws = Ws::Nowrap;
             }
         }
         // the two in-word breaking switches (see layout.rs): unknown values
@@ -4010,6 +4179,57 @@ fn apply_decl(
                 bx.declared |= decl::BCOLOR;
             }
         }
+        // two-sided logical border shorthands: the same `width style color`
+        // value applies to both physical sides of the axis
+        "border-inline" | "border-block" => {
+            let sides: [usize; 2] = if d.0 == "border-inline" { [3, 1] } else { [0, 2] };
+            let (w, c) = border_parts(&d.1, dark, vp);
+            if let Some(w) = w {
+                for s in sides {
+                    bx.border[s] = w;
+                }
+            }
+            if c.is_some() {
+                bx.bcolor = c;
+                bx.btransparent = false;
+            } else if border_transparent(&d.1) {
+                bx.btransparent = true;
+            }
+            bx.declared |= decl::BORDER;
+            if c.is_some() {
+                bx.declared |= decl::BCOLOR;
+            }
+        }
+        // two-sided logical border longhands: 1 value = both sides,
+        // 2 = start then end (same shape as `margin-inline`)
+        "border-inline-width" | "border-block-width" => {
+            let sides: [usize; 2] = if d.0 == "border-inline-width" { [3, 1] } else { [0, 2] };
+            let tok = joined_tokens(&d.1);
+            let a = tok.first().and_then(|t| parse_len(t, vp));
+            let b = tok.get(1).and_then(|t| parse_len(t, vp)).or(a);
+            if let Some(a) = a {
+                bx.border[sides[0]] = a;
+            }
+            if let Some(b) = b {
+                bx.border[sides[1]] = b;
+            }
+            bx.declared |= decl::BORDER;
+        }
+        // shortcut: the paint model keeps one colour for all sides, so the
+        // first colour token (start side) wins, like the per-side longhands
+        "border-inline-color" | "border-block-color" => {
+            let tok = joined_tokens(&d.1);
+            if let Some(c) = tok.first().and_then(|t| parse_color(pick_light_dark(t, dark))) {
+                bx.bcolor = Some(c);
+                bx.btransparent = false;
+                bx.declared |= decl::BCOLOR;
+            } else if border_transparent(&d.1) {
+                bx.btransparent = true;
+                bx.declared |= decl::BCOLOR;
+            }
+        }
+        // styles are ignored everywhere (every border paints solid)
+        "border-inline-style" | "border-block-style" => {}
         // table border model (layout.rs `table_layout`): collapse overlaps
         // adjacent cell boxes so their shared border paints once; separate
         // keeps `border-spacing` between/around cells. `separate` and
@@ -4093,6 +4313,30 @@ fn apply_decl(
                 4 => [vals[0], vals[1], vals[2], vals[3]],
                 _ => [None; 4],
             };
+        }
+        // two-sided logical insets: 1 value = both sides, 2 = start then end.
+        // `auto` stays None per slot (same as the `inset` shorthand).
+        "inset-inline" => {
+            let tok = joined_tokens(&d.1);
+            let start = tok.first().and_then(|t| parse_len(t, vp));
+            let end = if tok.len() > 1 {
+                tok.get(1).and_then(|t| parse_len(t, vp))
+            } else {
+                start
+            };
+            bx.inset[3] = start;
+            bx.inset[1] = end;
+        }
+        "inset-block" => {
+            let tok = joined_tokens(&d.1);
+            let start = tok.first().and_then(|t| parse_len(t, vp));
+            let end = if tok.len() > 1 {
+                tok.get(1).and_then(|t| parse_len(t, vp))
+            } else {
+                start
+            };
+            bx.inset[0] = start;
+            bx.inset[2] = end;
         }
         // generated content for a pseudo-element box — stored raw (its
         // case matters, and `attr()` resolves at box synthesis, which has
@@ -11649,6 +11893,104 @@ mod tests {
         assert_eq!(
             marker_text(ListStyleType::UpperRoman, 1994).as_deref(),
             Some("MCMXCIV.")
+        );
+    }
+
+    #[test]
+    fn logical_properties_alias_the_physical_axis() {
+        let sheet = parse(
+            ".a{inline-size:120px;block-size:40px;min-inline-size:30px;max-block-size:90px;\
+             inset-inline-start:3px;inset-block-end:7px;margin-before:5px;margin-end:6px;\
+             padding-block-start:2px;border-inline-start-width:4px}\
+             .b{inset-inline:1px 2px;inset-block:3px}\
+             .c{border-inline:2px solid;border-block-width:1px 3px}\
+             .d{border-block-start:4px solid red}",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>",
+        );
+        let bx = |cls: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None)
+                .bx
+        };
+        let a = bx("a");
+        assert_eq!(a.width, Some(Len::Px(120.0)), "inline-size -> width");
+        assert_eq!(a.height, Some(Len::Px(40.0)), "block-size -> height");
+        assert_eq!(a.min_width, Some(Len::Px(30.0)), "min-inline-size");
+        assert_eq!(a.max_height, Some(Len::Px(90.0)), "max-block-size");
+        assert_eq!(a.inset[3], Some(Len::Px(3.0)), "inset-inline-start -> left");
+        assert_eq!(a.inset[2], Some(Len::Px(7.0)), "inset-block-end -> bottom");
+        assert_eq!(a.margin[0], Len::Px(5.0), "margin-before -> margin-top");
+        assert_eq!(a.margin[1], Len::Px(6.0), "margin-end -> margin-right");
+        assert_eq!(a.pad[0], Len::Px(2.0), "padding-block-start");
+        assert_eq!(a.border[3], Len::Px(4.0), "border-inline-start-width");
+
+        let b = bx("b");
+        assert_eq!(
+            b.inset,
+            [
+                Some(Len::Px(3.0)),
+                Some(Len::Px(2.0)),
+                Some(Len::Px(3.0)),
+                Some(Len::Px(1.0))
+            ],
+            "inset-inline sets left/right, inset-block sets top/bottom"
+        );
+
+        let c = bx("c");
+        assert_eq!(
+            c.border,
+            [
+                Len::Px(1.0),
+                Len::Px(2.0),
+                Len::Px(3.0),
+                Len::Px(2.0)
+            ],
+            "border-inline sets left/right, border-block-width top/bottom"
+        );
+
+        let d = bx("d");
+        assert_eq!(d.border[0], Len::Px(4.0), "border-block-start -> border-top");
+        assert_eq!(d.bcolor, Some(0x00ff_0000), "colour carried through");
+    }
+
+    #[test]
+    fn text_wrap_nowrap_and_appearance_none_are_accepted() {
+        let sheet = parse(
+            ".a{text-wrap:nowrap} .b{text-wrap:balance} \
+             .c{appearance:none} .d{appearance:auto}",
+        );
+        let dom =
+            dom_of("<div class=a></div><div class=b></div><div class=c></div><div class=d></div>");
+        let out = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None);
+        assert_eq!(out("a").style.ws, Ws::Nowrap, "text-wrap: nowrap");
+        assert_eq!(out("b").style.ws, Ws::Normal, "balance is a hint");
+        assert!(out("c").bx.appearance_none, "appearance: none");
+        assert!(!out("d").bx.appearance_none, "appearance: auto keeps chrome");
+    }
+
+    #[test]
+    fn background_position_axis_longhands_keep_the_other_axis() {
+        let sheet = parse(
+            ".a{background-position:10px 20px;background-position-x:30px}\
+             .b{background-position:10px 20px;background-position-y:bottom}",
+        );
+        let dom = dom_of("<div class=a></div><div class=b></div>");
+        let bx = |cls: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None)
+                .bx
+        };
+        assert_eq!(
+            bx("a").bg_pos,
+            [BgPos::Px(30.0), BgPos::Px(20.0)],
+            "x longhand replaces x only"
+        );
+        assert_eq!(
+            bx("b").bg_pos,
+            [BgPos::Px(10.0), BgPos::Pct(100.0)],
+            "y longhand replaces y only"
         );
     }
 }
