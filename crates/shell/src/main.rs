@@ -425,6 +425,13 @@ struct Shell {
     /// downloads this session (active, saved, or failed)
     downloads: Vec<Download>,
     downloads_open: bool,
+    /// find-in-page bar (Ctrl+F) and the last result the renderer reported
+    find_open: bool,
+    find_query: String,
+    find_active: u32,
+    find_total: u32,
+    /// focus the find box on the next frame (opened or after Enter)
+    find_focus: bool,
     title: String,
     err: Option<String>,
     /// content size last sent to the renderer
@@ -489,6 +496,11 @@ impl Shell {
             lat: Vec::new(),
             downloads: Vec::new(),
             downloads_open: false,
+            find_open: false,
+            find_query: String::new(),
+            find_active: 0,
+            find_total: 0,
+            find_focus: false,
             title: String::new(),
             err: None,
             size: (0, 0),
@@ -515,6 +527,17 @@ impl Shell {
     fn save_scroll(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.scroll = self.scroll;
+        }
+    }
+
+    /// Close the find bar and drop every highlight in the renderer.
+    fn close_find(&mut self) {
+        if self.find_open {
+            self.find_open = false;
+            self.find_query.clear();
+            self.find_active = 0;
+            self.find_total = 0;
+            self.r.send(Command::FindClose);
         }
     }
 
@@ -820,6 +843,17 @@ impl Shell {
                         },
                         None => println!("[form] file pick cancelled"),
                     }
+                }
+                Event::FindResult { active, total } => {
+                    self.find_active = active;
+                    self.find_total = total;
+                    println!("[find] {active}/{total}");
+                }
+                Event::ScrollTo(y) => {
+                    // the renderer moved the page to a find hit; adopt the
+                    // offset so tab switching remembers it
+                    self.scroll = y.max(0.0);
+                    self.save_scroll();
                 }
                 Event::Exited => {
                     if self.r.restart() {
@@ -1303,6 +1337,7 @@ impl eframe::App for Shell {
         let mut k_close = false;
         let mut k_reload = false;
         let mut k_focus = false;
+        let mut k_find = false;
         let mut k_next = 0i32;
         let mut k_select = None;
         ui.input(|i| {
@@ -1320,6 +1355,9 @@ impl eframe::App for Shell {
             }
             if i.key_pressed(egui::Key::L) {
                 k_focus = true;
+            }
+            if i.key_pressed(egui::Key::F) {
+                k_find = true;
             }
             if i.key_pressed(egui::Key::Tab) {
                 k_next = if i.modifiers.shift { -1 } else { 1 };
@@ -1367,6 +1405,13 @@ impl eframe::App for Shell {
         if k_focus {
             self.focus_url = true;
         }
+        if k_find {
+            self.find_open = true;
+            self.find_focus = true;
+        }
+        if self.find_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_find();
+        }
         if k_next != 0 {
             let n = self.tabs.len() as i32;
             let next = (self.active as i32 + k_next).rem_euclid(n) as usize;
@@ -1375,6 +1420,72 @@ impl eframe::App for Shell {
         if let Some(n) = k_select {
             if n < self.tabs.len() {
                 self.select_tab(n);
+            }
+        }
+
+        // ---- find bar (Ctrl+F) ------------------------------------------
+        let mut find_rect: Option<Rect> = None;
+        if self.find_open {
+            let mut step = 0i32;
+            let mut changed = false;
+            let mut close_now = false;
+            let bar_w = 318.0;
+            let pos = egui::pos2(
+                page_rect.right() - bar_w - 14.0,
+                page_rect.top() + 10.0,
+            );
+            let shown = egui::Area::new(egui::Id::new("find-bar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(bar_w);
+                        ui.horizontal(|ui| {
+                            let resp = ui.add_sized(
+                                [180.0, 22.0],
+                                egui::TextEdit::singleline(&mut self.find_query)
+                                    .hint_text("Find in page"),
+                            );
+                            if self.find_focus {
+                                resp.request_focus();
+                                self.find_focus = false;
+                            }
+                            let count = if self.find_total == 0 {
+                                "0/0".to_string()
+                            } else {
+                                format!("{}/{}", self.find_active, self.find_total)
+                            };
+                            ui.label(
+                                egui::RichText::new(count).color(MUTED).size(11.5),
+                            );
+                            if ui.button("✕").clicked() {
+                                close_now = true;
+                            }
+                            if resp.changed() {
+                                changed = true;
+                            }
+                            // Enter steps forward, Shift+Enter back; the
+                            // TextEdit gives up focus on Enter, so take it
+                            // back for the next press
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                && (resp.has_focus() || resp.lost_focus())
+                            {
+                                step =
+                                    if ui.input(|i| i.modifiers.shift) { -1 } else { 1 };
+                                self.find_focus = true;
+                            }
+                        });
+                    });
+                });
+            find_rect = Some(shown.response.rect);
+            if changed {
+                self.r.send(Command::Find(self.find_query.clone()));
+            }
+            if step != 0 {
+                self.r.send(Command::FindStep(step));
+            }
+            if close_now {
+                self.close_find();
             }
         }
 
@@ -1449,7 +1560,9 @@ impl eframe::App for Shell {
             self.r.send(Command::Scroll(self.scroll));
             self.sent = Some(Instant::now());
         }
-        if let Some(p) = click.filter(|_| page) {
+        if let Some(p) = click.filter(|_| page).filter(|p| {
+            !find_rect.map(|r| r.contains(*p)).unwrap_or(false)
+        }) {
             self.r.send(Command::Click {
                 x: p.x - page_rect.min.x,
                 y: p.y - page_rect.min.y,

@@ -445,17 +445,191 @@ enum HeadlessMsg {
 }
 
 /// Paint one page into a mapped BGRA frame and announce it on stdout.
+/// One find-in-page hit: a slice of one laid-out text run.
+#[derive(Clone, Copy)]
+struct FindHit {
+    /// document coords (viewport coords inside a `position: fixed` subtree)
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fixed: bool,
+}
+
+/// Live find-in-page state. Matches are per text run, so a phrase split
+/// across runs (or a styled `b` in the middle) is not found — a deliberate
+/// shortcut until runs carry a paragraph index.
+struct FindState {
+    query: String,
+    hits: Vec<FindHit>,
+    active: usize,
+}
+
+impl FindState {
+    fn new(query: String, laid: &layout::Layout) -> Self {
+        let mut s = Self {
+            query,
+            hits: Vec::new(),
+            active: 0,
+        };
+        s.rescan(laid);
+        s
+    }
+
+    /// Rebuild the hit list against the current layout (new page, relayout).
+    fn rescan(&mut self, laid: &layout::Layout) {
+        self.hits.clear();
+        if self.query.is_empty() {
+            self.active = 0;
+            return;
+        }
+        let q = self.query.to_lowercase();
+        // own a copy so the scan loop does not hold a borrow of `self.query`
+        // (the fallback needle below) while `push_run_hit` mutates `self`
+        let q_orig = self.query.clone();
+        for r in &laid.runs {
+            let lower = r.text.to_lowercase();
+            // case folding can change byte length (`İ`, `ß`): when it did,
+            // scan the original text so offsets stay on char boundaries
+            let (hay, needle) = if lower.len() == r.text.len() {
+                (&lower, q.as_str())
+            } else {
+                (&r.text, q_orig.as_str())
+            };
+            let mut start = 0;
+            while let Some(i) = hay[start..].find(needle) {
+                let at = start + i;
+                self.push_run_hit(r, at, needle.len());
+                start = at + needle.len().max(1);
+            }
+        }
+        self.active = if self.hits.is_empty() {
+            0
+        } else {
+            self.active.min(self.hits.len() - 1)
+        };
+    }
+
+    /// Turn a byte range of run `r` into a rect, sizing x by character share
+    /// (per-glyph advances are not kept after layout).
+    fn push_run_hit(&mut self, r: &layout::PositionedRun, byte: usize, len: usize) {
+        let Some(before) = r.text.get(..byte) else { return };
+        let Some(matched) = r.text.get(byte..byte + len.max(1)) else { return };
+        let total = r.text.chars().count().max(1);
+        let b = before.chars().count();
+        let span = matched.chars().count().max(1);
+        let f0 = b as f32 / total as f32;
+        let f1 = (b + span) as f32 / total as f32;
+        self.hits.push(FindHit {
+            x: r.x + r.width * f0,
+            y: r.y,
+            w: (r.width * (f1 - f0)).max(2.0),
+            h: r.style.size * 1.25,
+            fixed: r.fixed,
+        });
+    }
+
+    /// 1-based active match (0 = none) for the shell's counter.
+    fn active_no(&self) -> u32 {
+        if self.hits.is_empty() {
+            0
+        } else {
+            self.active as u32 + 1
+        }
+    }
+}
+
+/// Scroll offset that brings `hit` into view with a margin; never scrolls a
+/// `fixed` hit (already on screen).
+fn find_scroll(hit: &FindHit, scroll: f32, vh: f32, doc_h: f32) -> f32 {
+    let mut s = scroll;
+    if !hit.fixed {
+        let margin = 40.0;
+        if hit.y < s + margin {
+            s = (hit.y - margin).max(0.0);
+        } else if hit.y + hit.h > s + vh - margin {
+            s = (hit.y + hit.h - vh + margin).max(0.0);
+        }
+    }
+    s.clamp(0.0, (doc_h - vh).max(0.0))
+}
+
+/// Blend one highlight rect over already-rendered pixels (0x00RRGGBB).
+fn blend_rect(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rgb: (u8, u8, u8),
+    alpha: f32,
+) {
+    let x0 = x.floor().max(0.0) as usize;
+    let y0 = y.floor().max(0.0) as usize;
+    let x1 = ((x + w).ceil()).max(0.0) as usize;
+    let y1 = ((y + h).ceil()).max(0.0) as usize;
+    let x1 = x1.min(width);
+    let y1 = y1.min(height);
+    let mix = |c: u32, n: u8| -> u32 { (c as f32 * (1.0 - alpha) + n as f32 * alpha) as u32 };
+    for py in y0..y1 {
+        let row = py * width;
+        for px in x0..x1 {
+            let i = row + px;
+            let p = buf[i];
+            let r = mix((p >> 16) & 0xff, rgb.0);
+            let g = mix((p >> 8) & 0xff, rgb.1);
+            let b = mix(p & 0xff, rgb.2);
+            buf[i] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+/// Draw every hit (active one orange, the rest yellow) over the painted page.
+fn paint_find(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    find: &FindState,
+    scroll: f32,
+) {
+    for (i, h) in find.hits.iter().enumerate() {
+        let (rgb, alpha) = if i == find.active {
+            ((0xff, 0x8a, 0x00), 0.45)
+        } else {
+            ((0xff, 0xeb, 0x3b), 0.35)
+        };
+        let y = if h.fixed { h.y } else { h.y - scroll };
+        blend_rect(
+            buf,
+            width,
+            height,
+            h.x + PADDING as f32,
+            y + PADDING as f32,
+            h.w,
+            h.h,
+            rgb,
+            alpha,
+        );
+    }
+}
+
 fn headless_paint(
     page: &Page,
     fonts: &Fonts,
     pw: usize,
     ph: usize,
     scroll: f32,
+    find: Option<&FindState>,
     frame: &mut Option<mazda_ipc::FrameMap>,
     seq: &mut u32,
 ) {
     let mut pixels = vec![page.bg; pw * ph];
     render(&mut pixels, pw, ph, &page.laid, fonts, scroll, page_h(ph), 0.0);
+    if let Some(f) = find {
+        paint_find(&mut pixels, pw, ph, f, scroll);
+    }
     draw_scrollbar(&mut pixels, pw, ph, page.laid.height, page_h(ph), scroll);
     let path = mazda_ipc::frame_path(&std::env::temp_dir(), std::process::id(), pw, ph);
     if frame.as_ref().map(|f| f.dims() != (pw, ph)).unwrap_or(true) {
@@ -727,6 +901,7 @@ fn tick_players(
     pw: usize,
     ph: usize,
     scroll: f32,
+    find: Option<&FindState>,
     frame: &mut Option<mazda_ipc::FrameMap>,
     seq: &mut u32,
 ) -> bool {
@@ -744,7 +919,7 @@ fn tick_players(
         }
     }
     if dirty {
-        headless_paint(p, fonts, pw, ph, scroll, frame, seq);
+        headless_paint(p, fonts, pw, ph, scroll, find, frame, seq);
     }
     dirty
 }
@@ -756,8 +931,9 @@ fn tick_players(
 /// only to be the sandboxed side of the split.
 ///
 /// Commands: `load <url>`, `resize <w> <h>`, `scroll <y>`, `click <x> <y>`,
-/// `quit`. Events: `frame <path> <w> <h> <doc_h> <seq>`, `title <url>`,
-/// `nav <url>`, `error <msg>`.
+/// `find <query>`, `find-step <±1>`, `find-close`, `quit`. Events:
+/// `frame <path> <w> <h> <doc_h> <seq>`, `title <url>`, `nav <url>`,
+/// `find-result <active> <total>`, `scroll-to <y>`, `error <msg>`.
 pub fn run_headless() {
     use std::io::BufRead;
 
@@ -842,6 +1018,9 @@ pub fn run_headless() {
     // live form state (typed text + picked files) rides every worker job so a
     // relayout never loses it; a navigation resets it
     let mut forms = layout::FormState::default();
+    // find-in-page: the query survives navigation, the hit list is rebuilt
+    // against each new layout
+    let mut find: Option<FindState> = None;
 
     if let Some(url) = url {
         nav_id += 1;
@@ -871,7 +1050,8 @@ pub fn run_headless() {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 drain_downloads(&dl_rx, &mut dl_active);
                 tick_players(
-                    &mut players, &mut page, &fonts, pw, ph, scroll, &mut frame, &mut seq,
+                    &mut players, &mut page, &fonts, pw, ph, scroll, find.as_ref(),
+                    &mut frame, &mut seq,
                 );
                 continue;
             }
@@ -910,8 +1090,22 @@ pub fn run_headless() {
                 scroll = scroll.min(max);
                 let title = p.url.clone();
                 page = Some(p);
+                // a fresh layout invalidates every old rect: rebuild the hits
+                // (the query stays, like a browser's find bar across pages)
+                if let Some(f) = find.as_mut() {
+                    let laid = &page.as_ref().unwrap().laid;
+                    f.rescan(laid);
+                    println!(
+                        "{}",
+                        mazda_ipc::Event::FindResult {
+                            active: f.active_no(),
+                            total: f.hits.len() as u32,
+                        }
+                        .encode()
+                    );
+                }
                 if let Some(p) = page.as_ref() {
-                    headless_paint(p, &fonts, pw, ph, scroll, &mut frame, &mut seq);
+                    headless_paint(p, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq);
                 }
                 println!("{}", mazda_ipc::Event::Title(title).encode());
                 if cfg!(feature = "count-alloc") {
@@ -992,7 +1186,9 @@ pub fn run_headless() {
                                 engine: EngineChoice::A,
                             });
                             scroll = scroll.min((p.laid.height - page_h(ph)).max(0.0));
-                            headless_paint(p, &fonts, pw, ph, scroll, &mut frame, &mut seq);
+                            headless_paint(
+                                p, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq,
+                            );
                         }
                     }
                     mazda_ipc::Command::FileChosen { node, name, path } => {
@@ -1020,11 +1216,90 @@ pub fn run_headless() {
                         if let Some(p) = page.as_ref() {
                             let max = (p.laid.height - page_h(ph)).max(0.0);
                             scroll = y.clamp(0.0, max);
-                            headless_paint(p, &fonts, pw, ph, scroll, &mut frame, &mut seq);
+                            headless_paint(
+                                p, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq,
+                            );
                             let _ = jobs_tx.send(LoadReq::Scroll {
                                 url: p.url.clone(),
                                 y: scroll,
                             });
+                        }
+                    }
+                    mazda_ipc::Command::Find(q) => {
+                        if q.trim().is_empty() {
+                            // an empty query is a clear, not a search
+                            find = None;
+                            println!(
+                                "{}",
+                                mazda_ipc::Event::FindResult { active: 0, total: 0 }.encode()
+                            );
+                            if let Some(p) = page.as_ref() {
+                                headless_paint(
+                                    p, &fonts, pw, ph, scroll, None, &mut frame, &mut seq,
+                                );
+                            }
+                        } else if let Some(p) = page.as_ref() {
+                            // a new query starts at its first hit and brings
+                            // that hit into view
+                            let f = FindState::new(q, &p.laid);
+                            if let Some(h) = f.hits.first() {
+                                scroll = find_scroll(h, scroll, page_h(ph), p.laid.height);
+                                println!("{}", mazda_ipc::Event::ScrollTo(scroll).encode());
+                            }
+                            println!(
+                                "{}",
+                                mazda_ipc::Event::FindResult {
+                                    active: f.active_no(),
+                                    total: f.hits.len() as u32,
+                                }
+                                .encode()
+                            );
+                            find = Some(f);
+                            if let Some(f) = find.as_ref() {
+                                headless_paint(
+                                    p, &fonts, pw, ph, scroll, Some(f), &mut frame, &mut seq,
+                                );
+                            }
+                        }
+                    }
+                    mazda_ipc::Command::FindStep(d) => {
+                        if let (Some(f), Some(p)) = (find.as_mut(), page.as_ref()) {
+                            if !f.hits.is_empty() {
+                                let n = f.hits.len() as i32;
+                                f.active =
+                                    (((f.active as i32 + d) % n + n) % n) as usize;
+                                scroll = find_scroll(
+                                    &f.hits[f.active],
+                                    scroll,
+                                    page_h(ph),
+                                    p.laid.height,
+                                );
+                                println!("{}", mazda_ipc::Event::ScrollTo(scroll).encode());
+                                println!(
+                                    "{}",
+                                    mazda_ipc::Event::FindResult {
+                                        active: f.active_no(),
+                                        total: n as u32,
+                                    }
+                                    .encode()
+                                );
+                                headless_paint(
+                                    p, &fonts, pw, ph, scroll, Some(f), &mut frame, &mut seq,
+                                );
+                            }
+                        }
+                    }
+                    mazda_ipc::Command::FindClose => {
+                        if find.take().is_some() {
+                            println!(
+                                "{}",
+                                mazda_ipc::Event::FindResult { active: 0, total: 0 }.encode()
+                            );
+                            if let Some(p) = page.as_ref() {
+                                headless_paint(
+                                    p, &fonts, pw, ph, scroll, None, &mut frame, &mut seq,
+                                );
+                            }
                         }
                     }
                     mazda_ipc::Command::Click { x, y } => {
@@ -1091,7 +1366,7 @@ pub fn run_headless() {
         }
         // playback advances even while commands stream in
         tick_players(
-            &mut players, &mut page, &fonts, pw, ph, scroll, &mut frame, &mut seq,
+            &mut players, &mut page, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq,
         );
         drain_downloads(&dl_rx, &mut dl_active);
     }
@@ -8115,6 +8390,35 @@ fn no_images() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_scroll_brings_a_hit_into_view_and_clamps() {
+        let hit = |y: f32| FindHit {
+            x: 0.0,
+            y,
+            w: 10.0,
+            h: 16.0,
+            fixed: false,
+        };
+        // below the viewport: scroll just enough plus the margin
+        assert_eq!(find_scroll(&hit(640.0), 0.0, 600.0, 2000.0), 96.0);
+        // above the viewport: pin the top with the margin
+        assert_eq!(find_scroll(&hit(100.0), 300.0, 600.0, 2000.0), 60.0);
+        // clamp at the document end
+        assert_eq!(find_scroll(&hit(1950.0), 0.0, 600.0, 2000.0), 1400.0);
+        // a fixed hit is already on screen: never scroll
+        let fixed = FindHit { fixed: true, ..hit(1999.0) };
+        assert_eq!(find_scroll(&fixed, 42.0, 600.0, 2000.0), 42.0);
+    }
+
+    #[test]
+    fn blend_rect_mixes_only_inside_the_rect() {
+        let mut buf = vec![0x00_ff_ff_ffu32; 4 * 4];
+        blend_rect(&mut buf, 4, 4, 1.0, 1.0, 2.0, 2.0, (0, 0, 0), 0.5);
+        assert_eq!(buf[0], 0x00_ff_ff_ff, "outside the rect stays white");
+        assert_eq!(buf[5], 0x00_7f_7f_7f, "inside is a 50% mix");
+        assert_eq!(buf[15], 0x00_ff_ff_ff);
+    }
 
     #[test]
     fn em_scale_treats_the_css_size_as_the_em_square() {

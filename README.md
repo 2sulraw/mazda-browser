@@ -12,8 +12,9 @@ Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux). **P3 is in place**:
 `<video>`/`<audio>` play through Media Foundation + WASAPI, decoded by a
 pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
 started**: `<a download>` streams to disk with a progress panel and lands in the
-user's Downloads folder, and `<input type=file>` posts files as
-`multipart/form-data` through the native picker.
+user's Downloads folder, `<input type=file>` posts files as
+`multipart/form-data` through the native picker, and Ctrl+F finds text in the
+page with scroll-to-match highlights.
 
 ## Workspace
 
@@ -97,6 +98,13 @@ dialog, copies the file into the renderer's sandbox temp dir and answers
 `file-chosen`. A POST with a pick (or `enctype="multipart/form-data"`) is built
 as a boundary'd multipart body with `Content-Length`, text fields first, then
 the file. Scripts never see the path or the bytes.
+
+Find (P4): Ctrl+F opens a bar; typing sends `find <query>` and the renderer scans
+the laid-out text runs itself, replying `find-result <active> <total>`. Enter
+(or Shift+Enter) sends `find-step ±1` and the reply includes `scroll-to <y>`,
+which the shell adopts for the active tab. Highlights are blended over the
+finished frame in the renderer (yellow for matches, orange for the active one),
+so closing the bar is just another repaint.
 
 Self-test (decode, audio endpoint and DRM rejection, plain and through the real
 sandbox):

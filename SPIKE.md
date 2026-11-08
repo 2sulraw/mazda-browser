@@ -673,4 +673,91 @@ $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8768/up.ht
 # click the file box -> pick a file -> the box shows the name -> Send
 ```
 
+## Find in page, executed (2026-11-08)
+
+Ctrl+F opens a find bar over the top-right of the page: a text box, an
+`active/total` counter and a close button. Typing sends `find <query>`, Enter
+sends `find-step 1` (Shift+Enter `-1`), Escape or the close button sends
+`find-close`.
+
+**The renderer owns the hits.** Every non-empty query scans `Layout::runs`
+(case-insensitively) and records one `FindHit` per match: document-space rect,
+`fixed` flag, and a 1-based active index. The scan runs again after every
+adopted layout (navigation, resize, relayout), so the counter survives a page
+change and the query stays in the bar like a browser's. A new query starts at
+its first hit; `find-step` wraps around. Each step emits `scroll-to <y>` (the
+offset that brings the hit into view with a 40 px margin; fixed hits never
+scroll) and `find-result <active> <total>`; the shell adopts the offset into the
+active tab's remembered scroll. An empty `find` or `find-close` drops every
+hit, emits `0 0` and repaints.
+
+**Highlights are a post-render blend.** `headless_paint` renders the page into
+the frame, then `paint_find` alpha-blends one rect per hit on top (inactive
+`#ffeb3b` at 35%, active `#ff8a00` at 45%) before the scrollbar goes down. No
+layout or paint code knows about find: closing the bar simply repaints without
+the overlay.
+
+## Acceptance
+
+Headless renderer against a local page with 81 occurrences of "alpha" plus two
+of "needle" (the second one deep in the document); stdin drove the flow:
+
+```
+find alpha
+scroll-to 0.0
+find-result 1 81
+find-step 1
+find-result 2 81
+find-step 1
+find-result 3 81
+find-step -1
+find-result 2 81
+find needle
+scroll-to 561.4
+find-result 1 2
+find-step -1
+scroll-to 594.3
+find-result 2 2
+find-close
+find-result 0 0
+find alpha
+find-result 1 81
+find
+find-result 0 0
+```
+
+Pixel check on the published frame: the plane painted with an active
+`find alpha` result has 2,845 yellowish and 127 orange pixels; the next plane
+(painted by the bare `find` clear) has none. Two new unit tests cover the
+scroll clamp and the blend math. Workspace tests: 901 engine + 1 shell + 5 IPC
++ 5 media + 4 probe green.
+
+The egui bar itself was not clicked on this host (the fullscreen game still owns
+the desktop); its wiring is the same `Command`/`Event` pair exercised above in
+headless mode. Manual check: Ctrl+F, type a word, Enter cycles, Esc closes.
+
+## Shortcuts (deliberate)
+
+- Matches are per text run: a phrase split across runs (an inline `<b>` in the
+  middle) is not found, and RTL/bidi text is scanned in logical order.
+- The highlight x/width are estimated by character share of the run, not the
+  real per-glyph advances (layout does not keep them), so a hit's box can be a
+  character wide of the glyphs.
+- Case folding uses Rust's `to_lowercase`; when folding changes byte length the
+  scan falls back to a case-sensitive match rather than mapping offsets.
+- No whole-word / regex / match-highlight-all options, no find history, no
+  scrollbar tick marks, and typing does not live-scroll: the first hit is shown
+  when the query changes and further hits only on Enter.
+- Find state is per renderer, so switching tabs keeps the bar and rescans the
+  newly adopted page; there is no per-tab query memory.
+
+## Reproduce
+
+```powershell
+# any long page served locally
+python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
+$env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/find.html
+# Ctrl+F, type "alpha", Enter cycles, Esc closes
+```
+
 

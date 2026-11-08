@@ -208,6 +208,12 @@ pub enum Command {
     /// `<input type=file>` got a file: the shell copied it into the sandbox's
     /// temp dir and names it here. `name` is the user-visible filename.
     FileChosen { node: u32, name: String, path: String },
+    /// find-in-page query; an empty string clears the search
+    Find(String),
+    /// move to the next (+1) or previous (-1) match
+    FindStep(i32),
+    /// close the find bar: drop the highlights
+    FindClose,
     Quit,
 }
 
@@ -222,6 +228,15 @@ impl Command {
             Command::FileChosen { node, name, path } => {
                 format!("file-chosen {node} {name}\t{path}")
             }
+            Command::Find(q) => {
+                if q.is_empty() {
+                    "find".to_string()
+                } else {
+                    format!("find {q}")
+                }
+            }
+            Command::FindStep(d) => format!("find-step {d}"),
+            Command::FindClose => "find-close".to_string(),
             Command::Quit => "quit".to_string(),
         }
     }
@@ -251,6 +266,9 @@ impl Command {
                 })
             }
             "quit" => Some(Command::Quit),
+            "find" => Some(Command::Find(rest.to_string())),
+            "find-step" => rest.trim().parse().ok().map(Command::FindStep),
+            "find-close" => Some(Command::FindClose),
             "file-chosen" => {
                 let (node, rest) = rest.split_once(' ')?;
                 let (name, path) = rest.split_once('\t')?;
@@ -283,6 +301,10 @@ pub enum Event {
     Download { done: u64, total: u64, name: String },
     /// a `<input type=file>` was clicked: the shell opens the OS picker
     PickFile { node: u32 },
+    /// find-in-page progress: `active` is 1-based, 0 when there are no hits
+    FindResult { active: u32, total: u32 },
+    /// the renderer scrolled to a find hit; the shell adopts this offset
+    ScrollTo(f32),
     /// the file is complete in the renderer's temp dir; the shell moves it out
     DownloadDone { path: PathBuf },
     DownloadFailed { name: String, err: String },
@@ -304,6 +326,10 @@ impl Event {
                 format!("download {done} {total} {name}")
             }
             Event::PickFile { node } => format!("pick-file {node}"),
+            Event::FindResult { active, total } => {
+                format!("find-result {active} {total}")
+            }
+            Event::ScrollTo(y) => format!("scroll-to {y:.1}"),
             Event::DownloadDone { path } => format!("download-done {}", path.display()),
             Event::DownloadFailed { name, err } => format!("download-failed {name}\t{err}"),
             Event::Exited => "exited".to_string(),
@@ -349,6 +375,14 @@ impl Event {
             "pick-file" => Some(Event::PickFile {
                 node: rest.trim().parse().ok()?,
             }),
+            "find-result" => {
+                let (a, t) = rest.split_once(' ')?;
+                Some(Event::FindResult {
+                    active: a.trim().parse().ok()?,
+                    total: t.trim().parse().ok()?,
+                })
+            }
+            "scroll-to" => rest.trim().parse().ok().map(Event::ScrollTo),
             "download-failed" => {
                 let (name, err) = rest.split_once('\t').unwrap_or((rest, ""));
                 Some(Event::DownloadFailed {
@@ -426,6 +460,11 @@ mod tests {
                 name: "My Notes (1).txt".into(),
                 path: "C:/Temp/mazda-uploads/7/My Notes (1).txt".into(),
             },
+            Command::Find("big cat & dog".into()),
+            Command::Find(String::new()),
+            Command::FindStep(1),
+            Command::FindStep(-1),
+            Command::FindClose,
             Command::Quit,
         ];
         for c in cases {
@@ -463,6 +502,9 @@ mod tests {
                 err: "connection reset".into(),
             },
             Event::PickFile { node: 12 },
+            Event::FindResult { active: 3, total: 17 },
+            Event::FindResult { active: 0, total: 0 },
+            Event::ScrollTo(812.5),
             Event::Exited,
         ];
         for e in cases {
