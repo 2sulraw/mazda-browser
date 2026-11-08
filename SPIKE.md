@@ -998,7 +998,8 @@ The point is to pick the first change from evidence - the interpreter is a
 tree-walker with linear property lookup, so the guess was property access, and
 the bench had to confirm it.
 
-**No optimization has landed yet.** These are the before numbers.
+The tables below are the before numbers. Step 1 (own-property fast path) is
+recorded at the end of this section with its own A/B measurement.
 
 ### What was built
 
@@ -1033,7 +1034,9 @@ not a conformance claim:
 Skips are deliberate: `onlyStrict` (strict mode is not implemented, running it
 sloppily would test different semantics), `module` and `async` flags, and
 module-resolution phase tests. They are reported as skips, not passes and not
-failures. 193.1 s total, 8.1 ms per executed test, zero panics.
+failures. 17.8 s total on an idle host (0.7 ms per executed test), zero
+panics. The first run took 193 s while the host was busy and produced the
+identical counts; wall time moves with machine load, pass/fail counts do not.
 
 The failure list is useful as a work queue, not just a score:
 
@@ -1076,6 +1079,45 @@ Order for P5, from this data:
 
 A rerun of this exact bench and the same test262 invocation is the before/after
 contract for each step.
+
+### Step 1: own-property fast path (2026-11-09)
+
+The first change follows the data and touches only the common case:
+`get_member`/`set_member` now check a plain object's own property first, in one
+borrow, before the lazy-prototype attach and the exotic-kind probes. A read
+that hits a data property returns immediately; a write that overwrites one
+does the same. Accessors, misses, arrays, functions, host wrappers and the
+prototype chain still take the old path, so semantics are unchanged.
+
+**Method.** Both binaries were built from this commit and its parent with the
+same release profile. They were then run alternately (the same host, the same
+10-iteration/3-warmup command) so machine state affects both sides:
+
+```powershell
+.\target\release\js-bench.exe --iterations 10 --warmup 3 --filter property
+```
+
+Property-only medians across seven alternating rounds:
+
+| | round 1 | 2 | 3 | 4 | 5 | 6 | 7 | median |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | 246.9 | 305.4 | 229.0 | 227.0 | 244.2 | 237.9 | 245.1 | **244.2 ms** |
+| after | 197.3 | 206.9 | 190.6 | 196.8 | 213.3 | 221.5 | 211.1 | **206.9 ms** |
+
+Minimums moved the same way (fastest sample across all rounds: 213.7 ->
+180.0 ms, -16%). That is **-15% median** on the benchmark the baseline
+singled out. As a load-independent check, property now costs 2.7x the
+arithmetic loop instead of 3.6x.
+
+Unrelated benches drifted by up to ~20% between the two binaries (the loop
+benchmark, which executes no member access, moved 61-76 ms), so no claim is
+made for them; only the targeted benchmark is compared.
+
+### Step 1: correctness
+
+Same test262 invocation, same 23,832 files: **17,678 run, 6,950 pass, 10,728
+fail, 6,154 skip** - identical counts to the baseline, zero panics. The change
+moves speed, not behavior. Workspace tests stay green (902 engine).
 
 ### Shortcuts (deliberate)
 

@@ -3029,6 +3029,21 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             _ => Val::Undefined,
         }),
         Val::Obj(o) => {
+            // Fast path: an own data property on a plain object. This is the
+            // common case for script objects and skips the lazy-prototype
+            // borrow, every exotic-kind probe and a second scan in
+            // `chain_get`. Accessors fall through so the getter runs with the
+            // receiver, and a miss still takes the full path.
+            {
+                let b = o.borrow();
+                if matches!(b.kind, ObjKind::Plain) {
+                    if let Some((_, v)) = b.props.iter().find(|(k, _)| k.as_ref() == key) {
+                        if !matches!(v, Val::Acc(_)) {
+                            return Ok(v.clone());
+                        }
+                    }
+                }
+            }
             // lazy prototype attach: engine-created arrays (literals,
             // builtins, embedder-made) pick up Array.prototype on first
             // property access, so they never pay for it up front. Plain
@@ -3440,6 +3455,20 @@ fn regex_member(_e: &JsEngine, o: &Rc<RefCell<Obj>>, key: &str) -> Result<Val, J
 pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Result<(), JsError> {
     match base {
         Val::Obj(o) => {
+            // Fast path: overwrite an existing own data property on a plain
+            // object. New keys and accessors take the full path, which checks
+            // the prototype for setters and handles array exotics.
+            {
+                let mut b = o.borrow_mut();
+                if matches!(b.kind, ObjKind::Plain) {
+                    if let Some((_, slot)) = b.props.iter_mut().find(|(k, _)| k.as_ref() == key) {
+                        if !matches!(&*slot, Val::Acc(_)) {
+                            *slot = v;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             // CSSStyleDeclaration stand-in: every write is a declaration
             // update on the element's `style` attribute (empty value removes
             // the declaration; `cssText` replaces the whole text).
