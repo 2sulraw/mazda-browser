@@ -1431,6 +1431,19 @@ fn template_literals() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn template_line_continuation_and_unicode_escapes() {
+    // `\` + U+2028/U+2029 is a line continuation. The lexer used to advance
+    // one byte into the three-byte terminator and panic while slicing.
+    assert_eq!(string("`a\\\u{2028}b`"), "ab");
+    assert_eq!(string("`a\\\u{2029}b`"), "ab");
+    // identity escape of a non-ASCII char drops the backslash
+    assert_eq!(string("`\\é`"), "é");
+    // malformed `\x` followed by a multi-byte char is an error, not a panic
+    let bad = err("`\\x\u{2028}`");
+    assert!(matches!(bad, JsError::Syntax { .. }));
+}
+
+#[test]
 fn state_persists_across_exec() {
     let mut e = JsEngine::new();
     e.exec("var counter = 0; function bump() { counter += 1 }").unwrap();

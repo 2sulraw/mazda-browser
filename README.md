@@ -160,7 +160,14 @@ Single-process reference (the pre-split app):
 .\tools\sandbox-check.ps1            # home unreadable, no child, network, memory cap (P2 gate)
 .\tools\screenshot-shell.ps1 -Url https://example.com   # capture the real window
 .\tools\ui-smoke.ps1                 # click print/star/clock, assert stores + screenshots
+.\target\release\js-bench.exe --iterations 10 --warmup 3   # JS engine speed (P5)
+.\target\release\test262.exe --dir "$env:TEMP\test262\test\language" --harness "$env:TEMP\test262\harness"
+                                     # JS engine correctness, non-strict subset (P5)
 ```
+
+The test262 runner needs a sparse checkout of the suite; see
+`SPIKE.md` ("JavaScript performance baseline") for the clone command and the
+current counts.
 
 Reference sites: **Google, GitHub, YouTube** — heavy, real-world pages used
 for memory and latency work; `example.com` / Wikipedia stay as the light

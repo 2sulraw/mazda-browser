@@ -614,8 +614,20 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 other => {
-                    out.push('\\');
-                    out.push(other as char);
+                    if other >= 0x80 {
+                        // Identity escape of a non-ASCII character: drop the
+                        // backslash and copy the whole char. U+2028/U+2029 are
+                        // line continuations, so they contribute nothing.
+                        let at = i - 1;
+                        let ch = raw[at..].chars().next().unwrap_or('\u{fffd}');
+                        if ch != '\u{2028}' && ch != '\u{2029}' {
+                            out.push(ch);
+                        }
+                        i = at + ch.len_utf8();
+                    } else {
+                        out.push('\\');
+                        out.push(other as char);
+                    }
                 }
             }
         }
@@ -681,11 +693,26 @@ impl<'a> Lexer<'a> {
                                 self.pos += 1;
                             }
                         }
-                        Some(_) => self.pos += 1,
+                        Some(_) => {
+                            // The escaped character may be multi-byte (e.g.
+                            // `\` + U+2028 line separator). Advancing one byte
+                            // would slice inside the char and panic.
+                            let n = self.src[self.pos..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(1);
+                            self.pos += n;
+                        }
                         None => {}
                     }
                     let end = self.pos.min(self.src.len());
-                    let raw = &self.src[raw_start..end];
+                    let Some(raw) = self.src.get(raw_start..end) else {
+                        return self.err(
+                            "malformed escape sequence in template literal",
+                            raw_start,
+                        );
+                    };
                     lit.push_str(&self.unescape(raw, start)?);
                 }
                 Some(_) => {

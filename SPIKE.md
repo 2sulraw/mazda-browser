@@ -990,5 +990,115 @@ powershell -NoProfile -File tools\ui-smoke.ps1
 # PASS: chrome clicks, stores and screenshots in ...\Temp\mazda-ui-smoke
 ```
 
+## JavaScript performance baseline (2026-11-09)
+
+P5 starts with a number, not an optimization. Two binaries measure the engine
+as shipped: a test262 runner for correctness and a six-program bench for speed.
+The point is to pick the first change from evidence - the interpreter is a
+tree-walker with linear property lookup, so the guess was property access, and
+the bench had to confirm it.
+
+**No optimization has landed yet.** These are the before numbers.
+
+### What was built
+
+- `crates/engine/src/bin/test262.rs` parses the suite's `/*--- ---*/`
+  frontmatter (includes, flags, negative phase/type), prepends `sta.js` and
+  `assert.js` (plus any file an `includes` entry names), and runs each test
+  once. A panic is caught per file, so one pathological test cannot abort the
+  run; with `MAZDA_TEST262_TRACE=1` every path is printed as it starts, which
+  makes a hung run diagnosable.
+- `crates/engine/src/bin/js-bench.rs` runs six small programs
+  (`benches-js/loop.js`, `fib.js`, `property.js`, `array.js`, `string.js`,
+  `closure.js`) N times and reports min/median/mean. Every sample builds a
+  fresh `JsEngine`, so parse plus execution is included - what a page pays per
+  script. Each program checksums its own result, so a broken optimization
+  cannot silently benchmark different work.
+
+### test262: what the number means
+
+The suite is checked out sparsely (only `test/language` and `harness`) and run
+in **non-strict mode only**. This is a measurement of the engine that exists,
+not a conformance claim:
+
+| | count |
+|---|---:|
+| `.js` files in `test/language` | 24,115 |
+| files after excluding `_FIXTURE` fixtures | 23,832 |
+| executed | 17,678 |
+| **pass** | **6,950 (39.3% of executed)** |
+| fail | 10,728 |
+| skipped | 6,154 |
+
+Skips are deliberate: `onlyStrict` (strict mode is not implemented, running it
+sloppily would test different semantics), `module` and `async` flags, and
+module-resolution phase tests. They are reported as skips, not passes and not
+failures. 193.1 s total, 8.1 ms per executed test, zero panics.
+
+The failure list is useful as a work queue, not just a score:
+
+- `eval-code` (7 pass / 272 fail) and `arguments-object` (19 / 175) are
+  dominated by one missing feature each: `eval` and a real `arguments` object.
+- `expressions` (3,379 / 5,285) is the broad bucket. Early samples show boxed
+  primitives, classes/trailing commas, object `ToPrimitive`, and
+  `Test262Error` printing as `[object Object]` in the failure reason.
+- Many `[object Object]` failures are the assert helpers throwing a value the
+  print path does not format; the test still failed, but the reason is opaque.
+
+### Benchmarks (median of 10 runs, 3 warmup)
+
+| program | min | median | mean |
+|---|---:|---:|---:|
+| loop x300k | 71.62 ms | **75.02 ms** | 75.97 ms |
+| fib(22) | 31.81 ms | **33.20 ms** | 33.57 ms |
+| property x300k | 249.30 ms | **271.70 ms** | 271.64 ms |
+| array x100k | 85.93 ms | **95.33 ms** | 95.28 ms |
+| string x2k | 15.84 ms | **18.54 ms** | 18.30 ms |
+| closure x300k | 209.95 ms | **224.52 ms** | 231.88 ms |
+
+### Interpretation
+
+Property-heavy work is the outlier: 300,000 property reads/writes cost ~3.6x
+the arithmetic loop and ~2.9x the closure loop, while the raw loop and `fib`
+show the evaluator itself is not the bottleneck. `Obj.props` is a linear
+`Vec<(name, value)>`; every `obj.x` walks the whole list, so a call-heavy script
+pays again through `this` and globals.
+
+Order for P5, from this data:
+
+1. Property access: string-keyed map or a small inline cache keyed by
+   `(shape, name)`, with the `Vec` retained for ordering when enumerating.
+2. Object shaping (same key sequence -> same shape) so a cache can be hit.
+3. Calls and closures (`this`, environment lookup) once property reads stop
+   dominating; `closure x300k` is the second-largest number.
+4. Bytecode only if the tree-walker's arithmetic/loop numbers stop improving -
+   the loop and `fib` numbers do not justify it yet.
+
+A rerun of this exact bench and the same test262 invocation is the before/after
+contract for each step.
+
+### Shortcuts (deliberate)
+
+- Sloppy mode only; strict, module, async and module-resolution tests are
+  skipped. The 39.3% is the sloppy subset, not the whole suite.
+- One engine per test, no fixture reuse. Isolation is worth the 8 ms/test.
+- No test262 score is published as "conformance"; directories with known
+  missing features (`eval-code`, `arguments-object`) are visible in the table.
+- Bench programs are small and hand-written, not a browser workload. They
+  isolate the interpreter; page-level timing is still `measure-sites.ps1`.
+- No JIT, by product rule. The target is a faster interpreter, not a compiler.
+
+### Reproduce
+
+```powershell
+# once: sparse suite (~2 min, needs the network)
+git clone --depth 1 --filter=blob:none --sparse https://github.com/tc39/test262.git "$env:TEMP\test262"
+git -C "$env:TEMP\test262" sparse-checkout set test/language harness
+
+cargo build --release --offline -p mazda-engine --bin test262 --bin js-bench
+.\target\release\test262.exe --dir "$env:TEMP\test262\test\language" --harness "$env:TEMP\test262\harness" --failures 50
+.\target\release\js-bench.exe --iterations 10 --warmup 3
+```
+
 
 
