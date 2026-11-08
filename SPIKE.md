@@ -884,4 +884,75 @@ $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/print
 # click the printer button (or Ctrl+P); the PDF appears in Downloads
 ```
 
+## History and bookmarks, executed (2026-11-08)
+
+The clock button (or Ctrl+H) opens a "Bookmarks & History" window anchored
+under the toolbar with bookmarks on top and the visit log below. The star button (or
+Ctrl+D) adds the active page to the bookmarks and fills the star while that URL
+is saved. Clicking a bookmark or a visit navigates the active tab and closes
+the panel; bookmarks have a `✕` remove button and the log has `Clear`.
+
+**Two text files in the trusted process.** Both stores live under
+`%LOCALAPPDATA%\mazda-browser` (XDG on Linux) and are read once at startup.
+Every committed load appends `<secs>\t<url>\t<title>` to `history.tsv`; a
+reload of the last URL collapses into that row instead of adding another, and
+the list is capped at 5,000 entries. Teammate tabs and crash/governor replays
+send `Restore`, which is deliberately not logged - each `inflight` request now
+carries a `record` flag beside its tab and URL. A bookmark toggle rewrites the
+small `bookmarks.tsv` immediately. Fields are stripped of tabs and newlines
+before writing, so a page cannot corrupt the format, and every disk error is
+ignored so the session list keeps working even when the profile is read-only.
+
+**UI stays shell-only.** The renderer and the IPC protocol are untouched: this
+is trusted-process chrome, like tabs and downloads. The panel is an egui
+`Window` with a capped `ScrollArea` of at most 300 visits, and each visit's
+age is formatted as "just now", "N min", "N h" or "N d".
+
+## Acceptance
+
+`cargo test -p mazda-shell` is green with 6 tests. Three cover the store:
+
+```
+history_lines_round_trip_and_collapse_reloads
+  two URLs + one reload -> 2 entries, reload takes the newest timestamp
+  tabs/newlines are cleaned, malformed lines are skipped
+ages_are_human_readable
+  just now / 5 min / 3 h / 2 d
+stores_round_trip_through_disk
+  append -> load -> write bookmarks -> load -> clear, against a scratch
+  LOCALAPPDATA so the real profile is untouched
+```
+
+Workspace tests: 902 engine + 6 shell + 5 IPC + 5 media + 4 probe green.
+
+The panel and the two buttons were not clicked on this host (the fullscreen
+game still owns the desktop). Manual check: open a page, Ctrl+D (star fills),
+Ctrl+H (row at the top), click the row, then Clear. The stores themselves are
+covered by the disk round-trip test above.
+
+## Shortcuts (deliberate)
+
+- Plain tab-separated files, loaded whole: no index, query, folders, tags,
+  import/export, favicons or sync. 5,000 visits is the cap.
+- Only fresh `Load`s are logged; switching tabs replays from memory snapshots
+  and does not create history entries (so the log is a visit log, not a
+  session transcript).
+- History click records the new visit; the clicked row's original timestamp
+  stays in the file until the next load of that URL collapses it.
+- Clearing history keeps bookmarks, and the panel scrolls only the log (the
+  bookmark list is short by assumption).
+- Title text is the tab label (the host), because the renderer's `title` event
+  carries the URL; there is no page `<title>` yet.
+- No confirmation dialog for Clear; the file is removed and the in-memory list
+  cleared.
+
+## Reproduce
+
+```powershell
+python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
+$env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/find.html
+# Ctrl+D, then Ctrl+H, click the visit, Clear
+```
+
+
 

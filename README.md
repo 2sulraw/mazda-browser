@@ -14,8 +14,9 @@ pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
 started**: `<a download>` streams to disk with a progress panel and lands in the
 user's Downloads folder, `<input type=file>` posts files as
 `multipart/form-data` through the native picker, Ctrl+F finds text in the page
-with scroll-to-match highlights, Ctrl+= / Ctrl+- zoom the page, and the printer
-button (or Ctrl+P) saves the page as a PDF in Downloads.
+with scroll-to-match highlights, Ctrl+= / Ctrl+- zoom the page, the printer
+button (or Ctrl+P) saves the page as a PDF in Downloads, and Ctrl+D / Ctrl+H
+drive bookmarks and the visit log.
 
 ## Workspace
 
@@ -120,6 +121,15 @@ shell moves the finished file into `%USERPROFILE%\Downloads` as `<host>.pdf`
 with the same dedupe and lists it in the Downloads panel. Pages are bitmaps, so
 text is not selectable, and a slice boundary cuts at a fixed height rather than
 at paragraph breaks.
+
+History and bookmarks (P4): every committed load appends one tab-separated line
+to `%LOCALAPPDATA%\mazda-browser\history.tsv` (reloads collapse to one visit,
+newest 5,000 kept); Ctrl+D or the toolbar star adds/removes
+`bookmarks.tsv`. The clock button or Ctrl+H opens the library panel: bookmarks
+on top with a remove button, then the visit log with relative times. Clicking
+any row navigates the active tab; history has a Clear button. Both stores are
+read once at startup and written from the trusted shell only; a failed write
+never breaks browsing.
 
 Self-test (decode, audio endpoint and DRM rejection, plain and through the real
 sandbox):

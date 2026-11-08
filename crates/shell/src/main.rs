@@ -308,6 +308,188 @@ fn adopt_pdf(src: &std::path::Path, label: &str) -> Result<std::path::PathBuf, S
 }
 
 // ---------------------------------------------------------------------------
+// History and bookmarks
+//
+// Both stores live in the trusted process and persist as tab-separated text
+// under `%LOCALAPPDATA%\mazda-browser` (XDG on Linux). Browsing must never fail
+// because a store cannot be written, so disk errors are ignored: the in-memory
+// list keeps working for the session.
+
+/// One committed page load.
+struct HistoryEntry {
+    secs: u64,
+    url: String,
+    title: String,
+}
+
+struct Bookmark {
+    url: String,
+    title: String,
+}
+
+const MAX_HISTORY: usize = 5000;
+const MAX_URL: usize = 2048;
+const MAX_TITLE: usize = 200;
+
+/// Per-user data dir; the fallback temp dir keeps tests working.
+fn data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mazda-browser")
+}
+
+fn history_path() -> PathBuf {
+    data_dir().join("history.tsv")
+}
+
+fn bookmarks_path() -> PathBuf {
+    data_dir().join("bookmarks.tsv")
+}
+
+/// Tabs and newlines would break the one-record-per-line format.
+fn clean_field(s: &str, cap: usize) -> String {
+    s.chars()
+        .map(|c| if c == '\t' || c == '\r' || c == '\n' { ' ' } else { c })
+        .take(cap)
+        .collect()
+}
+
+fn history_line(secs: u64, url: &str, title: &str) -> String {
+    format!(
+        "{secs}\t{}\t{}\n",
+        clean_field(url, MAX_URL),
+        clean_field(title, MAX_TITLE)
+    )
+}
+
+/// Parse the store format, collapsing consecutive visits to one URL (a reload
+/// keeps the newest timestamp) and capping the list at [`MAX_HISTORY`].
+fn parse_history(text: &str) -> Vec<HistoryEntry> {
+    let mut out: Vec<HistoryEntry> = Vec::new();
+    for line in text.lines() {
+        let mut f = line.splitn(3, '\t');
+        let (Some(secs), Some(url), title) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let Ok(secs) = secs.parse::<u64>() else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        if out.last().map(|e| e.url == url).unwrap_or(false) {
+            let e = out.last_mut().unwrap();
+            e.secs = secs;
+            if let Some(t) = title.filter(|t| !t.is_empty()) {
+                e.title = t.to_string();
+            }
+            continue;
+        }
+        out.push(HistoryEntry {
+            secs,
+            url: url.to_string(),
+            title: title.unwrap_or("").to_string(),
+        });
+    }
+    if out.len() > MAX_HISTORY {
+        out.drain(..out.len() - MAX_HISTORY);
+    }
+    out
+}
+
+fn load_history() -> Vec<HistoryEntry> {
+    let Ok(text) = std::fs::read_to_string(history_path()) else {
+        return Vec::new();
+    };
+    let h = parse_history(&text);
+    // a long session leaves one row per reload; compact them away on the next
+    // start instead of growing the file forever
+    if text.lines().count() != h.len() {
+        rewrite_history(&h);
+    }
+    h
+}
+
+fn rewrite_history(list: &[HistoryEntry]) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut text = String::new();
+    for e in list {
+        text.push_str(&history_line(e.secs, &e.url, &e.title));
+    }
+    let _ = std::fs::write(history_path(), text);
+}
+
+fn load_bookmarks() -> Vec<Bookmark> {
+    std::fs::read_to_string(bookmarks_path())
+        .map(|t| {
+            parse_history(&t)
+                .into_iter()
+                .map(|e| Bookmark {
+                    url: e.url,
+                    title: e.title,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_bookmarks(list: &[Bookmark]) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut text = String::new();
+    for b in list {
+        text.push_str(&history_line(0, &b.url, &b.title));
+    }
+    let _ = std::fs::write(bookmarks_path(), text);
+}
+
+fn append_history(secs: u64, url: &str, title: &str) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path())
+    {
+        let _ = f.write_all(history_line(secs, url, title).as_bytes());
+    }
+}
+
+fn clear_history_file() {
+    let _ = std::fs::remove_file(history_path());
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// "just now", "5 min", "3 h", "2 d" - enough to place a visit.
+fn ago(secs: u64, now: u64) -> String {
+    let d = now.saturating_sub(secs);
+    match d {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min", d / 60),
+        3600..=86399 => format!("{} h", d / 3600),
+        _ => format!("{} d", d / 86400),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File upload
 //
 // `<input type=file>` is clicked inside the renderer, but the OS picker runs
@@ -465,6 +647,11 @@ struct Shell {
     find_focus: bool,
     /// label of the page a print-to-PDF is rendering (None = no print)
     printing: Option<String>,
+    /// visited pages, newest last; the library panel shows them in reverse
+    history: Vec<HistoryEntry>,
+    bookmarks: Vec<Bookmark>,
+    /// the History/Bookmarks panel (toolbar clock or Ctrl+H)
+    library_open: bool,
     title: String,
     err: Option<String>,
     /// content size last sent to the renderer
@@ -484,7 +671,7 @@ struct Shell {
     /// front entry even when the user switched tabs while it was in flight.
     /// Without this, a slow load's title landed on whichever tab was active
     /// when it finished (the one-tab lag measured by `measure-tabs.ps1`).
-    inflight: VecDeque<(usize, String)>,
+    inflight: VecDeque<(usize, String, bool)>,
     // governor
     budget_mb: f64,
     last_sample: Instant,
@@ -512,7 +699,7 @@ impl Shell {
         let mut inflight = VecDeque::new();
         if !start.is_empty() {
             // `Renderer::spawn` already asked for this page
-            inflight.push_back((active, start.clone()));
+            inflight.push_back((active, start.clone(), true));
         }
         Some(Self {
             r,
@@ -536,6 +723,9 @@ impl Shell {
             find_total: 0,
             find_focus: false,
             printing: None,
+            history: load_history(),
+            bookmarks: load_bookmarks(),
+            library_open: false,
             title: String::new(),
             err: None,
             size: (0, 0),
@@ -587,6 +777,56 @@ impl Shell {
         self.r.send(Command::Print);
     }
 
+    /// Append a committed load to the visit log (memory + disk). Reloading a
+    /// URL updates its timestamp instead of adding a second row.
+    fn record_visit(&mut self, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        let secs = now_secs();
+        let title = short_title(url);
+        if let Some(last) = self.history.last_mut().filter(|e| e.url == url) {
+            last.secs = secs;
+            last.title = title.clone();
+        } else {
+            self.history.push(HistoryEntry {
+                secs,
+                url: url.to_string(),
+                title: title.clone(),
+            });
+            if self.history.len() > MAX_HISTORY {
+                self.history.remove(0);
+            }
+        }
+        append_history(secs, url, &title);
+    }
+
+    fn is_bookmarked(&self, url: &str) -> bool {
+        self.bookmarks.iter().any(|b| b.url == url)
+    }
+
+    /// Add or remove the active page from the bookmarks and persist the list.
+    fn toggle_bookmark(&mut self) {
+        let url = self.active_tab().url.clone();
+        if url.is_empty() {
+            return;
+        }
+        if self.is_bookmarked(&url) {
+            self.bookmarks.retain(|b| b.url != url);
+        } else {
+            self.bookmarks.push(Bookmark {
+                title: self.active_tab().label.clone(),
+                url,
+            });
+        }
+        write_bookmarks(&self.bookmarks);
+    }
+
+    fn clear_history(&mut self) {
+        self.history.clear();
+        clear_history_file();
+    }
+
     /// Load `url` in the active tab (fresh fetch).
     fn navigate(&mut self, url: String) {
         self.navigate_tab(self.active, url);
@@ -620,7 +860,7 @@ impl Shell {
             self.title.clear();
             println!("[nav] {url}");
         }
-        self.inflight.push_back((tab, url.clone()));
+        self.inflight.push_back((tab, url.clone(), true));
         self.r.send(Command::Load(url));
     }
 
@@ -647,7 +887,7 @@ impl Shell {
             self.pending_scroll = None;
         } else {
             self.loading = true;
-            self.inflight.push_back((i, url.clone()));
+            self.inflight.push_back((i, url.clone(), false));
             self.r.send(Command::Restore(url.clone()));
             self.pending_scroll = Some(scroll);
         }
@@ -701,7 +941,7 @@ impl Shell {
             } else {
                 self.loading = true;
                 self.title.clear();
-                self.inflight.push_back((self.active, url.clone()));
+                self.inflight.push_back((self.active, url.clone(), false));
                 self.r.send(Command::Restore(url));
                 self.pending_scroll = Some(scroll);
             }
@@ -765,14 +1005,19 @@ impl Shell {
                     // the renderer answers requests in order: this title
                     // belongs to the oldest request, not necessarily to the
                     // tab the user is looking at now
-                    let owner = self
+                    let (owner, record) = self
                         .inflight
                         .pop_front()
-                        .map(|(i, _)| i)
-                        .unwrap_or(self.active);
+                        .map(|(i, _, rec)| (i, rec))
+                        .unwrap_or((self.active, true));
                     if let Some(tab) = self.tabs.get_mut(owner) {
                         tab.url = t.clone();
                         tab.label = short_title(&t);
+                    }
+                    // a Restore (tab switch, crash recovery) replays a page
+                    // the log already has
+                    if record {
+                        self.record_visit(&t);
                     }
                     if owner == self.active {
                         self.loading = false;
@@ -792,7 +1037,7 @@ impl Shell {
                     let owner = self
                         .inflight
                         .pop_front()
-                        .map(|(i, _)| i)
+                        .map(|(i, _, _)| i)
                         .unwrap_or(self.active);
                     self.navigate_tab(owner, url);
                 }
@@ -800,7 +1045,7 @@ impl Shell {
                     let owner = self
                         .inflight
                         .pop_front()
-                        .map(|(i, _)| i)
+                        .map(|(i, _, _)| i)
                         .unwrap_or(self.active);
                     if owner == self.active {
                         self.loading = false;
@@ -1032,7 +1277,7 @@ impl Shell {
                     self.title.clear();
                     self.r.url = self.tabs[self.active].url.clone();
                     self.inflight
-                        .push_back((self.active, self.r.url.clone()));
+                        .push_back((self.active, self.r.url.clone(), false));
                     self.r.send(Command::Load(self.tabs[self.active].url.clone()));
                     println!(
                         "[tabs] active={} n={} url={}",
@@ -1320,8 +1565,8 @@ impl eframe::App for Shell {
             reload = true;
         }
 
-        // downloads button sits at the toolbar's right edge; print just left
-        // of it, and the address pill ends before both
+        // downloads button sits at the toolbar's right edge; print, bookmark
+        // and history stack left of it, and the address pill ends before them
         let dl_rect = Rect::from_center_size(
             egui::pos2(toolbar_rect.right() - 27.0, toolbar_rect.center().y),
             egui::vec2(34.0, 34.0),
@@ -1330,9 +1575,17 @@ impl eframe::App for Shell {
             egui::pos2(toolbar_rect.right() - 63.0, toolbar_rect.center().y),
             egui::vec2(34.0, 34.0),
         );
+        let bm_rect = Rect::from_center_size(
+            egui::pos2(toolbar_rect.right() - 99.0, toolbar_rect.center().y),
+            egui::vec2(34.0, 34.0),
+        );
+        let lib_rect = Rect::from_center_size(
+            egui::pos2(toolbar_rect.right() - 135.0, toolbar_rect.center().y),
+            egui::vec2(34.0, 34.0),
+        );
         let pill = Rect::from_min_max(
             egui::pos2(reload_rect.right() + 10.0, toolbar_rect.top() + 7.0),
-            egui::pos2(print_rect.left() - 8.0, toolbar_rect.bottom() - 7.0),
+            egui::pos2(lib_rect.left() - 8.0, toolbar_rect.bottom() - 7.0),
         );
         painter.rect_filled(pill, 16.0, PILL_BG);
         draw_globe(
@@ -1468,6 +1721,46 @@ impl eframe::App for Shell {
             print = true;
         }
 
+        // bookmark star: filled while the active URL is saved
+        let bm_resp = ui.interact(bm_rect, ui.id().with("bookmark"), Sense::click());
+        if bm_resp.hovered() {
+            painter.circle_filled(bm_rect.center(), 16.0, PILL_HOVER);
+        }
+        let saved = self.is_bookmarked(&self.active_tab().url);
+        let bm_col = if bm_resp.hovered() || saved {
+            ACCENT
+        } else {
+            MUTED
+        };
+        draw_star(&painter, bm_rect.center(), 8.0, saved, bm_col);
+        if bm_resp.clicked() {
+            self.toggle_bookmark();
+        }
+
+        // history / bookmarks panel
+        let lib_resp = ui.interact(lib_rect, ui.id().with("library"), Sense::click());
+        if lib_resp.hovered() {
+            painter.circle_filled(lib_rect.center(), 16.0, PILL_HOVER);
+        }
+        let lb_col = if lib_resp.hovered() || self.library_open {
+            ACCENT
+        } else {
+            MUTED
+        };
+        let lc = lib_rect.center();
+        painter.circle_stroke(lc, 7.5, Stroke::new(1.4, lb_col));
+        painter.line_segment(
+            [lc, egui::pos2(lc.x, lc.y - 4.5)],
+            Stroke::new(1.4, lb_col),
+        );
+        painter.line_segment(
+            [lc, egui::pos2(lc.x + 3.5, lc.y + 1.5)],
+            Stroke::new(1.4, lb_col),
+        );
+        if lib_resp.clicked() {
+            self.library_open = !self.library_open;
+        }
+
         // ---- keyboard: the usual browser chords ------------------------
         let mut k_new = false;
         let mut k_close = false;
@@ -1477,6 +1770,8 @@ impl eframe::App for Shell {
         let mut k_zoom = 0i32;
         let mut k_zoom_reset = false;
         let mut k_print = false;
+        let mut k_bookmark = false;
+        let mut k_library = false;
         let mut k_next = 0i32;
         let mut k_select = None;
         ui.input(|i| {
@@ -1509,6 +1804,12 @@ impl eframe::App for Shell {
             }
             if i.key_pressed(egui::Key::P) {
                 k_print = true;
+            }
+            if i.key_pressed(egui::Key::D) {
+                k_bookmark = true;
+            }
+            if i.key_pressed(egui::Key::H) {
+                k_library = true;
             }
             if i.key_pressed(egui::Key::Tab) {
                 k_next = if i.modifiers.shift { -1 } else { 1 };
@@ -1546,6 +1847,12 @@ impl eframe::App for Shell {
         }
         if print || k_print {
             self.print_page();
+        }
+        if k_bookmark {
+            self.toggle_bookmark();
+        }
+        if k_library {
+            self.library_open = !self.library_open;
         }
         if let Some(url) = go {
             self.navigate(url);
@@ -1669,7 +1976,7 @@ impl eframe::App for Shell {
         }
         // after a crash: the new renderer is sized, now replay the tab
         if let Some(url) = self.pending_restore.take() {
-            self.inflight.push_back((self.active, url.clone()));
+            self.inflight.push_back((self.active, url.clone(), false));
             self.r.send(Command::Restore(url));
         }
 
@@ -1847,6 +2154,115 @@ impl eframe::App for Shell {
             self.downloads_open = open;
         }
 
+        // ---- library panel: bookmarks + history -------------------------
+        if self.library_open {
+            let mut open = true;
+            let now = now_secs();
+            let mut go: Option<String> = None;
+            let mut unbookmark: Option<usize> = None;
+            let mut clear = false;
+            egui::Window::new("Bookmarks & History")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(430.0)
+                .anchor(
+                    Align2::RIGHT_TOP,
+                    [-14.0, title_rect.height() + toolbar_rect.height() + 8.0],
+                )
+                .show(ui.ctx(), |ui| {
+                    ui.strong("Bookmarks");
+                    if self.bookmarks.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No bookmarks - Ctrl+D saves the current page.",
+                            )
+                            .color(MUTED)
+                            .size(11.5),
+                        );
+                    }
+                    for (i, b) in self.bookmarks.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let shown = elide(
+                                ui,
+                                &b.title,
+                                &FontId::proportional(12.5),
+                                350.0,
+                            );
+                            if ui
+                                .link(shown)
+                                .on_hover_text(&b.url)
+                                .clicked()
+                            {
+                                go = Some(b.url.clone());
+                            }
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove bookmark")
+                                .clicked()
+                            {
+                                unbookmark = Some(i);
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.strong("History");
+                        if !self.history.is_empty() && ui.small_button("Clear").clicked() {
+                            clear = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            if self.history.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("No pages visited yet.")
+                                        .color(MUTED)
+                                        .size(11.5),
+                                );
+                            }
+                            for h in self.history.iter().rev().take(300) {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(ago(h.secs, now))
+                                            .color(MUTED)
+                                            .size(10.5),
+                                    );
+                                    let label = if h.title.is_empty() {
+                                        short_title(&h.url)
+                                    } else {
+                                        h.title.clone()
+                                    };
+                                    let shown = elide(
+                                        ui,
+                                        &label,
+                                        &FontId::proportional(12.5),
+                                        330.0,
+                                    );
+                                    if ui.link(shown).on_hover_text(&h.url).clicked() {
+                                        go = Some(h.url.clone());
+                                    }
+                                });
+                            }
+                        });
+                });
+            if let Some(i) = unbookmark {
+                if i < self.bookmarks.len() {
+                    self.bookmarks.remove(i);
+                    write_bookmarks(&self.bookmarks);
+                }
+            }
+            if clear {
+                self.clear_history();
+            }
+            self.library_open = open;
+            if let Some(url) = go {
+                self.library_open = false;
+                self.navigate(url);
+            }
+        }
+
         ui.ctx().request_repaint_after(Duration::from_millis(8));
     }
 }
@@ -1980,6 +2396,29 @@ fn draw_reload(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
         [tip, egui::pos2(back.x - 2.5 * nx, back.y - 2.5 * ny)],
         Stroke::new(1.6, color),
     );
+}
+
+fn draw_star(p: &egui::Painter, c: egui::Pos2, r: f32, filled: bool, color: Color32) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let pts: Vec<egui::Pos2> = (0..10)
+        .map(|i| {
+            let a = -FRAC_PI_2 + i as f32 * PI / 5.0;
+            let rr = if i % 2 == 0 { r } else { r * 0.45 };
+            egui::pos2(c.x + rr * a.cos(), c.y + rr * a.sin())
+        })
+        .collect();
+    if filled {
+        // a star is concave; fill it as ten triangles around the center
+        for i in 0..10 {
+            p.add(egui::Shape::convex_polygon(
+                vec![c, pts[i], pts[(i + 1) % 10]],
+                color,
+                Stroke::NONE,
+            ));
+        }
+    } else {
+        p.add(egui::Shape::closed_line(pts, Stroke::new(1.4, color)));
+    }
 }
 
 fn draw_globe(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
@@ -2147,5 +2586,60 @@ mod tests {
         assert_eq!(pdf_name("a/b:c*d?e"), "a_b_c_d_e.pdf");
         assert_eq!(pdf_name("..."), "page.pdf");
         assert_eq!(pdf_name(""), "page.pdf");
+    }
+
+    #[test]
+    fn history_lines_round_trip_and_collapse_reloads() {
+        let mut text = String::new();
+        text.push_str(&history_line(100, "https://a.test/", "a.test"));
+        text.push_str(&history_line(200, "https://b.test/x", "b.test"));
+        text.push_str(&history_line(300, "https://b.test/x", "b.test"));
+        let h = parse_history(&text);
+        assert_eq!(h.len(), 2, "the reload is one visit");
+        assert_eq!(h[0].url, "https://a.test/");
+        assert_eq!(h[1].secs, 300);
+        // tabs and newlines cannot escape their column
+        let line = history_line(1, "u\tv\nw", "t\tx");
+        assert!(line.ends_with("u v w\tt x\n"));
+        assert_eq!(parse_history("bad\nx\ty\n").len(), 0);
+    }
+
+    #[test]
+    fn ages_are_human_readable() {
+        assert_eq!(ago(100, 130), "just now");
+        assert_eq!(ago(100, 400), "5 min");
+        assert_eq!(ago(100, 100 + 3 * 3600), "3 h");
+        assert_eq!(ago(100, 100 + 2 * 86400), "2 d");
+    }
+
+    /// The stores are plain files under `%LOCALAPPDATA%`; point that at a
+    /// scratch dir so the real profile is untouched.
+    #[test]
+    fn stores_round_trip_through_disk() {
+        let dir = std::env::temp_dir().join(format!("mazda-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCALAPPDATA", &dir);
+        append_history(10, "https://a.test/", "a.test");
+        append_history(20, "https://b.test/x", "b.test");
+        append_history(30, "https://b.test/x", "b.test");
+        let h = load_history();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].url, "https://a.test/");
+        assert_eq!(h[1].secs, 30, "reload keeps the newest timestamp");
+        // the duplicate row was compacted out of the file on load
+        let rows = std::fs::read_to_string(history_path()).unwrap();
+        assert_eq!(rows.lines().count(), 2);
+        write_bookmarks(&[Bookmark {
+            url: "https://a.test/".into(),
+            title: "a.test".into(),
+        }]);
+        let b = load_bookmarks();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].url, "https://a.test/");
+        clear_history_file();
+        assert!(load_history().is_empty());
+        std::env::remove_var("LOCALAPPDATA");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
