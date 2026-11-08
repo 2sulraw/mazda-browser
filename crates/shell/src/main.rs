@@ -418,6 +418,8 @@ struct Shell {
     rgba: Vec<u8>,
     seq: u32,
     scroll: f32,
+    /// page zoom factor (Ctrl+= / Ctrl+- / Ctrl+0)
+    zoom: f32,
     /// time the last scroll command was written; a frame arriving after it
     /// measures the round trip
     sent: Option<Instant>,
@@ -492,6 +494,7 @@ impl Shell {
             rgba: Vec::new(),
             seq: 0,
             scroll: 0.0,
+            zoom: 1.0,
             sent: None,
             lat: Vec::new(),
             downloads: Vec::new(),
@@ -866,6 +869,8 @@ impl Shell {
                         self.map_path.clear();
                         self.tex = None;
                         self.seq = 0;
+                        // the restarted renderer is back at 100% zoom
+                        self.r.send(Command::Zoom(self.zoom));
                         // the restarted renderer never saw the old commands
                         self.inflight.clear();
                         // force a resize (and then the restore) next frame
@@ -900,6 +905,7 @@ impl Shell {
         self.seq = 0;
         self.size = (0, 0);
         self.inflight.clear();
+        self.r.send(Command::Zoom(self.zoom));
         let url = self.active_tab().url.clone();
         self.pending_restore = (!url.is_empty()).then_some(url);
         self.pending_scroll = Some(self.scroll);
@@ -1338,6 +1344,8 @@ impl eframe::App for Shell {
         let mut k_reload = false;
         let mut k_focus = false;
         let mut k_find = false;
+        let mut k_zoom = 0i32;
+        let mut k_zoom_reset = false;
         let mut k_next = 0i32;
         let mut k_select = None;
         ui.input(|i| {
@@ -1358,6 +1366,15 @@ impl eframe::App for Shell {
             }
             if i.key_pressed(egui::Key::F) {
                 k_find = true;
+            }
+            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                k_zoom = 1;
+            }
+            if i.key_pressed(egui::Key::Minus) {
+                k_zoom = -1;
+            }
+            if i.key_pressed(egui::Key::Num0) {
+                k_zoom_reset = true;
             }
             if i.key_pressed(egui::Key::Tab) {
                 k_next = if i.modifiers.shift { -1 } else { 1 };
@@ -1411,6 +1428,17 @@ impl eframe::App for Shell {
         }
         if self.find_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_find();
+        }
+        if k_zoom != 0 || k_zoom_reset {
+            let z = if k_zoom_reset {
+                1.0
+            } else {
+                zoom_step(self.zoom, k_zoom)
+            };
+            if (z - self.zoom).abs() > 0.001 {
+                self.zoom = z;
+                self.r.send(Command::Zoom(z));
+            }
         }
         if k_next != 0 {
             let n = self.tabs.len() as i32;
@@ -1556,7 +1584,9 @@ impl eframe::App for Shell {
                 .filter(|p| page_rect.contains(*p))
         });
         if wheel != 0.0 && page {
-            self.scroll = (self.scroll - wheel).max(0.0);
+            // the renderer scrolls in CSS pixels; the wheel arrives in
+            // physical pixels
+            self.scroll = (self.scroll - wheel / self.zoom).max(0.0);
             self.r.send(Command::Scroll(self.scroll));
             self.sent = Some(Instant::now());
         }
@@ -1600,6 +1630,9 @@ impl eframe::App for Shell {
             if self.err.is_some() { CLOSE_RED } else { MUTED },
         );
         let mut right = format!("{}/{} tabs", self.active + 1, self.tabs.len());
+        if (self.zoom - 1.0).abs() > 0.001 {
+            right.push_str(&format!("   {:.0}%", self.zoom * 100.0));
+        }
         if self.last_mb > 0.0 {
             right.push_str(&format!("   {:.0} MB", self.last_mb));
         }
@@ -1676,6 +1709,28 @@ impl eframe::App for Shell {
         }
 
         ui.ctx().request_repaint_after(Duration::from_millis(8));
+    }
+}
+
+/// Next/previous browser-zoom step (Ctrl+= / Ctrl+-).
+fn zoom_step(cur: f32, dir: i32) -> f32 {
+    const STEPS: [f32; 17] = [
+        0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+        4.0, 5.0,
+    ];
+    if dir > 0 {
+        STEPS
+            .iter()
+            .copied()
+            .find(|&s| s > cur + 0.001)
+            .unwrap_or(5.0)
+    } else {
+        STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|&s| s < cur - 0.001)
+            .unwrap_or(0.25)
     }
 }
 
@@ -1935,5 +1990,15 @@ mod tests {
         assert_eq!(a.file_name().unwrap(), "notes.txt");
         assert_eq!(b.file_name().unwrap(), "notes (1).txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zoom_steps_climb_and_stop_at_the_ends() {
+        assert_eq!(zoom_step(1.0, 1), 1.1);
+        assert_eq!(zoom_step(1.1, -1), 1.0);
+        assert_eq!(zoom_step(0.25, -1), 0.25, "bottom is sticky");
+        assert_eq!(zoom_step(5.0, 1), 5.0, "top is sticky");
+        assert_eq!(zoom_step(0.9, 1), 1.0);
+        assert_eq!(zoom_step(3.0, -1), 2.5);
     }
 }

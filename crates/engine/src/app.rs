@@ -615,22 +615,68 @@ fn paint_find(
     }
 }
 
+/// Bilinear scale of a 0x00RRGGBB buffer (zoom in/out of the painted page).
+fn scale_pixels(src: &[u32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u32> {
+    let mut out = vec![0u32; dw * dh];
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return out;
+    }
+    let xr = sw as f32 / dw as f32;
+    let yr = sh as f32 / dh as f32;
+    for y in 0..dh {
+        let sy = ((y as f32 + 0.5) * yr - 0.5).clamp(0.0, (sh - 1) as f32);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = sy - y0 as f32;
+        for x in 0..dw {
+            let sx = ((x as f32 + 0.5) * xr - 0.5).clamp(0.0, (sw - 1) as f32);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = sx - x0 as f32;
+            let p00 = src[y0 * sw + x0];
+            let p10 = src[y0 * sw + x1];
+            let p01 = src[y1 * sw + x0];
+            let p11 = src[y1 * sw + x1];
+            let mix = |shift: u32| -> u32 {
+                let a = ((p00 >> shift) & 0xff) as f32;
+                let b = ((p10 >> shift) & 0xff) as f32;
+                let c = ((p01 >> shift) & 0xff) as f32;
+                let d = ((p11 >> shift) & 0xff) as f32;
+                let top = a * (1.0 - fx) + b * fx;
+                let bot = c * (1.0 - fx) + d * fx;
+                (top * (1.0 - fy) + bot * fy).round() as u32
+            };
+            out[y * dw + x] = (mix(16) << 16) | (mix(8) << 8) | mix(0);
+        }
+    }
+    out
+}
+
 fn headless_paint(
     page: &Page,
     fonts: &Fonts,
     pw: usize,
     ph: usize,
+    zoom: f32,
     scroll: f32,
     find: Option<&FindState>,
     frame: &mut Option<mazda_ipc::FrameMap>,
     seq: &mut u32,
 ) {
-    let mut pixels = vec![page.bg; pw * ph];
-    render(&mut pixels, pw, ph, &page.laid, fonts, scroll, page_h(ph), 0.0);
+    // CSS-space buffer, then a bilinear scale to the physical frame size
+    let lw = ((pw as f32 / zoom.max(0.01)).round() as usize).max(1);
+    let lh = ((ph as f32 / zoom.max(0.01)).round() as usize).max(1);
+    let mut pixels = vec![page.bg; lw * lh];
+    render(&mut pixels, lw, lh, &page.laid, fonts, scroll, page_h(lh), 0.0);
     if let Some(f) = find {
-        paint_find(&mut pixels, pw, ph, f, scroll);
+        paint_find(&mut pixels, lw, lh, f, scroll);
     }
-    draw_scrollbar(&mut pixels, pw, ph, page.laid.height, page_h(ph), scroll);
+    draw_scrollbar(&mut pixels, lw, lh, page.laid.height, page_h(lh), scroll);
+    let pixels = if (lw, lh) == (pw, ph) {
+        pixels
+    } else {
+        scale_pixels(&pixels, lw, lh, pw, ph)
+    };
     let path = mazda_ipc::frame_path(&std::env::temp_dir(), std::process::id(), pw, ph);
     if frame.as_ref().map(|f| f.dims() != (pw, ph)).unwrap_or(true) {
         *frame = mazda_ipc::FrameMap::create(&path, pw, ph).ok();
@@ -900,6 +946,7 @@ fn tick_players(
     fonts: &Fonts,
     pw: usize,
     ph: usize,
+    zoom: f32,
     scroll: f32,
     find: Option<&FindState>,
     frame: &mut Option<mazda_ipc::FrameMap>,
@@ -919,7 +966,7 @@ fn tick_players(
         }
     }
     if dirty {
-        headless_paint(p, fonts, pw, ph, scroll, find, frame, seq);
+        headless_paint(p, fonts, pw, ph, zoom, scroll, find, frame, seq);
     }
     dirty
 }
@@ -931,8 +978,8 @@ fn tick_players(
 /// only to be the sandboxed side of the split.
 ///
 /// Commands: `load <url>`, `resize <w> <h>`, `scroll <y>`, `click <x> <y>`,
-/// `find <query>`, `find-step <±1>`, `find-close`, `quit`. Events:
-/// `frame <path> <w> <h> <doc_h> <seq>`, `title <url>`, `nav <url>`,
+/// `find <query>`, `find-step <±1>`, `find-close`, `zoom <factor>`, `quit`.
+/// Events: `frame <path> <w> <h> <doc_h> <seq>`, `title <url>`, `nav <url>`,
 /// `find-result <active> <total>`, `scroll-to <y>`, `error <msg>`.
 pub fn run_headless() {
     use std::io::BufRead;
@@ -1021,14 +1068,17 @@ pub fn run_headless() {
     // find-in-page: the query survives navigation, the hit list is rebuilt
     // against each new layout
     let mut find: Option<FindState> = None;
+    // page zoom: layout runs at CSS size `physical / zoom`, then the frame is
+    // scaled back up; scroll offsets stay in CSS pixels
+    let mut zoom = 1.0f32;
 
     if let Some(url) = url {
         nav_id += 1;
         let _ = jobs_tx.send(LoadReq::Load {
             id: nav_id,
             url,
-            max_w: page_w(pw),
-            vh: page_h(ph),
+            max_w: zoomed_w(pw, zoom),
+            vh: zoomed_h(ph, zoom),
             engine: EngineChoice::A,
             fonts: fonts_choice,
             restore: false,
@@ -1050,7 +1100,7 @@ pub fn run_headless() {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 drain_downloads(&dl_rx, &mut dl_active);
                 tick_players(
-                    &mut players, &mut page, &fonts, pw, ph, scroll, find.as_ref(),
+                    &mut players, &mut page, &fonts, pw, ph, zoom, scroll, find.as_ref(),
                     &mut frame, &mut seq,
                 );
                 continue;
@@ -1086,7 +1136,7 @@ pub fn run_headless() {
                 // navigation drops every decoder; the new page's videos open
                 // their files (already in the disk cache) on this thread
                 players = start_players(&p);
-                let max = (p.laid.height - page_h(ph)).max(0.0);
+                let max = (p.laid.height - zoomed_h(ph, zoom)).max(0.0);
                 scroll = scroll.min(max);
                 let title = p.url.clone();
                 page = Some(p);
@@ -1105,7 +1155,7 @@ pub fn run_headless() {
                     );
                 }
                 if let Some(p) = page.as_ref() {
-                    headless_paint(p, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq);
+                    headless_paint(p, &fonts, pw, ph, zoom, scroll, find.as_ref(), &mut frame, &mut seq);
                 }
                 println!("{}", mazda_ipc::Event::Title(title).encode());
                 if cfg!(feature = "count-alloc") {
@@ -1148,8 +1198,8 @@ pub fn run_headless() {
                         let _ = jobs_tx.send(LoadReq::Load {
                             id: nav_id,
                             url,
-                            max_w: page_w(pw),
-                            vh: page_h(ph),
+                            max_w: zoomed_w(pw, zoom),
+                            vh: zoomed_h(ph, zoom),
                             engine: EngineChoice::A,
                             fonts: fonts_choice,
                             restore: false,
@@ -1163,8 +1213,8 @@ pub fn run_headless() {
                         let _ = jobs_tx.send(LoadReq::Load {
                             id: nav_id,
                             url,
-                            max_w: page_w(pw),
-                            vh: page_h(ph),
+                            max_w: zoomed_w(pw, zoom),
+                            vh: zoomed_h(ph, zoom),
                             engine: EngineChoice::A,
                             fonts: fonts_choice,
                             restore: true,
@@ -1179,15 +1229,15 @@ pub fn run_headless() {
                             let _ = jobs_tx.send(LoadReq::Relayout {
                                 id: nav_id,
                                 url: p.url.clone(),
-                                max_w: page_w(pw),
-                                vh: page_h(ph),
+                                max_w: zoomed_w(pw, zoom),
+                                vh: zoomed_h(ph, zoom),
                                 forms: forms.clone(),
                                 hover: None,
                                 engine: EngineChoice::A,
                             });
-                            scroll = scroll.min((p.laid.height - page_h(ph)).max(0.0));
+                            scroll = scroll.min((p.laid.height - zoomed_h(ph, zoom)).max(0.0));
                             headless_paint(
-                                p, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq,
+                                p, &fonts, pw, ph, zoom, scroll, find.as_ref(), &mut frame, &mut seq,
                             );
                         }
                     }
@@ -1204,8 +1254,8 @@ pub fn run_headless() {
                             let _ = jobs_tx.send(LoadReq::Relayout {
                                 id: nav_id,
                                 url: p.url.clone(),
-                                max_w: page_w(pw),
-                                vh: page_h(ph),
+                                max_w: zoomed_w(pw, zoom),
+                                vh: zoomed_h(ph, zoom),
                                 forms: forms.clone(),
                                 hover: None,
                                 engine: EngineChoice::A,
@@ -1214,10 +1264,10 @@ pub fn run_headless() {
                     }
                     mazda_ipc::Command::Scroll(y) => {
                         if let Some(p) = page.as_ref() {
-                            let max = (p.laid.height - page_h(ph)).max(0.0);
+                            let max = (p.laid.height - zoomed_h(ph, zoom)).max(0.0);
                             scroll = y.clamp(0.0, max);
                             headless_paint(
-                                p, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq,
+                                p, &fonts, pw, ph, zoom, scroll, find.as_ref(), &mut frame, &mut seq,
                             );
                             let _ = jobs_tx.send(LoadReq::Scroll {
                                 url: p.url.clone(),
@@ -1235,7 +1285,7 @@ pub fn run_headless() {
                             );
                             if let Some(p) = page.as_ref() {
                                 headless_paint(
-                                    p, &fonts, pw, ph, scroll, None, &mut frame, &mut seq,
+                                    p, &fonts, pw, ph, zoom, scroll, None, &mut frame, &mut seq,
                                 );
                             }
                         } else if let Some(p) = page.as_ref() {
@@ -1243,7 +1293,7 @@ pub fn run_headless() {
                             // that hit into view
                             let f = FindState::new(q, &p.laid);
                             if let Some(h) = f.hits.first() {
-                                scroll = find_scroll(h, scroll, page_h(ph), p.laid.height);
+                                scroll = find_scroll(h, scroll, zoomed_h(ph, zoom), p.laid.height);
                                 println!("{}", mazda_ipc::Event::ScrollTo(scroll).encode());
                             }
                             println!(
@@ -1257,7 +1307,7 @@ pub fn run_headless() {
                             find = Some(f);
                             if let Some(f) = find.as_ref() {
                                 headless_paint(
-                                    p, &fonts, pw, ph, scroll, Some(f), &mut frame, &mut seq,
+                                    p, &fonts, pw, ph, zoom, scroll, Some(f), &mut frame, &mut seq,
                                 );
                             }
                         }
@@ -1271,7 +1321,7 @@ pub fn run_headless() {
                                 scroll = find_scroll(
                                     &f.hits[f.active],
                                     scroll,
-                                    page_h(ph),
+                                    zoomed_h(ph, zoom),
                                     p.laid.height,
                                 );
                                 println!("{}", mazda_ipc::Event::ScrollTo(scroll).encode());
@@ -1284,7 +1334,7 @@ pub fn run_headless() {
                                     .encode()
                                 );
                                 headless_paint(
-                                    p, &fonts, pw, ph, scroll, Some(f), &mut frame, &mut seq,
+                                    p, &fonts, pw, ph, zoom, scroll, Some(f), &mut frame, &mut seq,
                                 );
                             }
                         }
@@ -1297,12 +1347,39 @@ pub fn run_headless() {
                             );
                             if let Some(p) = page.as_ref() {
                                 headless_paint(
-                                    p, &fonts, pw, ph, scroll, None, &mut frame, &mut seq,
+                                    p, &fonts, pw, ph, zoom, scroll, None, &mut frame, &mut seq,
+                                );
+                            }
+                        }
+                    }
+                    mazda_ipc::Command::Zoom(z) => {
+                        if z.is_finite() && (0.25..=5.0).contains(&z) {
+                            zoom = z;
+                            if let Some(p) = page.as_ref() {
+                                // a new CSS viewport width means a fresh layout
+                                nav_id += 1;
+                                let _ = jobs_tx.send(LoadReq::Relayout {
+                                    id: nav_id,
+                                    url: p.url.clone(),
+                                    max_w: zoomed_w(pw, zoom),
+                                    vh: zoomed_h(ph, zoom),
+                                    forms: forms.clone(),
+                                    hover: None,
+                                    engine: EngineChoice::A,
+                                });
+                                scroll = scroll
+                                    .min((p.laid.height - zoomed_h(ph, zoom)).max(0.0));
+                                headless_paint(
+                                    p, &fonts, pw, ph, zoom, scroll, find.as_ref(),
+                                    &mut frame, &mut seq,
                                 );
                             }
                         }
                     }
                     mazda_ipc::Command::Click { x, y } => {
+                        // the shell clicks in physical pixels; the page is in
+                        // CSS pixels at this zoom
+                        let (x, y) = (x / zoom, y / zoom);
                         if let Some(p) = page.as_mut() {
                             // a click inside a video toggles playback (no
                             // native controls yet); everywhere else keeps the
@@ -1330,8 +1407,8 @@ pub fn run_headless() {
                                         let _ = jobs_tx.send(LoadReq::Event {
                                             id: nav_id,
                                             url: p.url.clone(),
-                                            max_w: page_w(pw),
-                                            vh: page_h(ph),
+                                            max_w: zoomed_w(pw, zoom),
+                                            vh: zoomed_h(ph, zoom),
                                             node: fb.node,
                                             kinds: vec!["click".into()],
                                             value: None,
@@ -1366,7 +1443,7 @@ pub fn run_headless() {
         }
         // playback advances even while commands stream in
         tick_players(
-            &mut players, &mut page, &fonts, pw, ph, scroll, find.as_ref(), &mut frame, &mut seq,
+            &mut players, &mut page, &fonts, pw, ph, zoom, scroll, find.as_ref(), &mut frame, &mut seq,
         );
         drain_downloads(&dl_rx, &mut dl_active);
     }
@@ -1517,6 +1594,17 @@ fn page_w(pw: usize) -> f32 {
 /// Viewport height for layout / scroll clamping (matches the old shell).
 fn page_h(ph: usize) -> f32 {
     (ph as f32 - 2.0 * PADDING as f32).max(40.0)
+}
+
+/// Layout width for a zoom factor: the renderer lays out (and paints) in CSS
+/// pixels at `pw / zoom`, then scales the frame up to the physical size.
+fn zoomed_w(pw: usize, zoom: f32) -> f32 {
+    page_w(((pw as f32 / zoom.max(0.01)).round() as usize).max(1))
+}
+
+/// Layout/viewport height for a zoom factor (see [`zoomed_w`]).
+fn zoomed_h(ph: usize, zoom: f32) -> f32 {
+    page_h(((ph as f32 / zoom.max(0.01)).round() as usize).max(1))
 }
 
 /// Page scrollbar: width of the strip in the right gutter, in pixels.

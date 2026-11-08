@@ -760,4 +760,61 @@ $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/find.
 # Ctrl+F, type "alpha", Enter cycles, Esc closes
 ```
 
+## Zoom, executed (2026-11-08)
+
+Ctrl+= / Ctrl+- step through 25% … 500% (Ctrl+0 is 100%); the shell shows the
+percentage in the status bar. Each step sends `zoom <factor>`; the renderer
+clamps to `0.25..=5.0` and re-lays the kept page out at the new CSS width.
+
+**Layout in CSS pixels, frame in physical pixels.** `zoomed_w/zoomed_h` divide
+the physical viewport by the factor before layout, so a zoomed-in page reflows
+exactly as if the window were narrower. `headless_paint` then paints into a
+`pw/zoom × ph/zoom` buffer and bilinearly scales it to the frame's physical
+size. Scroll offsets stay in CSS pixels end to end (the shell divides wheel
+deltas by the factor), and `Command::Click` divides the shell's physical
+coordinates before the hit tests. At 100% the scale is skipped entirely, so the
+common path is byte-identical to before.
+
+## Acceptance
+
+Headless renderer on a page of long paragraphs (reflow is visible), stdin
+drove the flow:
+
+```
+zoom 2.0   doc_height 367.2 -> 799.2   (half the CSS width, more lines)
+zoom 0.5   doc_height -> 194.4         (double the CSS width, fewer lines)
+zoom 1.0   doc_height -> 367.2
+find needle (at 200%)  scroll-to 488.2  find-result 1 1
+zoom 99    ignored (out of range, no repaint)
+```
+
+Frame check: the first text band is 17 px tall at 100%, 32 px at 200% and 8 px
+at 50%; ink pixels 56k / 107k / 18k for the same viewport. A new shell unit
+test covers the step ladder and its sticky ends. Workspace tests: 901 engine +
+2 shell + 5 IPC + 5 media + 4 probe green.
+
+The keyboard chords themselves were not pressed on this host (fullscreen game);
+the renderer half above is the same `zoom` command the chords send. Manual
+check: Ctrl+= twice, Ctrl+-, Ctrl+0.
+
+## Shortcuts (deliberate)
+
+- Zoom is a raster scale: at 100% layout and frame match exactly, above 100%
+  the already-painted CSS frame is upscaled bilinearly (text gets soft rather
+  than re-rasterized at the new size). A vector-crisp zoom would need paint to
+  run at the physical scale.
+- One zoom for every tab; no per-site zoom memory, no Ctrl+wheel, no pinch.
+- Fixed elements, media rects and find highlights all scale with the frame;
+  there is no separate compositor layer to keep crisp.
+- 25% allocates a temporary 10.7 M-pixel CSS buffer (about 43 MB) for the
+  duration of one paint, on top of the physical frame.
+
+## Reproduce
+
+```powershell
+python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
+$env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/zoom.html
+# Ctrl+= twice, Ctrl+-, Ctrl+0
+```
+
 

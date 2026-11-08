@@ -13,8 +13,8 @@ Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux). **P3 is in place**:
 pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
 started**: `<a download>` streams to disk with a progress panel and lands in the
 user's Downloads folder, `<input type=file>` posts files as
-`multipart/form-data` through the native picker, and Ctrl+F finds text in the
-page with scroll-to-match highlights.
+`multipart/form-data` through the native picker, Ctrl+F finds text in the page
+with scroll-to-match highlights, and Ctrl+= / Ctrl+- zoom the page.
 
 ## Workspace
 
@@ -105,6 +105,11 @@ the laid-out text runs itself, replying `find-result <active> <total>`. Enter
 which the shell adopts for the active tab. Highlights are blended over the
 finished frame in the renderer (yellow for matches, orange for the active one),
 so closing the bar is just another repaint.
+
+Zoom (P4): Ctrl+= / Ctrl+- step 25%…500% (Ctrl+0 resets), shown in the status
+bar. The renderer lays the page out at `physical / zoom` CSS pixels and scales
+the painted frame back up, so the page reflows like a narrower window; clicks
+and wheel deltas are converted at the boundary.
 
 Self-test (decode, audio endpoint and DRM rejection, plain and through the real
 sandbox):

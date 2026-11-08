@@ -214,6 +214,8 @@ pub enum Command {
     FindStep(i32),
     /// close the find bar: drop the highlights
     FindClose,
+    /// page zoom factor (1.0 = 100%)
+    Zoom(f32),
     Quit,
 }
 
@@ -237,6 +239,7 @@ impl Command {
             }
             Command::FindStep(d) => format!("find-step {d}"),
             Command::FindClose => "find-close".to_string(),
+            Command::Zoom(z) => format!("zoom {z}"),
             Command::Quit => "quit".to_string(),
         }
     }
@@ -269,6 +272,7 @@ impl Command {
             "find" => Some(Command::Find(rest.to_string())),
             "find-step" => rest.trim().parse().ok().map(Command::FindStep),
             "find-close" => Some(Command::FindClose),
+            "zoom" => rest.trim().parse().ok().map(Command::Zoom),
             "file-chosen" => {
                 let (node, rest) = rest.split_once(' ')?;
                 let (name, path) = rest.split_once('\t')?;
@@ -465,6 +469,8 @@ mod tests {
             Command::FindStep(1),
             Command::FindStep(-1),
             Command::FindClose,
+            Command::Zoom(1.25),
+            Command::Zoom(0.25),
             Command::Quit,
         ];
         for c in cases {
