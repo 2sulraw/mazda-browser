@@ -454,6 +454,13 @@ a click on the second, non-autoplay video prints `play (opened)`, then `pause`.
 Real page `https://www.w3schools.com/html/html5_video.asp`: 2 playable videos,
 0 refused; click → `[media] play`, 100 frames; click again → `[media] pause`.
 
+Sandboxed shell (the real product path): the same page loads with
+`[media] 2 playable, 0 refused` and `2 player(s) handed to the renderer`, the
+painted frame advances while it plays, a click prints `play` and the next click
+`pause`. Shell + renderer while playing: **76.4 + 83.6 = 160.0 MB WS**
+(74.6 + 58.2 MB private) — under the 350 MB video envelope. Closing the shell
+takes the renderer with it (job object).
+
 Memory, release renderer, 1000x700:
 
 | Scenario | Working set | Private |
