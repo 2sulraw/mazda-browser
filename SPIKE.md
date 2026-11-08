@@ -890,7 +890,7 @@ The clock button (or Ctrl+H) opens a "Bookmarks & History" window anchored
 under the toolbar with bookmarks on top and the visit log below. The star button (or
 Ctrl+D) adds the active page to the bookmarks and fills the star while that URL
 is saved. Clicking a bookmark or a visit navigates the active tab and closes
-the panel; bookmarks have a `✕` remove button and the log has `Clear`.
+the panel; bookmarks have a `×` remove button and the log has `Clear`.
 
 **Two text files in the trusted process.** Both stores live under
 `%LOCALAPPDATA%\mazda-browser` (XDG on Linux) and are read once at startup.
@@ -923,12 +923,24 @@ stores_round_trip_through_disk
   LOCALAPPDATA so the real profile is untouched
 ```
 
-Workspace tests: 902 engine + 6 shell + 5 IPC + 5 media + 4 probe green.
+Workspace tests: 901 engine + 6 shell + 5 IPC + 4 media green.
 
-The panel and the two buttons were not clicked on this host (the fullscreen
-game still owns the desktop). Manual check: open a page, Ctrl+D (star fills),
-Ctrl+H (row at the top), click the row, then Clear. The stores themselves are
-covered by the disk round-trip test above.
+The panel and both buttons were driven on this host without touching the real
+cursor. `tools/ui-smoke.ps1` posts `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/
+`WM_LBUTTONUP` to the shell window and reads the scratch stores; `PrintWindow`
+with `PW_RENDERFULLCONTENT` captures the wgpu window even when another window
+owns the foreground. One run: printer button -> `[print] saved
+...\Downloads\data_text.pdf` (5,448 bytes, one page); star -> `bookmarks.tsv`
+written and 106 blue star pixels; star again -> file empty and 0 blue pixels;
+clock -> the panel with the bookmark row and a "just now" visit.
+
+Ordering matters for the click: send the park move, the target move, the press
+and the release back to back. A sleep between messages lets Windows post
+`WM_MOUSELEAVE`, which clears egui's pointer position, so the press is
+silently dropped. The park move also defeats winit's duplicate-position filter
+(a second move to the same pixel emits no `CursorMoved`). Both `✕` buttons
+(panel close, bookmark remove) had no glyph in the shell font and rendered as
+hollow boxes, so they are now `×`.
 
 ## Shortcuts (deliberate)
 
@@ -953,6 +965,13 @@ covered by the disk round-trip test above.
 python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
 $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/find.html
 # Ctrl+D, then Ctrl+H, click the visit, Clear
+```
+
+Same buttons without a cursor, no focus change:
+
+```powershell
+powershell -NoProfile -File tools\ui-smoke.ps1
+# PASS: chrome clicks, stores and screenshots in ...\Temp\mazda-ui-smoke
 ```
 
 

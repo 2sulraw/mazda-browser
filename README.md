@@ -155,6 +155,7 @@ Single-process reference (the pre-split app):
 .\tools\crash-check.ps1              # kill the renderer -> supervisor restarts + restores
 .\tools\sandbox-check.ps1            # home unreadable, no child, network, memory cap (P2 gate)
 .\tools\screenshot-shell.ps1 -Url https://example.com   # capture the real window
+.\tools\ui-smoke.ps1                 # click print/star/clock, assert stores + screenshots
 ```
 
 Reference sites: **Google, GitHub, YouTube** — heavy, real-world pages used

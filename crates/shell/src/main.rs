@@ -1930,7 +1930,7 @@ impl eframe::App for Shell {
                             ui.label(
                                 egui::RichText::new(count).color(MUTED).size(11.5),
                             );
-                            if ui.button("✕").clicked() {
+                            if ui.button("×").clicked() {
                                 close_now = true;
                             }
                             if resp.changed() {
@@ -2197,7 +2197,7 @@ impl eframe::App for Shell {
                                 go = Some(b.url.clone());
                             }
                             if ui
-                                .small_button("✕")
+                                .small_button("×")
                                 .on_hover_text("Remove bookmark")
                                 .clicked()
                             {
