@@ -113,6 +113,10 @@ bar. The renderer lays the page out at `physical / zoom` CSS pixels and scales
 the painted frame back up, so the page reflows like a narrower window; clicks
 and wheel deltas are converted at the boundary.
 
+The stdin control channel also accepts `find`, `find-step`, `find-close` and
+`zoom in|out|reset`, so the bar, highlights and zoom badge can be exercised
+without taking the foreground from another app.
+
 Print (P4): the toolbar printer button (or Ctrl+P) sends `print`. The renderer
 paints the whole document in A4 slices at CSS resolution, scales each slice into
 a 794x1123 page bitmap with a half-inch margin, zlib-compresses the RGB planes

@@ -580,6 +580,10 @@ enum Ctl {
     Open(String),
     Close(usize),
     Reload,
+    Find(String),
+    FindStep(i32),
+    FindClose,
+    Zoom(i32),
     Status,
     Quit,
 }
@@ -594,6 +598,15 @@ impl Ctl {
             "open" if !rest.is_empty() => Some(Ctl::Open(rest.to_string())),
             "close" => rest.parse().ok().map(Ctl::Close),
             "reload" => Some(Ctl::Reload),
+            "find" => Some(Ctl::Find(rest.to_string())),
+            "find-step" => rest.parse().ok().map(Ctl::FindStep),
+            "find-close" => Some(Ctl::FindClose),
+            "zoom" => match rest {
+                "in" => Some(Ctl::Zoom(1)),
+                "out" => Some(Ctl::Zoom(-1)),
+                "reset" => Some(Ctl::Zoom(0)),
+                _ => None,
+            },
             "status" => Some(Ctl::Status),
             "quit" => Some(Ctl::Quit),
             _ => None,
@@ -763,6 +776,16 @@ impl Shell {
             self.find_active = 0;
             self.find_total = 0;
             self.r.send(Command::FindClose);
+        }
+    }
+
+    /// One zoom step; `dir == 0` resets to 100% (Ctrl+= / Ctrl+- / Ctrl+0).
+    fn zoom_by(&mut self, dir: i32) {
+        let z = if dir == 0 { 1.0 } else { zoom_step(self.zoom, dir) };
+        if (z - self.zoom).abs() > 0.001 {
+            self.zoom = z;
+            self.r.send(Command::Zoom(z));
+            println!("[zoom] {:.2}", z);
         }
     }
 
@@ -1288,6 +1311,19 @@ impl Shell {
                 }
                 Ctl::Close(i) => self.close_tab(i),
                 Ctl::Reload => self.reload(),
+                Ctl::Find(q) => {
+                    self.find_open = true;
+                    self.find_focus = true;
+                    self.find_query = q.clone();
+                    self.r.send(Command::Find(q));
+                }
+                Ctl::FindStep(d) => {
+                    if d != 0 {
+                        self.r.send(Command::FindStep(d.signum()));
+                    }
+                }
+                Ctl::FindClose => self.close_find(),
+                Ctl::Zoom(dir) => self.zoom_by(dir),
                 Ctl::Status => {
                     let shell = process_private_mb(std::process::id()).unwrap_or(0.0);
                     println!(
@@ -1873,16 +1909,11 @@ impl eframe::App for Shell {
         if self.find_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_find();
         }
-        if k_zoom != 0 || k_zoom_reset {
-            let z = if k_zoom_reset {
-                1.0
-            } else {
-                zoom_step(self.zoom, k_zoom)
-            };
-            if (z - self.zoom).abs() > 0.001 {
-                self.zoom = z;
-                self.r.send(Command::Zoom(z));
-            }
+        if k_zoom != 0 {
+            self.zoom_by(k_zoom);
+        }
+        if k_zoom_reset {
+            self.zoom_by(0);
         }
         if k_next != 0 {
             let n = self.tabs.len() as i32;
@@ -2568,6 +2599,18 @@ mod tests {
         assert_eq!(a.file_name().unwrap(), "notes.txt");
         assert_eq!(b.file_name().unwrap(), "notes (1).txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_verbs_parse() {
+        assert!(matches!(Ctl::parse("find alpha"), Some(Ctl::Find(q)) if q == "alpha"));
+        assert!(matches!(Ctl::parse("find"), Some(Ctl::Find(q)) if q.is_empty()));
+        assert!(matches!(Ctl::parse("find-step -1"), Some(Ctl::FindStep(-1))));
+        assert!(matches!(Ctl::parse("find-close"), Some(Ctl::FindClose)));
+        assert!(matches!(Ctl::parse("zoom in"), Some(Ctl::Zoom(1))));
+        assert!(matches!(Ctl::parse("zoom out"), Some(Ctl::Zoom(-1))));
+        assert!(matches!(Ctl::parse("zoom reset"), Some(Ctl::Zoom(0))));
+        assert!(Ctl::parse("zoom sideways").is_none());
     }
 
     #[test]

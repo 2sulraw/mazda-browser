@@ -534,7 +534,7 @@ UI: a toolbar download button (accent dot while a transfer is live) toggles a
 Downloads panel with a progress bar per active transfer and clickable saved-file
 links; the status bar reads `Downloading <name> — <pct>`.
 
-## Acceptance (partial)
+## Acceptance
 
 Headless renderer, `data:` page with one download link:
 
@@ -560,7 +560,9 @@ AppContainer blocks loopback), two links:
 788493 bytes on disk, equal to the server's `Content-Length`. A second click
 saved `movie (1).mp4` (dedupe, no overwrite). The panel showed a live `9 %`
 bar, the finished entry as a link, and the status bar
-`Downloading movie.mp4 — 9 %`.
+`Downloading movie.mp4 — 9 %`. The toolbar badge was also clicked with posted
+messages in the later find/zoom run: the panel listed `data_text.pdf saved`
+and stayed open across the steps (`%TEMP%\mazda-ui-test11\1-downloads.png`).
 
 ## Shortcuts (deliberate)
 
@@ -729,12 +731,17 @@ find-result 0 0
 Pixel check on the published frame: the plane painted with an active
 `find alpha` result has 2,845 yellowish and 127 orange pixels; the next plane
 (painted by the bare `find` clear) has none. Two new unit tests cover the
-scroll clamp and the blend math. Workspace tests: 901 engine + 1 shell + 5 IPC
-+ 5 media + 4 probe green.
+scroll clamp and the blend math. Workspace tests: 901 engine + 7 shell + 5 IPC
++ 4 media green.
 
-The egui bar itself was not clicked on this host (the fullscreen game still owns
-the desktop); its wiring is the same `Command`/`Event` pair exercised above in
-headless mode. Manual check: Ctrl+F, type a word, Enter cycles, Esc closes.
+The real shell was then driven through its stdin control channel (`find alpha`, `find-step 1`, `find-step -1`,
+`find-close`), because this host's fullscreen game takes the foreground back
+before a synthetic Ctrl+F can land. The bar showed `alpha`, `1/3` and a `×`; the
+`<h1>` hit was orange and the two paragraph hits yellow
+(`%TEMP%\mazda-ui-test11\2-find.png`). Step and back logged `2/3` and `1/3`,
+close logged `0/0` and repainted without highlights
+(`3-find-step.png` / `4-find-closed.png`). The Ctrl+F, Enter and Esc handlers
+call the same methods, so the keyboard path ends in the code verified here.
 
 ## Shortcuts (deliberate)
 
@@ -758,6 +765,8 @@ headless mode. Manual check: Ctrl+F, type a word, Enter cycles, Esc closes.
 python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
 $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/find.html
 # Ctrl+F, type "alpha", Enter cycles, Esc closes
+# The same bar is reachable from stdin once the page is loaded:
+#   find alpha / find-step 1 / find-close
 ```
 
 ## Zoom, executed (2026-11-08)
@@ -791,11 +800,15 @@ zoom 99    ignored (out of range, no repaint)
 Frame check: the first text band is 17 px tall at 100%, 32 px at 200% and 8 px
 at 50%; ink pixels 56k / 107k / 18k for the same viewport. A new shell unit
 test covers the step ladder and its sticky ends. Workspace tests: 901 engine +
-2 shell + 5 IPC + 5 media + 4 probe green.
+7 shell + 5 IPC + 4 media green.
 
-The keyboard chords themselves were not pressed on this host (fullscreen game);
-the renderer half above is the same `zoom` command the chords send. Manual
-check: Ctrl+= twice, Ctrl+-, Ctrl+0.
+The real shell was driven through the stdin verbs (`zoom in` twice, then
+`zoom reset`) because the key chords cannot hold focus on this host. The status
+badge read 110%, then 125%, then dropped back to the 100% default, and the
+shell logged `[zoom] 1.10`, `1.25`, `1.00` (`%TEMP%\mazda-ui-test11\5-zoom-in.png`
+… `7-zoom-reset.png`). Each step also logged `[nav] worker finished …` and
+`[page] …`: those are the zoom relayout jobs at the new CSS width, not page
+loads. Ctrl+= / Ctrl+- / Ctrl+0 run the same `zoom_by` path.
 
 ## Shortcuts (deliberate)
 
@@ -815,6 +828,7 @@ check: Ctrl+= twice, Ctrl+-, Ctrl+0.
 python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
 $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/zoom.html
 # Ctrl+= twice, Ctrl+-, Ctrl+0
+# or send zoom in / zoom in / zoom reset on stdin after the page loads
 ```
 
 ## Print to PDF, executed (2026-11-08)
@@ -854,12 +868,14 @@ objects and one `/Type /Pages` node with `/Count 3`, three
 the last is sparse, as expected for the short tail of the document (70
 paragraphs do not divide evenly into the page height). One new engine unit
 test builds a two-image PDF and checks the page/image counts and the xref
-offset against the raw bytes. Workspace tests: 902 engine + 3 shell + 5 IPC +
-5 media + 4 probe green.
+offset against the raw bytes. Workspace tests: 901 engine + 7 shell + 5 IPC +
+4 media green.
 
-The button and Ctrl+P were not pressed on this host (the fullscreen game still
-owns the desktop); the headless run above uses the same `print` command. Manual
-check: click the printer icon, watch for the file in Downloads.
+The printer button was clicked in the real window by `tools/ui-smoke.ps1`
+(posted messages, no cursor movement): it wrote a 5,448-byte PDF into the
+scratch Downloads folder. A second run on a `data:` page wrote 5,202 bytes and
+the Downloads panel listed `data_text.pdf saved`. Ctrl+P itself cannot be held
+on this host, but it dispatches to the same `print` command.
 
 ## Shortcuts (deliberate)
 
@@ -923,7 +939,7 @@ stores_round_trip_through_disk
   LOCALAPPDATA so the real profile is untouched
 ```
 
-Workspace tests: 901 engine + 6 shell + 5 IPC + 4 media green.
+Workspace tests: 901 engine + 7 shell + 5 IPC + 4 media green.
 
 The panel and both buttons were driven on this host without touching the real
 cursor. `tools/ui-smoke.ps1` posts `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/
