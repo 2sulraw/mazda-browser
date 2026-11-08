@@ -981,6 +981,14 @@ impl JsError {
 pub struct Env {
     parent: Option<Rc<Env>>,
     bindings: RefCell<Vec<Binding>>,
+    /// `this` of the nearest function frame. Block scopes leave it `None`
+    /// and resolution walks to the frame; arrows store their lexical `this`
+    /// so the binding exists exactly where the language says it does.
+    this: Option<Val>,
+    /// `new.target` of a non-arrow frame (`Some(Undefined)` for a plain
+    /// call, which must shadow an outer constructor). Arrow frames leave it
+    /// `None` so they see the enclosing function's value.
+    new_target: Option<Val>,
     /// page that owns this scope: lets `JsEngine::drop` clear exactly its own
     /// page's environments (see `clear_page_envs`).
     page: u64,
@@ -1203,13 +1211,15 @@ fn clear_page_graph(page: u64) {
 impl Env {
     /// Root scope of the current page (bound functions, tests).
     pub fn root() -> Rc<Env> {
-        Self::with_page(current_page())
+        Self::with_page(current_page(), None)
     }
 
-    fn with_page(page: u64) -> Rc<Env> {
+    fn with_page(page: u64, this: Option<Val>) -> Rc<Env> {
         let env = Rc::new(Env {
             parent: None,
             bindings: RefCell::new(Vec::new()),
+            this,
+            new_target: None,
             page,
         });
         register_env(&env);
@@ -1220,6 +1230,22 @@ impl Env {
         let env = Rc::new(Env {
             parent: Some(parent.clone()),
             bindings: RefCell::new(Vec::new()),
+            this: None,
+            new_target: None,
+            page: parent.page,
+        });
+        register_env(&env);
+        env
+    }
+
+    /// Function-call frame. `new_target` is `None` for an arrow (it inherits
+    /// through the env chain) and `Some` for every ordinary function.
+    fn call_frame(parent: &Rc<Env>, this: Val, new_target: Option<Val>) -> Rc<Env> {
+        let env = Rc::new(Env {
+            parent: Some(parent.clone()),
+            bindings: RefCell::new(Vec::new()),
+            this: Some(this),
+            new_target,
             page: parent.page,
         });
         register_env(&env);
@@ -1422,6 +1448,10 @@ pub struct JsEngine {
     /// `Error.prototype` — parent of every error instance, so `extends
     /// Error` and borrowed `Error.prototype.toString` both work
     pub(crate) error_proto: Option<Rc<RefCell<Obj>>>,
+    /// Synthetic binding name every value-using call frame declares. Cached
+    /// per engine so a call clones the `Rc` instead of allocating a fresh
+    /// string; it is on the hottest path in the interpreter.
+    pub(crate) arguments_key: Rc<str>,
     /// compiled-once regex literal cache, keyed by (pattern, flags). Regex
     /// literals are program text, so this cache is bounded by the number of
     /// distinct (pattern, flags) literals the page can create; still capped
@@ -1619,11 +1649,13 @@ impl JsEngine {
         // table so a long session keeps interning the CURRENT page's keys
         clear_key_intern();
         let page = page_start();
-        let global_env = Env::with_page(page);
+        let global_obj = new_obj(ObjKind::Plain, Vec::new(), None);
+        // global code's `this` is the global object (sloppy mode)
+        let global_env = Env::with_page(page, Some(Val::Obj(global_obj.clone())));
         let mut e = JsEngine {
             global_env,
             page,
-            global_obj: new_obj(ObjKind::Plain, Vec::new(), None),
+            global_obj,
             array_proto: None,
             object_proto: None,
             natives: Vec::new(),
@@ -1656,7 +1688,8 @@ impl JsEngine {
             abort_signal_proto: None,
             abort_controller_proto: None,
             function_proto: None,
-        error_proto: None,
+            error_proto: None,
+            arguments_key: Rc::from("arguments"),
             regex_cache: HashMap::new(),
             next_timer_id: 1.0,
             steps: 0,
@@ -2157,7 +2190,6 @@ impl JsEngine {
         let construct_target = self.pending_construct.take();
         match callee {
             Val::Func(c) => {
-                let env = Env::child(&c.env);
                 let this_val = if c.is_arrow {
                     c.this.as_deref().cloned().unwrap_or(Val::Undefined) // lexical this
                 } else if matches!(this, Val::Undefined) {
@@ -2166,18 +2198,18 @@ impl JsEngine {
                 } else {
                     this
                 };
-                env.declare(Rc::from("this"), this_val.clone(), false);
-                if !c.is_arrow {
-                    // arrows see the enclosing function's `new.target`
-                    env.declare(
-                        Rc::from("#new.target"),
-                        construct_target.unwrap_or(Val::Undefined),
-                        false,
-                    );
-                }
+                // arrows see the enclosing function's `new.target`, so they
+                // leave the slot empty; every ordinary frame shadows an outer
+                // constructor with its own value (undefined for a plain call)
+                let new_target = if c.is_arrow {
+                    None
+                } else {
+                    Some(construct_target.unwrap_or(Val::Undefined))
+                };
+                let env = Env::call_frame(&c.env, this_val, new_target);
                 if !c.is_arrow && c.def.uses_arguments {
                     let items = args.clone();
-                    env.declare(Rc::from("arguments"), Val::new_array(items), false);
+                    env.declare(self.arguments_key.clone(), Val::new_array(items), false);
                 }
                 interp::bind_params(self, &env, &c.def, &args)?;
                 if c.def.is_generator {
@@ -2257,6 +2289,16 @@ impl JsEngine {
     // -- identifier resolution (env chain, then global object) --------------
 
     pub(crate) fn env_get(&self, env: &Rc<Env>, name: &str) -> Val {
+        // `this` / `new.target` are frame slots, not bindings: no per-call
+        // `Rc<str>` allocation and no entries in the binding vec. These two
+        // compares run before the normal chain walk, so ordinary identifiers
+        // pay nothing extra per scope.
+        if name == "this" {
+            return Self::frame_slot(env, "this");
+        }
+        if name == "#new.target" {
+            return Self::frame_slot(env, "#new.target");
+        }
         let mut cur: &Env = env;
         loop {
             if let Some(v) = cur.bindings.borrow().iter().find(|b| b.name.as_ref() == name) {
@@ -2276,6 +2318,29 @@ impl JsEngine {
             note_js_miss("global", name);
         }
         v
+    }
+
+    /// Resolve a function-frame slot (`this` or `new.target`) through the
+    /// scope chain. Block scopes carry `None`, so the walk stops at the
+    /// nearest function frame; an arrow leaves `new.target` empty on purpose.
+    fn frame_slot(env: &Rc<Env>, name: &str) -> Val {
+        let want_this = name == "this";
+        let mut cur: &Env = env;
+        loop {
+            let hit = if want_this {
+                cur.this.as_ref()
+            } else {
+                cur.new_target.as_ref()
+            };
+            if let Some(v) = hit {
+                return v.clone();
+            }
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        Val::Undefined
     }
 
     /// Assignment: walks the chain; const bindings throw; unknown names are

@@ -41,6 +41,10 @@ const BENCHES: &[Bench] = &[
         name: "closure x300k",
         src: include_str!("../../benches-js/closure.js"),
     },
+    Bench {
+        name: "call x300k",
+        src: include_str!("../../benches-js/call.js"),
+    },
 ];
 
 fn run(src: &str) -> Result<(), String> {

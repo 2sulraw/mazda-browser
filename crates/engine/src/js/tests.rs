@@ -487,6 +487,8 @@ fn this_binding() {
     assert_eq!(num("let o = {v: 3, m: function() { return this.v }}; o.m()"), 3.0);
     // plain call: this = global object (sloppy mode, documented)
     assert_eq!(num("globalThis.gv = 9; function f() { return this.gv } f()"), 9.0);
+    // top-level `this` is the global object too
+    assert!(boolean("this === globalThis"));
     // call/apply/bind
     assert_eq!(num("let o = {v: 4}; function f() { return this.v } f.call(o)"), 4.0);
     assert_eq!(num("let o = {v: 5}; function f(x) { return this.v + x } f.apply(o, [2])"), 7.0);
@@ -1150,6 +1152,10 @@ fn new_target_and_private_brand_checks() {
     // an arrow inside a constructor sees the constructor's new.target
     assert!(boolean(
         "function F() { this.ok = (() => new.target === F)(); } new F().ok"
+    ));
+    // a plain nested call shadows it with undefined rather than inheriting
+    assert!(boolean(
+        "function F() { function g() { return new.target } this.ok = g() === undefined } new F().ok"
     ));
 }
 

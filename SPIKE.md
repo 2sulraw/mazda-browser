@@ -993,7 +993,7 @@ powershell -NoProfile -File tools\ui-smoke.ps1
 ## JavaScript performance baseline (2026-11-09)
 
 P5 starts with a number, not an optimization. Two binaries measure the engine
-as shipped: a test262 runner for correctness and a six-program bench for speed.
+as shipped: a test262 runner for correctness and a small bench set for speed.
 The point is to pick the first change from evidence - the interpreter is a
 tree-walker with linear property lookup, so the guess was property access, and
 the bench had to confirm it.
@@ -1009,9 +1009,10 @@ recorded at the end of this section with its own A/B measurement.
   once. A panic is caught per file, so one pathological test cannot abort the
   run; with `MAZDA_TEST262_TRACE=1` every path is printed as it starts, which
   makes a hung run diagnosable.
-- `crates/engine/src/bin/js-bench.rs` runs six small programs
+- `crates/engine/src/bin/js-bench.rs` runs small programs
   (`benches-js/loop.js`, `fib.js`, `property.js`, `array.js`, `string.js`,
-  `closure.js`) N times and reports min/median/mean. Every sample builds a
+  `closure.js`, plus `call.js` from step 2) N times and reports
+  min/median/mean. Every sample builds a
   fresh `JsEngine`, so parse plus execution is included - what a page pays per
   script. Each program checksums its own result, so a broken optimization
   cannot silently benchmark different work.
@@ -1058,6 +1059,9 @@ The failure list is useful as a work queue, not just a score:
 | array x100k | 85.93 ms | **95.33 ms** | 95.28 ms |
 | string x2k | 15.84 ms | **18.54 ms** | 18.30 ms |
 | closure x300k | 209.95 ms | **224.52 ms** | 231.88 ms |
+
+`call x300k` was added during step 2, after a diagnostic run showed calls were
+the larger cost; its before/after lives in that section.
 
 ### Interpretation
 
@@ -1118,6 +1122,52 @@ made for them; only the targeted benchmark is compared.
 Same test262 invocation, same 23,832 files: **17,678 run, 6,950 pass, 10,728
 fail, 6,154 skip** - identical counts to the baseline, zero panics. The change
 moves speed, not behavior. Workspace tests stay green (902 engine).
+
+### Step 2: call frames (2026-11-09)
+
+A temporary diagnostic bench (`s += f()` 300k times) showed the interpreter
+spends more in one call than in four property operations, so calls became the
+next target. The step removes per-call work rather than adding a compiler:
+
+- `this` and `new.target` are no longer bindings. Each `Env` has a `this` and
+  `new_target` slot; block scopes leave them empty and the lookup walks to the
+  nearest function frame. One ordinary frame stores `Some(Undefined)` for
+  `new.target`, which shadows an outer constructor exactly like the spec;
+  arrows leave the slot empty so they see the enclosing function's value.
+- `arguments`, `this` and `new.target` used to build a fresh `Rc<str>` name on
+  every call. The one binding that remains (`arguments`) reuses a cached name,
+  so a zero-argument call now allocates only its `Env` (the bindings `Vec`
+  stays empty).
+- The global frame carries the global object as `this`, so top-level `this`
+  stays the global object now that it no longer resolves through a binding.
+
+`call x300k` joined the permanent bench set (`benches-js/call.js`), so call
+cost is measured directly from now on.
+
+**Method.** Same as step 1: binaries from the step-1 commit and this working
+tree, same release profile, three alternating full runs.
+
+| program | before (median of 3) | after (median of 3) | change |
+|---|---:|---:|---:|
+| call x300k | 181.7 ms | **130.7 ms** | **-28%** |
+| closure x300k | 225.8 ms | **163.4 ms** | **-28%** |
+| fib(22) | 29.9 ms | **26.3 ms** | **-12%** |
+| property x300k | 188.2 ms | 202.4 ms | wash (see below) |
+
+Property looked 7% slower in the interleaved full runs, so it was re-measured
+on its own with the order reversed: after 188.9 / 202.7 / 191.9 ms against
+before 191.8 / 203.6 / 177.8 ms. That is a wash, not a regression; the call
+numbers reproduce in both orders.
+
+### Step 2: correctness
+
+Test262 initially lost 47 tests: top-level `this` had been resolving through
+the global object's own `"this"` property, and the frame walk returned
+undefined once that fallback was gone. Giving the global frame an explicit
+`this` restored the exact baseline counts: **17,678 run, 6,950 pass, 10,728
+fail, 6,154 skip**, zero panics, 15.2 s. Two regression assertions cover
+top-level `this === globalThis` and the plain nested call that must shadow an
+outer `new.target`. Workspace tests stay green (902 engine).
 
 ### Shortcuts (deliberate)
 
