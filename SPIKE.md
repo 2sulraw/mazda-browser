@@ -390,3 +390,113 @@ unchanged from P1 (174–182 MB vs 180.8 MB), comfortably under the 300 MB
 budget. Tab switches cost 1.3–15 s, dominated by the page fetch (no warm
 cache in a fresh sandbox temp dir), not by the sandbox.
 
+# P3 — media, executed (2026-11-08)
+
+Build: `cargo build --release --workspace --offline --features mazda-engine/woff2`.
+Host: Windows 11, standard user. Test clip: 3 s 320x180 H.264 baseline + AAC
+(ffmpeg), page with two `<video>` (one `autoplay muted`, one click-to-play),
+served by `python -m http.server`.
+
+## What was built
+
+New `crates/media` (`mazda-media`) — the whole playback path in Rust, borrowing
+only the OS codecs:
+
+- **`mp4.rs`** — pure-Rust ISO-BMFF walk: `ftyp`/`moov`, recursive `mdia`/`hdlr`,
+  track count, size from `tkhd`, duration from `mvhd`, and a DRM byte scan
+  (`encv`/`enca`/`sinf`/...). Four unit tests, no I/O.
+- **Windows backend** — Media Foundation `IMFSourceReader` with
+  `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING` asking for `RGB32`, so
+  video is decoded and converted at the display size; a negative stride is
+  flipped on read. Audio runs on its own thread through WASAPI shared mode
+  (reader format), started paused so a muted or idle player costs no endpoint.
+- **`stub.rs`** — non-Windows returns `Unsupported`; the crate still compiles
+  and links everywhere, so Linux keeps building.
+- **`Player`** — `open` reads the file and rejects non-MP4/DRM *before* any
+  decoder exists, then `play`/`pause`/`toggle`/`seek`/`next_frame`/`set_muted`/
+  `set_looping`, paced on the wall clock.
+
+`crates/media-probe` self-tests it: once directly, once through the real
+sandbox (`mazda-sandbox::spawn`), because Media Foundation and WASAPI have to
+work inside the AppContainer.
+
+Engine integration (`crates/engine`):
+
+- **`layout.rs`** — `<video>` is a replaced element (`MediaSlot`) sized from the
+  `width`/`height` attributes; `width` with auto height takes the intrinsic
+  ratio once probed; `object-fit` reuses the shared replaced-element rect.
+  `<audio>` gets no box. Candidates: `src`, then every `<source src>` in order.
+- **Worker** — `probe_media` fetches each candidate through the shared `fetch`
+  path (20 MB cap, disk cache), parses the header, copies the bytes to
+  `cache_dir()/media/<hash>.mp4`, decodes the first frame into `Layout::images`,
+  and ships a `MediaEntry` (file, draw rect, flags) on the page wire.
+- **Renderer** — opens its own `Player` for a `MediaEntry` and replaces that
+  image's pixels per frame. Only `autoplay muted` starts by itself; every other
+  video opens lazily on the first click (no decoder memory until watched), and
+  a click inside the video rect toggles play/pause. Players are dropped on
+  navigation, and the 16 ms loop repaints only while something plays.
+
+## Acceptance
+
+`media-probe`, plain and sandboxed:
+
+```
+PASS decoded 59 frames
+PASS audio endpoint
+PASS DRM rejected
+media probe: all checks passed
+```
+
+Local page: 172 frames in 6 s, correct colours and orientation; a 160 px-wide
+video lays out at the true 16:9 height; click pauses (86 frames, ≈3 s played);
+a click on the second, non-autoplay video prints `play (opened)`, then `pause`.
+
+Real page `https://www.w3schools.com/html/html5_video.asp`: 2 playable videos,
+0 refused; click → `[media] play`, 100 frames; click again → `[media] pause`.
+
+Memory, release renderer, 1000x700:
+
+| Scenario | Working set | Private |
+|---|---:|---:|
+| idle, no page | 10.0 MB | 3.7 MB |
+| page loaded, `MAZDA_NO_MEDIA=1` | 15.9 MB | 5.8 MB |
+| same page, two videos playing | **62.9 MB** | **42.5 MB** |
+
+Media cost while playing: **+47 MB WS / +36.7 MB private** — inside the +80 MB
+budget; with no media (or playback disabled) the cost is **0**. Eight reloads
+of the playing page: WS flat at 61.2–61.7 MB (no player leak).
+
+Gate: **PASS** — a local MP4 and a real page video play, +47 MB ≤ +80 MB,
+0 MB idle, DRM refuses before a decoder is created.
+
+## Shortcuts (deliberate)
+
+- Every video on a page can play at once (one decoder each); there is no
+  per-page or per-tab media budget yet, and no audio ducking.
+- No `HTMLMediaElement` JS API and no native controls: clicks toggle
+  play/pause, and playback state is invisible to the DOM.
+- MP4/H.264/AAC only (what Media Foundation is sure to have); no WebM/VP9;
+  no streaming, MSE or EME — the whole file is fetched.
+- The HTTP disk cache refuses bodies > 5 MB, so large clips are re-fetched and
+  copied to `cache_dir()/media/` every load instead of replaying from cache.
+- AppContainer loopback is still blocked: local test pages need
+  `MAZDA_SANDBOX=off` until a loopback exemption or socket broker exists.
+
+## Reproduce
+
+```powershell
+# 3 s 320x180 H.264 + AAC clip
+ffmpeg -f lavfi -i testsrc=size=320x180:rate=30 -f lavfi -i sine=frequency=440 `
+  -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac "$env:TEMP\mazda-test.mp4"
+cargo run --release -p media-probe -- --file "$env:TEMP\mazda-test.mp4"
+# runs twice: plain, then through the real sandbox
+
+# local page (renderer unsandboxed: AppContainer blocks loopback)
+python -m http.server 8766 --bind 127.0.0.1 --directory "$env:TEMP\mazda-media-page"
+$env:MAZDA_SANDBOX="off"; .\target\release\renderer.exe --size 1000x700
+
+# A/B the media cost: same page with playback probed out
+$env:MAZDA_NO_MEDIA="1"; .\target\release\renderer.exe --size 1000x700
+```
+
+

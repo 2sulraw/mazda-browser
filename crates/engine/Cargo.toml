@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 mazda-ipc = { path = "../ipc" }
+mazda-media = { path = "../media" }
 
 # process RSS reporting (Windows only)
 [target.'cfg(windows)'.dependencies]

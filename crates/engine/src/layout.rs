@@ -527,6 +527,73 @@ impl ImgSlot {
     }
 }
 
+/// `<video>` state on its box. The element is a replaced element like
+/// `<img>`: layout sizes it from the container's intrinsic video size, the
+/// worker decodes the first frame into [`Layout::images`], and the renderer
+/// keeps replacing those pixels as playback advances.
+///
+/// `<audio>` never gets a box (no paint), so only video boxes carry this.
+pub struct MediaSlot {
+    /// candidate URLs in document order (`src`, then every `<source src>`)
+    pub srcs: Vec<std::rc::Rc<str>>,
+    pub autoplay: bool,
+    pub muted: bool,
+    pub looping: bool,
+    /// worker probe results: the decoded file on disk + its dimensions
+    pub path: Option<std::rc::Rc<str>>,
+    pub w: u32,
+    pub h: u32,
+    pub duration: f64,
+    /// the fetch or the container was refused (DRM, unsupported, too big)
+    pub failed: bool,
+    /// height follows the intrinsic aspect ratio (`width` declared, `height`
+    /// auto): resolved at the end of the box's layout
+    pub auto_h: bool,
+    /// index into [`Layout::images`] of the frame the box paints
+    pub img: Option<usize>,
+}
+
+impl MediaSlot {
+    /// intrinsic (w, h) once probed
+    pub fn dims(&self) -> Option<(u32, u32)> {
+        (self.w > 0 && self.h > 0).then_some((self.w, self.h))
+    }
+
+    /// playback metadata for the page wire / renderer
+    pub fn entry(&self, rect: (f32, f32, f32, f32), fixed: bool) -> Option<MediaEntry> {
+        Some(MediaEntry {
+            x: rect.0,
+            y: rect.1,
+            w: rect.2,
+            h: rect.3,
+            fixed,
+            path: self.path.clone()?.to_string(),
+            index: self.img?,
+            autoplay: self.autoplay,
+            muted: self.muted,
+            looping: self.looping,
+        })
+    }
+}
+
+/// One playable `<video>` handed to the renderer.
+#[derive(Clone, Debug)]
+pub struct MediaEntry {
+    /// draw rect in document coords (the object-fit content rect)
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub fixed: bool,
+    /// local file the renderer opens (the worker already fetched it)
+    pub path: String,
+    /// index into [`Layout::images`] — the renderer swaps its pixels
+    pub index: usize,
+    pub autoplay: bool,
+    pub muted: bool,
+    pub looping: bool,
+}
+
 /// Resolve `object-fit`/`object-position` into (content rect, crop window)
 /// inside `bx` (the replaced element's padding box). The content rect keeps
 /// the intrinsic aspect ratio for every mode but `fill`; `object-position`
@@ -695,6 +762,8 @@ pub struct BoxNode {
     pub node: Option<u32>,
     /// `<img>` replacement data (None for every other box)
     pub img: Option<ImgSlot>,
+    /// `<video>` replacement data (None for every other box)
+    pub media: Option<MediaSlot>,
     /// object-fit content rect in document coords — where the image's pixels
     /// actually go. None = the box itself (initial `fill` / no declaration),
     /// which keeps the legacy draw path byte-identical.
@@ -751,6 +820,7 @@ impl BoxNode {
             link: None,
             node: None,
             img: None,
+            media: None,
             img_fit: None,
             img_clip: None,
             form: None,
@@ -782,6 +852,7 @@ impl BoxNode {
             link,
             node: None,
             img: None,
+            media: None,
             img_fit: None,
             img_clip: None,
             form: None,
@@ -805,6 +876,26 @@ impl BoxNode {
 const NON_RENDERED: &[&str] = &[
     "script", "style", "noscript", "template", "head", "title", "meta", "link", "source", "track",
 ];
+
+/// `<video src>` plus every `<source src>` child, in document order — the
+/// candidates the media probe tries until one container is playable.
+fn media_srcs(dom: &Dom, node: u32) -> Vec<std::rc::Rc<str>> {
+    let attr = |n: u32| {
+        dom.attr(n, "src")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| std::rc::Rc::from(s))
+    };
+    let mut out: Vec<std::rc::Rc<str>> = attr(node).into_iter().collect();
+    for &c in &dom.nodes[node as usize].children {
+        if dom.tag(c) == "source" {
+            if let Some(src) = attr(c) {
+                out.push(src);
+            }
+        }
+    }
+    out
+}
 
 /// Build the box tree for `node`'s subtree. `style`/`bx` are the cascade
 /// result for `node` itself (main resolves body before calling).
@@ -1398,34 +1489,67 @@ fn build_into(
                     out.push(g);
                     continue;
                 }
-                // <video>/<audio>: the media tier is gated (wave 28 ships the
-                // EME/playback fail-fast, not a decoder). A truthful
-                // placeholder beats the old empty hole; `poster` reuses the
-                // shared image pipeline, so a video that declares one still
-                // shows its frame.
+                // <video>/<audio>: replaced elements. Video carries a
+                // [`MediaSlot`] the worker probes (fetch + MP4 header) and the
+                // renderer plays; `<audio>` has no box at all (no paint — its
+                // playback lands with the audio-only path).
                 if tag == "video" || tag == "audio" {
+                    if tag == "audio" {
+                        continue;
+                    }
                     let mut g = BoxNode::group(outcome.style, outcome.bx);
                     g.node = Some(child);
                     g.bx.cursor = cur;
-                    // UA replaced-element size (video 300x150, audio 300x32)
-                    let (dw, dh) = if tag == "video" {
-                        (300.0, 150.0)
-                    } else {
-                        (300.0, 32.0)
-                    };
+                    // width/height attributes are presentational hints; CSS wins
                     if g.bx.width.is_none() {
-                        g.bx.width = Some(Len::Px(dw));
+                        g.bx.width = dom
+                            .attr(child, "width")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .map(Len::Px);
                     }
-                    // block boxes in this engine take their height from
-                    // content, so a declared/UA height becomes a min-height
-                    // floor (the `<button>` chrome uses the same idiom)
+                    let declared_w = g.bx.width.is_some();
+                    if g.bx.height.is_none() {
+                        g.bx.height = dom
+                            .attr(child, "height")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .map(Len::Px);
+                    }
+                    // width declared, height auto: the intrinsic ratio decides
+                    // the height once the worker knows the video size
+                    let auto_h = declared_w && g.bx.height.is_none();
+                    if g.bx.width.is_none() {
+                        g.bx.width = Some(Len::Px(300.0)); // UA replaced size
+                    }
                     if g.bx.min_height.is_none() {
-                        g.bx.min_height = Some(g.bx.height.unwrap_or(Len::Px(dh)));
+                        g.bx.min_height = Some(g.bx.height.unwrap_or(Len::Px(if auto_h {
+                            0.0
+                        } else {
+                            150.0
+                        })));
                     }
+                    let srcs = media_srcs(dom, child);
+                    if !srcs.is_empty() {
+                        g.media = Some(MediaSlot {
+                            srcs,
+                            autoplay: dom.attr(child, "autoplay").is_some(),
+                            muted: dom.attr(child, "muted").is_some(),
+                            looping: dom.attr(child, "loop").is_some(),
+                            path: None,
+                            w: 0,
+                            h: 0,
+                            duration: 0.0,
+                            failed: false,
+                            auto_h,
+                            img: None,
+                        });
+                    }
+                    // `poster` reuses the shared image pipeline and is dropped
+                    // once the container is accepted (the real frame replaces
+                    // it); with no playable source it stays as the placeholder
                     let poster = dom.attr(child, "poster").filter(|p| !p.trim().is_empty());
                     match poster {
                         Some(p) => g.img = Some(ImgSlot::Pending(std::rc::Rc::from(p))),
-                        None => {
+                        None if g.media.is_none() => {
                             let mut l = BoxNode::leaf(
                                 outcome.style,
                                 "[media] playback not supported".into(),
@@ -1436,12 +1560,13 @@ fn build_into(
                             l.bx.cursor = cur;
                             g.children.push(l);
                         }
+                        None => {}
                     }
-                    // shortcut: the spec makes video/audio inline-level
-                    // replaced elements, but our inline flow sizes a box from
-                    // its text child and ignores the declared replaced height.
-                    // Sites almost always style video block anyway, so box it
-                    // block and let the UA/author height apply.
+                    // shortcut: the spec makes video inline-level replaced
+                    // elements, but our inline flow sizes a box from its text
+                    // child and ignores the declared replaced height. Sites
+                    // almost always style video block anyway, so box it block
+                    // and let the UA/author height apply.
                     g.inline = false;
                     out.push(g);
                     continue;
@@ -4600,12 +4725,28 @@ fn place(
     n.x = bx0;
     n.y = by0;
     n.w = w;
-    // object-fit content rect for a content <img>: `fill` (or no slot) keeps
+    // a video sized by width alone keeps its intrinsic aspect ratio once the
+    // probe knows the encoded size (`<video width=640>` with height auto)
+    if let Some(m) = &n.media {
+        if m.auto_h {
+            if let Some((iw, ih)) = m.dims() {
+                let content_w = (n.w - bl - br).max(0.0);
+                n.h = content_w * ih as f32 / iw.max(1) as f32 + pt + pb + bt + bb;
+            }
+        }
+    }
+    // object-fit content rect for a content <img> (or a <video>, which is a
+    // replaced element with the same fit math): `fill` (or no slot) keeps
     // the legacy box draw byte-identically, every other mode computes the
     // letterbox/crop inside the padding box and (for cover/none) the visible
     // window decode trims to.
-    if n.img.is_some() && !n.is_bg && !n.is_mask && n.bx.obj_fit != ObjFit::Fill {
-        if let Some((iw, ih)) = n.img.as_ref().and_then(ImgSlot::dims) {
+    let replaced_dims = n
+        .img
+        .as_ref()
+        .and_then(ImgSlot::dims)
+        .or_else(|| n.media.as_ref().and_then(MediaSlot::dims));
+    if replaced_dims.is_some() && !n.is_bg && !n.is_mask && n.bx.obj_fit != ObjFit::Fill {
+        if let Some((iw, ih)) = replaced_dims {
             let fit_box = (
                 n.x + bl,
                 n.y + bt,
@@ -14134,22 +14275,46 @@ line</textarea></div>"#,
         );
         layout_tree(&mut root, 800.0, &m4);
         let div = &root.children[0];
+        // no `src`: the box keeps its UA size and says why nothing plays
         let v = &div.children[0];
         assert_eq!((v.w, v.h), (300.0, 150.0), "UA replaced size");
+        assert!(v.media.is_none(), "no source -> no media slot");
         assert!(
             v.children.iter().any(|c| c.is_text && c.text.contains("playback not supported")),
             "no silent empty hole"
         );
-        let a = &div.children[1];
-        assert_eq!(a.h, 32.0, "audio UA height");
+        // <audio> has no box: nothing to paint
+        assert_eq!(div.children.len(), 2, "audio does not get a box");
         // poster goes through the same ImgSlot pipeline as <img>, and the
         // text placeholder is suppressed (the poster IS the content)
-        let p = &div.children[2];
+        let p = &div.children[1];
         match &p.img {
             Some(ImgSlot::Pending(src)) => assert_eq!(&**src, "/frame.png"),
             _ => panic!("poster should enter the image pipeline"),
         }
         assert!(p.children.is_empty(), "poster replaces the text placeholder");
+    }
+
+    #[test]
+    fn video_source_candidates_and_auto_height() {
+        let mut root = boxes_of(
+            r#"<div><video id="v" src="a.mp4" width="640"></video><video id="s"><source src="b.webm"><source src="c.mp4"></video></div>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let div = &root.children[0];
+        let v = &div.children[0];
+        let m = v.media.as_ref().expect("src -> media slot");
+        assert_eq!(m.srcs.len(), 1);
+        assert_eq!(&*m.srcs[0], "a.mp4");
+        assert!(m.auto_h, "width without height follows the intrinsic ratio");
+        assert_eq!(v.w, 640.0);
+        // <source> fallbacks stay ordered; the probe tries them in turn
+        let s = &div.children[1];
+        let m = s.media.as_ref().expect("<source> -> media slot");
+        let srcs: Vec<&str> = m.srcs.iter().map(|s| &**s).collect();
+        assert_eq!(srcs, ["b.webm", "c.mp4"]);
+        assert!(!m.auto_h, "no declared width -> UA 300x150 box");
     }
 
     // ---- ::before/::after generated content ----

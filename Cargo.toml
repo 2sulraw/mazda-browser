@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/ipc", "crates/renderer", "crates/sandbox", "crates/shell"]
+members = [
+    "crates/engine",
+    "crates/ipc",
+    "crates/media",
+    "crates/media-probe",
+    "crates/renderer",
+    "crates/sandbox",
+    "crates/shell",
+]
 
 [workspace.package]
 version = "0.1.0"

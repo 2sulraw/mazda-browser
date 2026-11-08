@@ -8,13 +8,17 @@ Phase S proved the process split is worth its cost (see `SPIKE.md`). **P1 is
 in place**: a real IPC protocol, double-buffered shared-memory frames, a
 renderer supervisor, tabs, snapshot restore, and a memory governor. **P2 is in
 place too**: the renderer runs in an OS sandbox (AppContainer + Job Object on
-Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux).
+Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux). **P3 is in place**:
+`<video>`/`<audio>` play through Media Foundation + WASAPI, decoded by a
+pure-Rust media crate, with DRM refused before any decoder is created.
 
 ## Workspace
 
 ```
 crates/engine     HTML/CSS/JS/DOM/layout/paint (copied from mazda-browser-rust)
 crates/ipc        P1 protocol: stdio lines + double-buffered mmap frames
+crates/media      P3 playback: MP4 header parse, Media Foundation, WASAPI
+crates/media-probe media self-test (plain + sandboxed decode/audio/DRM)
 crates/renderer   headless renderer process
 crates/sandbox    OS containment for the renderer + `sandbox-probe` self-test
 crates/shell      trusted shell (eframe/egui), owns the window and input
@@ -65,6 +69,22 @@ Sandbox behaviour (P2):
   increment; the code is compile-checked but not yet run on Linux here.
 - `MAZDA_SANDBOX=off` is a debugging escape hatch (local test servers,
   profilers); the normal path never uses it.
+
+Media (P3): `<video>` is a replaced element — layout sizes it from
+`width`/`height`, the worker fetches the file, parses the MP4 header (DRM and
+unsupported containers are refused before a decoder exists), and the renderer
+decodes through Media Foundation into the page's frame. Audio goes to WASAPI
+shared mode. Only `autoplay muted` starts by itself; any other video opens on
+the first click, and a click inside the video toggles play/pause. The whole
+playback path is in `crates/media`; on Linux it is a stub that reports
+`Unsupported`. `MAZDA_NO_MEDIA=1` disables probing for an A/B memory check.
+
+Self-test (decode, audio endpoint and DRM rejection, plain and through the real
+sandbox):
+
+```powershell
+cargo run --release -p media-probe -- --file "$env:TEMP\mazda-test.mp4"
+```
 
 Single-process reference (the pre-split app):
 

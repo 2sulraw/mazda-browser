@@ -1,0 +1,13 @@
+[package]
+name = "media-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "media-probe"
+path = "src/main.rs"
+
+[dependencies]
+mazda-media = { path = "../media" }
+mazda-sandbox = { path = "../sandbox" }

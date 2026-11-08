@@ -104,6 +104,9 @@ impl ImgCache {
 struct Page {
     url: String,
     laid: Layout,
+    /// playable `<video>` elements: draw rect, local file, and which
+    /// `laid.images` entry holds the frame the renderer keeps replacing
+    media: Vec<layout::MediaEntry>,
     /// page background from body/html background-color (fallback: BG const)
     bg: u32,
     /// inspector metadata by DOM node (built worker-side — the UI thread
@@ -486,6 +489,127 @@ fn headless_link_at(page: &Page, x: f32, y: f32, scroll: f32) -> Option<String> 
     resolve(&page.url, run.link.as_deref()?)
 }
 
+/// One live `<video>` on the renderer's current page. The player owns the
+/// decoders; the page keeps the draw rect and the `laid.images` index whose
+/// pixels are replaced as frames arrive.
+struct Playing {
+    /// index into `Page::media`
+    media: usize,
+    player: mazda_media::Player,
+    /// display pixel target (the first-frame entry's decoded size)
+    w: u32,
+    h: u32,
+}
+
+/// Open one player (renderer side: decoding happens here, never on the
+/// worker). `None` when the container has no image entry or decoding fails.
+fn start_player(page: &Page, i: usize) -> Option<Playing> {
+    let m = page.media.get(i)?;
+    let (w, h) = page
+        .laid
+        .images
+        .get(m.index)
+        .map(|e| (e.4.w.max(1), e.4.h.max(1)))?;
+    match mazda_media::Player::open(std::path::Path::new(&m.path)) {
+        Ok(mut player) => {
+            player.set_looping(m.looping);
+            player.set_muted(m.muted);
+            Some(Playing {
+                media: i,
+                player,
+                w,
+                h,
+            })
+        }
+        Err(e) => {
+            eprintln!("[media] renderer open {}: {e}", m.path);
+            None
+        }
+    }
+}
+
+/// Players a freshly adopted page starts with: only silent autoplay runs
+/// without a gesture, the same rule the big browsers apply. Every other
+/// video opens (and plays) on the first click, so a page full of videos
+/// costs no decoder memory until it is actually watched.
+fn start_players(page: &Page) -> Vec<Playing> {
+    let mut out = Vec::new();
+    for (i, m) in page.media.iter().enumerate() {
+        if !(m.autoplay && m.muted) {
+            continue;
+        }
+        if let Some(mut pl) = start_player(page, i) {
+            pl.player.play();
+            out.push(pl);
+        }
+    }
+    out
+}
+
+/// Find or create the player for media entry `i`, then toggle it.
+fn toggle_player(players: &mut Vec<Playing>, page: &Page, i: usize) {
+    if let Some(k) = players.iter().position(|pl| pl.media == i) {
+        players[k].player.toggle();
+        eprintln!(
+            "[media] {}",
+            if players[k].player.is_playing() {
+                "play"
+            } else {
+                "pause"
+            }
+        );
+        return;
+    }
+    if let Some(mut pl) = start_player(page, i) {
+        pl.player.play();
+        eprintln!("[media] play (opened)");
+        players.push(pl);
+    }
+}
+
+fn media_image(frame: mazda_media::Frame, w: u32, h: u32) -> image::ImageData {
+    image::downscale(
+        &image::ImageData {
+            w: frame.w,
+            h: frame.h,
+            px: frame.px,
+        },
+        w,
+        h,
+    )
+}
+
+/// Advance every player and repaint when a new frame landed. Returns true
+/// when the frame map changed (the caller already painted).
+fn tick_players(
+    players: &mut [Playing],
+    page: &mut Option<Page>,
+    fonts: &Fonts,
+    pw: usize,
+    ph: usize,
+    scroll: f32,
+    frame: &mut Option<mazda_ipc::FrameMap>,
+    seq: &mut u32,
+) -> bool {
+    if players.is_empty() {
+        return false;
+    }
+    let Some(p) = page.as_mut() else { return false };
+    let mut dirty = false;
+    for pl in players.iter_mut() {
+        let Some(f) = pl.player.next_frame() else { continue };
+        let Some(idx) = p.media.get(pl.media).map(|m| m.index) else { continue };
+        if let Some(slot) = p.laid.images.get_mut(idx) {
+            slot.4 = Rc::new(media_image(f, pl.w, pl.h));
+            dirty = true;
+        }
+    }
+    if dirty {
+        headless_paint(p, fonts, pw, ph, scroll, frame, seq);
+    }
+    dirty
+}
+
 /// Phase S headless renderer.
 ///
 /// Loads one page, paints it into a memory-mapped BGRA frame, and answers
@@ -570,6 +694,9 @@ pub fn run_headless() {
     let mut scroll = 0.0f32;
     let mut nav_id = 0u64;
     let mut prev_counters = crate::js::heap_counters();
+    // players for the current page (this thread owns COM/MF; navigation drops
+    // them all — files stay in the disk cache)
+    let mut players: Vec<Playing> = Vec::new();
 
     if let Some(url) = url {
         nav_id += 1;
@@ -584,7 +711,23 @@ pub fn run_headless() {
         });
     }
 
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // videos need a ~60 Hz tick; an idle page only wakes to answer stdin
+        let wait = if players.is_empty() {
+            std::time::Duration::from_millis(500)
+        } else {
+            std::time::Duration::from_millis(16)
+        };
+        let msg = match rx.recv_timeout(wait) {
+            Ok(msg) => msg,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tick_players(
+                    &mut players, &mut page, &fonts, pw, ph, scroll, &mut frame, &mut seq,
+                );
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match msg {
             HeadlessMsg::Done(done) => {
                 if done.panicked {
@@ -605,6 +748,9 @@ pub fn run_headless() {
                 fonts.begin_page(faces);
                 *fonts.stacks.borrow_mut() = stacks;
                 let p = wire_to_page(wire);
+                // navigation drops every decoder; the new page's videos open
+                // their files (already in the disk cache) on this thread
+                players = start_players(&p);
                 let max = (p.laid.height - page_h(ph)).max(0.0);
                 scroll = scroll.min(max);
                 let title = p.url.clone();
@@ -648,6 +794,7 @@ pub fn run_headless() {
                     mazda_ipc::Command::Load(url) => {
                         nav_id += 1;
                         scroll = 0.0;
+                        players.clear();
                         let _ = jobs_tx.send(LoadReq::Load {
                             id: nav_id,
                             url,
@@ -661,6 +808,7 @@ pub fn run_headless() {
                     mazda_ipc::Command::Restore(url) => {
                         nav_id += 1;
                         scroll = 0.0;
+                        players.clear();
                         let _ = jobs_tx.send(LoadReq::Load {
                             id: nav_id,
                             url,
@@ -702,8 +850,17 @@ pub fn run_headless() {
                         }
                     }
                     mazda_ipc::Command::Click { x, y } => {
-                        if let Some(p) = page.as_ref() {
-                            if let Some(href) = headless_link_at(p, x, y, scroll) {
+                        if let Some(p) = page.as_mut() {
+                            // a click inside a video toggles playback (no
+                            // native controls yet); everywhere else keeps the
+                            // link hit test
+                            let hit = p.media.iter().position(|m| {
+                                let py = if m.fixed { y } else { y + scroll };
+                                x >= m.x && x <= m.x + m.w && py >= m.y && py <= m.y + m.h
+                            });
+                            if let Some(i) = hit {
+                                toggle_player(&mut players, p, i);
+                            } else if let Some(href) = headless_link_at(p, x, y, scroll) {
                                 println!("{}", mazda_ipc::Event::Nav(href).encode());
                             }
                         }
@@ -711,6 +868,10 @@ pub fn run_headless() {
                 }
             }
         }
+        // playback advances even while commands stream in
+        tick_players(
+            &mut players, &mut page, &fonts, pw, ph, scroll, &mut frame, &mut seq,
+        );
     }
 }
 
@@ -973,6 +1134,7 @@ impl App {
                 hover_targets: Vec::new(),
             },
             bg: BG,
+            media: Vec::new(),
             elements: HashMap::new(),
         };
         let pixels = vec![page.bg; pw * ph];
@@ -3080,6 +3242,8 @@ struct PageWire {
         Option<std::sync::Arc<css::Filter>>,
     )>,
     shadows: Vec<layout::ShadowRect>,
+    /// playable `<video>` elements: draw rect + file + `images` index
+    media: Vec<layout::MediaEntry>,
     /// sticky pinning records — the UI thread applies them per frame in
     /// `render` (indexes into the channels above, so they ride along)
     sticky: Vec<layout::StickyGroup>,
@@ -3193,6 +3357,7 @@ fn page_to_wire(
         shadows: p.laid.shadows,
         sticky: p.laid.sticky,
         backdrops: p.laid.backdrops,
+        media: p.media,
         stacks,
         faces,
         forms: p.laid.forms,
@@ -3257,6 +3422,7 @@ fn wire_to_page(w: PageWire) -> Page {
             form_values: w.form_values,
             hover_targets: w.hover_targets,
         },
+        media: w.media,
         elements: w.elements,
     }
 }
@@ -4716,6 +4882,13 @@ fn layout_page(
     if n_img > 0 || skipped > 0 {
         eprintln!("[img] {n_img} probed, {skipped} skipped (format)");
     }
+    // `<video>`: fetch + container probe (no decoding yet — the renderer owns
+    // the player; layout only needs the intrinsic size and the DRM answer)
+    let (n_media, bad_media) = probe_media(&mut root_box, url);
+    stage!("media probe");
+    if n_media > 0 || bad_media > 0 {
+        eprintln!("[media] {n_media} playable, {bad_media} refused");
+    }
 
     // layout_in_forms applies `state` (focus + typed values) so the caret,
     // accent border and live text paint correctly
@@ -4746,6 +4919,12 @@ fn layout_page(
             imgs.decodes - decodes_before,
             n_px.saturating_sub(imgs.decodes - decodes_before)
         );
+    }
+    // videos whose first frame landed in `laid.images` become renderer players
+    let mut media = Vec::new();
+    collect_media_entries(&root_box, false, &mut media);
+    if !media.is_empty() {
+        eprintln!("[media] {} player(s) handed to the renderer", media.len());
     }
     eprintln!(
         "[mem] after layout: {:.1} MB ({} runs)",
@@ -4866,6 +5045,7 @@ fn layout_page(
     let page = Page {
         url: url.to_string(),
         laid,
+        media,
         bg,
         elements,
     };
@@ -4939,6 +5119,137 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
         skipped += s;
     }
     (probed, skipped)
+}
+
+fn no_media() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAZDA_NO_MEDIA").is_some())
+}
+
+/// Walk every `<video>`, fetch its bytes once, parse the MP4 header, and
+/// write a plain `.mp4` next to the other cache files for the renderer to
+/// open. Only the container is inspected here — decoding happens in the
+/// renderer process, on its main thread.
+///
+/// The intrinsic size is what layout needs (ratio/sizing); DRM and
+/// unsupported containers mark the box `failed`, which keeps its space and
+/// draws nothing, matching a browser that refused to play.
+fn probe_media(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
+    let mut probed = 0usize;
+    let mut failed = 0usize;
+    if no_media() {
+        n.media = None;
+        return (0, 0);
+    }
+    let pending = n
+        .media
+        .as_ref()
+        .is_some_and(|m| m.path.is_none() && !m.failed);
+    if pending {
+        let srcs: Vec<String> = n
+            .media
+            .as_ref()
+            .map(|m| m.srcs.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let mut last_err = "no media URL".to_string();
+        let mut ok = false;
+        for src in &srcs {
+            let Some(abs) = resolve_img(base, src) else {
+                last_err = format!("non-navigable media URL: {src}");
+                continue;
+            };
+            let bytes = match fetch(&abs) {
+                Ok((bytes, _)) => bytes,
+                Err(e) => {
+                    last_err = format!("fetch {src}: {e}");
+                    continue;
+                }
+            };
+            match media_file(src, &bytes) {
+                Ok((path, meta)) => {
+                    if let Some(m) = n.media.as_mut() {
+                        m.path = Some(std::rc::Rc::from(path.to_string_lossy().as_ref()));
+                        m.w = meta.width;
+                        m.h = meta.height;
+                        m.duration = meta.duration;
+                        if m.w == 0 || m.h == 0 {
+                            m.w = 300; // UA replaced size when the header is silent
+                            m.h = 150;
+                        }
+                    }
+                    // the container was accepted, so the poster's job is done:
+                    // the first frame replaces it in `decode_images`
+                    n.img = None;
+                    ok = true;
+                    break;
+                }
+                Err(e) => last_err = format!("{e} ({})", log_url(src)),
+            }
+        }
+        if ok {
+            probed += 1;
+        } else {
+            eprintln!("[media] {last_err}");
+            if let Some(m) = n.media.as_mut() {
+                m.failed = true;
+                m.auto_h = false;
+            }
+            if n.bx.height.is_none() {
+                n.bx.min_height = Some(css::Len::Px(150.0));
+            }
+            failed += 1;
+        }
+    }
+    for c in &mut n.children {
+        let (p, f) = probe_media(c, base);
+        probed += p;
+        failed += f;
+    }
+    (probed, failed)
+}
+
+/// Cache one fetched media file: DRM and trackless containers are refused
+/// here, before any decoder exists. The file name is the URL hash, so a
+/// relayout reuses the same bytes without touching the network.
+fn media_file(
+    src: &str,
+    bytes: &[u8],
+) -> Result<(std::path::PathBuf, mazda_media::mp4::Mp4Meta), String> {
+    let meta =
+        mazda_media::mp4::parse(bytes).ok_or_else(|| "not an MP4 (ISO-BMFF) file".to_string())?;
+    if meta.drm {
+        return Err("DRM-protected media is not supported".to_string());
+    }
+    if !meta.has_video && !meta.has_audio {
+        return Err("no audio or video track".to_string());
+    }
+    let dir = cache_dir().join("media");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("media cache: {e}"))?;
+    let path = dir.join(format!("{}.mp4", hash_str(src)));
+    let same = std::fs::metadata(&path).map(|m| m.len() as usize == bytes.len());
+    if !same.unwrap_or(false) {
+        std::fs::write(&path, bytes).map_err(|e| format!("media write: {e}"))?;
+    }
+    Ok((path, meta))
+}
+
+/// Worker-side: every probed `<video>` whose first frame decoded becomes a
+/// renderer player. The rect is the object-fit content rect layout computed.
+fn collect_media_entries(
+    n: &layout::BoxNode,
+    fixed: bool,
+    out: &mut Vec<layout::MediaEntry>,
+) {
+    let fixed = fixed || n.bx.pos == css::Pos::Fixed;
+    if let Some(m) = &n.media {
+        let rect = n.img_fit.unwrap_or((n.x, n.y, n.w, n.h));
+        if let Some(e) = m.entry(rect, fixed) {
+            out.push(e);
+        }
+    }
+    for c in &n.children {
+        collect_media_entries(c, fixed, out);
+    }
 }
 
 /// Post-layout: decode each probed image (disk cache hit, no refetch),
@@ -5305,6 +5616,52 @@ fn decode_images(
                     n.bx.filter.clone(),
                 ));
                 count += 1;
+            }
+        }
+    }
+    // `<video>`: decode the first frame here so the page ships a real frame
+    // (the renderer re-opens the same file and swaps these pixels as
+    // playback advances). The poster was already dropped when the container
+    // was accepted, so a decode failure leaves the box empty, like a refused
+    // video.
+    let media_src = n
+        .media
+        .as_ref()
+        .and_then(|m| m.path.clone().map(|p| (p, m.looping, m.muted)));
+    if let Some((path, looping, muted)) = media_src {
+        let (fx, fy, fw, fh) = n.img_fit.unwrap_or((n.x, n.y, n.w, n.h));
+        let dw = fw.round().max(1.0) as u32;
+        let dh = fh.round().max(1.0) as u32;
+        let px = (dw as usize) * (dh as usize);
+        if px <= *budget {
+            match mazda_media::Player::open(std::path::Path::new(&*path)) {
+                Ok(mut player) => {
+                    player.set_looping(looping);
+                    player.set_muted(muted);
+                    if let Some(f) = player.next_frame() {
+                        let frame = image::downscale(
+                            &image::ImageData { w: f.w, h: f.h, px: f.px },
+                            dw,
+                            dh,
+                        );
+                        *budget -= px;
+                        if let Some(m) = n.media.as_mut() {
+                            m.img = Some(laid.images.len());
+                        }
+                        laid.images.push((
+                            fx,
+                            fy,
+                            fw,
+                            fh,
+                            Rc::new(frame),
+                            fixed,
+                            layout::eff_alpha(n.eff),
+                            n.bx.filter.clone(),
+                        ));
+                        count += 1;
+                    }
+                }
+                Err(e) => eprintln!("[media] {}: {e}", log_url(&path)),
             }
         }
     }
@@ -8081,6 +8438,7 @@ mod tests {
             url: "https://example.com/".into(),
             laid,
             bg: 0xabcdef,
+            media: Vec::new(),
             elements: HashMap::from([(
                 7,
                 ElementInfo {
