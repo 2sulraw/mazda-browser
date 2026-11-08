@@ -937,8 +937,9 @@ covered by the disk round-trip test above.
 - Only fresh `Load`s are logged; switching tabs replays from memory snapshots
   and does not create history entries (so the log is a visit log, not a
   session transcript).
-- History click records the new visit; the clicked row's original timestamp
-  stays in the file until the next load of that URL collapses it.
+- History click records the new visit, so an older row stays in the log and a
+  fresh row appears at the top; only consecutive reloads collapse into one
+  row.
 - Clearing history keeps bookmarks, and the panel scrolls only the log (the
   bookmark list is short by assumption).
 - Title text is the tab label (the host), because the renderer's `title` event
