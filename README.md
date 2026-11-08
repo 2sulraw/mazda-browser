@@ -10,7 +10,9 @@ renderer supervisor, tabs, snapshot restore, and a memory governor. **P2 is in
 place too**: the renderer runs in an OS sandbox (AppContainer + Job Object on
 Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux). **P3 is in place**:
 `<video>`/`<audio>` play through Media Foundation + WASAPI, decoded by a
-pure-Rust media crate, with DRM refused before any decoder is created.
+pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
+started**: `<a download>` streams to disk with a progress panel and lands in the
+user's Downloads folder.
 
 ## Workspace
 
@@ -78,6 +80,15 @@ shared mode. Only `autoplay muted` starts by itself; any other video opens on
 the first click, and a click inside the video toggles play/pause. The whole
 playback path is in `crates/media`; on Linux it is a stub that reports
 `Unsupported`. `MAZDA_NO_MEDIA=1` disables probing for an A/B memory check.
+
+Downloads (P4): `<a href download>` saves instead of navigating. The renderer
+streams the response in 64 KB chunks into its own temp dir (progress every
+150 ms, no body in RAM); the trusted shell then moves the finished file into
+`%USERPROFILE%\Downloads` (`name (n)` dedupe) because the sandbox keeps the
+profile unwritable. Names from the `download` attribute are sanitized so a page
+cannot pick a path. The toolbar's download button opens a panel with live
+progress bars and clickable saved files; the status bar shows the active
+transfer.
 
 Self-test (decode, audio endpoint and DRM rejection, plain and through the real
 sandbox):

@@ -107,6 +107,8 @@ struct Page {
     /// playable `<video>` elements: draw rect, local file, and which
     /// `laid.images` entry holds the frame the renderer keeps replacing
     media: Vec<layout::MediaEntry>,
+    /// `<a download>` targets: the renderer saves these instead of navigating
+    downloads: Vec<layout::DownloadLink>,
     /// page background from body/html background-color (fallback: BG const)
     bg: u32,
     /// inspector metadata by DOM node (built worker-side — the UI thread
@@ -567,6 +569,143 @@ fn toggle_player(players: &mut Vec<Playing>, page: &Page, i: usize) {
     }
 }
 
+/// Messages a download thread sends back to the renderer's main loop.
+enum DlMsg {
+    Progress { done: u64, total: u64, name: String },
+    Done { path: std::path::PathBuf },
+    Failed { name: String, err: String },
+}
+
+/// Suggested save name: the `download` attribute value when usable, else the
+/// URL's last segment. Path separators and control characters become `_` so a
+/// hostile page cannot write outside the download dir.
+fn download_name(url: &str, suggested: &str) -> String {
+    let raw = if suggested.is_empty() {
+        url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or("")
+    } else {
+        suggested
+    };
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    name = name.trim().trim_matches('.').to_string();
+    if name.is_empty() {
+        name = "download".to_string();
+    }
+    if name.len() > 120 {
+        name.truncate(120);
+    }
+    name
+}
+
+/// Stream `url` into the renderer's temp dir, reporting progress. Runs on its
+/// own thread: a 20 MB file must not freeze the page. The shell moves the
+/// finished file out of the sandbox (the renderer cannot write the profile).
+fn start_download(url: String, name: String, tx: mpsc::Sender<DlMsg>) {
+    std::thread::spawn(move || {
+        let dir = std::env::temp_dir().join("mazda-downloads");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let _ = tx.send(DlMsg::Failed { name, err: format!("temp dir: {e}") });
+            return;
+        }
+        let path = dir.join(&name);
+        let mut req = http_agent().get(&url);
+        for (k, v) in net::request_headers(None) {
+            req = req.set(k, &v);
+        }
+        if let Some(c) = cookie::request_header(&url) {
+            req = req.set("Cookie", &c);
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(DlMsg::Failed { name, err: e.to_string() });
+                return;
+            }
+        };
+        cookie::store_response(&url, &set_cookie_values(&resp));
+        let total = resp
+            .header("content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut reader = resp.into_reader();
+        let mut file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(DlMsg::Failed { name, err: format!("create: {e}") });
+                return;
+            }
+        };
+        let _ = tx.send(DlMsg::Progress { done: 0, total, name: name.clone() });
+        let mut done = 0u64;
+        let mut last = std::time::Instant::now();
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let n = match std::io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.send(DlMsg::Failed { name, err: e.to_string() });
+                    return;
+                }
+            };
+            if let Err(e) = std::io::Write::write_all(&mut file, &chunk[..n]) {
+                let _ = tx.send(DlMsg::Failed { name, err: format!("write: {e}") });
+                return;
+            }
+            done += n as u64;
+            if last.elapsed() >= std::time::Duration::from_millis(150) {
+                last = std::time::Instant::now();
+                let _ = tx.send(DlMsg::Progress {
+                    done,
+                    total,
+                    name: name.clone(),
+                });
+            }
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = tx.send(DlMsg::Failed { name, err: format!("sync: {e}") });
+            return;
+        }
+        // a final tick so the shell reads 100% even for tiny files
+        let _ = tx.send(DlMsg::Progress {
+            done,
+            total: if total == 0 { done } else { total },
+            name: name.clone(),
+        });
+        let _ = tx.send(DlMsg::Done { path });
+    });
+}
+
+/// Forward queued download status to the shell; `active` clears on a terminal
+/// message so the loop can go back to its idle grace period.
+fn drain_downloads(rx: &mpsc::Receiver<DlMsg>, active: &mut bool) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            DlMsg::Progress { done, total, name } => println!(
+                "{}",
+                mazda_ipc::Event::Download { done, total, name }.encode()
+            ),
+            DlMsg::Done { path } => {
+                *active = false;
+                println!("{}", mazda_ipc::Event::DownloadDone { path }.encode());
+            }
+            DlMsg::Failed { name, err } => {
+                *active = false;
+                eprintln!("[download] {name}: {err}");
+                println!("{}", mazda_ipc::Event::DownloadFailed { name, err }.encode());
+            }
+        }
+    }
+}
+
 fn media_image(frame: mazda_media::Frame, w: u32, h: u32) -> image::ImageData {
     image::downscale(
         &image::ImageData {
@@ -697,6 +836,9 @@ pub fn run_headless() {
     // players for the current page (this thread owns COM/MF; navigation drops
     // them all — files stay in the disk cache)
     let mut players: Vec<Playing> = Vec::new();
+    // downloads stream on their own threads; the main loop forwards progress
+    let (dl_tx, dl_rx) = mpsc::channel::<DlMsg>();
+    let mut dl_active = false;
 
     if let Some(url) = url {
         nav_id += 1;
@@ -712,15 +854,19 @@ pub fn run_headless() {
     }
 
     loop {
-        // videos need a ~60 Hz tick; an idle page only wakes to answer stdin
-        let wait = if players.is_empty() {
-            std::time::Duration::from_millis(500)
-        } else {
+        // videos need a ~60 Hz tick; downloads report as they arrive; an idle
+        // page only wakes to answer stdin
+        let wait = if !players.is_empty() {
             std::time::Duration::from_millis(16)
+        } else if dl_active {
+            std::time::Duration::from_millis(50)
+        } else {
+            std::time::Duration::from_millis(500)
         };
         let msg = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                drain_downloads(&dl_rx, &mut dl_active);
                 tick_players(
                     &mut players, &mut page, &fonts, pw, ph, scroll, &mut frame, &mut seq,
                 );
@@ -861,7 +1007,19 @@ pub fn run_headless() {
                             if let Some(i) = hit {
                                 toggle_player(&mut players, p, i);
                             } else if let Some(href) = headless_link_at(p, x, y, scroll) {
-                                println!("{}", mazda_ipc::Event::Nav(href).encode());
+                                // `<a download>` saves the target; every other
+                                // link keeps normal navigation
+                                match p.downloads.iter().find(|d| d.href == href) {
+                                    Some(d) => {
+                                        let name = download_name(&href, &d.name);
+                                        eprintln!("[download] {href} -> {name}");
+                                        start_download(href, name, dl_tx.clone());
+                                        dl_active = true;
+                                    }
+                                    None => {
+                                        println!("{}", mazda_ipc::Event::Nav(href).encode())
+                                    }
+                                }
                             }
                         }
                     }
@@ -872,6 +1030,7 @@ pub fn run_headless() {
         tick_players(
             &mut players, &mut page, &fonts, pw, ph, scroll, &mut frame, &mut seq,
         );
+        drain_downloads(&dl_rx, &mut dl_active);
     }
 }
 
@@ -1135,6 +1294,7 @@ impl App {
             },
             bg: BG,
             media: Vec::new(),
+            downloads: Vec::new(),
             elements: HashMap::new(),
         };
         let pixels = vec![page.bg; pw * ph];
@@ -3244,6 +3404,8 @@ struct PageWire {
     shadows: Vec<layout::ShadowRect>,
     /// playable `<video>` elements: draw rect + file + `images` index
     media: Vec<layout::MediaEntry>,
+    /// `<a download>` targets (href resolved against the page)
+    downloads: Vec<layout::DownloadLink>,
     /// sticky pinning records — the UI thread applies them per frame in
     /// `render` (indexes into the channels above, so they ride along)
     sticky: Vec<layout::StickyGroup>,
@@ -3358,6 +3520,7 @@ fn page_to_wire(
         sticky: p.laid.sticky,
         backdrops: p.laid.backdrops,
         media: p.media,
+        downloads: p.downloads,
         stacks,
         faces,
         forms: p.laid.forms,
@@ -3423,6 +3586,7 @@ fn wire_to_page(w: PageWire) -> Page {
             hover_targets: w.hover_targets,
         },
         media: w.media,
+        downloads: w.downloads,
         elements: w.elements,
     }
 }
@@ -5039,6 +5203,8 @@ fn layout_page(
     }
     stage!("dump");
     let form_names = collect_form_names(dom);
+    // `<a download>` targets the renderer saves instead of navigating
+    let downloads = collect_downloads(dom, url);
     // inspector identity for every hit-test node (the UI thread has no DOM)
     let elements = collect_elements(dom, &laid.hover_targets);
     stage!("elements");
@@ -5046,10 +5212,35 @@ fn layout_page(
         url: url.to_string(),
         laid,
         media,
+        downloads,
         bg,
         elements,
     };
     (page, form_names)
+}
+
+/// Every `<a href download>` in document order, href resolved against the
+/// page. A present-but-empty `download` value means "derive the name from the
+/// URL", which the renderer does.
+fn collect_downloads(dom: &html::Dom, base: &str) -> Vec<layout::DownloadLink> {
+    let mut out = Vec::new();
+    for n in 0..dom.nodes.len() as u32 {
+        if dom.tag(n) != "a" {
+            continue;
+        }
+        let Some(download) = dom.attr(n, "download") else {
+            continue;
+        };
+        let Some(href) = dom.attr(n, "href").map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(href) = resolve(base, href) else { continue };
+        out.push(layout::DownloadLink {
+            href,
+            name: download.trim().to_string(),
+        });
+    }
+    out
 }
 
 /// One stylesheet source found in document order.
@@ -8080,6 +8271,38 @@ mod tests {
     }
 
     #[test]
+    fn collects_only_download_links() {
+        let dom = html::parse(
+            r#"<body>
+                 <a href="/a.zip" download>one</a>
+                 <a href="/b.zip" download="renamed.zip">two</a>
+                 <a href="/c.html">plain</a>
+                 <a download>no href</a>
+                 <a href="javascript:void(0)" download>bad scheme</a>
+               </body>"#,
+        );
+        let d = collect_downloads(&dom, "https://example.com/dir/page.html");
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].href, "https://example.com/a.zip");
+        assert_eq!(d[0].name, "", "empty download attr -> derive from URL");
+        assert_eq!(d[1].href, "https://example.com/b.zip");
+        assert_eq!(d[1].name, "renamed.zip");
+    }
+
+    #[test]
+    fn download_names_cannot_escape_the_temp_dir() {
+        assert_eq!(download_name("https://x/a/b.mp4?x=1", ""), "b.mp4");
+        assert_eq!(download_name("https://x/", ""), "download");
+        // a hostile `download` value loses every path separator and dot edge
+        let n = download_name("https://x/f", "../../evil\\name.zip");
+        assert!(!n.contains('/') && !n.contains('\\'), "{n}");
+        assert!(!n.starts_with('.'), "{n}");
+        // empty/blank suggestions fall back
+        assert_eq!(download_name("https://x/", "   "), "download");
+        assert_eq!(download_name("https://x/", ".."), "download");
+    }
+
+    #[test]
     fn latin_stays_on_primary_font() {
         let fonts = Fonts::load();
         let primary = fonts.pick(&Style::new());
@@ -8439,6 +8662,7 @@ mod tests {
             laid,
             bg: 0xabcdef,
             media: Vec::new(),
+            downloads: Vec::new(),
             elements: HashMap::from([(
                 7,
                 ElementInfo {

@@ -506,4 +506,81 @@ $env:MAZDA_SANDBOX="off"; .\target\release\renderer.exe --size 1000x700
 $env:MAZDA_NO_MEDIA="1"; .\target\release\renderer.exe --size 1000x700
 ```
 
+# P4 - browser gaps (in progress)
+
+## Downloads, executed (2026-11-08)
+
+`<a href download>` is a save, not a navigation. The renderer collects every
+such link at layout time (`Page.downloads`), and a click on one starts a
+download thread instead of emitting `nav`.
+
+**Streaming, not buffering.** The renderer opens the request with the same
+agent/cookies/headers as navigation, then copies `into_reader()` into a file in
+`%TEMP%\mazda-downloads\` in 64 KB chunks. It reports `done`/`total` every
+150 ms (plus a final 100% tick), so a 20 MB file neither blocks the page loop
+(main loop polls at 50 ms while active) nor holds the body in RAM.
+
+**The shell owns the profile.** The renderer is sandboxed and cannot write
+`%USERPROFILE%`, so `DownloadDone` carries a temp path and the trusted shell
+moves it into `%USERPROFILE%\Downloads` (rename, falling back to copy+remove
+across volumes) with `name (n)` dedupe. `DownloadFailed` surfaces the error.
+
+**Names are sanitized.** The `download` attribute is used when present, else
+the URL's last segment; path separators, control characters and Windows-reserved
+characters become `_`, leading/trailing dots are stripped, and an empty result
+falls back to `download`. A page cannot choose a path outside the temp dir.
+
+UI: a toolbar download button (accent dot while a transfer is live) toggles a
+Downloads panel with a progress bar per active transfer and clickable saved-file
+links; the status bar reads `Downloading <name> — <pct>`.
+
+## Acceptance (partial)
+
+Headless renderer, `data:` page with one download link:
+
+```
+download 0 0 example.html
+download 577 577 example.html
+download-done C:\...\Temp\mazda-downloads\example.html
+```
+
+Split shell, local page `http://127.0.0.1:8767/dl.html` (unsandboxed renderer:
+AppContainer blocks loopback), two links:
+
+```
+[download] movie.mp4 0/788493
+[download] movie.mp4 23760/788493
+[download] movie.mp4 145165/788493
+[download] movie.mp4 275421/788493
+[download] movie.mp4 516096/788493
+[download] movie.mp4 788493/788493
+[download] saved C:\Users\werlos\Downloads\movie.mp4
+```
+
+788493 bytes on disk, equal to the server's `Content-Length`. A second click
+saved `movie (1).mp4` (dedupe, no overwrite). The panel showed a live `9 %`
+bar, the finished entry as a link, and the status bar
+`Downloading movie.mp4 — 9 %`.
+
+## Shortcuts (deliberate)
+
+- No cancel/pause/resume, no retry, no `Content-Disposition` filename
+  preference (the `download` attribute and URL win), no download history on
+  disk: the panel is per session.
+- Downloads ignore the memory governor and the disk cache; the file streams
+  straight to disk and is not capped.
+- Multiple simultaneous downloads are allowed; the panel shows them all but the
+  status bar only names the newest active one.
+- `data:`/`blob:` targets are not downloadable: download hrefs go through
+  `resolve`, which only accepts `http(s)`.
+
+## Reproduce
+
+```powershell
+# page with two download links, served locally
+python -m http.server 8767 --bind 127.0.0.1 --directory "$env:TEMP\mazda-dl-page"
+$env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8767/dl.html
+# click a link -> Downloads\file; click the toolbar button -> panel
+```
+
 

@@ -214,6 +214,66 @@ impl Tab {
     }
 }
 
+/// One download: the renderer streams it into its sandbox temp dir; the shell
+/// moves the finished file into the user's Downloads folder.
+struct Download {
+    name: String,
+    done: u64,
+    total: u64,
+    state: DlState,
+}
+
+enum DlState {
+    Active,
+    Done(std::path::PathBuf),
+    Failed(String),
+}
+
+/// `%USERPROFILE%\Downloads` when it exists, else the system temp dir.
+fn downloads_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Downloads"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// `dir/name`, `dir/name (1)`, ... so an existing file is never overwritten.
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let mut path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for n in 1..10_000 {
+        path = dir.join(format!("{stem} ({n}){ext}"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    path
+}
+
+/// Move the renderer's temp file out of the sandbox. Rename is atomic on the
+/// same volume; copy+remove covers a temp dir on another drive.
+fn adopt_download(src: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let dir = downloads_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    let dst = unique_path(&dir, name);
+    match std::fs::rename(src, &dst) {
+        Ok(()) => Ok(dst),
+        Err(_) => {
+            std::fs::copy(src, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+            let _ = std::fs::remove_file(src);
+            Ok(dst)
+        }
+    }
+}
+
 /// Short tab-label from a URL: host minus `www.`, or `New tab`.
 fn short_title(url: &str) -> String {
     let rest = url
@@ -305,6 +365,9 @@ struct Shell {
     /// measures the round trip
     sent: Option<Instant>,
     lat: Vec<f32>,
+    /// downloads this session (active, saved, or failed)
+    downloads: Vec<Download>,
+    downloads_open: bool,
     title: String,
     err: Option<String>,
     /// content size last sent to the renderer
@@ -367,6 +430,8 @@ impl Shell {
             scroll: 0.0,
             sent: None,
             lat: Vec::new(),
+            downloads: Vec::new(),
+            downloads_open: false,
             title: String::new(),
             err: None,
             size: (0, 0),
@@ -616,6 +681,63 @@ impl Shell {
                         self.err = Some(e.clone());
                     }
                     println!("[error] tab={owner} {e}");
+                }
+                Event::Download { done, total, name } => {
+                    match self
+                        .downloads
+                        .iter_mut()
+                        .find(|d| d.name == name && matches!(d.state, DlState::Active))
+                    {
+                        Some(d) => {
+                            d.done = done;
+                            d.total = total;
+                        }
+                        None => self.downloads.push(Download {
+                            name: name.clone(),
+                            done,
+                            total,
+                            state: DlState::Active,
+                        }),
+                    }
+                    println!("[download] {name} {done}/{total}");
+                }
+                Event::DownloadDone { path } => {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("download")
+                        .to_string();
+                    let state = match adopt_download(&path) {
+                        Ok(p) => {
+                            println!("[download] saved {}", p.display());
+                            DlState::Done(p)
+                        }
+                        Err(e) => {
+                            println!("[download] move failed: {e}");
+                            DlState::Failed(e)
+                        }
+                    };
+                    match self.downloads.iter_mut().find(|d| d.name == name) {
+                        Some(d) => d.state = state,
+                        None => self.downloads.push(Download {
+                            name,
+                            done: 0,
+                            total: 0,
+                            state,
+                        }),
+                    }
+                }
+                Event::DownloadFailed { name, err } => {
+                    println!("[download] {name}: {err}");
+                    match self.downloads.iter_mut().find(|d| d.name == name) {
+                        Some(d) => d.state = DlState::Failed(err),
+                        None => self.downloads.push(Download {
+                            name,
+                            done: 0,
+                            total: 0,
+                            state: DlState::Failed(err),
+                        }),
+                    }
                 }
                 Event::Exited => {
                     if self.r.restart() {
@@ -993,9 +1115,15 @@ impl eframe::App for Shell {
             reload = true;
         }
 
+        // downloads button sits at the toolbar's right edge; the address pill
+        // ends before it
+        let dl_rect = Rect::from_center_size(
+            egui::pos2(toolbar_rect.right() - 27.0, toolbar_rect.center().y),
+            egui::vec2(34.0, 34.0),
+        );
         let pill = Rect::from_min_max(
             egui::pos2(reload_rect.right() + 10.0, toolbar_rect.top() + 7.0),
-            egui::pos2(toolbar_rect.right() - 12.0, toolbar_rect.bottom() - 7.0),
+            egui::pos2(dl_rect.left() - 8.0, toolbar_rect.bottom() - 7.0),
         );
         painter.rect_filled(pill, 16.0, PILL_BG);
         draw_globe(
@@ -1047,6 +1175,45 @@ impl eframe::App for Shell {
         );
         if go_resp.clicked() || enter {
             go = Some(self.url_edit.clone());
+        }
+
+        // ---- downloads button + active badge ---------------------------
+        let dl_resp = ui.interact(dl_rect, ui.id().with("downloads"), Sense::click());
+        if dl_resp.hovered() {
+            painter.circle_filled(dl_rect.center(), 16.0, PILL_HOVER);
+        }
+        let dl_active = self
+            .downloads
+            .iter()
+            .any(|d| matches!(d.state, DlState::Active));
+        let dl_col = if dl_resp.hovered() || self.downloads_open || dl_active {
+            ACCENT
+        } else {
+            MUTED
+        };
+        let dc = dl_rect.center();
+        // arrow into a tray
+        painter.line_segment(
+            [egui::pos2(dc.x, dc.y - 7.0), egui::pos2(dc.x, dc.y + 3.0)],
+            Stroke::new(1.6, dl_col),
+        );
+        painter.line_segment(
+            [egui::pos2(dc.x - 4.5, dc.y - 1.5), egui::pos2(dc.x, dc.y + 3.0)],
+            Stroke::new(1.6, dl_col),
+        );
+        painter.line_segment(
+            [egui::pos2(dc.x + 4.5, dc.y - 1.5), egui::pos2(dc.x, dc.y + 3.0)],
+            Stroke::new(1.6, dl_col),
+        );
+        painter.line_segment(
+            [egui::pos2(dc.x - 6.5, dc.y + 7.0), egui::pos2(dc.x + 6.5, dc.y + 7.0)],
+            Stroke::new(1.6, dl_col),
+        );
+        if dl_active {
+            painter.circle_filled(egui::pos2(dc.x + 8.0, dc.y - 8.0), 3.0, ACCENT);
+        }
+        if dl_resp.clicked() {
+            self.downloads_open = !self.downloads_open;
         }
 
         // ---- keyboard: the usual browser chords ------------------------
@@ -1208,7 +1375,18 @@ impl eframe::App for Shell {
         }
 
         // ---- status bar -------------------------------------------------
-        let left = if let Some(e) = &self.err {
+        let active_dl = self
+            .downloads
+            .iter()
+            .find(|d| matches!(d.state, DlState::Active));
+        let left = if let Some(d) = active_dl {
+            let pct = if d.total > 0 {
+                format!("{}%", d.done * 100 / d.total.max(1))
+            } else {
+                format!("{} KB", d.done / 1024)
+            };
+            format!("Downloading {} — {pct}", d.name)
+        } else if let Some(e) = &self.err {
             format!("⚠ {e}")
         } else if self.loading {
             format!("Loading…  {}", self.active_tab().url)
@@ -1244,8 +1422,76 @@ impl eframe::App for Shell {
             MUTED,
         );
 
+        // ---- downloads panel --------------------------------------------
+        if self.downloads_open {
+            let mut open = true;
+            egui::Window::new("Downloads")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(380.0)
+                .anchor(
+                    Align2::RIGHT_TOP,
+                    [-14.0, title_rect.height() + toolbar_rect.height() + 8.0],
+                )
+                .show(ui.ctx(), |ui| {
+                    if self.downloads.is_empty() {
+                        ui.label("Nothing downloaded yet.");
+                    }
+                    for d in self.downloads.iter().rev() {
+                        ui.horizontal(|ui| match &d.state {
+                            DlState::Active => {
+                                let text = if d.total > 0 {
+                                    format!("{}%", d.done * 100 / d.total.max(1))
+                                } else {
+                                    format!("{} KB", d.done / 1024)
+                                };
+                                let frac = if d.total > 0 {
+                                    (d.done as f32 / d.total as f32).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .desired_width(150.0)
+                                        .text(text),
+                                );
+                                ui.label(elide(ui, &d.name, &FontId::proportional(12.5), 190.0));
+                            }
+                            DlState::Done(p) => {
+                                let shown = elide(ui, &d.name, &FontId::proportional(12.5), 240.0);
+                                if ui
+                                    .link(shown)
+                                    .on_hover_text(p.display().to_string())
+                                    .clicked()
+                                {
+                                    open_path(p);
+                                }
+                                ui.label(egui::RichText::new("saved").color(MUTED).size(11.0));
+                            }
+                            DlState::Failed(e) => {
+                                ui.colored_label(CLOSE_RED, "⚠");
+                                ui.label(elide(ui, &d.name, &FontId::proportional(12.5), 220.0));
+                                ui.label(egui::RichText::new(e).color(MUTED).size(11.0));
+                            }
+                        });
+                    }
+                });
+            self.downloads_open = open;
+        }
+
         ui.ctx().request_repaint_after(Duration::from_millis(8));
     }
+}
+
+/// Open a saved download with the platform's file handler (the trusted shell
+/// process; the renderer never touches the profile).
+fn open_path(path: &std::path::Path) {
+    #[cfg(windows)]
+    let cmd = "explorer.exe";
+    #[cfg(not(windows))]
+    let cmd = "xdg-open";
+    let _ = std::process::Command::new(cmd).arg(path).spawn();
 }
 
 /// Truncate `text` with an ellipsis so it fits in `max_w`.

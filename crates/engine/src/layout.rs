@@ -594,6 +594,16 @@ pub struct MediaEntry {
     pub looping: bool,
 }
 
+/// One `<a download>` target the renderer can save instead of navigating.
+/// The href is already resolved against the page; `name` is the attribute
+/// value (`""` when the attribute has no value, letting the renderer derive
+/// one from the URL).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadLink {
+    pub href: String,
+    pub name: String,
+}
+
 /// Resolve `object-fit`/`object-position` into (content rect, crop window)
 /// inside `bx` (the replaced element's padding box). The content rect keeps
 /// the intrinsic aspect ratio for every mode but `fill`; `object-position`

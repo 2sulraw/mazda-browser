@@ -264,6 +264,11 @@ pub enum Event {
     Title(String),
     Nav(String),
     Error(String),
+    /// a download is streaming to disk: bytes so far and total (0 = unknown)
+    Download { done: u64, total: u64, name: String },
+    /// the file is complete in the renderer's temp dir; the shell moves it out
+    DownloadDone { path: PathBuf },
+    DownloadFailed { name: String, err: String },
     /// not on the wire: the reader thread's EOF signal
     Exited,
 }
@@ -278,6 +283,11 @@ impl Event {
             Event::Title(t) => format!("title {t}"),
             Event::Nav(u) => format!("nav {u}"),
             Event::Error(e) => format!("error {e}"),
+            Event::Download { done, total, name } => {
+                format!("download {done} {total} {name}")
+            }
+            Event::DownloadDone { path } => format!("download-done {}", path.display()),
+            Event::DownloadFailed { name, err } => format!("download-failed {name}\t{err}"),
             Event::Exited => "exited".to_string(),
         }
     }
@@ -305,6 +315,26 @@ impl Event {
             "title" => Some(Event::Title(rest.to_string())),
             "nav" => Some(Event::Nav(rest.to_string())),
             "error" => Some(Event::Error(rest.to_string())),
+            "download" => {
+                let mut it = rest.splitn(3, ' ');
+                let done = it.next()?.parse().ok()?;
+                let total = it.next()?.parse().ok()?;
+                Some(Event::Download {
+                    done,
+                    total,
+                    name: it.next().unwrap_or_default().to_string(),
+                })
+            }
+            "download-done" => Some(Event::DownloadDone {
+                path: PathBuf::from(rest),
+            }),
+            "download-failed" => {
+                let (name, err) = rest.split_once('\t').unwrap_or((rest, ""));
+                Some(Event::DownloadFailed {
+                    name: name.to_string(),
+                    err: err.to_string(),
+                })
+            }
             "exited" => Some(Event::Exited),
             _ => None,
         }
@@ -394,6 +424,18 @@ mod tests {
             Event::Title("https://example.com".into()),
             Event::Nav("https://example.com/next".into()),
             Event::Error("pipeline panic: bad box".into()),
+            Event::Download {
+                done: 1024,
+                total: 4096,
+                name: "Big File (1).zip".into(),
+            },
+            Event::DownloadDone {
+                path: PathBuf::from("C:/Temp/mazda-dl/a b.mp4"),
+            },
+            Event::DownloadFailed {
+                name: "a b.mp4".into(),
+                err: "connection reset".into(),
+            },
             Event::Exited,
         ];
         for e in cases {
