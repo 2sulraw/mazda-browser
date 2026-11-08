@@ -1169,6 +1169,49 @@ fail, 6,154 skip**, zero panics, 15.2 s. Two regression assertions cover
 top-level `this === globalThis` and the plain nested call that must shadow an
 outer `new.target`. Workspace tests stay green (902 engine).
 
+### Step 3: recycled call frames (2026-11-09)
+
+A call still allocated and freed one `Env` each time. Two changes make that
+cost disappear for ordinary calls:
+
+- The page registry that breaks reference cycles now records a scope only when
+  a closure captures it. A scope can only enter a cycle through a `Closure`
+  (the sole `Rc<Env>` owner besides the call stack), so uncaptured frames do
+  not need a `Weak` entry. This also removes a thread-local push from every
+  call.
+- A call frame goes back to a per-engine pool (cap 64) after the body if its
+  `Rc` is unique. A closure or generator that captured the frame keeps its own
+  `Rc`, so the strong-count check alone decides safety; an escaped frame is
+  simply dropped as before. The pooled frame keeps its binding-`Vec` capacity,
+  so recursive calls reuse both the allocation and the storage.
+
+`Rc::get_mut` refuses a value that still has a `Weak`, which is exactly why
+the registry had to move first: a frame with a registry entry is never
+recycled (safe fallback, just no reuse).
+
+**Method.** Same alternating A/B against the step-2 binary, three full runs.
+
+| program | before (median of 3) | after (median of 3) | change |
+|---|---:|---:|---:|
+| fib(22) | 24.7 ms | **16.8 ms** | **-32%** |
+| closure x300k | 158.8 ms | **131.8 ms** | **-17%** |
+| call x300k | 122.3 ms | **106.7 ms** | **-13%** |
+| property x300k | 187.6 ms | 164.3 ms | bonus, not claimed |
+| array x100k | 77.0 ms | 79.3 ms | wash |
+| loop x300k | 63.2 ms | 62.7 ms | wash |
+
+`fib` gains most because recursion reuses one frame per depth instead of
+allocating ~57k frames; the flat call bench gains less because its loop frame
+is already reused and only the callee frame cycles.
+
+### Step 3: correctness
+
+Test262 counts are again identical: **17,678 run, 6,950 pass, 10,728 fail,
+6,154 skip**, zero panics, 16.1 s. Escaping frames are covered by the existing
+closure, generator and `Function.prototype.bind` tests, and the suite's
+17,678 fresh engines exercised pool teardown on every test. Workspace tests
+stay green (902 engine).
+
 ### Shortcuts (deliberate)
 
 - Sloppy mode only; strict, module, async and module-resolution tests are

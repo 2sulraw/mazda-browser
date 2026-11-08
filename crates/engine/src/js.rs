@@ -992,6 +992,12 @@ pub struct Env {
     /// page that owns this scope: lets `JsEngine::drop` clear exactly its own
     /// page's environments (see `clear_page_envs`).
     page: u64,
+    /// Set when a closure captures this scope. Only captured scopes can join
+    /// a reference cycle (the only `Rc<Env>` owner besides the call stack is
+    /// `Closure`), so only they need the page-drop registry. Uncaptured scopes
+    /// stay registry-free, which also lets the call-frame pool recycle them
+    /// (`Rc::get_mut` refuses a value that still has a `Weak`).
+    registered: Cell<bool>,
 }
 
 thread_local! {
@@ -1057,6 +1063,7 @@ pub(crate) fn new_closure(
     this: Option<Box<Val>>,
     is_arrow: bool,
 ) -> Rc<Closure> {
+    ensure_env_registered(&env);
     let c = Rc::new(Closure {
         def,
         env,
@@ -1150,6 +1157,15 @@ fn register_env(env: &Rc<Env>) {
     });
 }
 
+/// Register a scope the first time a closure captures it. The registration
+/// costs a `Weak` plus a thread-local push, so it is paid per captured scope
+/// instead of per call; nothing else can put an `Env` into a cycle.
+fn ensure_env_registered(env: &Rc<Env>) {
+    if !env.registered.replace(true) {
+        register_env(env);
+    }
+}
+
 /// Break every reference cycle owned by `page`, then forget its registry
 /// entries. Called from `JsEngine::drop`.
 ///
@@ -1215,41 +1231,38 @@ impl Env {
     }
 
     fn with_page(page: u64, this: Option<Val>) -> Rc<Env> {
-        let env = Rc::new(Env {
+        Rc::new(Env {
             parent: None,
             bindings: RefCell::new(Vec::new()),
             this,
             new_target: None,
             page,
-        });
-        register_env(&env);
-        env
+            registered: Cell::new(false),
+        })
     }
 
     pub fn child(parent: &Rc<Env>) -> Rc<Env> {
-        let env = Rc::new(Env {
+        Rc::new(Env {
             parent: Some(parent.clone()),
             bindings: RefCell::new(Vec::new()),
             this: None,
             new_target: None,
             page: parent.page,
-        });
-        register_env(&env);
-        env
+            registered: Cell::new(false),
+        })
     }
 
     /// Function-call frame. `new_target` is `None` for an arrow (it inherits
     /// through the env chain) and `Some` for every ordinary function.
     fn call_frame(parent: &Rc<Env>, this: Val, new_target: Option<Val>) -> Rc<Env> {
-        let env = Rc::new(Env {
+        Rc::new(Env {
             parent: Some(parent.clone()),
             bindings: RefCell::new(Vec::new()),
             this: Some(this),
             new_target,
             page: parent.page,
-        });
-        register_env(&env);
-        env
+            registered: Cell::new(false),
+        })
     }
 
     fn declare(&self, name: Rc<str>, v: Val, is_const: bool) {
@@ -1394,6 +1407,10 @@ pub struct JsEngine {
     pub(crate) natives: Vec<NativeEntry>,
     pub(crate) natives_by_name: HashMap<Rc<str>, usize>,
     pub(crate) call_depth: usize,
+    /// Recycled call frames. A frame returns here only when its `Rc` is
+    /// unique after the body (no closure or generator captured it), so
+    /// recursive and call-heavy scripts stop paying an allocation per call.
+    pub(crate) env_pool: Vec<Rc<Env>>,
     pub(crate) timers: Vec<TimerTask>,
     /// ids passed to `clearTimeout`/`clearInterval` since the last drain;
     /// the embedder removes already-queued jobs with these ids
@@ -1661,6 +1678,7 @@ impl JsEngine {
             natives: Vec::new(),
             natives_by_name: HashMap::new(),
             call_depth: 0,
+            env_pool: Vec::new(),
             timers: Vec::new(),
             cancelled_timers: Vec::new(),
             microtasks: Vec::new(),
@@ -2183,6 +2201,77 @@ impl JsEngine {
         format!(" (in {})", names.join(" <- "))
     }
 
+    /// A call frame from the pool when one is free, otherwise a fresh one.
+    fn take_env(&mut self, parent: &Rc<Env>, this: Val, new_target: Option<Val>) -> Rc<Env> {
+        while let Some(mut env) = self.env_pool.pop() {
+            // pooled frames are unregistered, so `get_mut` succeeds unless a
+            // `Weak` appeared; then drop it and take the next (or a new) one
+            if let Some(e) = Rc::get_mut(&mut env) {
+                e.parent = Some(parent.clone());
+                e.this = Some(this);
+                e.new_target = new_target;
+                return env;
+            }
+        }
+        Env::call_frame(parent, this, new_target)
+    }
+
+    /// Return a frame to the pool when nothing escaped into it. A closure or
+    /// generator that captured the frame holds its own `Rc`, so the strong
+    /// count is the whole safety argument.
+    fn recycle_env(&mut self, mut env: Rc<Env>) {
+        const ENV_POOL_MAX: usize = 64;
+        if Rc::strong_count(&env) != 1 || self.env_pool.len() >= ENV_POOL_MAX {
+            return;
+        }
+        let Some(e) = Rc::get_mut(&mut env) else { return };
+        e.bindings.get_mut().clear();
+        e.parent = None;
+        e.this = None;
+        e.new_target = None;
+        self.env_pool.push(env);
+    }
+
+    /// Run a closure body after its frame and parameters are set up.
+    fn run_closure_body(
+        &mut self,
+        c: &Rc<Closure>,
+        env: &Rc<Env>,
+        args: Vec<Val>,
+    ) -> Result<Val, JsError> {
+        if c.def.is_generator {
+            // generators never run the body at call time; the mini-VM
+            // (gen.rs) resumes it on `.next`
+            return gen::gen_object(self, &c.def, env);
+        }
+        if c.def.is_async {
+            // run-to-completion tradeoff: the body runs NOW to completion;
+            // each `await` inside pumps the microtask queue and the result
+            // settles the promise this call returns.
+            let p = self.new_promise();
+            match interp::run_function_body(self, c, env) {
+                Ok(v) => resolve_promise(self, &p, v),
+                Err(JsError::Throw(v)) => settle_promise(self, &p, Err(v)),
+                Err(other) => return Err(other),
+            }
+            return Ok(Val::Obj(p));
+        }
+        match &c.def.body {
+            FnBody::Expr(x) => interp::eval_expr(self, env, x),
+            FnBody::Block(_stmts) => interp::run_function_body(self, c, env),
+            // Function.prototype.bind partial application
+            FnBody::Bound {
+                target,
+                this,
+                args: bargs,
+            } => {
+                let mut all = bargs.clone();
+                all.extend(args);
+                self.call(target.clone(), this.clone(), all)
+            }
+        }
+    }
+
     fn call_inner(&mut self, callee: Val, this: Val, args: Vec<Val>) -> Result<Val, JsError> {
         // only the direct callee of `new` sees this; a plain call made from
         // inside the constructor takes it during ITS own call_inner, so the
@@ -2206,44 +2295,17 @@ impl JsEngine {
                 } else {
                     Some(construct_target.unwrap_or(Val::Undefined))
                 };
-                let env = Env::call_frame(&c.env, this_val, new_target);
+                let env = self.take_env(&c.env, this_val, new_target);
                 if !c.is_arrow && c.def.uses_arguments {
                     let items = args.clone();
                     env.declare(self.arguments_key.clone(), Val::new_array(items), false);
                 }
-                interp::bind_params(self, &env, &c.def, &args)?;
-                if c.def.is_generator {
-                    // generators never run the body at call time; the mini-VM
-                    // (gen.rs) resumes it on `.next`
-                    return gen::gen_object(self, &c.def, &env);
-                }
-                if c.def.is_async {
-                    // run-to-completion tradeoff: the body runs NOW to
-                    // completion; each `await` inside pumps the microtask
-                    // queue (await_promise) and the result settles the
-                    // promise this call returns.
-                    let p = self.new_promise();
-                    match interp::run_function_body(self, &c, &env) {
-                        Ok(v) => resolve_promise(self, &p, v),
-                        Err(JsError::Throw(v)) => settle_promise(self, &p, Err(v)),
-                        Err(other) => return Err(other),
-                    }
-                    return Ok(Val::Obj(p));
-                }
-                match &c.def.body {
-                    FnBody::Expr(x) => interp::eval_expr(self, &env, x),
-                    FnBody::Block(_stmts) => interp::run_function_body(self, &c, &env),
-                    // Function.prototype.bind partial application
-                    FnBody::Bound {
-                        target,
-                        this: bthis,
-                        args: bargs,
-                    } => {
-                        let mut all = bargs.clone();
-                        all.extend(args);
-                        self.call(target.clone(), bthis.clone(), all)
-                    }
-                }
+                let result = match interp::bind_params(self, &env, &c.def, &args) {
+                    Ok(()) => self.run_closure_body(&c, &env, args),
+                    Err(err) => Err(err),
+                };
+                self.recycle_env(env);
+                result
             }
             Val::Native(id) => {
                 let (f, idx, host) = {
