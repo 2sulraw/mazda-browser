@@ -205,6 +205,9 @@ pub enum Command {
     Resize { width: u32, height: u32 },
     Scroll(f32),
     Click { x: f32, y: f32 },
+    /// `<input type=file>` got a file: the shell copied it into the sandbox's
+    /// temp dir and names it here. `name` is the user-visible filename.
+    FileChosen { node: u32, name: String, path: String },
     Quit,
 }
 
@@ -216,6 +219,9 @@ impl Command {
             Command::Resize { width, height } => format!("resize {width} {height}"),
             Command::Scroll(y) => format!("scroll {y:.1}"),
             Command::Click { x, y } => format!("click {x:.1} {y:.1}"),
+            Command::FileChosen { node, name, path } => {
+                format!("file-chosen {node} {name}\t{path}")
+            }
             Command::Quit => "quit".to_string(),
         }
     }
@@ -245,6 +251,15 @@ impl Command {
                 })
             }
             "quit" => Some(Command::Quit),
+            "file-chosen" => {
+                let (node, rest) = rest.split_once(' ')?;
+                let (name, path) = rest.split_once('\t')?;
+                Some(Command::FileChosen {
+                    node: node.parse().ok()?,
+                    name: name.to_string(),
+                    path: path.to_string(),
+                })
+            }
             _ => None,
         }
     }
@@ -266,6 +281,8 @@ pub enum Event {
     Error(String),
     /// a download is streaming to disk: bytes so far and total (0 = unknown)
     Download { done: u64, total: u64, name: String },
+    /// a `<input type=file>` was clicked: the shell opens the OS picker
+    PickFile { node: u32 },
     /// the file is complete in the renderer's temp dir; the shell moves it out
     DownloadDone { path: PathBuf },
     DownloadFailed { name: String, err: String },
@@ -286,6 +303,7 @@ impl Event {
             Event::Download { done, total, name } => {
                 format!("download {done} {total} {name}")
             }
+            Event::PickFile { node } => format!("pick-file {node}"),
             Event::DownloadDone { path } => format!("download-done {}", path.display()),
             Event::DownloadFailed { name, err } => format!("download-failed {name}\t{err}"),
             Event::Exited => "exited".to_string(),
@@ -327,6 +345,9 @@ impl Event {
             }
             "download-done" => Some(Event::DownloadDone {
                 path: PathBuf::from(rest),
+            }),
+            "pick-file" => Some(Event::PickFile {
+                node: rest.trim().parse().ok()?,
             }),
             "download-failed" => {
                 let (name, err) = rest.split_once('\t').unwrap_or((rest, ""));
@@ -400,6 +421,11 @@ mod tests {
             Command::Resize { width: 1000, height: 700 },
             Command::Scroll(123.4),
             Command::Click { x: 10.5, y: 20.5 },
+            Command::FileChosen {
+                node: 42,
+                name: "My Notes (1).txt".into(),
+                path: "C:/Temp/mazda-uploads/7/My Notes (1).txt".into(),
+            },
             Command::Quit,
         ];
         for c in cases {
@@ -436,6 +462,7 @@ mod tests {
                 name: "a b.mp4".into(),
                 err: "connection reset".into(),
             },
+            Event::PickFile { node: 12 },
             Event::Exited,
         ];
         for e in cases {

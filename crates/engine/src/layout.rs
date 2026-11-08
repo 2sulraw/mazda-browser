@@ -671,7 +671,10 @@ pub enum FormKind {
     /// `<select>` — closed one-line display only (no popup yet; kept
     /// working as before, but now hit-testable for a future popup)
     Select,
-    /// other `<input>` types (range/color/date/file/…) — chrome box
+    /// `<input type=file>` — shows "Choose File" (or the picked filename);
+    /// a click asks the shell for the OS picker
+    File,
+    /// other `<input>` types (range/color/date/…) — chrome box
     /// shows the value attr, but no widget art and no interaction yet
     Generic,
 }
@@ -730,6 +733,18 @@ pub struct FormState {
     /// live values by DOM node id (raw text; password masking is display-
     /// only)
     pub values: HashMap<u32, String>,
+    /// `<input type=file>` picks by DOM node id: what the control shows and
+    /// the sandbox-readable copy the worker uploads
+    pub files: HashMap<u32, FilePick>,
+}
+
+/// One picked `<input type=file>` value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePick {
+    /// the user-visible filename (shown in the control + the part header)
+    pub name: String,
+    /// path of the copy inside the renderer's sandbox temp dir
+    pub path: String,
 }
 
 /// Box tree node: a text run (leaf) or an element box (block/flex/grid).
@@ -1670,10 +1685,13 @@ fn build_into(
                                 "radio" => FormKind::Radio,
                                 "submit" | "button" | "reset" | "image" => FormKind::Submit,
                                 "password" => FormKind::TextInput { password: true },
+                                // a file input shows a button-ish label; the
+                                // shell opens the OS picker on click
+                                "file" => FormKind::File,
                                 // other typed inputs: chrome box, no widget
                                 // art and no interaction yet
                                 "range" | "color" | "date" | "time" | "month" | "week"
-                                | "datetime-local" | "file" => FormKind::Generic,
+                                | "datetime-local" => FormKind::Generic,
                                 _ => FormKind::TextInput { password: false },
                             };
                             // raw stored value = the value attribute only
@@ -1695,6 +1713,9 @@ fn build_into(
                                 // button-ish inputs show their value as the label
                                 FormKind::Submit => val.to_string(),
                                 FormKind::Select => String::new(),
+                                // UA label until a file is picked (the live
+                                // value map replaces it with the filename)
+                                FormKind::File => "Choose File".to_string(),
                                 // range/color/date/… show the value attr as text
                                 FormKind::Generic => val.to_string(),
                             };
@@ -1711,6 +1732,7 @@ fn build_into(
                                 // button-ish inputs shrink to their label
                                 FormKind::Submit => (22.0, None),
                                 FormKind::Select => (22.0, None),
+                                FormKind::File => (22.0, None),
                                 // generic chrome box: shrink to its value text
                                 FormKind::Generic => (22.0, None),
                             };
@@ -2804,6 +2826,9 @@ impl Layout {
         FormState {
             focused: self.focused,
             values: self.form_values.clone(),
+            // picks live in the caller's state, not in layout (only the
+            // filename reaches layout, through `values`)
+            files: HashMap::new(),
         }
     }
 }
@@ -13691,6 +13716,7 @@ line</textarea></div>"#,
             let st = FormState {
                 focused: Some(node2),
                 values: Default::default(),
+                files: Default::default(),
             };
             let l = layout_in_forms(&mut root, 250.0, 400.0, &m4, &st);
             assert!(l.forms[1].focused, "field 2 focused at width A");

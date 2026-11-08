@@ -1202,11 +1202,20 @@ impl DomHost {
         // lives UI-side and never crosses turns, but every typed value the
         // shell synced (input/change events) is already in a `value`
         // attribute on the worker DOM — so this sees the real state.
-        match crate::build_submission(self.dom_ref(), node, &Default::default(), &base) {
+        match crate::build_submission(
+            self.dom_ref(),
+            node,
+            &Default::default(),
+            &Default::default(),
+            &base,
+        ) {
             Some(sub) => match sub.method {
                 crate::SubmitMethod::Post => {
                     eprintln!("[js] form.submit() → POST {} (body {} bytes)", sub.target, sub.body.len());
-                    self.request_form_nav(FormNav { url: sub.target, body: sub.body });
+                    self.request_form_nav(FormNav {
+                        url: sub.target,
+                        body: String::from_utf8_lossy(&sub.body).into_owned(),
+                    });
                 }
                 crate::SubmitMethod::Get => {
                     eprintln!("[js] form.submit() → GET {}", sub.target);

@@ -839,6 +839,9 @@ pub fn run_headless() {
     // downloads stream on their own threads; the main loop forwards progress
     let (dl_tx, dl_rx) = mpsc::channel::<DlMsg>();
     let mut dl_active = false;
+    // live form state (typed text + picked files) rides every worker job so a
+    // relayout never loses it; a navigation resets it
+    let mut forms = layout::FormState::default();
 
     if let Some(url) = url {
         nav_id += 1;
@@ -880,6 +883,7 @@ pub fn run_headless() {
                     println!("{}", mazda_ipc::Event::Error("pipeline panic".into()).encode());
                     continue;
                 }
+                let nav_done = done.nav.is_some() && done.nav_done;
                 if let Some(nav) = done.nav {
                     if !done.nav_done {
                         // script navigation: the shell decides whether to load
@@ -888,6 +892,11 @@ pub fn run_headless() {
                     }
                 }
                 let Some(mut wire) = done.page else { continue };
+                // a form submission (or any navigation) starts a fresh
+                // document: typed values and picks belong to the old one
+                if nav_done {
+                    forms = layout::FormState::default();
+                }
                 // adopt the worker's font state exactly like the shell does
                 let stacks = std::mem::take(&mut wire.stacks);
                 let faces = std::mem::take(&mut wire.faces);
@@ -941,6 +950,7 @@ pub fn run_headless() {
                         nav_id += 1;
                         scroll = 0.0;
                         players.clear();
+                        forms = layout::FormState::default();
                         let _ = jobs_tx.send(LoadReq::Load {
                             id: nav_id,
                             url,
@@ -955,6 +965,7 @@ pub fn run_headless() {
                         nav_id += 1;
                         scroll = 0.0;
                         players.clear();
+                        forms = layout::FormState::default();
                         let _ = jobs_tx.send(LoadReq::Load {
                             id: nav_id,
                             url,
@@ -976,12 +987,33 @@ pub fn run_headless() {
                                 url: p.url.clone(),
                                 max_w: page_w(pw),
                                 vh: page_h(ph),
-                                forms: layout::FormState::default(),
+                                forms: forms.clone(),
                                 hover: None,
                                 engine: EngineChoice::A,
                             });
                             scroll = scroll.min((p.laid.height - page_h(ph)).max(0.0));
                             headless_paint(p, &fonts, pw, ph, scroll, &mut frame, &mut seq);
+                        }
+                    }
+                    mazda_ipc::Command::FileChosen { node, name, path } => {
+                        eprintln!("[form] picked {name} ({path}) for node {node}");
+                        forms.focused = None;
+                        forms.values.insert(node, name.clone());
+                        forms.files.insert(node, layout::FilePick { name, path });
+                        if let Some(p) = page.as_ref() {
+                            // the control shows the filename: re-lay out the
+                            // kept page with the new state (no repaint here —
+                            // the worker's page arrives and paints)
+                            nav_id += 1;
+                            let _ = jobs_tx.send(LoadReq::Relayout {
+                                id: nav_id,
+                                url: p.url.clone(),
+                                max_w: page_w(pw),
+                                vh: page_h(ph),
+                                forms: forms.clone(),
+                                hover: None,
+                                engine: EngineChoice::A,
+                            });
                         }
                     }
                     mazda_ipc::Command::Scroll(y) => {
@@ -1006,6 +1038,37 @@ pub fn run_headless() {
                             });
                             if let Some(i) = hit {
                                 toggle_player(&mut players, p, i);
+                            } else if let Some(fb) = p.laid.hit_test_form(x, y, scroll).map(|i| p.laid.forms[i]) {
+                                // form controls: a file input asks the shell
+                                // for the OS picker, a submit button runs the
+                                // full submission (listeners, then GET/POST)
+                                match fb.kind {
+                                    layout::FormKind::File => {
+                                        println!(
+                                            "{}",
+                                            mazda_ipc::Event::PickFile { node: fb.node }.encode()
+                                        );
+                                    }
+                                    layout::FormKind::Submit => {
+                                        eprintln!("[form] submit click on node {}", fb.node);
+                                        nav_id += 1;
+                                        let _ = jobs_tx.send(LoadReq::Event {
+                                            id: nav_id,
+                                            url: p.url.clone(),
+                                            max_w: page_w(pw),
+                                            vh: page_h(ph),
+                                            node: fb.node,
+                                            kinds: vec!["click".into()],
+                                            value: None,
+                                            key: None,
+                                            href: None,
+                                            submit: true,
+                                            forms: forms.clone(),
+                                            engine: EngineChoice::A,
+                                        });
+                                    }
+                                    _ => {}
+                                }
                             } else if let Some(href) = headless_link_at(p, x, y, scroll) {
                                 // `<a download>` saves the target; every other
                                 // link keeps normal navigation
@@ -1889,7 +1952,7 @@ impl App {
                 self.forms.focused = None;
                 self.dispatch_event_ext(fb.node, &["click"], None, None, true, pw, ph);
             }
-            layout::FormKind::Select | layout::FormKind::Generic => {
+            layout::FormKind::Select | layout::FormKind::Generic | layout::FormKind::File => {
                 // no popup / non-interactive yet — just blur
                 if let Some(prev) = self.forms.focused.take() {
                     let val = self.forms.values.get(&prev).cloned();
@@ -4008,7 +4071,7 @@ fn process_job(
                 if submit_decision(pd) == SubmitDecision::Cancel {
                     eprintln!("[js] preventDefault — submission canceled at activation (no submit event)");
                 } else {
-                    let submission = build_submission(&kp.dom, target, &forms.values, url);
+                    let submission = build_submission(&kp.dom, target, &forms.values, &forms.files, url);
                     match submission {
                         None => {
                             eprintln!(
@@ -4017,10 +4080,11 @@ fn process_job(
                         }
                         Some(sub) => {
                             eprintln!(
-                                "[form] submit method={} url={} body={} bytes (urlencoded)",
+                                "[form] submit method={} url={} body={} bytes ({})",
                                 sub.method.as_str(),
                                 sub.target,
-                                sub.body.len()
+                                sub.body.len(),
+                                sub.content_type
                             );
                             // the form's submit listeners get the submit event
                             // (bubbles like the click dispatch). A preventDefault
@@ -4074,9 +4138,16 @@ fn process_job(
                                         return (wire, script_nav.or(Some(sub.target)), pd, panicked, done);
                                     }
                                     SubmitMethod::Post => {
-                                        let f = runtime::FormNav { url: sub.target.clone(), body: sub.body };
-                                        let (wire, nav2) =
-                                            do_form_nav(kept, fonts, &f, *max_w, *vh, job.engine());
+                                        let (wire, nav2) = do_form_nav_raw(
+                                            kept,
+                                            fonts,
+                                            &sub.target,
+                                            &sub.body,
+                                            &sub.content_type,
+                                            *max_w,
+                                            *vh,
+                                            job.engine(),
+                                        );
                                         let done = nav2.is_none();
                                         return (wire, nav2.or(Some(sub.target)), false, false, done);
                                     }
@@ -4275,14 +4346,36 @@ fn do_form_nav(
     vh: f32,
     engine: EngineChoice,
 ) -> (Option<PageWire>, Option<String>) {
+    do_form_nav_raw(
+        kept,
+        fonts,
+        &f.url,
+        f.body.as_bytes(),
+        URLENCODED,
+        max_w,
+        vh,
+        engine,
+    )
+}
+
+/// `do_form_nav` for a body that is not necessarily urlencoded text
+/// (multipart uploads are bytes).
+fn do_form_nav_raw(
+    kept: &mut Option<KeptPage>,
+    fonts: &mut Fonts,
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    max_w: f32,
+    vh: f32,
+    engine: EngineChoice,
+) -> (Option<PageWire>, Option<String>) {
     eprintln!(
-        "[nav] queued load (form POST {}, urlencoded body {} bytes)",
-        f.url,
-        f.body.len()
+        "[nav] queued load (form POST {url}, {content_type} body {} bytes)",
+        body.len()
     );
-    let fetched = fetch_post(&f.url, &f.body.clone());
-    let (wire, nav, form_nav2) =
-        do_load_full(kept, fonts, &f.url, fetched, max_w, vh, engine);
+    let fetched = fetch_post(url, body, content_type);
+    let (wire, nav, form_nav2) = do_load_full(kept, fonts, url, fetched, max_w, vh, engine);
     if let Some(f2) = form_nav2 {
         eprintln!("[js] form.submit() chain after POST load (dropped, one step)");
         eprintln!("[nav] form submission chain → {}", f2.url);
@@ -4765,7 +4858,9 @@ pub(crate) struct SubmissionReq {
     /// absolute target (GET: the built `?name=value&…` URL)
     pub target: String,
     /// urlencoded data (GET: the query serial; POST: the request body)
-    pub body: String,
+    pub body: Vec<u8>,
+    /// `Content-Type` for a POST body (urlencoded or multipart)
+    pub content_type: String,
 }
 
 /// True when `node` is a submit button (`<button>` without a `type`, or with
@@ -4826,11 +4921,11 @@ pub(crate) fn build_submission(
     dom: &html::Dom,
     activated: u32,
     live: &HashMap<u32, String>,
+    files: &HashMap<u32, layout::FilePick>,
     base: &str,
 ) -> Option<SubmissionReq> {
     let form = form_ancestor(dom, activated)?;
     let pairs = collect_form_pairs(dom, form, live, implicit_submitter(dom, form, activated));
-    let body = urlencode_pairs(&pairs);
     let action = resolve_form_target(base, dom.attr(form, "action"))
         .or_else(|| resolve_form_target(base, None))
         .or_else(|| {
@@ -4838,11 +4933,128 @@ pub(crate) fn build_submission(
             None
         })?;
     let method = SubmitMethod::from_form(dom.attr(form, "method"));
+    // multipart when the form asks for it or a file was picked; otherwise the
+    // body stays the plain urlencoded serial
+    let picked = picked_files(dom, form, files);
+    let multipart = method == SubmitMethod::Post
+        && (!picked.is_empty()
+            || dom
+                .attr(form, "enctype")
+                .is_some_and(|e| e.eq_ignore_ascii_case("multipart/form-data")));
+    let (body, content_type) = if multipart {
+        multipart_body(&pairs, &picked)
+    } else {
+        (urlencode_pairs(&pairs).into_bytes(), URLENCODED.to_string())
+    };
     let target = match method {
-        SubmitMethod::Get => form_get_url(&action, &body).unwrap_or(action),
+        SubmitMethod::Get => form_get_url(&action, &String::from_utf8_lossy(&body)).unwrap_or(action),
         SubmitMethod::Post => action,
     };
-    Some(SubmissionReq { method, target, body })
+    Some(SubmissionReq {
+        method,
+        target,
+        body,
+        content_type,
+    })
+}
+
+const URLENCODED: &str = "application/x-www-form-urlencoded";
+
+/// Successful `<input type=file>` controls of `form` that have a pick, in
+/// document order: (name attribute, pick). Disabled controls and disabled
+/// fieldsets are skipped exactly like `collect_form_pairs`.
+fn picked_files(
+    dom: &html::Dom,
+    form: u32,
+    files: &HashMap<u32, layout::FilePick>,
+) -> Vec<(String, layout::FilePick)> {
+    fn walk(
+        dom: &html::Dom,
+        node: u32,
+        files: &HashMap<u32, layout::FilePick>,
+        out: &mut Vec<(String, layout::FilePick)>,
+    ) {
+        for &c in &dom.nodes[node as usize].children {
+            if dom.tag(c) == "input"
+                && dom.attr(c, "type").is_some_and(|t| t.eq_ignore_ascii_case("file"))
+                && !control_disabled(dom, c)
+            {
+                if let (Some(name), Some(pick)) = (dom.attr(c, "name"), files.get(&c)) {
+                    out.push((name.to_string(), pick.clone()));
+                }
+            }
+            walk(dom, c, files, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(dom, form, files, &mut out);
+    out
+}
+
+/// `multipart/form-data` body: text pairs first, then one part per file.
+/// Returns the bytes and the matching `Content-Type` header value. A file
+/// that cannot be read is skipped (logged): the rest of the submission
+/// still goes out, the way a browser drops an inaccessible part.
+fn multipart_body(
+    pairs: &[(String, String)],
+    files: &[(String, layout::FilePick)],
+) -> (Vec<u8>, String) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let boundary = format!("----MazdaFormBoundary{:x}{nanos:x}", std::process::id());
+    let mut body: Vec<u8> = Vec::new();
+    for (name, value) in pairs {
+        push_str(
+            &mut body,
+            &format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                header_escape(name)
+            ),
+        );
+        body.extend_from_slice(value.as_bytes());
+        push_str(&mut body, "\r\n");
+    }
+    for (name, file) in files {
+        let bytes = match std::fs::read(&file.path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[form] upload {} unreadable: {e}", file.path);
+                continue;
+            }
+        };
+        push_str(
+            &mut body,
+            &format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+                header_escape(name),
+                header_escape(&file.name)
+            ),
+        );
+        body.extend_from_slice(&bytes);
+        push_str(&mut body, "\r\n");
+    }
+    push_str(&mut body, &format!("--{boundary}--\r\n"));
+    (body, format!("multipart/form-data; boundary={boundary}"))
+}
+
+fn push_str(body: &mut Vec<u8>, s: &str) {
+    body.extend_from_slice(s.as_bytes());
+}
+
+/// Keep a form field name/filename from breaking the part header: quotes,
+/// backslashes and line breaks become `_`.
+fn header_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if matches!(c, '"' | '\\' | '\r' | '\n') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// is a form POST allowed for a `data:` target? no — fetch_post cannot read
@@ -4854,10 +5066,12 @@ fn set_cookie_values(resp: &ureq::Response) -> Vec<String> {
     resp.all("set-cookie").iter().map(|s| s.to_string()).collect()
 }
 
-pub(crate) fn fetch_post(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>), String> {
-    let mut req = http_agent()
-        .post(url)
-        .set("Content-Type", "application/x-www-form-urlencoded");
+pub(crate) fn fetch_post(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let mut req = http_agent().post(url).set("Content-Type", content_type);
     // a form POST is a document navigation: the same identity every GET uses
     for (name, value) in net::request_headers(None) {
         req = req.set(name, &value);
@@ -4865,7 +5079,9 @@ pub(crate) fn fetch_post(url: &str, body: &str) -> Result<(Vec<u8>, Option<Strin
     if let Some(c) = cookie::request_header(url) {
         req = req.set("Cookie", &c);
     }
-    let resp = req.send(body.as_bytes()).map_err(|e| e.to_string())?;
+    // `send` treats a slice as a reader (chunked); `send_bytes` sends a
+    // Content-Length body, which every form endpoint accepts
+    let resp = req.send_bytes(body).map_err(|e| e.to_string())?;
     cookie::store_response(url, &set_cookie_values(&resp));
     let content_type = resp.header("content-type").map(|s| s.to_string());
     // same 20MB cap as every GET fetch (no disk cache: a POST response is
@@ -9122,22 +9338,48 @@ mod tests {
                 .find(|&i| dom.attr(i, "name") == Some(name))
                 .unwrap()
         };
-        let sub = build_submission(&dom, find("act"), &Default::default(), "https://e.com/")
-            .expect("submission");
-        assert_eq!(sub.body, "q=x&act=save", "the clicked button is included");
-        let enter = build_submission(&dom, find("q"), &Default::default(), "https://e.com/")
-            .expect("submission");
+        let sub = build_submission(
+            &dom,
+            find("act"),
+            &Default::default(),
+            &Default::default(),
+            "https://e.com/",
+        )
+        .expect("submission");
         assert_eq!(
-            enter.body, "q=x&act=save",
+            std::str::from_utf8(&sub.body).unwrap(),
+            "q=x&act=save",
+            "the clicked button is included"
+        );
+        let enter = build_submission(
+            &dom,
+            find("q"),
+            &Default::default(),
+            &Default::default(),
+            "https://e.com/",
+        )
+        .expect("submission");
+        assert_eq!(
+            std::str::from_utf8(&enter.body).unwrap(),
+            "q=x&act=save",
             "implicit submission names the form's default (first) submit button"
         );
         let form = (1..dom.nodes.len() as u32)
             .find(|&i| dom.tag(i) == "form")
             .unwrap();
         assert_eq!(
-            build_submission(&dom, form, &Default::default(), "https://e.com/")
+            std::str::from_utf8(
+                &build_submission(
+                    &dom,
+                    form,
+                    &Default::default(),
+                    &Default::default(),
+                    "https://e.com/"
+                )
                 .unwrap()
-                .body,
+                .body
+            )
+            .unwrap(),
             "q=x",
             "form.submit() activates the form: no submitter pair"
         );
@@ -9149,9 +9391,18 @@ mod tests {
             .find(|&i| dom3.attr(i, "name") == Some("q"))
             .unwrap();
         assert_eq!(
-            build_submission(&dom3, q3, &Default::default(), "https://e.com/")
+            std::str::from_utf8(
+                &build_submission(
+                    &dom3,
+                    q3,
+                    &Default::default(),
+                    &Default::default(),
+                    "https://e.com/"
+                )
                 .unwrap()
-                .body,
+                .body
+            )
+            .unwrap(),
             "q=x"
         );
         // `<input type=submit>` behaves the same, but a reset button never
@@ -9166,18 +9417,36 @@ mod tests {
             .find(|&i| dom2.attr(i, "name") == Some("go"))
             .unwrap();
         assert_eq!(
-            build_submission(&dom2, go, &Default::default(), "https://e.com/")
+            std::str::from_utf8(
+                &build_submission(
+                    &dom2,
+                    go,
+                    &Default::default(),
+                    &Default::default(),
+                    "https://e.com/"
+                )
                 .unwrap()
-                .body,
+                .body
+            )
+            .unwrap(),
             "go=Go"
         );
         let wipe = (1..dom2.nodes.len() as u32)
             .find(|&i| dom2.attr(i, "name") == Some("wipe"))
             .unwrap();
         assert_eq!(
-            build_submission(&dom2, wipe, &Default::default(), "https://e.com/")
+            std::str::from_utf8(
+                &build_submission(
+                    &dom2,
+                    wipe,
+                    &Default::default(),
+                    &Default::default(),
+                    "https://e.com/"
+                )
                 .unwrap()
-                .body,
+                .body
+            )
+            .unwrap(),
             "",
             "a reset button never submits"
         );
@@ -9314,23 +9583,123 @@ mod tests {
                 .find(|&i| dom.attr(i, "name") == Some(name))
                 .unwrap()
         };
-        let sub = build_submission(&dom, node_with("q"), &Default::default(), "https://src.com/").unwrap();
+        let sub = build_submission(
+            &dom,
+            node_with("q"),
+            &Default::default(),
+            &Default::default(),
+            "https://src.com/",
+        )
+        .unwrap();
         assert_eq!(sub.method, SubmitMethod::Get);
         assert_eq!(sub.target, "https://e.com/find?q=big+cat");
-        assert_eq!(sub.body, "q=big+cat");
+        assert_eq!(std::str::from_utf8(&sub.body).unwrap(), "q=big+cat");
         // the second form: POST target untouched, body urlencoded; also
         // proves form_ancestor picked the RIGHT enclosing form
-        let sub = build_submission(&dom, node_with("t"), &Default::default(), "https://src.com/").unwrap();
+        let sub = build_submission(
+            &dom,
+            node_with("t"),
+            &Default::default(),
+            &Default::default(),
+            "https://src.com/",
+        )
+        .unwrap();
         assert_eq!(sub.method, SubmitMethod::Post);
         assert_eq!(sub.target, "https://e.com/save");
-        assert_eq!(sub.body, "t=a%26b");
+        assert_eq!(std::str::from_utf8(&sub.body).unwrap(), "t=a%26b");
         // no enclosing form / no activation → no submission at all
-        assert!(build_submission(&dom, 0, &Default::default(), "https://src.com/").is_none());
+        assert!(build_submission(
+            &dom,
+            0,
+            &Default::default(),
+            &Default::default(),
+            "https://src.com/"
+        )
+        .is_none());
 
         // the decision helper both stages share: a preventDefault anywhere
         // cancels the not-yet-built request
         assert_eq!(submit_decision(false), SubmitDecision::Submit);
         assert_eq!(submit_decision(true), SubmitDecision::Cancel);
+    }
+
+    /// A picked file turns a POST into `multipart/form-data`: text pairs keep
+    /// their names, the file part carries the user-visible filename (escaped),
+    /// and a file input with no pick contributes nothing.
+    #[test]
+    fn file_pick_makes_a_multipart_post() {
+        let dom = html::parse(
+            r#"<html><body><form action="/up" method="post">
+                <input name="note" value="hi">
+                <input type="file" name="doc">
+                <input type="file" name="none">
+            </form></body></html>"#,
+        );
+        let node_with = |name: &str| {
+            (1..dom.nodes.len() as u32)
+                .find(|&i| dom.attr(i, "name") == Some(name))
+                .unwrap()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "mazda-upload-test-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"file bytes").unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            node_with("doc"),
+            layout::FilePick {
+                name: "a\"b.txt".into(),
+                path: path.to_string_lossy().into_owned(),
+            },
+        );
+        let sub = build_submission(
+            &dom,
+            node_with("note"),
+            &Default::default(),
+            &files,
+            "https://e.com/",
+        )
+        .unwrap();
+        assert_eq!(sub.method, SubmitMethod::Post);
+        assert_eq!(sub.target, "https://e.com/up");
+        assert!(
+            sub.content_type.starts_with("multipart/form-data; boundary="),
+            "content type names the boundary: {}",
+            sub.content_type
+        );
+        let text = String::from_utf8_lossy(&sub.body);
+        assert!(text.contains("name=\"note\"\r\n\r\nhi\r\n"), "{text}");
+        assert!(text.contains("filename=\"a_b.txt\""), "quotes escaped: {text}");
+        assert!(text.contains("file bytes"));
+        assert!(text.ends_with("--\r\n"), "closing boundary last");
+        assert!(!text.contains("name=\"none\""), "no pick, no part");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `enctype=multipart/form-data` alone is enough: a text-only form still
+    /// posts multipart, the way a browser does.
+    #[test]
+    fn enctype_multipart_without_a_file() {
+        let dom = html::parse(
+            r#"<html><body><form action="/u" method="post" enctype="multipart/form-data">
+                <input name="a" value="1">
+            </form></body></html>"#,
+        );
+        let n = (1..dom.nodes.len() as u32)
+            .find(|&i| dom.attr(i, "name") == Some("a"))
+            .unwrap();
+        let sub = build_submission(
+            &dom,
+            n,
+            &Default::default(),
+            &Default::default(),
+            "https://e.com/",
+        )
+        .unwrap();
+        assert!(sub.content_type.starts_with("multipart/form-data; boundary="));
+        let text = String::from_utf8_lossy(&sub.body);
+        assert!(text.contains("name=\"a\"\r\n\r\n1\r\n"), "{text}");
     }
 
     /// The worker's real submission stage through `process_job` (no network

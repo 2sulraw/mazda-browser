@@ -12,7 +12,8 @@ Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux). **P3 is in place**:
 `<video>`/`<audio>` play through Media Foundation + WASAPI, decoded by a
 pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
 started**: `<a download>` streams to disk with a progress panel and lands in the
-user's Downloads folder.
+user's Downloads folder, and `<input type=file>` posts files as
+`multipart/form-data` through the native picker.
 
 ## Workspace
 
@@ -89,6 +90,13 @@ profile unwritable. Names from the `download` attribute are sanitized so a page
 cannot pick a path. The toolbar's download button opens a panel with live
 progress bars and clickable saved files; the status bar shows the active
 transfer.
+
+Uploads (P4): `<input type=file>` shows "Choose File", then the picked name. The
+renderer only emits `pick-file <node>`; the trusted shell opens the Win32 Open
+dialog, copies the file into the renderer's sandbox temp dir and answers
+`file-chosen`. A POST with a pick (or `enctype="multipart/form-data"`) is built
+as a boundary'd multipart body with `Content-Length`, text fields first, then
+the file. Scripts never see the path or the bytes.
 
 Self-test (decode, audio endpoint and DRM rejection, plain and through the real
 sandbox):

@@ -583,4 +583,94 @@ $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8767/dl.ht
 # click a link -> Downloads\file; click the toolbar button -> panel
 ```
 
+## File upload, executed (2026-11-08)
+
+`<input type=file>` is a real control now: layout gives it `FormKind::File`
+and the UA label `Choose File`; once a file is picked the live value map shows
+the filename in the same box.
+
+**The picker is the shell's job.** A click on the control emits
+`pick-file <node>` instead of doing anything in the page. The trusted shell
+opens the native `GetOpenFileNameW` dialog (modal to its own window), then
+copies the file into the renderer's granted temp dir at
+`...\mazda-sandbox-<pid>\tmp\mazda-uploads\<name>` — the renderer cannot read
+the user profile, so the bytes have to cross as a copy. The chosen name and
+staged path go back as `file-chosen <node> <name>\t<path>`; the renderer stores
+a `FilePick` by node id and re-lays out, so the control shows the filename. Each
+pick gets a fresh sandbox-local copy; `stage_upload` unit test covers the
+`name (n)` dedupe.
+
+**Submission is multipart.** A POST (submit button, Enter, or a scripted
+`form.submit()`) with a picked file, or with
+`enctype="multipart/form-data"`, builds `multipart/form-data` with a
+per-submission boundary: text pairs first, then one part per picked file with
+`Content-Type: application/octet-stream` and the user-visible filename (quotes,
+backslashes and line breaks escaped). A file that cannot be read is logged and
+skipped; the rest still goes out. GET always stays urlencoded. The body is sent
+through `send_bytes`: `send` treats a byte slice as a reader and would use
+`Transfer-Encoding: chunked`, which some form endpoints reject.
+
+## Acceptance
+
+Headless renderer, local page (`MAZDA_SANDBOX` irrelevant here) with a text
+field, a file input and a submit button; stdin drove the flow:
+
+```
+click 20.0 60.0
+pick-file 12
+file-chosen 12 My Notes.txt<TAB>C:\...\mazda-up-page\My Notes.txt
+[form] picked My Notes.txt (...) for node 12
+click 20.0 100.0
+[form] submit method=POST url=http://127.0.0.1:8768/echo body=328 bytes (multipart/form-data; boundary=----MazdaFormBoundary3cc818e629d3413db318)
+```
+
+The echo server received `Content-Length: 328` and the exact body:
+
+```
+------MazdaFormBoundary3cc818e629d3413db318
+Content-Disposition: form-data; name="note"
+
+hi
+------MazdaFormBoundary3cc818e629d3413db318
+Content-Disposition: form-data; name="doc"; filename="My Notes.txt"
+Content-Type: application/octet-stream
+
+hello upload
+second line
+
+------MazdaFormBoundary3cc818e629d3413db318--
+```
+
+The page then loaded the server's `uploaded` response through the normal POST
+navigation path. Workspace tests: 899 engine + 1 shell + 5 IPC + 5 media +
+4 probe green.
+
+The native picker itself was not driven by synthetic input on this host (a
+fullscreen game owned the desktop); `pick_file` is a direct `comdlg32` call and
+`stage_upload` plus the renderer half are covered above and by tests. Manual
+check: click the box, choose a file, the box shows its name, then Send.
+
+## Shortcuts (deliberate)
+
+- One file per `<input>`; no `multiple`, no drag-and-drop, no `accept` filter
+  (the dialog lists all files).
+- Page scripts never see the path or the bytes: `value` is the filename and
+  `input.files` is not implemented. A scripted `form.submit()` therefore posts
+  no file part even after a pick (only the UI-driven submit carries it).
+- No upload progress beyond the POST itself (no chunked progress events) and no
+  resumable uploads.
+- The picker is Windows-only; other builds log `the OS file picker is
+  Windows-only for now` and leave the control unchanged.
+- Staged copies are not deleted after submission: they live in the sandbox temp
+  dir, which the shell recreates per run.
+
+## Reproduce
+
+```powershell
+# echo server + page (also used by the download repro)
+python "$env:TEMP\mazda-up-page\echo.py"   # writes the last POST to last.txt
+$env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8768/up.html
+# click the file box -> pick a file -> the box shows the name -> Send
+```
+
 

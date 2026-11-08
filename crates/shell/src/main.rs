@@ -24,7 +24,7 @@ use mazda_ipc::{Command, Event};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,9 @@ struct Renderer {
     stdin: std::fs::File,
     rx: Receiver<Event>,
     exe: PathBuf,
+    /// directory granted to the renderer (`tmp` = its `%TEMP%`); uploads are
+    /// copied here so the renderer can read them
+    sandbox: PathBuf,
     /// page the supervisor replays after a crash
     url: String,
     restarts: u32,
@@ -154,6 +157,7 @@ impl Renderer {
             stdin,
             rx,
             exe,
+            sandbox: dir,
             url: initial.unwrap_or("").to_string(),
             restarts: 0,
         })
@@ -272,6 +276,59 @@ fn adopt_download(src: &std::path::Path) -> Result<std::path::PathBuf, String> {
             Ok(dst)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// File upload
+//
+// `<input type=file>` is clicked inside the renderer, but the OS picker runs
+// here in the trusted shell. The chosen file is copied into the renderer's
+// sandbox temp dir (the only place it may read) and its path travels back over
+// the command channel.
+
+/// Open the native Open dialog and return what the user chose. Runs on the UI
+/// thread; `comdlg32` blocks here until the dialog closes, which is normal for
+/// a picker.
+#[cfg(windows)]
+fn pick_file() -> Option<PathBuf> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    // filter pairs are NUL separated and the list ends with a second NUL
+    let filter: Vec<u16> = "All Files\0*.*\0\0".encode_utf16().collect();
+    let mut buf = [0u16; 1024];
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    // the click came from the shell window, so it is the foreground window
+    ofn.hwndOwner = unsafe { GetForegroundWindow() };
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = buf.as_mut_ptr();
+    ofn.nMaxFile = buf.len() as u32;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+#[cfg(not(windows))]
+fn pick_file() -> Option<PathBuf> {
+    eprintln!("[form] the OS file picker is Windows-only for now");
+    None
+}
+
+/// Copy a picked file into the renderer's sandbox. The renderer cannot open
+/// the user profile, so the bytes have to cross the boundary as a copy.
+fn stage_upload(src: &Path, uploads: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(uploads).map_err(|e| format!("{}: {e}", uploads.display()))?;
+    let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("upload");
+    let dst = unique_path(uploads, name);
+    std::fs::copy(src, &dst).map_err(|e| format!("{}: {e}", src.display()))?;
+    Ok(dst)
 }
 
 /// Short tab-label from a URL: host minus `www.`, or `New tab`.
@@ -737,6 +794,31 @@ impl Shell {
                             total: 0,
                             state: DlState::Failed(err),
                         }),
+                    }
+                }
+                Event::PickFile { node } => {
+                    let uploads = self.r.sandbox.join("tmp").join("mazda-uploads");
+                    match pick_file() {
+                        Some(src) => match stage_upload(&src, &uploads) {
+                            Ok(dst) => {
+                                let name = src
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                println!(
+                                    "[form] picked {} -> {} for node {node}",
+                                    src.display(),
+                                    dst.display()
+                                );
+                                self.r.send(Command::FileChosen {
+                                    node,
+                                    name,
+                                    path: dst.to_string_lossy().into_owned(),
+                                });
+                            }
+                            Err(e) => println!("[form] upload copy failed: {e}"),
+                        },
+                        None => println!("[form] file pick cancelled"),
                     }
                 }
                 Event::Exited => {
@@ -1715,4 +1797,30 @@ fn main() -> eframe::Result {
             ))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The renderer can only read inside its granted dir, so a picked file is
+    /// copied there. A second pick of the same name must not overwrite the
+    /// first (the renderer may still be uploading it).
+    #[test]
+    fn stage_upload_copies_and_dedupes() {
+        let dir = std::env::temp_dir().join(format!("mazda-stage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("notes.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let uploads = dir.join("uploads");
+        let a = stage_upload(&src, &uploads).unwrap();
+        let b = stage_upload(&src, &uploads).unwrap();
+        assert_ne!(a, b, "second copy gets its own name");
+        assert_eq!(std::fs::read(&a).unwrap(), b"hello");
+        assert_eq!(a.file_name().unwrap(), "notes.txt");
+        assert_eq!(b.file_name().unwrap(), "notes (1).txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
