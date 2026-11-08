@@ -2534,6 +2534,23 @@ impl PageScripts {
     /// order), then drain timers/microtasks queued by them. Never panics:
     /// script errors are logged `[js]` and skipped.
     pub fn run_scripts(&mut self, dom: &mut Dom) -> Turn {
+        let t0 = Instant::now();
+        crate::fetch_nanos_take(); // start from zero: earlier turns don't count
+        let turn = self.run_scripts_inner(dom);
+        if std::env::var_os("MAZDA_TIME").is_some() {
+            let total = t0.elapsed().as_secs_f64() * 1000.0;
+            let fetch = crate::fetch_nanos_take() as f64 / 1e6;
+            eprintln!(
+                "[time] scripts: {:.0} ms (fetch {:.0} ms, exec {:.0} ms)",
+                total,
+                fetch,
+                (total - fetch).max(0.0)
+            );
+        }
+        turn
+    }
+
+    fn run_scripts_inner(&mut self, dom: &mut Dom) -> Turn {
         let scripts = collect_scripts(dom);
         // a dual build (module entry + `nomodule` fallback) must run only the
         // module half; with no module script at all the legacy half still runs

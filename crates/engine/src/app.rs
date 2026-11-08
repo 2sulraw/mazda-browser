@@ -6939,8 +6939,24 @@ fn snapshot_write(url: &str, dom: &html::Dom) {
     }
 }
 
+thread_local! {
+    /// Nanoseconds this worker thread spent inside [`fetch`]. The script
+    /// runtime subtracts it from its turn timing so `MAZDA_TIME` reports
+    /// execution rather than network wait; page loads fetch synchronously, so
+    /// a reference site's script turn would otherwise measure its downloads.
+    static FETCH_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn fetch(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
-    fetch_accept(url, None)
+    let t0 = Instant::now();
+    let r = fetch_accept(url, None);
+    FETCH_NANOS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
+    r
+}
+
+/// Take (and reset) the fetch time accumulated on this thread.
+pub(crate) fn fetch_nanos_take() -> u64 {
+    FETCH_NANOS.with(|c| c.replace(0))
 }
 
 /// Image `Accept` header: formats `image::decode`/`svg::render` handle. WebP

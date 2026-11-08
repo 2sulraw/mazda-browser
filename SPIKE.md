@@ -1212,6 +1212,54 @@ closure, generator and `Function.prototype.bind` tests, and the suite's
 17,678 fresh engines exercised pool teardown on every test. Workspace tests
 stay green (902 engine).
 
+### Step 4: page-level timing (2026-11-09)
+
+The bench programs are synthetic, so the question is whether the gains reach a
+real page. `run_scripts` now logs its own turn under `MAZDA_TIME=1`:
+
+```text
+[time] scripts: 1581 ms (fetch 1417 ms, exec 164 ms)
+```
+
+`fetch` is the time this worker thread spent inside `crate::fetch` during the
+turn (classic scripts, module graphs, and `fetch()` calls). `exec` is the
+remainder: parse + evaluation. The split matters because page load fetches
+scripts synchronously; without it a reference site's "script time" is mostly
+download time.
+
+**Method.** Baseline is worktree `%TEMP%\mazda-p5-base` at `dbddfa7` (before
+step 1) with only the timing patch applied; both binaries were built from the
+same host and run alternately, three pairs per page.
+
+| page | exec before (median of 3) | exec after (median of 3) | change |
+|---|---:|---:|---:|
+| Google | 141 ms | 147 ms | wash |
+| YouTube | 42 ms | 43 ms | wash |
+| GitHub | 250 ms | 251 ms | wash |
+
+That is the expected result, and it is not evidence against the steps. On all
+three pages the big bundles abort at parse before the call/property-heavy code
+runs: GitHub's `core.js` stops at line 27 (`yield` form), its marketing bundle
+fails on a source character, and the Google/YouTube bundles hit the same
+parser gaps. What the turn does execute is bootstrap code with few calls.
+Total script time is also network-dominated where the page snapshot cache
+misses: YouTube fetched ~2.1-2.7 s per run against 42 ms of execution, GitHub
+~0.7-1.0 s against 250 ms.
+
+To confirm the optimizations do reach page code when a page actually runs it,
+the same measurement was taken on a local loopback page whose only script does
+300k iterations of one call plus one property read:
+
+| page | exec before (median of 3) | exec after (median of 3) | change |
+|---|---:|---:|---:|
+| local call+property page | 246 ms | **166 ms** | **-33%** |
+
+So the page-level path shows the same gain as `call`/`property` once the script
+survives parsing. The reference pages remain the acceptance target, and their
+honest before/after is "no measurable change yet, because they do not reach the
+optimized code". Closing that gap is parser coverage (P7), not another
+interpreter micro-optimization.
+
 ### Shortcuts (deliberate)
 
 - Sloppy mode only; strict, module, async and module-resolution tests are
@@ -1220,7 +1268,9 @@ stay green (902 engine).
 - No test262 score is published as "conformance"; directories with known
   missing features (`eval-code`, `arguments-object`) are visible in the table.
 - Bench programs are small and hand-written, not a browser workload. They
-  isolate the interpreter; page-level timing is still `measure-sites.ps1`.
+  isolate the interpreter; step 4 adds the page-level check on top.
+- The reference-page exec numbers cover only the scripts that parse; the
+  bundles that abort contribute parse cost and nothing else.
 - No JIT, by product rule. The target is a faster interpreter, not a compiler.
 
 ### Reproduce
@@ -1233,6 +1283,11 @@ git -C "$env:TEMP\test262" sparse-checkout set test/language harness
 cargo build --release --offline -p mazda-engine --bin test262 --bin js-bench
 .\target\release\test262.exe --dir "$env:TEMP\test262\test\language" --harness "$env:TEMP\test262\harness" --failures 50
 .\target\release\js-bench.exe --iterations 10 --warmup 3
+
+# page-level script turn (needs the network for the reference sites)
+$env:MAZDA_TIME="1"
+.\target\release\renderer.exe --once https://www.google.com 2>&1 | Select-String '^\[time\] scripts'
+Remove-Item Env:MAZDA_TIME
 ```
 
 
