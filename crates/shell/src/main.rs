@@ -263,10 +263,9 @@ fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
 
 /// Move the renderer's temp file out of the sandbox. Rename is atomic on the
 /// same volume; copy+remove covers a temp dir on another drive.
-fn adopt_download(src: &std::path::Path) -> Result<std::path::PathBuf, String> {
+fn adopt_named(src: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
     let dir = downloads_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("download");
     let dst = unique_path(&dir, name);
     match std::fs::rename(src, &dst) {
         Ok(()) => Ok(dst),
@@ -276,6 +275,36 @@ fn adopt_download(src: &std::path::Path) -> Result<std::path::PathBuf, String> {
             Ok(dst)
         }
     }
+}
+
+fn adopt_download(src: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    adopt_named(src, name)
+}
+
+/// Windows-safe `<host>.pdf` name for a printed page.
+fn pdf_name(label: &str) -> String {
+    let name: String = label
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let name = name.trim().trim_matches('.').to_string();
+    let name = if name.is_empty() {
+        "page".to_string()
+    } else {
+        name.chars().take(80).collect()
+    };
+    format!("{name}.pdf")
+}
+
+fn adopt_pdf(src: &std::path::Path, label: &str) -> Result<std::path::PathBuf, String> {
+    adopt_named(src, &pdf_name(label))
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +463,8 @@ struct Shell {
     find_total: u32,
     /// focus the find box on the next frame (opened or after Enter)
     find_focus: bool,
+    /// label of the page a print-to-PDF is rendering (None = no print)
+    printing: Option<String>,
     title: String,
     err: Option<String>,
     /// content size last sent to the renderer
@@ -504,6 +535,7 @@ impl Shell {
             find_active: 0,
             find_total: 0,
             find_focus: false,
+            printing: None,
             title: String::new(),
             err: None,
             size: (0, 0),
@@ -542,6 +574,17 @@ impl Shell {
             self.find_total = 0;
             self.r.send(Command::FindClose);
         }
+    }
+
+    /// Ask the renderer to paint the whole document into a PDF; the finished
+    /// file arrives as `PrintDone` and lands in Downloads.
+    fn print_page(&mut self) {
+        if self.active_tab().url.is_empty() || self.printing.is_some() {
+            return;
+        }
+        self.printing = Some(self.active_tab().label.clone());
+        self.err = None;
+        self.r.send(Command::Print);
     }
 
     /// Load `url` in the active tab (fresh fetch).
@@ -858,6 +901,42 @@ impl Shell {
                     self.scroll = y.max(0.0);
                     self.save_scroll();
                 }
+                Event::PrintDone { path } => {
+                    // the label was captured when the print started, so a tab
+                    // switch mid-print still names the file after its page
+                    let label = self
+                        .printing
+                        .take()
+                        .unwrap_or_else(|| self.active_tab().label.clone());
+                    match adopt_pdf(&path, &label) {
+                        Ok(p) => {
+                            println!("[print] saved {}", p.display());
+                            let name = p
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("page.pdf")
+                                .to_string();
+                            self.downloads.push(Download {
+                                name,
+                                done: 0,
+                                total: 0,
+                                state: DlState::Done(p),
+                            });
+                        }
+                        Err(e) => {
+                            println!("[print] move failed: {e}");
+                            self.err = Some(format!(
+                                "print written to {} (move failed: {e})",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                Event::PrintFailed(e) => {
+                    self.printing = None;
+                    println!("[print] failed: {e}");
+                    self.err = Some(format!("print failed: {e}"));
+                }
                 Event::Exited => {
                     if self.r.restart() {
                         self.err = Some(format!(
@@ -871,6 +950,8 @@ impl Shell {
                         self.seq = 0;
                         // the restarted renderer is back at 100% zoom
                         self.r.send(Command::Zoom(self.zoom));
+                        // a print in flight died with the old renderer
+                        self.printing = None;
                         // the restarted renderer never saw the old commands
                         self.inflight.clear();
                         // force a resize (and then the restore) next frame
@@ -906,6 +987,7 @@ impl Shell {
         self.size = (0, 0);
         self.inflight.clear();
         self.r.send(Command::Zoom(self.zoom));
+        self.printing = None;
         let url = self.active_tab().url.clone();
         self.pending_restore = (!url.is_empty()).then_some(url);
         self.pending_scroll = Some(self.scroll);
@@ -1005,6 +1087,7 @@ impl eframe::App for Shell {
         let mut open_new = false;
         let mut go = None;
         let mut reload = false;
+        let mut print = false;
 
         let full = ui.max_rect();
         let title_rect = Rect::from_min_size(full.min, egui::vec2(full.width(), TITLE_H));
@@ -1237,15 +1320,19 @@ impl eframe::App for Shell {
             reload = true;
         }
 
-        // downloads button sits at the toolbar's right edge; the address pill
-        // ends before it
+        // downloads button sits at the toolbar's right edge; print just left
+        // of it, and the address pill ends before both
         let dl_rect = Rect::from_center_size(
             egui::pos2(toolbar_rect.right() - 27.0, toolbar_rect.center().y),
             egui::vec2(34.0, 34.0),
         );
+        let print_rect = Rect::from_center_size(
+            egui::pos2(toolbar_rect.right() - 63.0, toolbar_rect.center().y),
+            egui::vec2(34.0, 34.0),
+        );
         let pill = Rect::from_min_max(
             egui::pos2(reload_rect.right() + 10.0, toolbar_rect.top() + 7.0),
-            egui::pos2(dl_rect.left() - 8.0, toolbar_rect.bottom() - 7.0),
+            egui::pos2(print_rect.left() - 8.0, toolbar_rect.bottom() - 7.0),
         );
         painter.rect_filled(pill, 16.0, PILL_BG);
         draw_globe(
@@ -1338,6 +1425,49 @@ impl eframe::App for Shell {
             self.downloads_open = !self.downloads_open;
         }
 
+        // print-to-PDF button
+        let print_resp =
+            ui.interact(print_rect, ui.id().with("print"), Sense::click());
+        if print_resp.hovered() {
+            painter.circle_filled(print_rect.center(), 16.0, PILL_HOVER);
+        }
+        let pr_col = if print_resp.hovered() || self.printing.is_some() {
+            ACCENT
+        } else {
+            MUTED
+        };
+        let pc = print_rect.center();
+        painter.rect_stroke(
+            Rect::from_min_max(
+                egui::pos2(pc.x - 8.0, pc.y - 3.0),
+                egui::pos2(pc.x + 8.0, pc.y + 5.0),
+            ),
+            2.0,
+            Stroke::new(1.4, pr_col),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            Rect::from_min_max(
+                egui::pos2(pc.x - 5.0, pc.y - 9.0),
+                egui::pos2(pc.x + 5.0, pc.y - 2.0),
+            ),
+            1.0,
+            Stroke::new(1.2, pr_col),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            Rect::from_min_max(
+                egui::pos2(pc.x - 5.0, pc.y + 4.0),
+                egui::pos2(pc.x + 5.0, pc.y + 9.0),
+            ),
+            1.0,
+            Stroke::new(1.2, pr_col),
+            egui::StrokeKind::Inside,
+        );
+        if print_resp.clicked() {
+            print = true;
+        }
+
         // ---- keyboard: the usual browser chords ------------------------
         let mut k_new = false;
         let mut k_close = false;
@@ -1346,6 +1476,7 @@ impl eframe::App for Shell {
         let mut k_find = false;
         let mut k_zoom = 0i32;
         let mut k_zoom_reset = false;
+        let mut k_print = false;
         let mut k_next = 0i32;
         let mut k_select = None;
         ui.input(|i| {
@@ -1375,6 +1506,9 @@ impl eframe::App for Shell {
             }
             if i.key_pressed(egui::Key::Num0) {
                 k_zoom_reset = true;
+            }
+            if i.key_pressed(egui::Key::P) {
+                k_print = true;
             }
             if i.key_pressed(egui::Key::Tab) {
                 k_next = if i.modifiers.shift { -1 } else { 1 };
@@ -1409,6 +1543,9 @@ impl eframe::App for Shell {
         }
         if reload || k_reload {
             self.reload();
+        }
+        if print || k_print {
+            self.print_page();
         }
         if let Some(url) = go {
             self.navigate(url);
@@ -1611,6 +1748,8 @@ impl eframe::App for Shell {
                 format!("{} KB", d.done / 1024)
             };
             format!("Downloading {} — {pct}", d.name)
+        } else if self.printing.is_some() {
+            "Preparing PDF…".to_string()
         } else if let Some(e) = &self.err {
             format!("⚠ {e}")
         } else if self.loading {
@@ -2000,5 +2139,13 @@ mod tests {
         assert_eq!(zoom_step(5.0, 1), 5.0, "top is sticky");
         assert_eq!(zoom_step(0.9, 1), 1.0);
         assert_eq!(zoom_step(3.0, -1), 2.5);
+    }
+
+    #[test]
+    fn pdf_names_are_safe_for_windows() {
+        assert_eq!(pdf_name("example.com"), "example.com.pdf");
+        assert_eq!(pdf_name("a/b:c*d?e"), "a_b_c_d_e.pdf");
+        assert_eq!(pdf_name("..."), "page.pdf");
+        assert_eq!(pdf_name(""), "page.pdf");
     }
 }

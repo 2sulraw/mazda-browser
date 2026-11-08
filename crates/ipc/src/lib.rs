@@ -216,6 +216,8 @@ pub enum Command {
     FindClose,
     /// page zoom factor (1.0 = 100%)
     Zoom(f32),
+    /// render the whole document to a PDF in the sandbox temp dir
+    Print,
     Quit,
 }
 
@@ -240,6 +242,7 @@ impl Command {
             Command::FindStep(d) => format!("find-step {d}"),
             Command::FindClose => "find-close".to_string(),
             Command::Zoom(z) => format!("zoom {z}"),
+            Command::Print => "print".to_string(),
             Command::Quit => "quit".to_string(),
         }
     }
@@ -273,6 +276,7 @@ impl Command {
             "find-step" => rest.trim().parse().ok().map(Command::FindStep),
             "find-close" => Some(Command::FindClose),
             "zoom" => rest.trim().parse().ok().map(Command::Zoom),
+            "print" => Some(Command::Print),
             "file-chosen" => {
                 let (node, rest) = rest.split_once(' ')?;
                 let (name, path) = rest.split_once('\t')?;
@@ -309,6 +313,9 @@ pub enum Event {
     FindResult { active: u32, total: u32 },
     /// the renderer scrolled to a find hit; the shell adopts this offset
     ScrollTo(f32),
+    /// the printed PDF is complete in the renderer's temp dir
+    PrintDone { path: PathBuf },
+    PrintFailed(String),
     /// the file is complete in the renderer's temp dir; the shell moves it out
     DownloadDone { path: PathBuf },
     DownloadFailed { name: String, err: String },
@@ -334,6 +341,10 @@ impl Event {
                 format!("find-result {active} {total}")
             }
             Event::ScrollTo(y) => format!("scroll-to {y:.1}"),
+            Event::PrintDone { path } => format!("print-done {}", path.display()),
+            Event::PrintFailed(err) => {
+                format!("print-failed {}", err.replace(['\r', '\n'], " "))
+            }
             Event::DownloadDone { path } => format!("download-done {}", path.display()),
             Event::DownloadFailed { name, err } => format!("download-failed {name}\t{err}"),
             Event::Exited => "exited".to_string(),
@@ -387,6 +398,10 @@ impl Event {
                 })
             }
             "scroll-to" => rest.trim().parse().ok().map(Event::ScrollTo),
+            "print-done" => Some(Event::PrintDone {
+                path: PathBuf::from(rest),
+            }),
+            "print-failed" => Some(Event::PrintFailed(rest.to_string())),
             "download-failed" => {
                 let (name, err) = rest.split_once('\t').unwrap_or((rest, ""));
                 Some(Event::DownloadFailed {
@@ -471,6 +486,7 @@ mod tests {
             Command::FindClose,
             Command::Zoom(1.25),
             Command::Zoom(0.25),
+            Command::Print,
             Command::Quit,
         ];
         for c in cases {
@@ -511,6 +527,10 @@ mod tests {
             Event::FindResult { active: 3, total: 17 },
             Event::FindResult { active: 0, total: 0 },
             Event::ScrollTo(812.5),
+            Event::PrintDone {
+                path: PathBuf::from("C:/Temp/mazda-print/page.pdf"),
+            },
+            Event::PrintFailed("disk full: no space left".into()),
             Event::Exited,
         ];
         for e in cases {

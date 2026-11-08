@@ -14,7 +14,8 @@ pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
 started**: `<a download>` streams to disk with a progress panel and lands in the
 user's Downloads folder, `<input type=file>` posts files as
 `multipart/form-data` through the native picker, Ctrl+F finds text in the page
-with scroll-to-match highlights, and Ctrl+= / Ctrl+- zoom the page.
+with scroll-to-match highlights, Ctrl+= / Ctrl+- zoom the page, and the printer
+button (or Ctrl+P) saves the page as a PDF in Downloads.
 
 ## Workspace
 
@@ -110,6 +111,15 @@ Zoom (P4): Ctrl+= / Ctrl+- step 25%…500% (Ctrl+0 resets), shown in the status
 bar. The renderer lays the page out at `physical / zoom` CSS pixels and scales
 the painted frame back up, so the page reflows like a narrower window; clicks
 and wheel deltas are converted at the boundary.
+
+Print (P4): the toolbar printer button (or Ctrl+P) sends `print`. The renderer
+paints the whole document in A4 slices at CSS resolution, scales each slice into
+a 794x1123 page bitmap with a half-inch margin, zlib-compresses the RGB planes
+and assembles a PDF 1.4 file with an xref table in its temp dir. The trusted
+shell moves the finished file into `%USERPROFILE%\Downloads` as `<host>.pdf`
+with the same dedupe and lists it in the Downloads panel. Pages are bitmaps, so
+text is not selectable, and a slice boundary cuts at a fixed height rather than
+at paragraph breaks.
 
 Self-test (decode, audio endpoint and DRM rejection, plain and through the real
 sandbox):

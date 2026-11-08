@@ -817,4 +817,71 @@ $env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/zoom.
 # Ctrl+= twice, Ctrl+-, Ctrl+0
 ```
 
+## Print to PDF, executed (2026-11-08)
+
+The toolbar printer button (left of the download badge) or Ctrl+P sends
+`print`. The renderer answers with `print-done <path>` once the file is in its
+temp dir, or `print-failed <err>`; the shell moves the finished file into
+Downloads as `<host>.pdf` and records it like a download.
+
+**Slices, not pagination.** The print path reuses the page that is already laid
+out instead of asking layout for page breaks. Each A4 page covers
+`(1123 - 96) / scale` CSS pixels of document height, where `scale` maps the
+physical page width onto `794 - 96` printable pixels. `render` paints that
+slice over the page background, `scale_pixels` resizes it to the printable
+width, and the result is composited into a white 794x1123 page with a 48 px
+margin. The RGB plane is zlib-compressed (`/Filter /FlateDecode`) and
+`build_pdf` writes catalog, pages, page, content-stream and image objects with
+a real xref table (`startxref` points at `xref`). MediaBox is `[0 0 595 842]`;
+the content stream draws one image across the whole box because the margin is
+already baked into the bitmap.
+
+## Acceptance
+
+Headless renderer against a local page of 70 paragraphs (`print.html`):
+
+```
+print
+[print] 3 pages, 667853 bytes -> C:\...\Temp\mazda-print\page-468.pdf
+print-done C:\...\Temp\mazda-print\page-468.pdf
+```
+
+The file was checked independently: `%PDF-1.4` header, 3 `/Type /Page`
+objects and one `/Type /Pages` node with `/Count 3`, three
+`/Subtype /Image` objects, and `startxref 667545` landing exactly on the
+`xref` keyword. Each image stream decompresses to 2,674,986 bytes
+(`794*1123*3`), and the three pages hold 95,903 / 96,658 / 6,460 ink pixels -
+the last is sparse, as expected for the short tail of the document (70
+paragraphs do not divide evenly into the page height). One new engine unit
+test builds a two-image PDF and checks the page/image counts and the xref
+offset against the raw bytes. Workspace tests: 902 engine + 3 shell + 5 IPC +
+5 media + 4 probe green.
+
+The button and Ctrl+P were not pressed on this host (the fullscreen game still
+owns the desktop); the headless run above uses the same `print` command. Manual
+check: click the printer icon, watch for the file in Downloads.
+
+## Shortcuts (deliberate)
+
+- Pages are bitmaps: the PDF has no text layer, so text is not selectable or
+  searchable and the file is larger than a vector print would be.
+- Page breaks are fixed-height slices, not paragraph-aware pagination; a line
+  can be cut in half at a boundary. There are no headers, footers or page
+  numbers.
+- Fixed-position elements are re-rendered at the top of every page (there is no
+  compositor to place them per page), so a fixed header repeats.
+- One paper size (A4) with a fixed 48 px margin, no page range, scale or
+  orientation options; the whole document is painted into page images while the
+  PDF is assembled, so peak memory grows with page count.
+- The shell name comes from the tab label (the host), not the page title, and a
+  print in flight dies with a renderer restart.
+
+## Reproduce
+
+```powershell
+python -m http.server 8769 --bind 127.0.0.1 --directory "$env:TEMP\mazda-find-page"
+$env:MAZDA_SANDBOX="off"; .\target\release\shell.exe http://127.0.0.1:8769/print.html
+# click the printer button (or Ctrl+P); the PDF appears in Downloads
+```
+
 

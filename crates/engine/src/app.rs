@@ -652,6 +652,167 @@ fn scale_pixels(src: &[u32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
     out
 }
 
+/// A4 at 96 dpi with a half-inch margin (the bitmap pages printed by
+/// [`write_print_pdf`]).
+const PRINT_PAGE_W: usize = 794;
+const PRINT_PAGE_H: usize = 1123;
+const PRINT_MARGIN: usize = 48;
+
+/// zlib stream for a PDF `/FlateDecode` image.
+fn zlib_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut e =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data)?;
+    e.finish()
+}
+
+/// Assemble a PDF from one zlib-compressed RGB image per page. The images are
+/// drawn to fill the whole A4 MediaBox (the margins are in the bitmap), so the
+/// file has no text layer yet - a deliberate shortcut.
+fn build_pdf(images: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    // offsets[n] is the byte offset of object n; index 0 is the free head
+    let mut offsets: Vec<usize> = vec![0];
+    let mut obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+        offsets.push(out.len());
+        let n = offsets.len() - 1;
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    let kids = (0..images.len())
+        .map(|i| format!("{} 0 R", 3 + i * 3))
+        .collect::<Vec<_>>()
+        .join(" ");
+    obj(
+        &mut out,
+        &mut offsets,
+        format!(
+            "<< /Type /Pages /Kids [{kids}] /Count {} >>",
+            images.len()
+        )
+        .as_bytes(),
+    );
+    for (i, img) in images.iter().enumerate() {
+        let page_no = 3 + i * 3;
+        let img_no = page_no + 2;
+        obj(
+            &mut out,
+            &mut offsets,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+                 /Resources << /XObject << /Im0 {img_no} 0 R >> >> \
+                 /Contents {} 0 R >>",
+                page_no + 1
+            )
+            .as_bytes(),
+        );
+        let content = b"q 595 0 0 842 0 0 cm /Im0 Do Q";
+        let mut body =
+            format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        body.extend_from_slice(content);
+        body.extend_from_slice(b"\nendstream");
+        obj(&mut out, &mut offsets, &body);
+        // the image object carries binary data: push it by hand
+        offsets.push(out.len());
+        let n = offsets.len() - 1;
+        let hdr = format!(
+            "{n} 0 obj\n<< /Type /XObject /Subtype /Image /Width {PRINT_PAGE_W} \
+             /Height {PRINT_PAGE_H} /ColorSpace /DeviceRGB /BitsPerComponent 8 \
+             /Filter /FlateDecode /Length {} >>\nstream\n",
+            img.len()
+        );
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(img);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for &o in &offsets[1..] {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Render the whole kept document into an A4 PDF in the temp dir.
+///
+/// Each page is a slice of the document at CSS resolution, scaled to the
+/// printable width, composited over white and zlib-compressed. This keeps the
+/// print path independent of pagination in layout; the cost is bitmap (not
+/// selectable) text and pages split at slice boundaries.
+fn write_print_pdf(
+    page: &Page,
+    fonts: &Fonts,
+    pw: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    let printable_w = PRINT_PAGE_W - 2 * PRINT_MARGIN;
+    let printable_h = PRINT_PAGE_H - 2 * PRINT_MARGIN;
+    let s = printable_w as f32 / pw.max(1) as f32;
+    let chunk = (printable_h as f32 / s).ceil() as usize;
+    let total = page.laid.height.ceil().max(1.0) as usize + 2 * PADDING;
+    let pages = total.div_ceil(chunk.max(1));
+    let mut images = Vec::with_capacity(pages);
+    for i in 0..pages {
+        let y0 = i * chunk;
+        let src_h = chunk.min(total.saturating_sub(y0)).max(1);
+        let mut src = vec![page.bg; pw * src_h];
+        // fixed elements repeat at each page's top (no compositor here)
+        render(
+            &mut src,
+            pw,
+            src_h,
+            &page.laid,
+            fonts,
+            y0 as f32,
+            src_h as f32,
+            0.0,
+        );
+        let dst_h = ((src_h as f32 * s).round() as usize)
+            .clamp(1, printable_h);
+        let scaled = scale_pixels(&src, pw, src_h, printable_w, dst_h);
+        let mut pg = vec![0x00_ff_ff_ffu32; PRINT_PAGE_W * PRINT_PAGE_H];
+        for y in 0..dst_h {
+            let row = &scaled[y * printable_w..(y + 1) * printable_w];
+            let off = (PRINT_MARGIN + y) * PRINT_PAGE_W + PRINT_MARGIN;
+            pg[off..off + printable_w].copy_from_slice(row);
+        }
+        let mut rgb = Vec::with_capacity(pg.len() * 3);
+        for p in &pg {
+            rgb.push((p >> 16) as u8);
+            rgb.push((p >> 8) as u8);
+            rgb.push(*p as u8);
+        }
+        images.push(zlib_bytes(&rgb)?);
+    }
+    let pdf = build_pdf(&images);
+    let dir = std::env::temp_dir().join("mazda-print");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("page-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf)?;
+    eprintln!(
+        "[print] {} pages, {} bytes -> {}",
+        images.len(),
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        path.display()
+    );
+    Ok(path)
+}
+
 fn headless_paint(
     page: &Page,
     fonts: &Fonts,
@@ -978,9 +1139,10 @@ fn tick_players(
 /// only to be the sandboxed side of the split.
 ///
 /// Commands: `load <url>`, `resize <w> <h>`, `scroll <y>`, `click <x> <y>`,
-/// `find <query>`, `find-step <±1>`, `find-close`, `zoom <factor>`, `quit`.
-/// Events: `frame <path> <w> <h> <doc_h> <seq>`, `title <url>`, `nav <url>`,
-/// `find-result <active> <total>`, `scroll-to <y>`, `error <msg>`.
+/// `find <query>`, `find-step <±1>`, `find-close`, `zoom <factor>`, `print`,
+/// `quit`. Events: `frame <path> <w> <h> <doc_h> <seq>`, `title <url>`,
+/// `nav <url>`, `find-result <active> <total>`, `scroll-to <y>`,
+/// `print-done <path>`, `error <msg>`.
 pub fn run_headless() {
     use std::io::BufRead;
 
@@ -1376,6 +1538,23 @@ pub fn run_headless() {
                             }
                         }
                     }
+                    mazda_ipc::Command::Print => match page.as_ref() {
+                        Some(p) => match write_print_pdf(p, &fonts, pw) {
+                            Ok(path) => println!(
+                                "{}",
+                                mazda_ipc::Event::PrintDone { path }.encode()
+                            ),
+                            Err(e) => println!(
+                                "{}",
+                                mazda_ipc::Event::PrintFailed(e.to_string()).encode()
+                            ),
+                        },
+                        None => println!(
+                            "{}",
+                            mazda_ipc::Event::PrintFailed("no page to print".into())
+                                .encode()
+                        ),
+                    },
                     mazda_ipc::Command::Click { x, y } => {
                         // the shell clicks in physical pixels; the page is in
                         // CSS pixels at this zoom
@@ -8497,6 +8676,30 @@ mod tests {
         // a fixed hit is already on screen: never scroll
         let fixed = FindHit { fixed: true, ..hit(1999.0) };
         assert_eq!(find_scroll(&fixed, 42.0, 600.0, 2000.0), 42.0);
+    }
+
+    #[test]
+    fn print_pdf_has_a_page_per_image_and_a_valid_xref() {
+        let pdf = build_pdf(&[vec![0u8; 10], vec![1u8; 20]]);
+        let s = String::from_utf8_lossy(&pdf);
+        assert!(s.starts_with("%PDF-1.4\n"));
+        assert!(s.ends_with("%%EOF\n"));
+        assert!(s.contains("/Count 2"));
+        assert_eq!(s.matches("/Type /Page ").count(), 2);
+        assert_eq!(s.matches("/Subtype /Image").count(), 2);
+        // startxref must point at the xref table itself (not "startxref").
+        // Search the raw bytes: the binary comment on line 2 is not UTF-8, so
+        // offsets in the lossy string would not be file offsets.
+        let kw = b"startxref\n";
+        let start = pdf.windows(kw.len()).rposition(|w| w == kw).unwrap() + kw.len();
+        let len = pdf[start..].iter().position(|&b| b == b'\n').unwrap();
+        let startxref: usize = std::str::from_utf8(&pdf[start..start + len])
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let xref = pdf.windows(6).rposition(|w| w == b"\nxref\n").unwrap() + 1;
+        assert_eq!(startxref, xref);
     }
 
     #[test]
