@@ -347,6 +347,8 @@ pub(crate) fn install(e: &mut JsEngine) {
     // .call(x)`). The primitive dispatch table in `get_member` stays the real
     // implementation; these prototype objects expose the same natives as
     // borrowed callables, so both patterns work.
+    let from_char_code = e.register_native("String.fromCharCode", n_str_static, 0);
+    e.set_native_prop(str_id, "fromCharCode", Val::Native(from_char_code));
     let str_proto = Val::new_object();
     for (i, (name, _m)) in STR_METHODS.iter().enumerate() {
         let id = e.register_native(&format!("String.prototype.{name}"), n_str_proto, i as u16);
@@ -2791,6 +2793,24 @@ fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<V
         })
         .ok_or_else(|| JsError::throw("SyntaxError: invalid function body"))?;
     Ok(Val::Func(new_closure(def, e.global_env.clone(), None, false)))
+}
+
+/// `String` static helpers. `fromCharCode` builds the string from UTF-16 code
+/// units (surrogates are pairs; lone surrogates become U+FFFD because the
+/// engine's `Val::Str` is UTF-8).
+fn n_str_static(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let units: Vec<u16> = args
+        .iter()
+        .map(|v| {
+            let n = v.to_number();
+            if n.is_finite() {
+                ((n.trunc() as i64).rem_euclid(65536)) as u16
+            } else {
+                0
+            }
+        })
+        .collect();
+    Ok(Val::Str(Rc::from(String::from_utf16_lossy(&units))))
 }
 
 fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {

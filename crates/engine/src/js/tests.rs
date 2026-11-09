@@ -1395,6 +1395,11 @@ fn primitive_and_function_prototypes_exist() {
     assert_eq!(string("String.prototype.trim.call('  x  ')"), "x");
     assert_eq!(string("String.prototype.toUpperCase.call('ab')"), "AB");
     assert_eq!(string("Number.prototype.toFixed.call(1.5, 1)"), "1.5");
+    // String statics
+    assert_eq!(string("String.fromCharCode(65, 66, 67)"), "ABC");
+    assert_eq!(string("String.fromCharCode(0x000A)"), "\n");
+    assert_eq!(string("String.fromCharCode(0xD83D, 0xDE00)"), "\u{1f600}");
+    assert_eq!(string("String.fromCharCode()"), "");
     // Number's own value properties
     assert!(boolean("Number.POSITIVE_INFINITY === Infinity"));
     assert!(boolean("Number.NEGATIVE_INFINITY === -Infinity"));

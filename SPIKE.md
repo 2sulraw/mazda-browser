@@ -2035,3 +2035,16 @@ directly, `Date` uses the string hint for `default`, and
   now expects identity).
 - Remaining gap: `String(obj)` / template literals still use the non-observable
   `Val::to_string` fast path.
+## String.fromCharCode (P7 fix, 2026-11-09)
+
+`String.fromCharCode` was missing, so the legacy string-literal tests that
+compare against `String.fromCharCode(...)` failed with a TypeError. The
+static now builds a string from UTF-16 code units (arguments go through
+ToUint16; a surrogate pair combines). Lone surrogates become U+FFFD because
+`Val::Str` is UTF-8.
+
+### Measured
+
+- test262 language subset: 13,607 -> **13,622** pass (77.1% of 17,678 run,
+  6,154 skipped).
+- engine tests **934** green.
