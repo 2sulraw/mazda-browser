@@ -1052,7 +1052,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// innermost function context is a generator body
+    fn in_generator(&self) -> bool {
+        self.fn_ctx.last().is_some_and(|c| c.is_generator)
+    }
+
+    /// `yield` lexes as a keyword but is an ordinary `IdentifierReference` and
+    /// `BindingIdentifier` in sloppy mode outside a generator function. A class
+    /// body (and everything nested in it) is always strict mode code, where
+    /// `yield` stays reserved.
+    fn yield_as_ident(&self) -> Option<Rc<str>> {
+        if self.in_generator() || !self.class_stack.is_empty() {
+            return None;
+        }
+        if *self.peek() == Tok::Kw(Kw::Yield) {
+            Some(Rc::from("yield"))
+        } else {
+            None
+        }
+    }
+
+    /// `yield` as the name of the function being parsed: allowed in sloppy
+    /// code, but never for a generator function itself (its own `[Yield]`
+    /// grammar parameter), and never inside a class body (strict code).
+    fn yield_fn_name(&self, is_generator: bool) -> bool {
+        !is_generator
+            && self.class_stack.is_empty()
+            && *self.peek() == Tok::Kw(Kw::Yield)
+    }
+
     fn expect_ident(&mut self) -> Result<Rc<str>, JsError> {
+        if let Some(s) = self.yield_as_ident() {
+            self.next();
+            return Ok(s);
+        }
         match self.peek().clone() {
             Tok::Ident(s) => {
                 // an escaped identifier whose StringValue is a reserved word is
@@ -2102,6 +2135,14 @@ impl<'a> Parser<'a> {
                     span: Span { start: 0, end: 0 },
                 }
             }
+            // `yield` binds like an identifier in sloppy code outside generators
+            Tok::Kw(Kw::Yield) if self.yield_as_ident().is_some() => {
+                self.next();
+                Expr {
+                    kind: ExprKind::Ident(Rc::from("yield")),
+                    span: Span { start: 0, end: 0 },
+                }
+            }
             _ => return self.err("expected binding name in pattern"),
         };
         // assignment forms may extend to a member/index chain
@@ -2310,6 +2351,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             self.check_ctx_ident(&s)?;
             self.next();
             s
+        } else if self.yield_fn_name(is_generator) {
+            // `var f = function yield() {}`: a sloppy function expression may
+            // be named `yield`; an enclosing generator does not carry into the
+            // nested function, but an enclosing class body (strict) does
+            self.next();
+            Rc::from("yield")
         } else {
             Rc::from("")
         };
@@ -2403,6 +2450,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     self.next();
                     (s, None)
                 }
+                // sloppy-mode `yield` is a valid parameter name outside generators
+                Tok::Kw(Kw::Yield) if self.yield_as_ident().is_some() => {
+                    self.next();
+                    (Rc::from("yield"), None)
+                }
                 Tok::Punct(Punct::LBrack) | Tok::Punct(Punct::LBrace) => {
                     let pat = self.parse_pattern(true)?;
                     // synthetic non-lexable env name; destructured after the
@@ -2488,6 +2540,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     /// Lower a class body whose binding name is already known (declaration
     /// and expression forms share everything below this point).
     fn class_rest_named(&mut self, name: Rc<str>) -> Result<Vec<Stmt>, JsError> {
+        // a class name is a strict-mode BindingIdentifier: `class yield {}` is
+        // an early error even in sloppy code
+        if &*name == "yield" {
+            return self.err("`yield` is not a valid class name");
+        }
         let superclass = if self.eat_kw(Kw::Extends) {
             Some(self.lhs_expr()?)
         } else {
@@ -3690,7 +3747,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         };
         if let Some(op) = op {
             self.next();
-            if *self.peek() == Tok::Kw(Kw::Yield) {
+            if self.in_generator() && *self.peek() == Tok::Kw(Kw::Yield) {
                 return self.err("`yield` cannot be the operand of a unary operator");
             }
             let expr = self.unary_expr()?;
@@ -3706,7 +3763,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             });
         }
         if self.eat_kw(Kw::Typeof) {
-            if *self.peek() == Tok::Kw(Kw::Yield) {
+            if self.in_generator() && *self.peek() == Tok::Kw(Kw::Yield) {
                 return self.err("`yield` cannot be the operand of a unary operator");
             }
             let expr = self.unary_expr()?;
@@ -3716,7 +3773,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             });
         }
         if self.eat_kw(Kw::Void) {
-            if *self.peek() == Tok::Kw(Kw::Yield) {
+            if self.in_generator() && *self.peek() == Tok::Kw(Kw::Yield) {
                 return self.err("`yield` cannot be the operand of a unary operator");
             }
             let expr = self.unary_expr()?;
@@ -3726,7 +3783,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             });
         }
         if self.eat_kw(Kw::Delete) {
-            if *self.peek() == Tok::Kw(Kw::Yield) {
+            if self.in_generator() && *self.peek() == Tok::Kw(Kw::Yield) {
                 return self.err("`yield` cannot be the operand of a unary operator");
             }
             let expr = self.unary_expr()?;
@@ -4162,30 +4219,37 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
             }
             Tok::Kw(Kw::Yield) => {
-                self.next();
-                if *self.peek() == Tok::Eof {
-                    return self.err("unterminated yield expression");
-                }
-                // `yield* x` delegates to another iterator; `*` cannot start
-                // an operand, so it is never ambiguous with multiplication
-                if self.eat_op(Op::Mul) {
-                    if *self.peek() == Tok::Eof {
-                        return self.err("unterminated `yield*` expression");
-                    }
-                    let v = self.assign_expr()?;
-                    ExprKind::YieldStar(Box::new(v))
+                // in sloppy code outside a generator `yield` is an ordinary
+                // identifier, not a yield expression
+                if self.yield_as_ident().is_some() {
+                    self.next();
+                    ExprKind::Ident(Rc::from("yield"))
                 } else {
-                    // yield's operand is an AssignmentExpression (`yield a + b`
-                    // yields a+b) per JS grammar
-                    let v = match self.peek() {
-                        Tok::Punct(Punct::Semi)
-                        | Tok::Punct(Punct::RParen)
-                        | Tok::Punct(Punct::RBrace)
-                        | Tok::Punct(Punct::RBrack)
-                        | Tok::Punct(Punct::Comma) => None,
-                        _ => Some(Box::new(self.assign_expr()?)),
-                    };
-                    ExprKind::Yield(v)
+                    self.next();
+                    if *self.peek() == Tok::Eof {
+                        return self.err("unterminated yield expression");
+                    }
+                    // `yield* x` delegates to another iterator; `*` cannot start
+                    // an operand, so it is never ambiguous with multiplication
+                    if self.eat_op(Op::Mul) {
+                        if *self.peek() == Tok::Eof {
+                            return self.err("unterminated `yield*` expression");
+                        }
+                        let v = self.assign_expr()?;
+                        ExprKind::YieldStar(Box::new(v))
+                    } else {
+                        // yield's operand is an AssignmentExpression (`yield a + b`
+                        // yields a+b) per JS grammar
+                        let v = match self.peek() {
+                            Tok::Punct(Punct::Semi)
+                            | Tok::Punct(Punct::RParen)
+                            | Tok::Punct(Punct::RBrace)
+                            | Tok::Punct(Punct::RBrack)
+                            | Tok::Punct(Punct::Comma) => None,
+                            _ => Some(Box::new(self.assign_expr()?)),
+                        };
+                        ExprKind::Yield(v)
+                    }
                 }
             }
             Tok::Kw(Kw::Await) => {

@@ -2675,8 +2675,9 @@ fn generator_yield_star_delegates() {
         err("function* g(){ yield* 5 } g().next()"),
         JsError::Throw(_)
     ));
-    // `yield*` is still a generator-only construct
-    assert!(matches!(err("function f(){ yield* [1] }"), JsError::Syntax { .. }));
+    // outside a generator, sloppy `yield` is an ordinary identifier, so
+    // `yield* [1]` is a multiplication rather than a delegation
+    assert_eq!(num("var yield = 2; yield * 3"), 6.0);
 }
 
 #[test]
@@ -3123,6 +3124,55 @@ fn nested_pattern_elements_with_a_default() {
             panic!("failed: {src}\n  {err}");
         }
     }
+}
+
+#[test]
+fn yield_is_an_identifier_outside_generators() {
+    // sloppy mode: `yield` is an ordinary IdentifierReference / BindingIdentifier
+    assert_eq!(num("var yield = 5; yield + 1"), 6.0);
+    assert_eq!(num("var yield; yield = 7; yield"), 7.0);
+    assert_eq!(num("function f(yield) { return yield; } f(3)"), 3.0);
+    assert_eq!(num("var f; (function (yield = 4) { f = yield; }()); f"), 4.0);
+    assert_eq!(num("var yield = 9; var o = { yield }; o.yield"), 9.0);
+    assert_eq!(num("var yield = 2; var x; ({x = yield} = {}); x"), 2.0);
+    assert_eq!(num("var yield = 8; var r; r = {yield} = {yield: 1}; yield"), 1.0);
+    assert!(!boolean("var yield = 1; !yield"));
+    assert_eq!(num("var yield = 1; typeof yield === 'number' ? 1 : 0"), 1.0);
+    // inside a generator it is still a yield expression
+    assert_eq!(
+        num("var g = function*() { var x = yield 1; return x; }; \
+             var it = g(); it.next(); it.next(5).value"),
+        5.0
+    );
+    // a class body (and every nested function) is strict mode code, where
+    // `yield` stays reserved
+    assert!(matches!(err("class A { m() { var yield; } }"), JsError::Syntax { .. }));
+    assert!(matches!(err("class A { m(yield) {} }"), JsError::Syntax { .. }));
+    assert!(matches!(err("class yield {}"), JsError::Syntax { .. }));
+    assert!(matches!(err("var C = class yield {};"), JsError::Syntax { .. }));
+    assert!(matches!(
+        err("class A { m() { function h() { yield = 1; } } }"),
+        JsError::Syntax { .. }
+    ));
+    // an object-literal method is not strict code
+    assert_eq!(num("var o = { m(yield) { return yield; } }; o.m(4)"), 4.0);
+    // a function expression may be named `yield` in sloppy code
+    assert_eq!(num("var f = function yield() { return 1; }; f()"), 1.0);
+    assert_eq!(
+        string("(function yield() { return typeof yield; })()"),
+        "function"
+    );
+    // an enclosing generator does not reserve the nested function's name
+    assert_eq!(
+        num("var g = function*() { return (function yield() { return 3; })(); }; \
+             g().next().value"),
+        3.0
+    );
+    // but a generator function expression cannot itself be named `yield`
+    assert!(matches!(
+        err("var g = function* yield() {};"),
+        JsError::Syntax { .. }
+    ));
 }
 
 #[test]

@@ -2474,3 +2474,32 @@ right-hand side now runs after the target read, as the spec orders it.
   and 12 DummyError evaluation-order cases among them). No directory
   regressed.
 - engine tests **958** green (new reference-capture test).
+
+## `yield` is an identifier outside generators (P7, 2026-11-10)
+
+The lexer produces a `Yield` keyword token, and the parser treated it as a
+yield expression everywhere, so sloppy code such as `var yield = 5`,
+`function f(yield) {}` or `{ yield } = o` was rejected with "expected
+identifier, found `Kw(Yield)`". Outside a generator, in sloppy code, `yield`
+is an ordinary `IdentifierReference`/`BindingIdentifier`: the identifier
+sites (`expect_ident`, the binding leaf of a pattern, a formal parameter) now
+accept it, and `primary` returns an identifier instead of a yield expression.
+Strictness still wins where the parser knows it up front — a class body and
+everything nested in it is strict code, so `yield` stays reserved there, and a
+class name is a strict `BindingIdentifier` (`class yield {}` is an error). A
+function *expression* name has `[~Yield]` even inside a generator body
+(`function* g(){ (function yield(){}) })` is legal), while a generator
+expression's own name is not (`function* yield(){}` is an early error); the
+name is resolved with the nested function's own generator flag. Duplicate
+arrow/parameter handling and the strict `"use strict"` prologue are unchanged
+(that prologue still does not reserve `yield`, a known gap).
+
+### Measured
+
+- test262 language subset: 14,944 -> **14,994** pass (84.8% of 17,678 run,
+  6,154 skipped).
+- The 47 `expected identifier, found Kw(Yield)` failures are gone;
+  `expressions/assignment` 80 -> **67**, `statements/for-of` 124 -> **111**,
+  `expressions/object` 121 -> **114**, `statements/class` 493 -> **492**,
+  `expressions/class` 324 -> **323**. No directory regressed.
+- engine tests **959** green (new sloppy-`yield` test).
