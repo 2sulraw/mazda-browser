@@ -2048,3 +2048,18 @@ ToUint16; a surrogate pair combines). Lone surrogates become U+FFFD because
 - test262 language subset: 13,607 -> **13,622** pass (77.1% of 17,678 run,
   6,154 skipped).
 - engine tests **934** green.
+## Numeric separators (P7, 2026-11-09)
+
+The lexer read runs of digits, so `1_000`, `0x1_0` and `1_0n` split into a
+number plus an identifier. Numbers now scan with `_` allowed only between two
+digits of the same radix; any other placement (`1_`, `1__0`, `0x_1`,
+`10._1`, `1_e1`) is a SyntaxError. Legacy leading-zero forms (`0_1`, `08_0`)
+reject separators too, and the underscore is stripped before the value is
+parsed.
+
+### Measured
+
+- test262 language subset: 13,622 -> **13,681** pass (77.4% of 17,678 run,
+  6,154 skipped).
+- `language/literals/numeric`: 114/146 -> **144/146** pass.
+- engine tests **935** green (new numeric-separator test).

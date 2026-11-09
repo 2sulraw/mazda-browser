@@ -1463,6 +1463,38 @@ fn to_primitive_uses_observable_methods() {
 }
 
 #[test]
+fn numeric_separators() {
+    assert_eq!(num("1_000"), 1000.0);
+    assert_eq!(num("1_000.000_1"), 1000.0001);
+    assert_eq!(num("1e1_0"), 1e10);
+    assert_eq!(num("0x1_0"), 16.0);
+    assert_eq!(num("0b1_0"), 2.0);
+    assert_eq!(num("0o1_0"), 8.0);
+    assert!(boolean("1_0n === 10n"));
+    // separators hold no value of their own
+    assert_eq!(num("1_2_3"), 123.0);
+    // illegal placements are syntax errors
+    for src in [
+        "var x = 1_",
+        "var x = 1__0",
+        "var x = 0_1",
+        "var x = 00_0",
+        "var x = 0_8",
+        "var x = 0x_1",
+        "var x = 0b0__0",
+        "var x = 10._1",
+        "var x = 10.0_e1",
+        "var x = 1_e1",
+        "var x = 0x0_",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+}
+
+#[test]
 fn unicode_whitespace_and_line_terminators() {
     // NBSP, BOM and the U+2028/U+2029 terminators are not identifiers
     assert_eq!(num("1\u{a0}+ 2"), 3.0);

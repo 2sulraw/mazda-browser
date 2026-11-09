@@ -498,32 +498,59 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Consume digits of one radix, allowing `_` separators only between two
+    /// digits of that radix (`1_000`, `0x1_0`) when `allow_sep` is set.
+    fn scan_digits(
+        &mut self,
+        ok: impl Fn(u8) -> bool,
+        allow_sep: bool,
+        start: usize,
+    ) -> Result<(), LexError> {
+        let mut last_digit = false;
+        while let Some(c) = self.peek() {
+            if ok(c) {
+                last_digit = true;
+                self.pos += 1;
+            } else if c == b'_' {
+                if !allow_sep || !last_digit || !matches!(self.peek2(), Some(n) if ok(n)) {
+                    return self.err("invalid numeric separator", start);
+                }
+                last_digit = false;
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn digits_text(&self, start: usize) -> String {
+        self.src[start..self.pos].chars().filter(|c| *c != '_').collect()
+    }
+
     fn read_number(&mut self, start: usize) -> Result<Tok, LexError> {
         let b0 = self.peek();
         if b0 == Some(b'0') {
             if let Some(x) = self.peek2() {
-                let radix = match x {
-                    b'x' | b'X' => 16,
-                    b'b' | b'B' => 2,
-                    b'o' | b'O' => 8,
-                    _ => 0,
+                let (radix, ok): (u32, fn(u8) -> bool) = match x {
+                    b'x' | b'X' => (16, |c| c.is_ascii_hexdigit()),
+                    b'b' | b'B' => (2, |c| c == b'0' || c == b'1'),
+                    b'o' | b'O' => (8, |c| (b'0'..=b'7').contains(&c)),
+                    _ => (0, |_| false),
                 };
                 if radix != 0 {
                     self.pos += 2;
                     let dstart = self.pos;
-                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric()) {
+                    self.scan_digits(ok, true, start)?;
+                    let digits = self.digits_text(dstart);
+                    if self.peek() == Some(b'n') {
                         self.pos += 1;
-                    }
-                    let mut digits = &self.src[dstart..self.pos];
-                    let big = digits.ends_with('n');
-                    if big {
-                        digits = &digits[..digits.len() - 1];
-                        return match i128::from_str_radix(digits, radix) {
+                        return match i128::from_str_radix(&digits, radix) {
                             Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
                             Err(_) => self.err("BigInt literal too large", start),
                         };
                     }
-                    return match u64::from_str_radix(digits, radix) {
+                    return match u64::from_str_radix(&digits, radix) {
                         Ok(v) => Ok(Tok::Num(v as f64)),
                         Err(_) => self.err("malformed numeric literal", start),
                     };
@@ -531,14 +558,14 @@ impl<'a> Lexer<'a> {
             }
         }
         // decimal: digits [. digits] [eE [+-] digits]
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-            self.pos += 1;
-        }
+        // A leading zero followed by another digit (or `_`) is a legacy
+        // octal / non-octal decimal form, where separators are not allowed.
+        let allow_sep = !(b0 == Some(b'0')
+            && matches!(self.peek2(), Some(c) if c.is_ascii_digit() || c == b'_'));
+        self.scan_digits(|c| c.is_ascii_digit(), allow_sep, start)?;
         if self.peek() == Some(b'.') {
             self.pos += 1;
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.pos += 1;
-            }
+            self.scan_digits(|c| c.is_ascii_digit(), allow_sep, start)?;
         }
         if matches!(self.peek(), Some(b'e') | Some(b'E')) {
             let save = self.pos;
@@ -547,9 +574,7 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
             if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.pos += 1;
-                }
+                self.scan_digits(|c| c.is_ascii_digit(), true, start)?;
             } else {
                 self.pos = save; // `1e` is just `1` followed by ident `e`
             }
@@ -557,17 +582,18 @@ impl<'a> Lexer<'a> {
         if self.peek() == Some(b'n') {
             // `123n` is a BigInt literal; a fraction or exponent before the
             // suffix is a syntax error (`1.5n`, `1e3n`)
-            let text = &self.src[start..self.pos];
-            if text.contains(['.', 'e', 'E']) {
+            let raw = &self.src[start..self.pos];
+            if raw.contains(['.', 'e', 'E']) {
                 return self.err("invalid BigInt literal", start);
             }
             self.pos += 1; // `n`
+            let text = raw.chars().filter(|c| *c != '_').collect::<String>();
             return match text.parse::<i128>() {
                 Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
                 Err(_) => self.err("BigInt literal too large", start),
             };
         }
-        let s = &self.src[start..self.pos];
+        let s = self.digits_text(start);
         match s.parse::<f64>() {
             Ok(v) => Ok(Tok::Num(v)),
             Err(_) => self.err("malformed numeric literal", start),
