@@ -2434,6 +2434,17 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             if is_acc {
                 let getset = self.expect_ident()?;
                 let key = self.class_member_key()?;
+                if let ClassKey::Name(k) = &key {
+                    if &**k == "#constructor" {
+                        return self.err("`#constructor` is not a valid private name");
+                    }
+                    if is_static && (&**k == "prototype" || &**k == "constructor") {
+                        return self.err("a static accessor cannot be named `prototype` or `constructor`");
+                    }
+                    if !is_static && &**k == "constructor" {
+                        return self.err("an accessor cannot be named `constructor`");
+                    }
+                }
                 self.fn_ctx.push(FnCtx::default());
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
@@ -2494,7 +2505,22 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 ClassKey::Name(k) => Some(k.clone()),
                 ClassKey::Computed(_) => None,
             };
+            if let Some(k) = &key_name {
+                if &**k == "#constructor" {
+                    return self.err("`#constructor` is not a valid private name");
+                }
+            }
             if *self.peek() == Tok::Punct(Punct::LParen) {
+                if let Some(k) = &key_name {
+                    if is_static && (&**k == "prototype" || &**k == "constructor") {
+                        return self.err(
+                            "a static method cannot be named `prototype` or `constructor`",
+                        );
+                    }
+                    if !is_static && &**k == "constructor" && (is_async || is_gen) {
+                        return self.err("a constructor cannot be async or a generator");
+                    }
+                }
                 self.fn_ctx.push(FnCtx {
                     is_async,
                     is_generator: is_gen,
@@ -2535,6 +2561,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
             } else {
                 // public field: `x = init` / `x`
+                if let Some(k) = &key_name {
+                    if &**k == "constructor" || (is_static && &**k == "prototype") {
+                        return self.err(
+                            "a class field cannot be named `constructor` (or static `prototype`)",
+                        );
+                    }
+                }
                 let init = if self.eat_op(Op::Assign) {
                     Some(self.assign_expr()?)
                 } else {

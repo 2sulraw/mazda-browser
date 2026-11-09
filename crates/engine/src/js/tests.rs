@@ -1681,6 +1681,37 @@ fn trailing_comma_in_parameter_lists() {
 }
 
 #[test]
+fn class_element_reserved_names() {
+    for src in [
+        "class C { static prototype() {} }",
+        "class C { static *prototype() {} }",
+        "class C { static async prototype() {} }",
+        "class C { static get prototype() {} }",
+        "class C { static set prototype(v) {} }",
+        "class C { static constructor() {} }",
+        "class C { get constructor() {} }",
+        "class C { set constructor(v) {} }",
+        "class C { constructor; }",
+        "class C { static prototype; }",
+        "class C { static constructor; }",
+        "class C { #constructor() {} }",
+        "class C { static #constructor() {} }",
+        "class C { #constructor; }",
+        "class C { *constructor() {} }",
+        "class C { async constructor() {} }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // instance members named `prototype` and `constructor` methods are legal
+    assert_eq!(num("class C { prototype() { return 1 } }; new C().prototype()"), 1.0);
+    assert_eq!(num("class C { constructor() { this.x = 2 } }; new C().x"), 2.0);
+    assert_eq!(num("class C { get prototype() { return 3 } }; new C().prototype"), 3.0);
+}
+
+#[test]
 fn unresolved_identifier_reads_throw_reference_error() {
     assert!(matches!(err("void missingName"), JsError::Throw(_)));
     assert!(matches!(err("missingName + 1"), JsError::Throw(_)));

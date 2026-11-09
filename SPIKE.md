@@ -1793,3 +1793,15 @@ global property (as are `NaN`/`Infinity` already). 11,824 -> **12,770**
 
 - test262 language subset: 11,824 -> **12,770** pass (72.2% of 17,678 run,
   6,154 skipped). Engine tests **923** green.
+
+### Class element reserved names
+
+`static prototype`, `static constructor` and `#constructor` cannot be class
+member names, and a `constructor` cannot be an accessor, generator or async.
+`class_body` now rejects those shapes while leaving instance methods named
+`prototype` legal. 12,770 -> **12,806** (+36).
+
+### Measured
+
+- test262 language subset: 12,770 -> **12,806** pass (72.4% of 17,678 run,
+  6,154 skipped). Engine tests **924** green.
