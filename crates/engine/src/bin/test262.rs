@@ -247,7 +247,10 @@ fn run_one(path: &Path, harness: &Path) -> Result<Result<(), String>, String> {
                 Ok(Err(format!("expected {want}, got {got}")))
             }
         }
-        (Err(e), None) => Ok(Err(format!("{e}"))),
+        (Err(e), None) => Ok(Err(match e {
+            JsError::Throw(v) => format!("Uncaught {}", engine.describe_thrown(&v)),
+            other => format!("{other}"),
+        })),
         (Ok(_), Some(want)) => Ok(Err(format!("expected {want}, completed normally"))),
         (Ok(_), None) => Ok(Ok(())),
     }

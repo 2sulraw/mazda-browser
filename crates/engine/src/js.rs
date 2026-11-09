@@ -1796,6 +1796,26 @@ impl JsEngine {
         Ok(last)
     }
 
+    /// Human-readable text for a thrown value, for embedder logs and tools.
+    /// Plain `Val::to_string` prints `[object Object]` for script errors that
+    /// keep their text in a `message` property (test262's `Test262Error`
+    /// does), which hides the actual assertion from a failure report. Reads
+    /// the property directly instead of calling `toString`, so a diagnostic
+    /// can never run user code or throw.
+    pub fn describe_thrown(&mut self, v: &Val) -> String {
+        if let Val::Obj(o) = v {
+            let msg = obj_get_own(o, "message");
+            if !msg.is_undefined() {
+                let name = obj_get_own(o, "name");
+                if !name.is_undefined() {
+                    return format!("{}: {}", name.to_string(), msg.to_string());
+                }
+                return msg.to_string();
+            }
+        }
+        v.to_string()
+    }
+
     /// Run already-fetched module source on this engine's module registry
     /// (static `<script type="module">`). The loader is taken out around the
     /// call because a module body runs with `&mut self` (re-entrancy).
