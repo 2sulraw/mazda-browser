@@ -3205,6 +3205,19 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 return self.err("`yield` cannot be the operand of a unary operator");
             }
             let expr = self.unary_expr()?;
+            // A private reference is never a valid delete operand:
+            // `delete obj.#x` and `delete obj.#m()` are early errors (also
+            // when parenthesized, since the AST drops the parens).
+            let private = match &expr.kind {
+                ExprKind::Member { key, .. } => key.starts_with('#'),
+                ExprKind::Call { callee, .. } => {
+                    matches!(&callee.kind, ExprKind::Member { key, .. } if key.starts_with('#'))
+                }
+                _ => false,
+            };
+            if private {
+                return self.err("`delete` cannot take a private reference");
+            }
             return Ok(Expr {
                 kind: ExprKind::Delete(Box::new(expr)),
                 span: self.span_from(start),

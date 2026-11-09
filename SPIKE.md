@@ -1696,3 +1696,16 @@ so `async function f() { function g() { var \u0061wait; } }` still parses.
 
 - test262 language subset: 10,553 -> **11,187** pass (63.3% of 17,678 run,
   6,154 skipped). Engine tests **915** green.
+
+### `delete` of a private reference
+
+`delete obj.#x` and `delete obj.#m()` are early errors even in sloppy
+mode: a private reference is never a valid delete operand. Parenthesized
+forms are covered too because the AST drops parens. `unary_expr` now
+rejects a `Member` whose key starts with `#` and a `Call` whose callee is
+such a member. 11,187 -> **11,379** (+192).
+
+### Measured
+
+- test262 language subset: 11,187 -> **11,379** pass (64.4% of 17,678 run,
+  6,154 skipped). Engine tests **916** green.

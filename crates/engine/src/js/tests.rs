@@ -1660,6 +1660,23 @@ fn escaped_await_yield_in_function_contexts() {
 }
 
 #[test]
+fn delete_of_a_private_reference_is_an_early_error() {
+    for src in [
+        r"class C { #x; m() { delete this.#x; } }",
+        r"class C { #m() {}; x = delete this.#m(); }",
+        r"class C { #x; x = delete (this.#x); }",
+        r"class C { #x; x = delete ((this.#x)); }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // a public member still deletes normally
+    assert!(boolean("var o = { x: 1 }; delete o.x"));
+}
+
+#[test]
 fn template_line_continuation_and_unicode_escapes() {
     // `\` + U+2028/U+2029 is a line continuation. The lexer used to advance
     // one byte into the three-byte terminator and panic while slicing.
