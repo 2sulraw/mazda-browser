@@ -539,6 +539,25 @@ pub enum FnBody {
 
 pub type Program = Vec<Stmt>;
 
+/// Does a function body's directive prologue contain `"use strict"`? Only the
+/// leading run of expression statements made of string literals counts.
+fn has_use_strict(body: &[Stmt]) -> bool {
+    for st in body {
+        match &st.kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::Str(s) => {
+                    if &**s == "use strict" {
+                        return true;
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// NamedEvaluation for a binding initializer: `fn = function () {}`,
 /// `gen = function* () {}` and `arrow = () => {}` give the anonymous
 /// function the bound name, so `fn.name === 'fn'`. Applied at parse time,
@@ -709,6 +728,30 @@ impl<'a> Parser<'a> {
             line,
             col,
         })
+    }
+
+    /// Early error: `"use strict"` in the directive prologue of a function
+    /// whose parameter list is not simple (default, rest or destructuring).
+    fn check_strict_body(&self, params: &[Param], body: &[Stmt]) -> Result<(), JsError> {
+        if params
+            .iter()
+            .any(|p| p.pat.is_some() || p.default.is_some() || p.rest)
+            && has_use_strict(body)
+        {
+            return self.err(
+                "illegal 'use strict' directive in a function with a non-simple parameter list",
+            );
+        }
+        Ok(())
+    }
+
+    /// Arrow-function form of [`Parser::check_strict_body`] (a concise body
+    /// has no directive prologue).
+    fn check_strict_arrow(&self, params: &[Param], body: &FnBody) -> Result<(), JsError> {
+        if let FnBody::Block(stmts) = body {
+            self.check_strict_body(params, stmts)?;
+        }
+        Ok(())
     }
 
     fn expect_punct(&mut self, p: Punct) -> Result<(), JsError> {
@@ -1784,6 +1827,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         let params = self.param_list()?;
         self.expect_punct(Punct::LBrace)?;
         let mut body_stmts = self.block_body()?;
+        self.check_strict_body(&params, &body_stmts)?;
         if is_generator {
             self.prepare_generator_body(&mut body_stmts, is_async)?;
         } else if stmts_use(&body_stmts, SusKind::Yield) {
@@ -2255,6 +2299,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let body = self.block_body()?;
+                self.check_strict_body(&params, &body)?;
                 let uses_arguments = scan_uses_arguments_stmts(&body);
                 let f = Rc::new(FnDef {
                     src: self.src_id,
@@ -2313,6 +2358,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let mut body = self.block_body()?;
+                self.check_strict_body(&params, &body)?;
                 if is_gen {
                     self.prepare_generator_body(&mut body, is_async)?;
                 }
@@ -2411,16 +2457,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 self.next();
                 self.next(); // =>
                 let body = self.arrow_body()?;
+                let params = vec![Param {
+                    name: s,
+                    pat: None,
+                    default: None,
+                    rest: false,
+                }];
+                self.check_strict_arrow(&params, &body)?;
                 return Ok(Expr {
                     kind: ExprKind::Arrow(Rc::new(FnDef {
                         src: self.src_id,
                         name: Rc::from(""),
-                        params: vec![Param {
-                            name: s,
-                            pat: None,
-                            default: None,
-                            rest: false,
-                        }],
+                        params,
                         body,
                         uses_arguments: false, // arrows have no arguments
                         is_async: false,
@@ -2439,16 +2487,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     self.next(); // ident
                     self.next(); // =>
                     let body = self.arrow_body()?;
+                    let params = vec![Param {
+                        name: s,
+                        pat: None,
+                        default: None,
+                        rest: false,
+                    }];
+                    self.check_strict_arrow(&params, &body)?;
                     return Ok(Expr {
                         kind: ExprKind::Arrow(Rc::new(FnDef {
                             src: self.src_id,
                             name: Rc::from(""),
-                            params: vec![Param {
-                                name: s,
-                                pat: None,
-                                default: None,
-                                rest: false,
-                            }],
+                            params,
                             body,
                             uses_arguments: false,
                             is_async: true,
@@ -2463,6 +2513,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             if *self.peek_at(1) == Tok::Punct(Punct::LParen) {
                 if let Some(params) = self.try_arrow_params(true)? {
                     let body = self.arrow_body()?;
+                    self.check_strict_arrow(&params, &body)?;
                     return Ok(Expr {
                         kind: ExprKind::Arrow(Rc::new(FnDef {
                             src: self.src_id,
@@ -2483,6 +2534,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         if *self.peek() == Tok::Punct(Punct::LParen) {
             if let Some(params) = self.try_arrow_params(false)? {
                 let body = self.arrow_body()?;
+                self.check_strict_arrow(&params, &body)?;
                 return Ok(Expr {
                     kind: ExprKind::Arrow(Rc::new(FnDef {
                         src: self.src_id,
@@ -3496,6 +3548,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
                         let mut body = self.block_body()?;
+                        self.check_strict_body(&params, &body)?;
                         if is_gen {
                             // sync generators keep the strict yield-position
                             // check; async ones defer to call time
@@ -3531,6 +3584,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             let params = self.param_list()?;
                             self.expect_punct(Punct::LBrace)?;
                             let body = self.block_body()?;
+                            self.check_strict_body(&params, &body)?;
                             let uses_arguments = scan_uses_arguments_stmts(&body);
                             Expr {
                                 kind: ExprKind::Func(Rc::new(FnDef {
@@ -3572,6 +3626,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
                         let body = self.block_body()?;
+                        self.check_strict_body(&params, &body)?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
                             src: self.src_id,
@@ -3597,6 +3652,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
                         let body = self.block_body()?;
+                        self.check_strict_body(&params, &body)?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
                             src: self.src_id,

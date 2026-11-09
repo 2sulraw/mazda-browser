@@ -739,6 +739,32 @@ fn optional_chaining() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn strict_directive_needs_a_simple_parameter_list() {
+    // a default/rest/destructuring parameter list may not opt into strict
+    // mode with a `"use strict"` directive
+    for src in [
+        "function f(a = 1) { 'use strict'; }",
+        "var f = ([a]) => { 'use strict' }",
+        "var f = (a, ...r) => { 'use strict' }",
+        "({ m(a = 1) { 'use strict' } })",
+        "class C { m(a = 1) { 'use strict' } }",
+        "class C { set x({ a }) { 'use strict' } }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected SyntaxError for {src}"
+        );
+    }
+    // a simple list is fine, and a string after a real statement is not a
+    // directive
+    assert_eq!(num("function f(a) { 'use strict'; return a } f(2)"), 2.0);
+    assert_eq!(
+        num("function f(a = 1) { var x; 'use strict'; return a } f()"),
+        1.0
+    );
+}
+
+#[test]
 fn hashbang_comment_at_source_start() {
     assert_eq!(num("#! /usr/bin/env node\nvar a = 1; a"), 1.0);
     // only at position 0; a `#` later in the source is still an error
