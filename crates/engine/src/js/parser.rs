@@ -565,6 +565,48 @@ fn has_use_strict(body: &[Stmt]) -> bool {
     false
 }
 
+/// Always-reserved words. `await`/`yield`/`let`/`static`/`async` are
+/// contextual and deliberately absent: sloppy code may use them as names.
+/// Escaped spellings (`\u0062reak`) decode to the same StringValue, so this
+/// predicate catches both forms.
+fn is_reserved_word(s: &str) -> bool {
+    matches!(
+        s,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+    )
+}
+
 /// NamedEvaluation for a binding initializer: `fn = function () {}`,
 /// `gen = function* () {}` and `arrow = () => {}` give the anonymous
 /// function the bound name, so `fn.name === 'fn'`. Applied at parse time,
@@ -772,6 +814,11 @@ impl<'a> Parser<'a> {
     fn expect_ident(&mut self) -> Result<Rc<str>, JsError> {
         match self.peek().clone() {
             Tok::Ident(s) => {
+                // an escaped identifier whose StringValue is a reserved word is
+                // still a ReservedWord and cannot be used as an Identifier
+                if is_reserved_word(&s) {
+                    return self.err(format!("`{s}` is a reserved word"));
+                }
                 self.next();
                 Ok(s)
             }
@@ -1578,6 +1625,9 @@ impl<'a> Parser<'a> {
                     } else {
                         // shorthand: `{a}` / `{a = d}` binds the name `a`
                         let key = key.clone().expect("shorthand key");
+                        if is_reserved_word(&key) {
+                            return self.err(format!("`{key}` is a reserved word"));
+                        }
                         if *self.peek() == Tok::Op(Op::Assign) {
                             self.next();
                             let mut d = self.assign_expr()?;
@@ -1630,6 +1680,9 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let mut e = match self.peek().clone() {
             Tok::Ident(s) => {
+                if is_reserved_word(&s) {
+                    return self.err(format!("`{s}` is a reserved word"));
+                }
                 self.next();
                 Expr {
                     kind: ExprKind::Ident(s),
@@ -1940,7 +1993,29 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     fn param_list(&mut self) -> Result<Vec<Param>, JsError> {
         self.expect_punct(Punct::LParen)?;
         let mut idx = 0usize;
-        self.params_after_lparen(&mut idx)
+        let params = self.params_after_lparen(&mut idx)?;
+        // BoundNames of a non-simple parameter list must not repeat
+        // (`(x = 0, x) => {}`); a simple list may (`function f(x, x)` in
+        // sloppy mode).
+        let simple = params
+            .iter()
+            .all(|p| p.pat.is_none() && p.default.is_none() && !p.rest);
+        if !simple {
+            let mut names = Vec::new();
+            for p in &params {
+                match &p.pat {
+                    Some(pat) => pat_binding_names(pat, &mut names),
+                    None => names.push(p.name.clone()),
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for n in names {
+                if !seen.insert(n.clone()) {
+                    return self.err(format!("duplicate parameter name `{n}`"));
+                }
+            }
+        }
+        Ok(params)
     }
 
     /// `class Name { constructor(){} method(){} get x(){} set x(v){} }`
@@ -3020,6 +3095,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         };
         if let Some(op) = op {
             self.next();
+            if *self.peek() == Tok::Kw(Kw::Yield) {
+                return self.err("`yield` cannot be the operand of a unary operator");
+            }
             let expr = self.unary_expr()?;
             if matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) {
                 check_assign_target(&expr)?;
@@ -3033,6 +3111,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             });
         }
         if self.eat_kw(Kw::Typeof) {
+            if *self.peek() == Tok::Kw(Kw::Yield) {
+                return self.err("`yield` cannot be the operand of a unary operator");
+            }
             let expr = self.unary_expr()?;
             return Ok(Expr {
                 kind: ExprKind::Typeof(Box::new(expr)),
@@ -3040,6 +3121,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             });
         }
         if self.eat_kw(Kw::Void) {
+            if *self.peek() == Tok::Kw(Kw::Yield) {
+                return self.err("`yield` cannot be the operand of a unary operator");
+            }
             let expr = self.unary_expr()?;
             return Ok(Expr {
                 kind: ExprKind::Void(Box::new(expr)),
@@ -3047,6 +3131,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             });
         }
         if self.eat_kw(Kw::Delete) {
+            if *self.peek() == Tok::Kw(Kw::Yield) {
+                return self.err("`yield` cannot be the operand of a unary operator");
+            }
             let expr = self.unary_expr()?;
             return Ok(Expr {
                 kind: ExprKind::Delete(Box::new(expr)),
@@ -3072,6 +3159,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             } else {
             // new callee(args) — callee is a member chain WITHOUT a call
             let mut c = self.primary()?;
+            // `new import(...)` parses as `import` called, but ImportCall is a
+            // CallExpression and cannot be a constructor expression.
+            if matches!(&c.kind, ExprKind::Ident(n) if n.as_ref() == "import") {
+                return self.err("`new import(...)` is not valid syntax");
+            }
             while self.eat_punct(Punct::Dot) {
                 let key = self.prop_name()?;
                 c = Expr {
@@ -3120,6 +3212,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 Tok::Punct(Punct::Dot) => {
                     self.next();
                     let key = self.prop_name()?;
+                    if steps.is_empty()
+                        && matches!(&e.kind, ExprKind::Ident(n) if n.as_ref() == "import")
+                        && key.as_ref() != "meta"
+                    {
+                        return self.err("`import` only supports `import.meta` property access");
+                    }
                     steps.push(ChainStep::Member {
                         key,
                         optional: false,
@@ -3214,13 +3312,28 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         },
                         span: self.span_from(start),
                     },
-                    ChainStep::Call { args, .. } => Expr {
-                        kind: ExprKind::Call {
-                            callee: Box::new(e),
-                            args,
-                        },
-                        span: self.span_from(start),
-                    },
+                    ChainStep::Call { args, .. } => {
+                        // ImportCall takes one AssignmentExpression and an
+                        // optional second (import attributes) argument; no
+                        // spread, no third argument.
+                        if matches!(&e.kind, ExprKind::Ident(n) if n.as_ref() == "import") {
+                            if args.is_empty()
+                                || args.len() > 2
+                                || args.iter().any(|a| matches!(a, CallArg::Spread(_)))
+                            {
+                                return self.err(
+                                    "import() takes one argument (plus optional import attributes)",
+                                );
+                            }
+                        }
+                        Expr {
+                            kind: ExprKind::Call {
+                                callee: Box::new(e),
+                                args,
+                            },
+                            span: self.span_from(start),
+                        }
+                    }
                     ChainStep::Tagged { segs } => Expr {
                         kind: ExprKind::TaggedTemplate {
                             tag: Box::new(e),
@@ -3390,6 +3503,21 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 ExprKind::Func(f)
             }
             Tok::Ident(s) => {
+                // `import` is not an identifier expression: it may only start a
+                // dynamic-import call or `import.meta`. Accepting it as a bare
+                // identifier made `typeof import`, `import.name` and
+                // `new import('')` parse when the spec makes them early errors.
+                if s.as_ref() == "import"
+                    && !matches!(
+                        *self.peek_at(1),
+                        Tok::Punct(Punct::LParen) | Tok::Punct(Punct::Dot)
+                    )
+                {
+                    return self.err("`import` is only valid as `import(...)` or `import.meta`");
+                }
+                if is_reserved_word(&s) {
+                    return self.err(format!("`{s}` is a reserved word"));
+                }
                 self.next();
                 ExprKind::Ident(s)
             }
@@ -3681,6 +3809,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         props.push(ObjElem::Prop(key, v));
                     } else {
                         // shorthand `{a}` -> `{a: a}`
+                        if is_reserved_word(&key) {
+                            return self.err(format!("`{key}` is a reserved word"));
+                        }
                         props.push(ObjElem::Prop(
                             key.clone(),
                             Expr {

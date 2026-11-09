@@ -647,6 +647,24 @@ fn class_members_are_not_enumerable() {
 }
 
 #[test]
+fn dynamic_import_call_grammar() {
+    // ImportCall is not an identifier expression and takes exactly one
+    // argument plus optional import attributes (no spread, no third arg).
+    for src in [
+        "import()",
+        "import('a', {}, '')",
+        "import(...xs)",
+        "typeof import",
+        "import.UNKNOWN('x')",
+        "new import('x')",
+        "new import('x').prop",
+    ] {
+        let msg = err(src).to_string();
+        assert!(msg.contains("import"), "expected an import error for {src}, got {msg}");
+    }
+}
+
+#[test]
 fn object_assign_accepts_function_target() {
     // a class/function target is a legitimate assignee (`Object.assign(C, ...)`);
     // it must not hit the "builtin installed on non-object" path
@@ -1594,8 +1612,9 @@ fn unicode_identifier_escapes() {
         7.0
     );
     assert_eq!(num(r"var \u0061bc = 3; abc"), 3.0);
-    // an escaped keyword is an identifier, not the keyword
-    assert_eq!(string(r"var \u0069f = 1; typeof \u0069f"), "number");
+    // an escaped reserved word is still a ReservedWord: invalid as a binding
+    // name even though the lexer decoded it to an identifier
+    assert!(matches!(err(r"var \u0069f = 1; typeof \u0069f"), JsError::Syntax { .. }));
     // `\u{...}` form, including a char outside the BMP
     assert_eq!(num(r"var \u{1d49c} = 4; \u{1d49c}"), 4.0);
     // a bad escape is a syntax error, not a panic
