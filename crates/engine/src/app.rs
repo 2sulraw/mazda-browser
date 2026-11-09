@@ -5831,6 +5831,11 @@ fn layout_page(
     // fetch + probe every <img> header (disk-cached; no pixel decode yet —
     // layout only needs the intrinsic size to size the box)
     let mut img_budget = IMG_PIXEL_BUDGET;
+    // the probe fetches every image in document order, one at a time; overlap
+    // the round trips first (same reason as the markup preload)
+    let mut img_urls = Vec::new();
+    pending_image_urls(&root_box, url, &mut img_urls);
+    preload_accept(&img_urls, Some(IMAGE_ACCEPT));
     let (n_img, skipped) = probe_images(&mut root_box, url);
     stage!("image probe");
     if n_img > 0 || skipped > 0 {
@@ -6100,6 +6105,21 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
         skipped += s;
     }
     (probed, skipped)
+}
+
+/// Every `<img>` the probe below will fetch, as absolute URLs (inline `<svg>`
+/// markup is parsed in place and needs no request).
+fn pending_image_urls(n: &layout::BoxNode, base: &str, out: &mut Vec<String>) {
+    if let Some(layout::ImgSlot::Pending(src)) = &n.img {
+        if !src.starts_with('<') {
+            if let Some(abs) = resolve_img(base, src) {
+                out.push(abs);
+            }
+        }
+    }
+    for c in &n.children {
+        pending_image_urls(c, base, out);
+    }
 }
 
 fn no_media() -> bool {
@@ -7041,7 +7061,15 @@ const PRELOAD_THREADS: usize = 6;
 /// Fetch `urls` concurrently (deduped, order irrelevant). Errors are logged
 /// and swallowed: a failed preload just means the later sequential fetch
 /// retries and reports the failure in its own phase.
-fn preload(urls: &[String]) {
+pub(crate) fn preload(urls: &[String]) {
+    preload_accept(urls, None);
+}
+
+/// [`preload`] with a content-negotiation `Accept` header. The cache is keyed
+/// by URL only, so the preload must ask for the same representation the
+/// sequential phase would: images lead with WebP, and a preload that asked for
+/// HTML would poison that entry with the original JPEG.
+fn preload_accept(urls: &[String], accept: Option<&str>) {
     let mut seen = std::collections::HashSet::new();
     let todo: Vec<&str> = urls
         .iter()
@@ -7058,7 +7086,7 @@ fn preload(urls: &[String]) {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(url) = todo.get(i) else { break };
-                if let Err(e) = fetch(url) {
+                if let Err(e) = fetch_accept(url, accept) {
                     eprintln!("[preload] {} failed: {e}", log_url(url));
                 }
             });

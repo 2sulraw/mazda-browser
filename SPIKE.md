@@ -2561,3 +2561,24 @@ per origin; more only queues in the server's accept backlog.
   imports 2.9 s.
 - engine tests **960** green (no test change: this is I/O scheduling, not
   language behaviour).
+
+## Probe images on the same lanes (P8b, 2026-11-10)
+
+The image probe walked the box tree and fetched one `<img>` at a time, so it
+paid a full round trip per image (11 of them on github.com: 6.4 s). The probe
+needs the bytes anyway, and the URLs are already resolved in the box tree's
+`ImgSlot::Pending`, so collect them first and run them through the same 6-lane
+preload before the sequential walk.
+
+The preload has to send the *same* `Accept` the probe will: the disk cache is
+keyed by URL only, so an image preloaded as `text/html` (the document profile)
+would poison the entry with the original JPEG and lose the WebP negotiation
+that `fetch_image` exists for.
+
+### Measured
+
+- `[time] image probe`: 6,430 -> **3,257–3,746 ms** across three cold runs.
+- cold github.com totals: 21,973 -> **17,100 / 18,309 / 18,705 ms** (three
+  runs; the page variant changes per request, which moves the CPU phases by
+  ~2 s — the phase number is the stable signal).
+- engine tests **960** green.
