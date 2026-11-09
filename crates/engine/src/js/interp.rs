@@ -1718,7 +1718,9 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             if !f.name.is_empty() {
                 let fenv = Env::child(env);
                 let c = new_closure(f.clone(), fenv.clone(), None, false);
-                fenv.declare(f.name.clone(), Val::Func(c.clone()), false);
+                // the self-binding is immutable: in sloppy mode an assignment
+                // to it is silently ignored, not an overwrite
+                fenv.declare_read_only(f.name.clone(), Val::Func(c.clone()));
                 return Ok(Val::Func(c));
             }
             Ok(Val::Func(c))

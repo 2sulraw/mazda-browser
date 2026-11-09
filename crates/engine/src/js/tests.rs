@@ -2984,6 +2984,19 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn named_function_self_binding_is_immutable() {
+    // a named function expression's own name cannot be reassigned (sloppy)
+    assert!(boolean(
+        "var f = function g() { g = 1; return typeof g }; f() === 'function'"
+    ));
+    assert!(boolean(
+        "var f = function* g() { g = 1; yield typeof g }; f().next().value === 'function'"
+    ));
+    // ...but a function *declaration* binding stays mutable
+    assert_eq!(num("function f() { f = 1; return f } f()"), 1.0);
+}
+
+#[test]
 fn function_name_and_length_descriptors() {
     // name/length are non-writable, non-enumerable, configurable own props
     assert!(boolean(

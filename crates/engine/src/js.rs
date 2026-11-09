@@ -1187,6 +1187,9 @@ struct Binding {
     name: Rc<str>,
     val: Val,
     is_const: bool,
+    /// immutable but not an error to assign in sloppy mode (a named function
+    /// expression's self-binding): writes are silently ignored
+    read_only: bool,
 }
 
 #[cfg(feature = "count-alloc")]
@@ -1383,7 +1386,23 @@ impl Env {
     }
 
     fn declare(&self, name: Rc<str>, v: Val, is_const: bool) {
-        self.bindings.borrow_mut().push(Binding { name, val: v, is_const });
+        self.bindings.borrow_mut().push(Binding {
+            name,
+            val: v,
+            is_const,
+            read_only: false,
+        });
+    }
+
+    /// declare an immutable binding whose sloppy-mode assignment is a silent
+    /// no-op (named function expression self-binding)
+    pub(crate) fn declare_read_only(&self, name: Rc<str>, v: Val) {
+        self.bindings.borrow_mut().push(Binding {
+            name,
+            val: v,
+            is_const: false,
+            read_only: true,
+        });
     }
 
     /// declare only if this exact env doesn't already have the name
@@ -1406,7 +1425,12 @@ impl Env {
                 return;
             }
         }
-        bs.push(Binding { name, val: v, is_const: false });
+        bs.push(Binding {
+            name,
+            val: v,
+            is_const: false,
+            read_only: false,
+        });
     }
 
     /// set in this env only (no chain walk); returns Err if const/missing
@@ -1416,6 +1440,11 @@ impl Env {
             if b.name.as_ref() == name {
                 if b.is_const {
                     return Err(JsError::throw("TypeError: Assignment to constant variable"));
+                }
+                if b.read_only {
+                    // sloppy mode: assignment to a named function expression's
+                    // own name is silently ignored
+                    return Ok(true);
                 }
                 b.val = v;
                 return Ok(true);

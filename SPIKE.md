@@ -2193,3 +2193,20 @@ the slot is gone.
   6,154 skipped).
 - `fn-name` failures 77 -> **36**; `init-fn-name` failures 30 -> **10**.
 - engine tests **941** green (new descriptor test).
+
+## Immutable named-function-expression self-binding (P7, 2026-11-09)
+
+A named function expression binds its own name inside its body, but that
+binding is immutable: in sloppy mode `function g() { g = 1 }` must leave `g`
+as the function. The engine declared the self-binding like an ordinary
+variable, so the assignment replaced it. `Env` now has a third binding kind
+(`read_only`) whose `set_own` reports the write as handled but drops the new
+value; `declare_read_only` installs it for the function-expression
+self-name. Function *declarations* keep a mutable binding.
+
+### Measured
+
+- test262 language subset: 14,320 -> **14,328** pass (81.0% of 17,678 run,
+  6,154 skipped).
+- `named-no-strict-reassign-fn-name-in-body*` failures 6 -> **0**.
+- engine tests **942** green (new immutable-binding test).
