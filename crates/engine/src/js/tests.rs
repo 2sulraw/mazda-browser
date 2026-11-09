@@ -2833,6 +2833,25 @@ fn error_objects_have_names_prototypes_and_stack() {
     assert!(err("throw new TypeError('bad')")
         .to_string()
         .contains("TypeError: bad"));
+    // engine-raised errors are caught as real Error objects, so `instanceof`
+    // and `e.constructor` let code tell error classes apart
+    assert!(boolean(
+        "var r = false; try { null.x } catch (e) { r = e instanceof TypeError } r"
+    ));
+    assert_eq!(
+        string("var n; try { null.x } catch (e) { n = e.name } n"),
+        "TypeError"
+    );
+    assert!(boolean(
+        "var r = false; try { null.x } catch (e) { r = e.constructor === TypeError } r"
+    ));
+    assert!(boolean(
+        "var r = false; try { null.x } catch (e) { r = e.message.length > 0 } r"
+    ));
+    assert!(boolean("new ReferenceError('r') instanceof Error"));
+    assert!(boolean("new EvalError('e') instanceof Error"));
+    assert!(boolean("new URIError('u') instanceof Error"));
+    assert!(boolean("new ReferenceError('r').constructor === ReferenceError"));
 }
 
 #[test]

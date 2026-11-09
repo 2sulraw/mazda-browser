@@ -522,7 +522,7 @@ fn unwind_error(e: &mut JsEngine, vm: &mut GenVm, err: JsError) -> Unwound {
                 if phase == TryPhase::Block {
                     if let Some(c) = catch {
                         let v = match &err {
-                            JsError::Throw(v) => v.clone(),
+                            JsError::Throw(v) => interp::caught_value(e, v.clone()),
                             _ => Val::Undefined,
                         };
                         // the caught error is gone; the next throw in this

@@ -2251,7 +2251,10 @@ impl JsEngine {
             let p = self.new_promise();
             match interp::run_function_body(self, c, env) {
                 Ok(v) => resolve_promise(self, &p, v),
-                Err(JsError::Throw(v)) => settle_promise(self, &p, Err(v)),
+                Err(JsError::Throw(v)) => {
+                    let v = interp::caught_value(self, v);
+                    settle_promise(self, &p, Err(v))
+                }
                 Err(other) => return Err(other),
             }
             return Ok(Val::Obj(p));
@@ -2575,7 +2578,10 @@ pub(crate) fn new_promise_with_executor(e: &mut JsEngine, executor: Val) -> Resu
     };
     match run {
         Ok(()) => {}
-        Err(JsError::Throw(v)) => reject_slot(e, slot, v),
+        Err(JsError::Throw(v)) => {
+            let v = interp::caught_value(e, v);
+            reject_slot(e, slot, v)
+        }
         Err(other) => return Err(other),
     }
     Ok(Val::Obj(p))
@@ -2672,7 +2678,10 @@ fn exec_job(e: &mut JsEngine, job: Job) -> Result<(), JsError> {
             // failing the whole drain (JS microtask semantics)
             match e.call(handler, Val::Undefined, vec![value]) {
                 Ok(v) => deliver_resolve(e, re.ret, v),
-                Err(JsError::Throw(thrown)) => deliver(e, re.ret, Err(thrown)),
+                Err(JsError::Throw(thrown)) => {
+                    let thrown = interp::caught_value(e, thrown);
+                    deliver(e, re.ret, Err(thrown))
+                }
                 Err(other) => return Err(other),
             }
             Ok(())
@@ -2687,6 +2696,7 @@ fn exec_job(e: &mut JsEngine, job: Job) -> Result<(), JsError> {
                     Ok(())
                 }
                 Err(JsError::Throw(thrown)) => {
+                    let thrown = interp::caught_value(e, thrown);
                     deliver(e, re.ret, Err(thrown));
                     Ok(())
                 }

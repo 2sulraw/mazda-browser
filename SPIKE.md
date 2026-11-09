@@ -1522,3 +1522,37 @@ now returned as its own iterator.
 - The remaining generated-test failures are no longer template syntax; they
   are runtime semantics (iterator closing, `assert` helper surface, strict
   mode, argument-object shape).
+
+## Engine errors caught as real Error objects (P7, 2026-11-09)
+
+`JsError::throw` has always carried a plain string (`"TypeError: ..."`), so
+`catch (e)` bound a string: `e instanceof TypeError` was false, `e.message`
+was undefined, and test262's `assert.throws` aborted inside its own
+comparison (`thrown.constructor.name` where `constructor` was missing) -
+892 failures with `Cannot read property 'name' of undefined`.
+
+Three changes, all at the boundary where an engine error becomes a value
+script can observe:
+
+- the Error family is complete: `ReferenceError`, `EvalError` and `URIError`
+  join `Error`/`TypeError`/`RangeError`/`SyntaxError`. Before this,
+  `ReferenceError` itself resolved to undefined, so `assert.throws(
+  ReferenceError, ...)` failed while evaluating its first argument.
+- every error prototype exposes `constructor` (the shared `Error.prototype`
+  points at `Error`); `e.constructor === TypeError` now works.
+- `interp::caught_value` turns a caught engine string into an instance of the
+  named class - used by `try`/`catch`, the generator walker's catch frames,
+  async-function settlement and promise reaction/finally callbacks. A user
+  `throw "plain string"` is untouched; only strings whose prefix is exactly
+  one of the seven class names plus `": "` are materialised.
+
+Engine-internal throws still travel as strings, so nothing on the hot path
+changed; the cost is one object allocation when a script actually catches.
+
+### Measured
+
+- test262 sloppy subset: 7,850 -> **8,366** (47.3%), +516 with no skip
+  change (17,678 run, 6,154 skip).
+- engine tests: **907** green; the error-family test now checks caught
+  engine errors (`instanceof`, `name`, `message`, `constructor`) and the
+  three added classes.

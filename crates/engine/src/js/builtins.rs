@@ -258,14 +258,23 @@ pub(crate) fn install(e: &mut JsEngine) {
     if let Val::Obj(o) = &error_proto {
         e.error_proto = Some(o.clone());
     }
-    for (i, name) in ["Error", "TypeError", "RangeError", "SyntaxError"]
-        .iter()
-        .enumerate()
+    for (i, name) in [
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "EvalError",
+        "URIError",
+    ]
+    .iter()
+    .enumerate()
     {
         let id = e.register_native(name, n_error_ctor, i as u16);
         if i == 0 {
             // `Error.prototype` IS the shared base prototype, so an instance
             // of any subclass satisfies `x instanceof Error`.
+            obj_set_own(own(&error_proto), "constructor", Val::Native(id));
             e.set_native_prop(id, "prototype", error_proto.clone());
             e.set_global(name, Val::Native(id));
             continue;
@@ -273,6 +282,9 @@ pub(crate) fn install(e: &mut JsEngine) {
         let proto = Val::new_object();
         obj_set_own(own(&proto), "name", Val::Str(Rc::from(*name)));
         obj_set_own(own(&proto), "message", Val::Str(Rc::from("")));
+        // `err.constructor === TypeError` - the harness (and real code) uses
+        // this to identify an error's class
+        obj_set_own(own(&proto), "constructor", Val::Native(id));
         if let (Val::Obj(o), Val::Obj(parent)) = (&proto, &error_proto) {
             o.borrow_mut().proto = Some(parent.clone());
         }
@@ -2516,12 +2528,18 @@ const E_ERROR: u16 = 0;
 const E_TYPE: u16 = 1;
 const E_RANGE: u16 = 2;
 const E_SYNTAX: u16 = 3;
+const E_REFERENCE: u16 = 4;
+const E_EVAL: u16 = 5;
+const E_URI: u16 = 6;
 
 fn n_error_ctor(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let name: Rc<str> = Rc::from(match idx {
         E_TYPE => "TypeError",
         E_RANGE => "RangeError",
         E_SYNTAX => "SyntaxError",
+        E_REFERENCE => "ReferenceError",
+        E_EVAL => "EvalError",
+        E_URI => "URIError",
         _ => "Error",
     });
     let msg: Rc<str> = Rc::from(args.first().map_or("".to_string(), |v| v.to_string()).as_str());

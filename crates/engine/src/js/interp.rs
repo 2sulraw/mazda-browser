@@ -465,8 +465,11 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
             finally,
         } => {
             let mut result = run_block(e, env, block);
-            if let (Some(v), Some(cat)) = (as_err_ref(&result), catch) {
-                let v = v.clone();
+            let caught = match &result {
+                Err(JsError::Throw(v)) => Some(caught_value(e, v.clone())),
+                _ => None,
+            };
+            if let (Some(v), Some(cat)) = (caught, catch) {
                 // the caught error is gone; the next throw in this turn must
                 // be able to record its own location
                 e.err_located = false;
@@ -580,11 +583,37 @@ fn make_val_closure(e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, arrow: bool)
     Val::Func(new_closure(f.clone(), env.clone(), None, arrow))
 }
 
-/// helper: `Err(JsError::Throw(v))` -> Some(v) without consuming
-fn as_err_ref(r: &Result<Flow, JsError>) -> Option<&Val> {
-    match r {
-        Err(JsError::Throw(v)) => Some(v),
-        _ => None,
+/// The value script sees when an engine-raised error is caught. Engine errors
+/// travel as `Val::Str("TypeError: message")` (see `JsError::throw`), but real
+/// code inspects `e.name`, `e.message` and `e.constructor`, and test262's
+/// `assert.throws` compares `thrown.constructor` with the expected class, so a
+/// caught engine error becomes a real Error object of the right class.
+/// User-thrown strings are left alone unless they look exactly like an engine
+/// message (no realistic page throws `"TypeError: ..."` as a value).
+pub(crate) fn caught_value(e: &mut JsEngine, v: Val) -> Val {
+    let Val::Str(s) = v else { return v };
+    let Some((name, msg)) = s.split_once(": ") else {
+        return Val::Str(s);
+    };
+    let known = matches!(
+        name,
+        "Error"
+            | "TypeError"
+            | "RangeError"
+            | "SyntaxError"
+            | "ReferenceError"
+            | "EvalError"
+            | "URIError"
+    );
+    if !known {
+        return Val::Str(s);
+    }
+    let Some(id) = e.native_id(name) else {
+        return Val::Str(s);
+    };
+    match e.call(Val::Native(id), Val::Undefined, vec![Val::Str(Rc::from(msg))]) {
+        Ok(v) => v,
+        Err(_) => Val::Str(s),
     }
 }
 
