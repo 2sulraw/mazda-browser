@@ -1089,6 +1089,12 @@ pub struct Env {
     /// call, which must shadow an outer constructor). Arrow frames leave it
     /// `None` so they see the enclosing function's value.
     new_target: Option<Val>,
+    /// Set while a call frame is binding its parameter list: the function
+    /// whose parameters are being initialized. An eval in a default
+    /// expression must not hoist a `var` over those bindings, because the
+    /// spec puts the parameter environment between the eval's lexical and
+    /// variable environments. `None` for every other scope.
+    params: RefCell<Option<Rc<FnDef>>>,
     /// page that owns this scope: lets `JsEngine::drop` clear exactly its own
     /// page's environments (see `clear_page_envs`).
     page: u64,
@@ -1340,6 +1346,7 @@ impl Env {
             with: None,
             this,
             new_target: None,
+            params: RefCell::new(None),
             page,
             registered: Cell::new(false),
         })
@@ -1352,6 +1359,7 @@ impl Env {
             with: None,
             this: None,
             new_target: None,
+            params: RefCell::new(None),
             page: parent.page,
             registered: Cell::new(false),
         })
@@ -1366,6 +1374,7 @@ impl Env {
             with: Some(obj),
             this: None,
             new_target: None,
+            params: RefCell::new(None),
             page: parent.page,
             registered: Cell::new(false),
         })
@@ -1380,6 +1389,7 @@ impl Env {
             with: None,
             this: Some(this),
             new_target,
+            params: RefCell::new(None),
             page: parent.page,
             registered: Cell::new(false),
         })
@@ -1935,6 +1945,19 @@ impl JsEngine {
     pub(crate) fn run_program(&mut self, source: &str, env: &Rc<Env>) -> Result<Val, JsError> {
         let src_id = self.register_source(source);
         let program: Program = parser::parse(source, src_id)?;
+        // EvalDeclarationInstantiation: a sloppy direct eval hoists its vars
+        // into the caller's variable environment, but not over a binding that
+        // sits between its lexical and variable environments (a block `let`,
+        // a catch parameter, or a parameter binding while a default runs).
+        // `exec` always targets the global environment, so it never collides.
+        if Self::eval_var_collides(env, &program) {
+            return Err(JsError::Syntax {
+                msg: "A direct eval will not hoist a var declaration over a like-named declaration"
+                    .into(),
+                line: 0,
+                col: 0,
+            });
+        }
         self.cur_span = 0;
         self.cur_src = src_id;
         self.err_located = false;
@@ -1954,6 +1977,52 @@ impl JsEngine {
             r.map_err(|err| self.finish_error(err, source))?;
         }
         Ok(last)
+    }
+
+    /// Would this direct eval hoist a `var` name over an existing binding?
+    /// Walks the scope chain from the eval site out to the variable
+    /// environment (the nearest function frame, or the global environment).
+    /// A frame still binding its parameters is the parameter environment, so
+    /// its (pending) parameter names and the implicit `arguments` object
+    /// count; object (`with`) environments carry no bindings and are skipped.
+    /// Strict eval gets a fresh variable environment, so it never collides.
+    fn eval_var_collides(env: &Rc<Env>, prog: &Program) -> bool {
+        if parser::has_use_strict(prog) {
+            return false;
+        }
+        let names = interp::var_declared_names(prog);
+        if names.is_empty() {
+            return false;
+        }
+        let mut cur = env.clone();
+        loop {
+            let pending = cur.params.borrow().clone();
+            if let Some(def) = pending {
+                // parameter environment: the variable environment is its
+                // parent, so every binding here is "in between"
+                if cur.new_target.is_some() && names.iter().any(|n| n.as_ref() == "arguments") {
+                    return true;
+                }
+                return names.iter().any(|n| {
+                    def.params.iter().any(|p| interp::param_binds(p, n))
+                        || cur.bindings.borrow().iter().any(|b| b.name == *n)
+                });
+            }
+            if cur.this.is_some() {
+                // reached the variable environment itself
+                return false;
+            }
+            if names
+                .iter()
+                .any(|n| cur.bindings.borrow().iter().any(|b| b.name == *n))
+            {
+                return true;
+            }
+            match &cur.parent {
+                Some(p) => cur = p.clone(),
+                None => return false,
+            }
+        }
     }
 
     /// Human-readable text for a thrown value, for embedder logs and tools.
@@ -2409,6 +2478,7 @@ impl JsEngine {
         e.parent = None;
         e.this = None;
         e.new_target = None;
+        e.params.get_mut().take();
         self.env_pool.push(env);
     }
 
@@ -2483,7 +2553,13 @@ impl JsEngine {
                     let items = args.clone();
                     env.declare(self.arguments_key.clone(), Val::new_array(items), false);
                 }
-                let result = match interp::bind_params(self, &env, &c.def, &args) {
+                // while the parameter list is being bound the frame is the
+                // parameter environment: a direct eval in a default must not
+                // hoist a var over these bindings
+                *env.params.borrow_mut() = Some(c.def.clone());
+                let bound = interp::bind_params(self, &env, &c.def, &args);
+                env.params.borrow_mut().take();
+                let result = match bound {
                     Ok(()) => self.run_closure_body(&c, &env, args),
                     Err(err) => Err(err),
                 };

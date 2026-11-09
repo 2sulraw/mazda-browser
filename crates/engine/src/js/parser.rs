@@ -588,7 +588,7 @@ pub type Program = Vec<Stmt>;
 
 /// Does a function body's directive prologue contain `"use strict"`? Only the
 /// leading run of expression statements made of string literals counts.
-fn has_use_strict(body: &[Stmt]) -> bool {
+pub(crate) fn has_use_strict(body: &[Stmt]) -> bool {
     for st in body {
         match &st.kind {
             StmtKind::Expr(e) => match &e.kind {

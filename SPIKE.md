@@ -2326,3 +2326,27 @@ requires.
   6,154 skipped).
 - `with requires an object` failures 3 -> **0** (`12.10-2-1/2/3`).
 - engine tests **948** green (new primitive-boxing test).
+
+## Direct eval cannot hoist a var over a parameter binding (P7, 2026-11-10)
+
+EvalDeclarationInstantiation walks from the eval's lexical environment to its
+variable environment and throws SyntaxError when a var name is already bound
+in between. In practice a sloppy direct eval inside a parameter default may
+not declare a name held by the parameter environment (a parameter, or the
+implicit `arguments` object), nor a `var` over a block `let`/catch binding on
+the way out. `JsEngine::run_program` now performs that collision walk for
+direct eval (never for `exec`, which always targets the global environment),
+using the parsed body's VarDeclaredNames without descending into nested
+function bodies. A call frame records the function whose parameter list it is
+binding, so the walk treats the frame as the parameter environment: pending
+parameter names plus the implicit `arguments` object, which an arrow does not
+have. Strict eval gets a fresh variable environment and is skipped.
+
+### Measured
+
+- test262 language subset: 14,601 -> **14,749** pass (83.4% of 17,678 run,
+  6,154 skipped).
+- `eval-code/direct` failures 176 -> **39**; `declare-arguments` failures
+  141 -> **5** (the five left are arrow-body `arguments` resolution, a
+  different gap). No directory regressed.
+- engine tests **949** green (new collision test).

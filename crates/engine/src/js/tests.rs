@@ -3034,6 +3034,36 @@ fn named_function_self_binding_is_immutable() {
 }
 
 #[test]
+fn direct_eval_cannot_hoist_var_over_param_bindings() {
+    // a parameter default's eval must not declare a var over the implicit
+    // `arguments` object (EvalDeclarationInstantiation's collision walk)
+    assert!(boolean(
+        "(function () { function f(p = eval('var arguments')) {} \
+         try { f(); return false; } catch (e) { return e instanceof SyntaxError; } })()"
+    ));
+    // ... nor over a parameter binding, even one declared after the default
+    assert!(boolean(
+        "(function () { function f(p = eval('var arguments'), arguments) {} \
+         try { f(); return false; } catch (e) { return e instanceof SyntaxError; } })()"
+    ));
+    // a plain body eval may still declare `arguments`
+    assert!(boolean(
+        "(function () { function f() { try { eval('var arguments'); return true; } \
+         catch (e) { return false; } } return f(); })()"
+    ));
+    // an arrow has no implicit arguments object, so this one is allowed
+    assert!(boolean(
+        "(function () { var f = (p = eval('var arguments')) => {}; \
+         try { f(); return true; } catch (e) { return false; } })()"
+    ));
+    // a block `let` between the eval and the function environment collides
+    assert!(boolean(
+        "(function () { function f() { { let x; try { eval('var x'); return false; } \
+         catch (e) { return e instanceof SyntaxError; } } } return f(); })()"
+    ));
+}
+
+#[test]
 fn with_primitive_boxes_to_an_object() {
     // ToObject: the wrapper has no `foo`, so the assignment falls through
     assert!(boolean("var o = 2, foo = 1; with (o) { foo = 42; } foo === 42"));

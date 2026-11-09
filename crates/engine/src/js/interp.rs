@@ -12,7 +12,8 @@
 use super::gen;
 use super::parser::{
     ArrayElem, BinOp, BindTgt, CallArg, ClassKey, Declarator, Expr, ExprKind, FnBody, FnDef,
-    ForTarget, LogOp, ObjElem, ObjPatPart, Pat, PatPart, Stmt, StmtKind, TplSeg, UnaryOp, VarKind,
+    ForTarget, LogOp, ObjElem, ObjPatPart, Param, Pat, PatPart, Stmt, StmtKind, TplSeg, UnaryOp,
+    VarKind,
 };
 use super::regex;
 use super::*;
@@ -199,6 +200,88 @@ fn pat_part_leaves(pp: &super::parser::PatPart) -> Vec<Rc<str>> {
 
 fn make_closure(_e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, is_arrow: bool) -> Val {
     Val::Func(new_closure(f.clone(), env.clone(), None, is_arrow))
+}
+
+/// Does parameter `p` bind `name`? (a parameter env's pending bindings, for
+/// the direct-eval var/lexical collision check)
+pub(crate) fn param_binds(p: &Param, name: &str) -> bool {
+    p.name.as_ref() == name
+        || p.pat
+            .as_ref()
+            .is_some_and(|pat| pat_leaf_names(pat).iter().any(|n| n.as_ref() == name))
+}
+
+/// `VarDeclaredNames` of a script/eval body: `var` (including `for (var ...)`)
+/// binding names and function declaration names, without descending into
+/// nested function bodies. [`hoist`] walks the same statement shapes.
+pub(crate) fn var_declared_names(stmts: &[Stmt]) -> Vec<Rc<str>> {
+    fn walk(stmts: &[Stmt], out: &mut Vec<Rc<str>>) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::VarDecl(VarKind::Var, ds) => {
+                    for d in ds {
+                        match &d.pat {
+                            Some(p) => out.extend(pat_leaf_names(p)),
+                            None => out.push(d.name.clone()),
+                        }
+                    }
+                }
+                StmtKind::FuncDecl(f) => out.push(f.name.clone()),
+                StmtKind::Block(b) | StmtKind::List(b) => walk(b, out),
+                StmtKind::Export { inner: Some(st), .. } => {
+                    walk(std::slice::from_ref(&**st), out)
+                }
+                StmtKind::If { then, other, .. } => {
+                    walk(std::slice::from_ref(&**then), out);
+                    if let Some(o) = other {
+                        walk(std::slice::from_ref(&**o), out);
+                    }
+                }
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::Label { body, .. }
+                | StmtKind::With { body, .. } => walk(std::slice::from_ref(&**body), out),
+                StmtKind::For { init, body, .. } => {
+                    if let Some(i) = init {
+                        walk(std::slice::from_ref(&**i), out);
+                    }
+                    walk(std::slice::from_ref(&**body), out);
+                }
+                StmtKind::ForIn { kind, target, body, .. }
+                | StmtKind::ForOf { kind, target, body, .. } => {
+                    if *kind == Some(VarKind::Var) {
+                        match target {
+                            ForTarget::Name(n) => out.push(n.clone()),
+                            ForTarget::Pat(p) => out.extend(pat_leaf_names(p)),
+                        }
+                    }
+                    walk(std::slice::from_ref(&**body), out);
+                }
+                StmtKind::Switch { cases, .. } => {
+                    for c in cases {
+                        walk(&c.body, out);
+                    }
+                }
+                StmtKind::Try {
+                    block,
+                    catch,
+                    finally,
+                } => {
+                    walk(block, out);
+                    if let Some(c) = catch {
+                        walk(&c.block, out);
+                    }
+                    if let Some(f) = finally {
+                        walk(f, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(stmts, &mut out);
+    out
 }
 
 /// Run a function body to completion (used by plain calls and the async
