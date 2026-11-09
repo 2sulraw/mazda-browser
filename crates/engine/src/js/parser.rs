@@ -1472,6 +1472,11 @@ impl<'a> Parser<'a> {
                             self.parse_binding_leaf(decl_form)?
                         };
                         parts.push(PatPart::Rest(Box::new(t)));
+                        // `BindingRestElement` must be the last element;
+                        // `[...a, b]` and `[...a,]` are early errors.
+                        if *self.peek() == Tok::Punct(Punct::Comma) {
+                            return self.err("rest element must be last in a pattern");
+                        }
                         continue;
                     }
                     parts.push(self.pat_part(decl_form)?);
@@ -1498,6 +1503,10 @@ impl<'a> Parser<'a> {
                             return self.err("object rest must bind a simple name");
                         }
                         parts.push(ObjPatPart::Rest(t));
+                        // object rest must be last too (`{...a, b}`)
+                        if *self.peek() == Tok::Punct(Punct::Comma) {
+                            return self.err("rest element must be last in a pattern");
+                        }
                         continue;
                     }
                     // `{[expr]: target}` - computed property name
