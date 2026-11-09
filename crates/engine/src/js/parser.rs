@@ -229,6 +229,11 @@ pub enum CallArg {
 pub enum ObjElem {
     /// key -> value (shorthand `{a}` desugars to Prop("a", Ident("a")))
     Prop(Rc<str>, Expr),
+    /// `{x = default}` — the CoverInitializedName form. Only legal when the
+    /// enclosing object literal becomes a destructuring pattern; the parser
+    /// rejects a surviving CoverInit in value position. `expr_to_pat` turns it
+    /// into a `Prop` with a default.
+    CoverInit(Rc<str>, Expr),
     /// `...expr`; the flag marks a trailing comma after the spread
     /// (`{...a,}`) — legal in an object literal, an early error in a pattern.
     Spread(Expr, bool),
@@ -818,6 +823,7 @@ pub fn parse(source: &str, src_id: u32) -> Result<Program, JsError> {
         fn_ctx: Vec::new(),
         no_in: false,
         block_scopes: Vec::new(),
+        cover_depth: 0,
     };
     p.program()
 }
@@ -858,6 +864,11 @@ struct Parser<'a> {
     /// open StatementLists, innermost last, for the lexical/var redeclaration
     /// early error
     block_scopes: Vec<BlockScope>,
+    /// >0 while parsing a position where a CoverInitializedName may still be
+    /// resolved into a pattern (parentheses, array elements, object property
+    /// values, a for-in/of head). A CoverInit that survives to an
+    /// `assign_expr` at depth 0 is a SyntaxError.
+    cover_depth: usize,
 }
 
 /// nesting cap; deep enough for any real page, shallow enough to stay far
@@ -2157,7 +2168,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             // consumes the init-terminating `;` itself
             return self.for_classic_tail(None);
         }
-        let e = self.no_in_expr()?;
+        // the head may be an assignment destructuring target: allow the object
+        // cover form until we know whether an `in`/`of` follows
+        self.cover_depth += 1;
+        let e = self.no_in_expr();
+        self.cover_depth -= 1;
+        let e = e?;
         if self.eat_kw(Kw::In) {
             let target = self.expr_to_loop_target(&e, "invalid for-in target")?;
             let obj = self.expr()?;
@@ -2172,6 +2188,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             let target = self.expr_to_loop_target(&e, "invalid for-of target")?;
             let iter = self.assign_expr()?;
             return Ok(ForHead::Of { kind: None, target, iter });
+        }
+        // a classic `for` init is a plain expression, not a pattern
+        if expr_has_cover_init(&e) {
+            return self.err("`{x = default}` is only valid in a destructuring pattern");
         }
         let init = Some(Box::new(Stmt {
             kind: StmtKind::Expr(Box::new(e)),
@@ -3008,7 +3028,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         }
         let r = self.assign_expr_inner();
         self.depth -= 1;
-        r
+        let e = r?;
+        // a `{x = default}` cover form that was never resolved into a pattern
+        // (its literal stayed an expression) is a SyntaxError
+        if self.cover_depth == 0 && expr_has_cover_init(&e) {
+            return self.err("`{x = default}` is only valid in a destructuring pattern");
+        }
+        Ok(e)
     }
 
     fn assign_expr_inner(&mut self) -> Result<Expr, JsError> {
@@ -3297,6 +3323,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }],
             no_in: false,
             block_scopes: Vec::new(),
+            cover_depth: 0,
         };
         let mut idx = 0usize;
         let params = sub.params_after_lparen(&mut idx)?;
@@ -3945,6 +3972,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         fn_ctx: self.fn_ctx.clone(),
                         no_in: false,
                         block_scopes: Vec::new(),
+                        cover_depth: 0,
                     };
                     let e = sub.expr()?;
                     segs.push(TplSeg::Expr(e));
@@ -4144,7 +4172,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 // parentheses: `for (var x = (a in b); ;)` is valid
                 let prev_no_in = self.no_in;
                 self.no_in = false;
+                // `({x = 1} = obj)` / `({x = 1}) => {}` start from a cover form
+                self.cover_depth += 1;
                 let e = self.expr();
+                self.cover_depth -= 1;
                 self.no_in = prev_no_in;
                 let e = e?;
                 self.expect_punct(Punct::RParen)?;
@@ -4155,6 +4186,8 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 // array elements are their own grammar: `for (var x = [a in b];;)`
                 let prev_no_in = self.no_in;
                 self.no_in = false;
+                // `[{x = 1}] = arr` needs the element cover form to parse
+                self.cover_depth += 1;
                 let mut items = Vec::new();
                 loop {
                     if self.eat_punct(Punct::RBrack) {
@@ -4187,6 +4220,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         self.expect_punct(Punct::Comma)?;
                     }
                 }
+                self.cover_depth -= 1;
                 self.no_in = prev_no_in;
                 ExprKind::Array(items)
             }
@@ -4315,7 +4349,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             }
                         } else {
                             self.expect_punct(Punct::Colon)?;
-                            self.assign_expr()?
+                            // `{a: {x = 1}} = obj` — the value may be a nested
+                            // pattern, so the cover form is still allowed here
+                            self.cover_depth += 1;
+                            let v = self.assign_expr();
+                            self.cover_depth -= 1;
+                            v?
                         };
                         props.push(ObjElem::Computed {
                             key: key_e,
@@ -4420,8 +4459,22 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                     if *self.peek() == Tok::Punct(Punct::Colon) {
                         self.next();
+                        // property values may themselves be patterns
+                        self.cover_depth += 1;
+                        let v = self.assign_expr();
+                        self.cover_depth -= 1;
+                        props.push(ObjElem::Prop(key, v?));
+                    } else if *self.peek() == Tok::Op(Op::Assign) {
+                        // `{x = default}` — CoverInitializedName. Only a valid
+                        // pattern element; the assign_expr guard rejects it if
+                        // this literal is not converted to a pattern.
+                        if is_reserved_word(&key) {
+                            return self.err(format!("`{key}` is a reserved word"));
+                        }
+                        self.check_ctx_ident(&key)?;
+                        self.next();
                         let v = self.assign_expr()?;
-                        props.push(ObjElem::Prop(key, v));
+                        props.push(ObjElem::CoverInit(key, v));
                     } else {
                         // shorthand `{a}` -> `{a: a}`
                         if is_reserved_word(&key) {
@@ -4467,6 +4520,94 @@ enum ForHead {
         target: ForTarget,
         iter: Expr,
     },
+}
+
+/// Does this expression still carry an unresolved `{x = default}` cover form?
+/// Only the walk needed for the parse-time rejection: a form that escaped a
+/// pattern position. Functions/classes are opaque (their bodies were parsed
+/// and checked separately), so the fallback is `false`.
+fn expr_has_cover_init(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Object(props) => props.iter().any(|p| match p {
+            ObjElem::CoverInit(..) => true,
+            ObjElem::Prop(_, v) | ObjElem::Spread(v, _) => expr_has_cover_init(v),
+            ObjElem::Computed { key, value } => {
+                expr_has_cover_init(key) || expr_has_cover_init(value)
+            }
+            ObjElem::ComputedAccessor { key, .. } => expr_has_cover_init(key),
+            ObjElem::Accessor { .. } => false,
+        }),
+        ExprKind::Array(items) => items.iter().any(|i| match i {
+            ArrayElem::Item(x) | ArrayElem::Spread(x, _) => expr_has_cover_init(x),
+            ArrayElem::Hole => false,
+        }),
+        ExprKind::Assign { target, value, .. } => {
+            expr_has_cover_init(target) || expr_has_cover_init(value)
+        }
+        ExprKind::LogicalAssign { target, value, .. } => {
+            expr_has_cover_init(target) || expr_has_cover_init(value)
+        }
+        ExprKind::Logical { l, r, .. } | ExprKind::Binary { l, r, .. } => {
+            expr_has_cover_init(l) || expr_has_cover_init(r)
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Postfix { target: expr, .. }
+        | ExprKind::Typeof(expr)
+        | ExprKind::Void(expr)
+        | ExprKind::Delete(expr)
+        | ExprKind::Await(expr)
+        | ExprKind::YieldStar(expr)
+        | ExprKind::PrivateIn { obj: expr, .. } => expr_has_cover_init(expr),
+        ExprKind::Yield(Some(expr)) => expr_has_cover_init(expr),
+        ExprKind::Yield(None) => false,
+        ExprKind::Cond { test, then, other } => {
+            expr_has_cover_init(test)
+                || expr_has_cover_init(then)
+                || expr_has_cover_init(other)
+        }
+        ExprKind::Seq(list) => list.iter().any(expr_has_cover_init),
+        ExprKind::Call { callee, args } | ExprKind::New { callee, args } => {
+            expr_has_cover_init(callee) || args.iter().any(arg_has_cover_init)
+        }
+        ExprKind::Member { base, .. } => expr_has_cover_init(base),
+        ExprKind::Index { base, index } => {
+            expr_has_cover_init(base) || expr_has_cover_init(index)
+        }
+        ExprKind::OptionalChain { base, steps } => {
+            expr_has_cover_init(base)
+                || steps.iter().any(|s| match s {
+                    ChainStep::Member { .. } => false,
+                    ChainStep::Index { index, .. } => expr_has_cover_init(index),
+                    ChainStep::Call { args, .. } => args.iter().any(arg_has_cover_init),
+                    ChainStep::Tagged { segs } => segs.iter().any(tpl_has_cover_init),
+                })
+        }
+        ExprKind::SuperCall { class, args, .. } => {
+            expr_has_cover_init(class) || args.iter().any(arg_has_cover_init)
+        }
+        ExprKind::SuperMember { class, .. } => expr_has_cover_init(class),
+        ExprKind::Template(segs) => segs.iter().any(tpl_has_cover_init),
+        ExprKind::TaggedTemplate { tag, segs } => {
+            expr_has_cover_init(tag) || segs.iter().any(tpl_has_cover_init)
+        }
+        ExprKind::PatAssign { value, .. } => expr_has_cover_init(value),
+        // a function/class body was parsed and validated on its own
+        ExprKind::Func(_) | ExprKind::Arrow(_) | ExprKind::ClassExpr { .. } => false,
+        _ => false,
+    }
+}
+
+fn arg_has_cover_init(a: &CallArg) -> bool {
+    match a {
+        CallArg::Arg(e) | CallArg::Spread(e) => expr_has_cover_init(e),
+    }
+}
+
+fn tpl_has_cover_init(s: &TplSeg) -> bool {
+    match s {
+        TplSeg::Lit(_) => false,
+        TplSeg::Expr(e) => expr_has_cover_init(e),
+    }
 }
 
 /// Convert an already-parsed array/object literal expression into the
@@ -4550,6 +4691,18 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                             _ => return Err("invalid destructuring binding".into()),
                         };
                         parts.push(ObjPatPart::Prop { key: key.clone(), part });
+                    }
+                    ObjElem::CoverInit(key, v) => {
+                        // `{x = default}` -> `{x: x = default}`
+                        let mut value = v.clone();
+                        name_anon_fn(key, &mut value);
+                        parts.push(ObjPatPart::Prop {
+                            key: key.clone(),
+                            part: PatPart::Bind(
+                                Box::new(Pat::Name(BindTgt::Name(key.clone()))),
+                                Some(value),
+                            ),
+                        });
                     }
                     ObjElem::Computed { .. }
                     | ObjElem::Accessor { .. }
@@ -4717,6 +4870,7 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
         }),
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => expr_uses(v, k),
+            ObjElem::CoverInit(_, v) => expr_uses(v, k),
             ObjElem::Spread(v, _) => expr_uses(v, k),
             ObjElem::Computed { key, value } => expr_uses(key, k) || expr_uses(value, k),
             // computed accessor keys are evaluated here; bodies are nested
@@ -5766,6 +5920,7 @@ impl YieldLift {
     fn object(&mut self, props: Vec<ObjElem>, pre: &mut Vec<Stmt>) -> Vec<ObjElem> {
         let suspends = |p: &ObjElem| match p {
             ObjElem::Prop(_, v) | ObjElem::Spread(v, _) => expr_uses(v, SusKind::Yield),
+            ObjElem::CoverInit(_, v) => expr_uses(v, SusKind::Yield),
             ObjElem::Computed { key, value } => {
                 expr_uses(key, SusKind::Yield) || expr_uses(value, SusKind::Yield)
             }
@@ -5789,6 +5944,16 @@ impl YieldLift {
                         v
                     };
                     ObjElem::Prop(key, v)
+                }
+                ObjElem::CoverInit(key, v) => {
+                    let span = v.span;
+                    let v = self.expr(v, pre);
+                    let v = if i < last && !is_lift_temp(&v) {
+                        self.bind(v, pre, span)
+                    } else {
+                        v
+                    };
+                    ObjElem::CoverInit(key, v)
                 }
                 ObjElem::Spread(v, trailing) => {
                     let span = v.span;
@@ -6021,6 +6186,7 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         }),
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => scan_expr_arguments(v),
+            ObjElem::CoverInit(_, v) => scan_expr_arguments(v),
             ObjElem::Spread(v, _) => scan_expr_arguments(v),
             ObjElem::Computed { key, value } => {
                 scan_expr_arguments(key) || scan_expr_arguments(value)

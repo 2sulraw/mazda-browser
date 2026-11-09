@@ -1645,6 +1645,12 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                         let val = eval_expr(e, env, v)?;
                         obj_set_own(&orc, k, val);
                     }
+                    // unreachable: a surviving cover form is a parse error, so
+                    // an object literal in value position never carries one
+                    ObjElem::CoverInit(k, v) => {
+                        let val = eval_expr(e, env, v)?;
+                        obj_set_own(&orc, k, val);
+                    }
                     // `{...src}` copies own enumerable props (arrays copy
                     // their dense items as index keys; accessors invoke their
                     // getters — matching real spread semantics closely enough

@@ -3034,6 +3034,37 @@ fn named_function_self_binding_is_immutable() {
 }
 
 #[test]
+fn object_cover_initialized_names() {
+    // `{x = default}` in assignment destructuring
+    assert_eq!(num("var x; ({x = 5} = {}); x"), 5.0);
+    assert_eq!(num("var x; ({x = 5} = {x: 1}); x"), 1.0);
+    assert!(boolean("var x; ({x = 5} = {x: null}); x === null"));
+    // nested object and array elements
+    assert_eq!(num("var x; [{x = 3}] = [{}]; x"), 3.0);
+    assert_eq!(num("var x; ({a: {x = 4}} = {a: {}}); x"), 4.0);
+    // for-of head assignment pattern
+    assert_eq!(
+        num("var x, r; for ({x = 9} of [{}]) r = x; r"),
+        9.0
+    );
+    // the shorthand initializer gives an anonymous function the bound name
+    assert!(boolean(
+        "var fn; ({fn = function () {}} = {}); fn.name === 'fn'"
+    ));
+    // a surviving cover form in value position is a SyntaxError
+    assert!(matches!(err("var o = {x = 1};"), JsError::Syntax { .. }));
+    assert!(matches!(err("var o = [{x = 1}];"), JsError::Syntax { .. }));
+    assert!(matches!(err("f({x = 1});"), JsError::Syntax { .. }));
+    // ...but `{x: y = 1}` is an ordinary value expression
+    assert_eq!(num("var y; var o = {x: y = 1}; o.x"), 1.0);
+    // ordinary object/array literals and classic for-inits still parse
+    assert_eq!(num("var o = {a: {b: 1}}; o.a.b"), 1.0);
+    assert_eq!(num("var n = 0; for (var i = {v: 1}; i && n < 1; n++) ; n"), 1.0);
+    assert_eq!(num("var x; for (var {x: x} of [{x: 7}]) ; x"), 7.0);
+    assert_eq!(num("var x; let {x: y = 2} = {}; y"), 2.0);
+}
+
+#[test]
 fn function_name_and_length_descriptors() {
     // name/length are non-writable, non-enumerable, configurable own props
     assert!(boolean(

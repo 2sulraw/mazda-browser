@@ -2264,3 +2264,28 @@ backslash + line terminator from the value.
 - `unterminated string literal` failures 20 -> **2**; the NIST
   `line-continuation-single`/`-double` cases pass.
 - engine tests **945** green (new continuation test).
+
+## CoverInitializedName in object destructuring (P7, 2026-11-09)
+
+Assignment destructuring rejected `{x = default}` with `expected Comma, found
+Op(Assign)`: the object-literal parser had no shorthand-initializer form. It
+now parses `{x = default}` into a new `ObjElem::CoverInit` variant, and
+`expr_to_pat` converts it to `Prop { key, Bind(Name(key), Some(default)) }`,
+applying NamedEvaluation so `({fn = function(){}} = {})` still names the
+function `fn`.
+
+A cover form is only legal once the literal becomes a pattern, so the parser
+tracks `cover_depth`: parentheses, array elements, object property values and
+a for-in/of head raise it while their contents parse. After every
+`assign_expr` at depth 0, `expr_has_cover_init` rejects a surviving
+CoverInit (`var o = {x = 1}`, `f({x = 1})`, `for ({x = 1}; ;)`), while
+`{x: y = 1}` stays an ordinary value expression.
+
+### Measured
+
+- test262 language subset: 14,527 -> **14,555** pass (82.3% of 17,678 run,
+  6,154 skipped).
+- `expected Comma, found Op(Assign)` failures 36 -> **0**; `dstr` failures
+  184 -> **156** (28 now pass, the other 8 advance to separate yield/error
+  checks). No other directory changed, so the total delta is the same -28.
+- engine tests **946** green (new cover-init test).
