@@ -1993,3 +1993,20 @@ threw. The constructor now carries its value properties: `MAX_VALUE`,
 - `language/expressions/addition`: 27/48 -> 34/48 pass; the remaining 14 are
   ToPrimitive / `Symbol.toPrimitive` cases.
 - engine tests **932** green.
+## Unicode white space in the lexer (P7 fix, 2026-11-09)
+
+`skip_ws` only knew ASCII space/tab/VT/FF and CR/LF, so NBSP (U+00A0), the
+BOM/ZWNBSP (U+FEFF) and the other Zs characters lexed as identifiers. Any
+source that used them between tokens failed with a spurious parse error; the
+addition tests hit this through `eval("1\u00a0+\u00a02")`. The lexer now
+decodes a non-ASCII character at a token boundary and skips it when it is
+white space (or U+FEFF), while U+2028/U+2029 count as line terminators.
+Anything else still starts an identifier, so the loose UTF-8 identifier rule
+is unchanged.
+
+### Measured
+
+- test262 language subset: 13,483 -> **13,528** pass (76.5% of 17,678 run,
+  6,154 skipped).
+- `language/white-space`: 45/67 -> **64/67** pass.
+- engine tests **933** green (new unicode-whitespace test).

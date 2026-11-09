@@ -331,6 +331,20 @@ impl<'a> Lexer<'a> {
                 Some(b' ') | Some(b'\t') | Some(0x0b) | Some(0x0c) => {
                     self.pos += 1
                 }
+                // Non-ASCII white space (NBSP, ZWNBSP/BOM, the Zs block) and
+                // the U+2028/U+2029 line terminators. Any other non-ASCII
+                // byte starts an identifier, so leave it to `next_token`.
+                Some(b) if b >= 0x80 => {
+                    let ch = self.src[self.pos..].chars().next().unwrap_or('\u{fffd}');
+                    if ch == '\u{2028}' || ch == '\u{2029}' {
+                        nl = true;
+                        self.pos += ch.len_utf8();
+                    } else if ch == '\u{feff}' || (ch.is_whitespace() && !ch.is_ascii()) {
+                        self.pos += ch.len_utf8();
+                    } else {
+                        return nl;
+                    }
+                }
                 Some(b'/') if self.peek2() == Some(b'/') => {
                     while let Some(b) = self.peek() {
                         if b == b'\n' {

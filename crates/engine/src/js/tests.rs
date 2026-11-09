@@ -1427,6 +1427,16 @@ fn primitive_and_function_prototypes_exist() {
 }
 
 #[test]
+fn unicode_whitespace_and_line_terminators() {
+    // NBSP, BOM and the U+2028/U+2029 terminators are not identifiers
+    assert_eq!(num("1\u{a0}+ 2"), 3.0);
+    assert_eq!(num("\u{feff}1 + 2"), 3.0);
+    assert_eq!(num("1;\u{2028}2"), 2.0);
+    assert_eq!(num("1;\u{2029}2"), 2.0);
+    assert_eq!(num("1\u{2009}+\u{2009}2"), 3.0);
+}
+
+#[test]
 fn in_operator_survives_nested_grammar_in_for_heads() {
     assert!(boolean("'a' in { a: 1 }"));
     assert!(boolean(
