@@ -1480,6 +1480,81 @@ struct Rule {
     order: u32,
 }
 
+/// Rightmost-compound buckets over one cascade-ordered rule list.
+///
+/// A selector can only match an element if its LAST compound's id, class or
+/// tag does, so the cascade tests just the buckets the element falls into
+/// instead of the whole list (GitHub ships ~33k rules; walking all of them for
+/// every node cost ~8 s per page). Each rule lands in exactly one bucket — the
+/// most selective necessary key — so the candidate indices never repeat, and
+/// each bucket keeps rule order.
+#[derive(Default)]
+struct RuleIndex {
+    ids: std::collections::HashMap<String, Vec<u32>>,
+    classes: std::collections::HashMap<String, Vec<u32>>,
+    tags: std::collections::HashMap<String, Vec<u32>>,
+    universal: Vec<u32>,
+}
+
+impl RuleIndex {
+    fn build(rules: &[Rule]) -> Self {
+        let mut ix = RuleIndex::default();
+        for (i, r) in rules.iter().enumerate() {
+            let i = i as u32;
+            let Some(last) = r.segs.last() else {
+                ix.universal.push(i);
+                continue;
+            };
+            if let Some(id) = &last.id {
+                ix.ids.entry(id.clone()).or_default().push(i);
+            } else if let Some(c) = last.classes.first() {
+                ix.classes.entry(c.clone()).or_default().push(i);
+            } else if last.tag.as_deref() == Some("slot")
+                && last.attrs.iter().any(|(n, _, _)| n == "name")
+            {
+                // `slot[name=X]` also selects the light-DOM nodes projected
+                // into it (see `seg_matches`), so a tag key would miss them
+                ix.universal.push(i);
+            } else if let Some(t) = &last.tag {
+                ix.tags.entry(t.clone()).or_default().push(i);
+            } else {
+                ix.universal.push(i);
+            }
+        }
+        ix
+    }
+
+    /// Indices of every rule that could match `node`, ascending (cascade
+    /// order) in `out`, which is cleared first.
+    fn candidates(&self, dom: &Dom, node: u32, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend_from_slice(&self.universal);
+        if let Some(v) = self.tags.get(dom.tag(node)) {
+            out.extend_from_slice(v);
+        }
+        if let Some(id) = dom.attr(node, "id") {
+            if let Some(v) = self.ids.get(id) {
+                out.extend_from_slice(v);
+            }
+        }
+        if let Some(cl) = dom.attr(node, "class") {
+            for c in cl.split_whitespace() {
+                if let Some(v) = self.classes.get(c) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+        out.sort_unstable();
+    }
+}
+
+thread_local! {
+    /// Candidate rule indices for the element being cascaded. One reusable
+    /// buffer: `resolve` is called once per element, never nested.
+    static RULE_SCRATCH: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The custom properties in effect for one element — the inheritance chain
 /// CSS defines for `--*` (they inherit, but a declaration on an element wins
 /// over every ancestor's for that subtree).
@@ -1507,9 +1582,14 @@ impl VarScope {
 pub struct Sheet {
     /// sorted by (spec, order) at parse time; cascade = apply matches in order
     rules: Vec<Rule>,
+    /// rightmost-compound buckets over `rules` — the cascade tests only the
+    /// rules that could match the element (see [`RuleIndex`])
+    index: RuleIndex,
     /// custom-property-only rules, cascade-sorted (see `var_rules` at parse) —
     /// `scope_of` walks this short list to build an element's `VarScope`
     var_rules: Vec<Rule>,
+    /// rightmost-compound buckets over `var_rules`
+    var_index: RuleIndex,
     /// pseudo-element rules, bucketed by kind ([0] `::before`, [1] `::after`,
     /// [2] `::marker`), cascade-sorted like `rules`. Kept OUT of `rules` so
     /// the origin element's cascade, the SVG paint injector and the `color-scheme`
@@ -2332,6 +2412,8 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         }
     }
     let rules = plain;
+    let index = RuleIndex::build(&rules);
+    let var_index = RuleIndex::build(&var_rules);
     // color-scheme decides light-dark() for every element but is declared on
     // very few rules — keep the (already cascade-ordered) slice so resolve can
     // find a winning value without re-walking the full rule list. Last
@@ -2348,7 +2430,9 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         .collect();
     Sheet {
         rules,
+        index,
         var_rules,
+        var_index,
         schemes,
         pseudo,
         hover,
@@ -2487,51 +2571,7 @@ fn match_brace(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// Merge of the plain rule list with the `:hover` bucket, keyed by the
-/// cascade order `(spec, order)` both were sorted by — iterating the two
-/// sorted slices in step yields exactly the order a single sorted list
-/// would, so a hover rule interleaves with the rest at its own
-/// specificity/source position instead of trumping everything after it.
-struct MergeRules<'a> {
-    plain: std::slice::Iter<'a, Rule>,
-    hover: std::slice::Iter<'a, Rule>,
-}
-
-impl<'a> Iterator for MergeRules<'a> {
-    type Item = &'a Rule;
-    fn next(&mut self) -> Option<&'a Rule> {
-        match (self.plain.as_slice().first(), self.hover.as_slice().first()) {
-            (Some(p), Some(h)) => {
-                if (p.spec, p.order) <= (h.spec, h.order) {
-                    self.plain.next()
-                } else {
-                    self.hover.next()
-                }
-            }
-            (Some(_), None) => self.plain.next(),
-            (None, Some(_)) => self.hover.next(),
-            (None, None) => None,
-        }
-    }
-}
-
 impl Sheet {
-    /// Every rule the cascade must walk for one element, in exact
-    /// `(spec, order)` order: [`Self::rules`] merged with [`Self::hover`]
-    /// while a hover cell is set, plain rules alone otherwise (a `:hover`
-    /// selector can't match with no cell, so the bucket is skipped whole).
-    fn cascade_rules(&self) -> MergeRules<'_> {
-        let hover: &[Rule] = if self.hovered.get().is_some() {
-            &self.hover
-        } else {
-            &[]
-        };
-        MergeRules {
-            plain: self.rules.iter(),
-            hover: hover.iter(),
-        }
-    }
-
     /// Cascade every matching rule + the inline `style` attribute over `base`.
     /// The parent font-size defaults to `base.size` (correct wherever `base` is
     /// the true parent style); callers that pass a UA-adjusted base (headings)
@@ -2579,19 +2619,58 @@ impl Sheet {
         let dark = scheme.unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK));
         let mut color_declared = false;
 
-        for rule in self.cascade_rules() {
-            if !matches(dom, node, &rule.segs, self.hovered.get()) {
-                continue;
-            }
-            for d in &rule.decls {
-                color_declared |= d.0 == "color";
-                let sd = self.subst_scoped(d, vars.as_deref());
-                let fs = self.fam_stack_of(&sd, parent_size, self.vp);
-                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
-                    display_none = true;
+        // Every rule that could match this element, in exact cascade order:
+        // the rightmost-compound buckets merged with the `:hover` bucket (a
+        // `:hover` selector can't match with no cell set, so it's skipped
+        // whole then). Testing only these instead of the whole sheet is what
+        // keeps a 33k-rule page from taking seconds per element.
+        let hover: &[Rule] = if self.hovered.get().is_some() {
+            &self.hover
+        } else {
+            &[]
+        };
+        RULE_SCRATCH.with(|scratch| {
+            let mut cand = scratch.borrow_mut();
+            self.index.candidates(dom, node, &mut cand);
+            let mut ci = 0usize;
+            let mut hi = 0usize;
+            loop {
+                let next_plain = cand.get(ci).map(|&i| &self.rules[i as usize]);
+                let next_hover = hover.get(hi);
+                let rule = match (next_plain, next_hover) {
+                    (Some(p), Some(h)) => {
+                        if (p.spec, p.order) <= (h.spec, h.order) {
+                            ci += 1;
+                            p
+                        } else {
+                            hi += 1;
+                            h
+                        }
+                    }
+                    (Some(p), None) => {
+                        ci += 1;
+                        p
+                    }
+                    (None, Some(h)) => {
+                        hi += 1;
+                        h
+                    }
+                    (None, None) => break,
+                };
+                if !matches(dom, node, &rule.segs, self.hovered.get()) {
+                    continue;
+                }
+                for d in &rule.decls {
+                    color_declared |= d.0 == "color";
+                    let sd = self.subst_scoped(d, vars.as_deref());
+                    let fs = self.fam_stack_of(&sd, parent_size, self.vp);
+                    if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs)
+                    {
+                        display_none = true;
+                    }
                 }
             }
-        }
+        });
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
             for d in &parse_decls(inline) {
@@ -2693,19 +2772,27 @@ impl Sheet {
     }
 
     /// Substitute `var(--name[, fallback])` references in a decl value.
-    /// No-op (no allocation path beyond the check) when there's no `var(`.
+    /// Borrows the original when there's no `var(` — cloning every matched
+    /// declaration used to allocate two strings per declaration per element.
     fn subst(&self, d: &Decl) -> Decl {
-        self.subst_scoped(d, None)
+        self.subst_scoped(d, None).into_owned()
     }
 
     /// `subst`, but `var()` resolves through the element's own
     /// [`VarScope`] chain (its declarations, then its ancestors', then the
     /// page-wide root palette) instead of the root palette alone.
-    fn subst_scoped(&self, d: &Decl, scope: Option<&VarScope>) -> Decl {
+    fn subst_scoped<'a>(
+        &self,
+        d: &'a Decl,
+        scope: Option<&VarScope>,
+    ) -> std::borrow::Cow<'a, Decl> {
         if !d.1.contains("var(") {
-            return d.clone();
+            return std::borrow::Cow::Borrowed(d);
         }
-        (d.0.clone(), subst_vars(&d.1, &|name| self.var_lookup(scope, name), 0))
+        std::borrow::Cow::Owned((
+            d.0.clone(),
+            subst_vars(&d.1, &|name| self.var_lookup(scope, name), 0),
+        ))
     }
 
     /// Value of `--name` in effect for an element: nearest declaring ancestor
@@ -2736,11 +2823,16 @@ impl Sheet {
             return parent;
         }
         let mut own: Vec<(String, String)> = Vec::new();
-        for rule in &self.var_rules {
-            if matches(dom, node, &rule.segs, self.hovered.get()) {
-                own.extend(rule.vars.iter().cloned());
+        RULE_SCRATCH.with(|scratch| {
+            let mut cand = scratch.borrow_mut();
+            self.var_index.candidates(dom, node, &mut cand);
+            for &ri in cand.iter() {
+                let rule = &self.var_rules[ri as usize];
+                if matches(dom, node, &rule.segs, self.hovered.get()) {
+                    own.extend(rule.vars.iter().cloned());
+                }
             }
-        }
+        });
         if let Some(inline) = inline {
             for d in &parse_decls(inline) {
                 if d.0.starts_with("--") {
@@ -8591,6 +8683,24 @@ mod tests {
         let sheet = parse("#a { color: #111111 } .b { color: #222222 } div { color: #333333 }");
         let dom = dom_of("<div id=a class=b></div>");
         assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0x111111);
+    }
+
+    #[test]
+    fn rule_index_matches_class_attr_and_projected_slot() {
+        // class key: the element carries several classes, only one indexed
+        let sheet = parse(".a.b { color: #111111 }");
+        let dom = dom_of("<div class='b a'></div>");
+        assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0x111111);
+        // attribute-only last compound: no tag/class/id, so the universal bucket
+        let sheet = parse("[data-role=x] { color: #222222 }");
+        let dom = dom_of("<div data-role=x></div>");
+        assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0x222222);
+        // `slot[name=X]` also selects the light-DOM node projected into it
+        // (its last compound is keyed universal for exactly this case)
+        let sheet = parse("slot[name=x] { color: #333333 }");
+        let dom = dom_of("<div><span slot=x id=s></span><slot name=x></slot></div>");
+        let s = by_attr(&dom, "id", "s");
+        assert_eq!(sheet.resolve(&dom, s, Style::new(), None).style.color, 0x333333);
     }
 
     #[test]

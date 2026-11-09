@@ -1932,3 +1932,24 @@ shell.
   7.9 s, image probe 5.1 s, media probe 3.2 s, layout 4 ms.
 - uncapped `shell.exe https://github.com`: first page at 27 s, shell peak
   68 MB, renderer peak 164 MB.
+
+## Cascade rule index
+
+`Sheet::resolve` walked every rule for every element. GitHub ships 31.5k rules
+and 2,665 DOM nodes, so the cascade did ~84M selector matches for one page.
+Rules are now bucketed by the necessary key of their rightmost compound
+(id > class > tag, else universal): each element tests only the buckets it
+falls into, and the `:hover` bucket is merged back at its exact
+`(spec, order)` position. Candidate indices reuse a thread-local scratch
+buffer, and `subst_scoped` borrows the declaration when it has no `var()`
+instead of cloning both strings. `slot[name=X]` rules stay universal because
+they also select the light-DOM nodes projected into the slot.
+
+### Measured
+
+- cold `renderer.exe https://github.com --once`: cascade + box tree
+  7,891 ms -> **1,240 ms**; total 32 s -> 27.5 s (network fetch varies
+  23-28 s); peak private 133 MB -> **131 MB**.
+- `shell.exe https://github.com`: renderer settles at **75 MB private** and
+  stays flat for a minute (no timer/RAF growth).
+- engine tests **932** green (new rule-index test).
