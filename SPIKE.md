@@ -1764,3 +1764,15 @@ and reports "not iterable" after a delete. 11,588 -> **11,702** (+114).
 
 - test262 language subset: 11,588 -> **11,702** pass (66.2% of 17,678 run,
   6,154 skipped). Engine tests **921** green.
+
+### Object destructuring requires a coercible value
+
+`var {} = null` / `function f({})` with `undefined` are TypeErrors: an
+object binding pattern runs RequireObjectCoercible before reading any
+property, so even an empty pattern throws. `bind_obj` now rejects
+`null`/`undefined`; primitives still coerce. 11,702 -> **11,824** (+122).
+
+### Measured
+
+- test262 language subset: 11,702 -> **11,824** pass (66.9% of 17,678 run,
+  6,154 skipped). Engine tests **922** green.

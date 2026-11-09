@@ -1681,7 +1681,28 @@ fn trailing_comma_in_parameter_lists() {
 }
 
 #[test]
-fn catch_parameter_destructuring() {    assert_eq!(
+fn object_destructuring_requires_coercible_value() {
+    // an object pattern throws for null/undefined even with no properties
+    for src in [
+        "var {} = null",
+        "var {} = undefined",
+        "function f({}) {} f()",
+        "function f({} = null) {} f()",
+        "var {x} = null",
+        "var {x = 1} = undefined",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Throw(_)),
+            "expected a throw for {src}"
+        );
+    }
+    // primitives still coerce (`{} = 5` reads no properties)
+    assert_eq!(num("var {} = 5; 1"), 1.0);
+}
+
+#[test]
+fn catch_parameter_destructuring() {
+    assert_eq!(
         num("var r; try { throw [1, 2] } catch ([a, b]) { r = a + b } r"),
         3.0
     );

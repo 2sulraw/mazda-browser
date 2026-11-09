@@ -779,6 +779,14 @@ fn bind_obj(
     value: &Val,
     kind: BindKind,
 ) -> Result<(), JsError> {
+    // RequireObjectCoercible: an object pattern throws for null/undefined even
+    // when it has no properties to read (`{} = null`, `function f({})`).
+    if matches!(value, Val::Undefined | Val::Null) {
+        return Err(JsError::throw(&format!(
+            "TypeError: Cannot destructure '{}' as an object",
+            value.type_of()
+        )));
+    }
     // track keys already extracted so `...rest` doesn't repeat them
     let mut used: Vec<Rc<str>> = Vec::new();
     for op in parts {
