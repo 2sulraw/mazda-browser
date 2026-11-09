@@ -732,6 +732,14 @@ fn array_basics() {
     assert!(!boolean("Array.isArray({})"));
     // holes/length write
     assert_eq!(num("let a = [1,2,3]; a.length = 1; a.length"), 1.0);
+    // elisions: leading `[,a]` (a webpack bundle uses it), interior, `[,]`,
+    // and a trailing comma that does NOT add a hole
+    assert_eq!(num("[,1].length"), 2.0);
+    assert_eq!(string("String([,1][0])"), "undefined");
+    assert_eq!(num("[1,,3].length"), 3.0);
+    assert_eq!(num("[,].length"), 1.0);
+    assert_eq!(num("[,,].length"), 2.0);
+    assert_eq!(num("[1,].length"), 1.0);
 }
 
 #[test]
@@ -2135,6 +2143,91 @@ fn generator_yield_lifted_out_of_expressions() {
         ),
         "9-2"
     );
+}
+
+#[test]
+fn generator_try_resumption() {
+    // a yield inside the try block suspends; the frame stays live and the
+    // finally runs when the block finishes normally
+    assert_eq!(
+        string(
+            "var log=''; function* g(){ try { yield 1; yield 2 } finally { log += 'f' } } \
+             var it = g(); var a = it.next(), b = it.next(), c = it.next(); \
+             a.value + ',' + b.value + ',' + c.done + ',' + log"
+        ),
+        "1,2,true,f"
+    );
+    // a throw resumes in the same try scope and lands in its catch
+    assert_eq!(
+        string(
+            "function* g(){ try { yield 1; throw 'boom' } catch (e) { return 'caught:' + e } } \
+             var it = g(); it.next(); it.next().value"
+        ),
+        "caught:boom"
+    );
+    // the catch block may itself suspend
+    assert_eq!(
+        string(
+            "function* g(){ try { throw 'e' } catch (e) { yield e; yield 'after' } } \
+             var it = g(); it.next().value + ',' + it.next().value"
+        ),
+        "e,after"
+    );
+    // `return` runs the finally before the generator completes
+    assert_eq!(
+        string(
+            "var log=''; function* g(){ try { yield 1; return 'r' } finally { log += 'f' } } \
+             var it = g(); var a = it.next(), b = it.next(); \
+             a.value + ',' + b.value + ',' + b.done + ',' + log"
+        ),
+        "1,r,true,f"
+    );
+    // yield inside finally: the try frame waits under it
+    assert_eq!(
+        string(
+            "function* g(){ try { yield 1 } finally { yield 2 } } \
+             var it = g(); var a = it.next(), b = it.next(), c = it.next(); \
+             a.value + ',' + b.value + ',' + b.done + ',' + c.done"
+        ),
+        "1,2,false,true"
+    );
+    // break out of a loop runs the finally on the way
+    assert_eq!(
+        string(
+            "var log=''; function* g(){ for (var i=0;i<3;i++){ try { if (i===1) break; yield i } \
+             finally { log += i } } return 'end' } \
+             var it = g(); var a = it.next(), b = it.next(); \
+             a.value + ',' + b.done + ',' + b.value + ',' + log"
+        ),
+        "0,true,end,01"
+    );
+    // `.return(v)` runs the finally, then completes with v
+    assert_eq!(
+        string(
+            "var log=''; function* g(){ try { yield 1 } finally { log += 'f' } } \
+             var it = g(); it.next(); var r = it.return('v'); \
+             r.value + ',' + r.done + ',' + log"
+        ),
+        "v,true,f"
+    );
+    // `.return(v)` stops at a yield in the finally and stays resumable; the
+    // pending return is applied once the finally completes
+    assert_eq!(
+        string(
+            "var log=''; function* g(){ try { yield 1 } finally { yield 'fin'; log += 'x' } } \
+             var it = g(); it.next(); var r = it.return('v'); \
+             r.value + ',' + r.done + ',' + log + '|' + it.next().value + ',' + log"
+        ),
+        "fin,false,|v,x"
+    );
+    // a throw in finally replaces the pending completion
+    assert!(matches!(
+        err(
+            "function* g(){ try { yield 1; throw 'a' } finally { throw 'b' } } \
+             var it = g(); it.next(); it.next()"
+        ),
+        JsError::Throw(_)
+    ));
 }
 
 #[test]

@@ -2461,7 +2461,7 @@ pub(crate) fn call_method(
         }
         GenReturn => {
             let arg = args.first().cloned().unwrap_or(Val::Undefined);
-            gen::gen_return(this, arg)
+            gen::gen_return(e, this, arg)
         }
         IterNext => iterator_next(this),
         IterSelf => Ok(this.clone()),

@@ -1753,8 +1753,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     /// Position check for `yield` inside a generator body *after* the lift
     /// pass: only a whole expression statement (`yield x;`) or a declarator
     /// initializer (`let x = yield v`) may remain. Anything the lift cannot
-    /// rewrite (loop conditions, `return yield`, try bodies, ...) is an honest
-    /// SyntaxError.
+    /// rewrite (loop conditions, `return yield`, ...) is an honest
+    /// SyntaxError. Try/catch/finally bodies are allowed: the walker keeps a
+    /// try frame on its stack (step 19.2).
     ///
     /// Async generators skip the parse-time check: their bodies often mix
     /// `yield` into logical expressions (stream splitters). The body parses,
@@ -3346,19 +3347,27 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let prev_no_in = self.no_in;
                 self.no_in = false;
                 let mut items = Vec::new();
-                while !self.eat_punct(Punct::RBrack) {
-                    if !items.is_empty() {
-                        self.expect_punct(Punct::Comma)?;
-                        if matches!(self.peek(), Tok::Punct(Punct::Comma | Punct::RBrack)) {
-                            items.push(ArrayElem::Hole); // interior hole `[a,,b]`
-                            continue;
-                        }
+                loop {
+                    if self.eat_punct(Punct::RBrack) {
+                        break;
+                    }
+                    // a comma at an element position is an elision: leading
+                    // `[,a]`, interior `[a,,b]`, and `[,]` all produce holes
+                    if self.eat_punct(Punct::Comma) {
+                        items.push(ArrayElem::Hole);
+                        continue;
                     }
                     if *self.peek() == Tok::Spread {
                         self.next();
                         items.push(ArrayElem::Spread(self.assign_expr()?));
                     } else {
                         items.push(ArrayElem::Item(self.assign_expr()?));
+                    }
+                    // after an element: `,` starts the next slot, `]` ends
+                    if !self.eat_punct(Punct::Comma)
+                        && !matches!(self.peek(), Tok::Punct(Punct::RBrack))
+                    {
+                        self.expect_punct(Punct::Comma)?;
                     }
                 }
                 self.no_in = prev_no_in;
@@ -4039,13 +4048,14 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
             Ok(())
         }
         Try { block, catch, finally } => {
-            if stmts_use(block, SusKind::Yield)
-                || catch.as_ref().map_or(false, |c| stmts_use(&c.block, SusKind::Yield))
-                || finally.as_ref().map_or(false, |f| stmts_use(f, SusKind::Yield))
-            {
-                return Err(
-                    "try/catch/finally containing a yield is not supported in generators".into(),
-                );
+            // resumable from 19.2: the walker keeps a try frame on its stack,
+            // so a yield may appear in any of the three blocks
+            check_yield_stmts(block)?;
+            if let Some(c) = catch {
+                check_yield_stmts(&c.block)?;
+            }
+            if let Some(f) = finally {
+                check_yield_stmts(f)?;
             }
             Ok(())
         }

@@ -3,10 +3,11 @@
 //! rewrites a `yield` buried in an expression into statement-level temps
 //! (`f(yield x)` -> `let $t = yield x; f($t)`), so this walker only ever sees
 //! `yield v;` as a whole expression statement or `let x = yield v` as a
-//! declarator initializer. Try/catch-with-yield is still rejected at parse
-//! time. Async generators use the same walker and run `await` blocking
-//! (yields are plain values, no promise wrapping — honest gap: `for await` is
-//! not implemented).
+//! declarator initializer. A `try`/`catch`/`finally` that contains a yield
+//! keeps a `GFrame::Try` on this stack while it runs, so a throw, `return`,
+//! `break` or `continue` runs the finally blocks on its way out. Async
+//! generators use the same walker and run `await` blocking (yields are plain
+//! values, no promise wrapping — honest gap: `for await` is not implemented).
 //!
 //! # Design
 //! A `GenVm` holds an explicit frame stack (`GFrame`). `.next()` resumes by
@@ -24,8 +25,9 @@
 //! native-stack growth across yields.
 //!
 //! Honest gaps (parse-time enforced where noted): `yield` in loop conditions
-//! or switch case tests, `return yield` / `throw yield`, try-with-yield,
-//! `.throw()`, nested generator suspension inside for-in/of heads.
+//! or switch case tests, `return yield` / `throw yield`, `.throw()`, nested
+//! generator suspension inside for-in/of heads, and a throw raised while
+//! binding a destructured `yield` result (it bypasses an enclosing catch).
 
 use super::interp::{self, eval_expr, Flow};
 use super::*;
@@ -62,6 +64,16 @@ enum GFrame {
         j: usize,
         env: Rc<Env>,
     },
+    /// try/catch/finally around a resumable block. `phase` says which part is
+    /// running (or just finished); `pending` holds the abrupt completion the
+    /// finally must resume once it completes on its own.
+    Try {
+        catch: Option<Rc<parser::CatchClause>>,
+        finally: Option<Rc<Vec<parser::Stmt>>>,
+        env: Rc<Env>,
+        phase: TryPhase,
+        pending: Option<Abrupt>,
+    },
     While {
         test: Rc<parser::Expr>,
         body: Rc<Vec<parser::Stmt>>,
@@ -94,6 +106,24 @@ enum GFrame {
         batch: Rc<Vec<parser::Stmt>>,
         env: Rc<Env>,
     },
+}
+
+/// which part of a `try` statement a `GFrame::Try` is executing
+#[derive(Clone, Copy, PartialEq)]
+enum TryPhase {
+    Block,
+    Catch,
+    Finally,
+}
+
+/// a completion travelling out of a resumable region. `finally` runs before
+/// the generator actually completes/throws/breaks, so the frame carries this
+/// until the finally block finishes.
+enum Abrupt {
+    Err(JsError),
+    Ret(Val),
+    Break,
+    Continue,
 }
 
 /// what one generator `.next` step produced
@@ -290,18 +320,49 @@ pub(crate) fn gen_next(e: &mut JsEngine, this: &Val, arg: Val) -> Result<Val, Js
     })
 }
 
-/// `.return(v)` — minimal: terminate the body now with value v
-/// (try/finally interaction cannot occur: the parser rejects try-with-yield)
-pub(crate) fn gen_return(this: &Val, v: Val) -> Result<Val, JsError> {
+/// `.return(v)` — complete the body with `v`, but run any live `finally`
+/// blocks first (they can suspend, in which case the generator reports the
+/// yielded value and stays resumable until the finally completes).
+pub(crate) fn gen_return(e: &mut JsEngine, this: &Val, v: Val) -> Result<Val, JsError> {
     let vm = gen_vm(this)?;
+    if vm.try_borrow_mut().is_err() {
+        return Err(JsError::throw(
+            "TypeError: generator is already running (reentrant .return)",
+        ));
+    }
     let mut vm = vm.borrow_mut();
     if vm.done || vm.running {
-        // return on a completed generator reports { done: true, value: v }
+        // return on a completed (or reentrant) generator reports
+        // { done: true, value: v }
         return Ok(result_val(v, true));
     }
-    vm.done = true;
-    vm.frames.clear();
-    Ok(result_val(v, true))
+    vm.running = true;
+    let saved_src = e.cur_src;
+    let saved_located = e.err_located;
+    e.cur_src = vm.def.src;
+    e.err_located = false;
+    let out = match unwind_flow(&mut vm, Abrupt::Ret(v.clone())) {
+        FlowOut::Done => Ok(GOut::Ret(v)),
+        FlowOut::Deferred => drive(e, &mut vm),
+    };
+    vm.running = false;
+    e.cur_src = saved_src;
+    e.err_located = saved_located;
+    match out {
+        // a finally suspended: `.return` stops at that yield and the
+        // generator stays alive with the pending return in its Try frame
+        Ok(GOut::Yield(y)) => Ok(result_val(y, false)),
+        Ok(GOut::Ret(r)) => {
+            vm.done = true;
+            vm.frames.clear();
+            Ok(result_val(r, true))
+        }
+        Err(err) => {
+            vm.done = true;
+            vm.frames.clear();
+            Err(err)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -320,31 +381,190 @@ fn drive(e: &mut JsEngine, vm: &mut GenVm) -> Result<GOut, JsError> {
             }
             Some(f) => f,
         };
-        match step_frame(e, vm, frame)? {
+        let step = match step_frame(e, vm, frame) {
+            Ok(step) => step,
+            // a throw may still be caught by a try frame further down the
+            // generator's own stack; only propagate when none is left
+            Err(err) => match unwind_error(e, vm, err) {
+                Unwound::Handled => continue,
+                Unwound::Propagate(err) => return Err(err),
+            },
+        };
+        match step {
             StepR::Susp(v) => return Ok(GOut::Yield(v)),
             StepR::Finished | StepR::NewFrame => {}
-            StepR::Retr(v) => return Ok(GOut::Ret(v)),
+            StepR::Retr(v) => match unwind_flow(vm, Abrupt::Ret(v.clone())) {
+                FlowOut::Deferred => {}
+                FlowOut::Done => return Ok(GOut::Ret(v)),
+            },
             StepR::BreakFlow => {
-                // discard frames until the innermost loop/switch construct
-                while let Some(f) = vm.frames.pop() {
-                    let is_target = matches!(
-                        f,
-                        GFrame::SwitchBody { .. }
-                            | GFrame::While { .. }
-                            | GFrame::DoWhile { .. }
-                            | GFrame::For { .. }
-                            | GFrame::ForEach { .. }
-                    );
-                    if is_target {
-                        break;
-                    }
-                }
+                // discard frames until the innermost loop/switch construct,
+                // running any finally block on the way out
+                let _ = unwind_flow(vm, Abrupt::Break);
             }
             StepR::ContinueFlow => {
                 // the enclosing loop frame is right below; `continue` amounts
                 // to re-stepping it (which re-evaluates update + condition),
                 // and switch frames are transparent for continue flows
+                let _ = unwind_flow(vm, Abrupt::Continue);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// abrupt completions through `finally`
+// ---------------------------------------------------------------------------
+
+enum FlowOut {
+    /// the completion left the generator (or reached its target frame)
+    Done,
+    /// a finally block was pushed; re-enter the driver
+    Deferred,
+}
+
+enum Unwound {
+    /// a catch/finally frame was pushed; keep driving
+    Handled,
+    /// no try frame left in this generator: the caller reports the error
+    Propagate(JsError),
+}
+
+/// Pop frames for `return`/`break`/`continue`, running the `finally` of every
+/// try frame on the way. A break/continue target is dropped (break) or left on
+/// top (continue) so the normal flow handling takes over afterwards.
+fn unwind_flow(vm: &mut GenVm, abrupt: Abrupt) -> FlowOut {
+    loop {
+        let frame = match vm.frames.pop() {
+            None => return FlowOut::Done,
+            Some(f) => f,
+        };
+        match frame {
+            GFrame::Try {
+                catch,
+                finally,
+                env,
+                phase,
+                ..
+            } => {
+                // a finally already running is not entered twice: a new
+                // completion from inside it simply replaces the pending one
+                if phase != TryPhase::Finally {
+                    if let Some(fin) = finally {
+                        vm.frames.push(GFrame::Try {
+                            catch,
+                            finally: Some(fin.clone()),
+                            env: env.clone(),
+                            phase: TryPhase::Finally,
+                            pending: Some(abrupt),
+                        });
+                        vm.frames.push(GFrame::Batch {
+                            stmts: fin,
+                            i: 0,
+                            env,
+                        });
+                        return FlowOut::Deferred;
+                    }
+                }
+            }
+            frame => {
+                let is_target = match &abrupt {
+                    Abrupt::Break => matches!(
+                        frame,
+                        GFrame::SwitchBody { .. }
+                            | GFrame::While { .. }
+                            | GFrame::DoWhile { .. }
+                            | GFrame::For { .. }
+                            | GFrame::ForEach { .. }
+                    ),
+                    Abrupt::Continue => matches!(
+                        frame,
+                        GFrame::While { .. }
+                            | GFrame::DoWhile { .. }
+                            | GFrame::For { .. }
+                            | GFrame::ForEach { .. }
+                    ),
+                    Abrupt::Ret(_) | Abrupt::Err(_) => false,
+                };
+                if is_target {
+                    // continue re-steps the loop frame itself; break is done
+                    if matches!(abrupt, Abrupt::Continue) {
+                        vm.frames.push(frame);
+                    }
+                    return FlowOut::Done;
+                }
+            }
+        }
+    }
+}
+
+/// Unwind a thrown value to the innermost try frame that can handle it: a
+/// catch (still in the try block) or a finally. Non-throw errors (budget,
+/// syntax) are not catchable and do not run finally - they abort the turn.
+fn unwind_error(e: &mut JsEngine, vm: &mut GenVm, err: JsError) -> Unwound {
+    let mut err = match err {
+        JsError::Throw(_) => err,
+        other => return Unwound::Propagate(other),
+    };
+    loop {
+        let frame = match vm.frames.pop() {
+            None => return Unwound::Propagate(err),
+            Some(f) => f,
+        };
+        match frame {
+            GFrame::Try {
+                catch,
+                finally,
+                env,
+                phase,
+                ..
+            } => {
+                if phase == TryPhase::Block {
+                    if let Some(c) = catch {
+                        let v = match &err {
+                            JsError::Throw(v) => v.clone(),
+                            _ => Val::Undefined,
+                        };
+                        // the caught error is gone; the next throw in this
+                        // turn must be able to record its own location
+                        e.err_located = false;
+                        let cenv = Env::child(&env);
+                        cenv.declare(c.name.clone(), v, false);
+                        vm.frames.push(GFrame::Try {
+                            catch: None,
+                            finally,
+                            env,
+                            phase: TryPhase::Catch,
+                            pending: None,
+                        });
+                        vm.frames.push(GFrame::Batch {
+                            stmts: Rc::new(c.block.clone()),
+                            i: 0,
+                            env: cenv,
+                        });
+                        return Unwound::Handled;
+                    }
+                }
+                if phase != TryPhase::Finally {
+                    if let Some(fin) = finally {
+                        vm.frames.push(GFrame::Try {
+                            catch: None,
+                            finally: Some(fin.clone()),
+                            env: env.clone(),
+                            phase: TryPhase::Finally,
+                            pending: Some(Abrupt::Err(err)),
+                        });
+                        vm.frames.push(GFrame::Batch {
+                            stmts: fin,
+                            i: 0,
+                            env,
+                        });
+                        return Unwound::Handled;
+                    }
+                }
+                // no handler here: the error keeps travelling outward
+            }
+            _ => {}
         }
     }
 }
@@ -602,6 +822,41 @@ fn step_frame(e: &mut JsEngine, vm: &mut GenVm, frame: GFrame) -> Result<StepR, 
             });
             Ok(StepR::NewFrame)
         }
+        GFrame::Try {
+            catch,
+            finally,
+            env,
+            phase,
+            pending,
+        } => match phase {
+            // the try block (or catch block) finished normally: run finally
+            TryPhase::Block | TryPhase::Catch => match finally {
+                Some(fin) => {
+                    vm.frames.push(GFrame::Try {
+                        catch,
+                        finally: Some(fin.clone()),
+                        env: env.clone(),
+                        phase: TryPhase::Finally,
+                        pending: None,
+                    });
+                    vm.frames.push(GFrame::Batch {
+                        stmts: fin,
+                        i: 0,
+                        env,
+                    });
+                    Ok(StepR::NewFrame)
+                }
+                None => Ok(StepR::Finished),
+            },
+            // the finally finished: whatever it was guarding resumes here
+            TryPhase::Finally => match pending {
+                None => Ok(StepR::Finished),
+                Some(Abrupt::Err(err)) => Err(err),
+                Some(Abrupt::Ret(v)) => Ok(StepR::Retr(v)),
+                Some(Abrupt::Break) => Ok(StepR::BreakFlow),
+                Some(Abrupt::Continue) => Ok(StepR::ContinueFlow),
+            },
+        },
         GFrame::SwitchBody { .. } => {
             // reached only after a `continue` flowed past it (a break pops
             // the frame inside drive); post-continue the switch is finished
@@ -938,8 +1193,27 @@ fn step_stmt(
             });
             Ok(SStep::Pushed)
         }
-        // try-with-yield is a parse error for sync generators; async
-        // generators reach here only at call time (honest error, no panic)
+        parser::StmtKind::Try {
+            block,
+            catch,
+            finally,
+        } => {
+            vm.frames.push(GFrame::Try {
+                catch: catch.as_ref().map(|c| Rc::new((**c).clone())),
+                finally: finally.as_ref().map(|f| Rc::new(f.clone())),
+                env: env.clone(),
+                phase: TryPhase::Block,
+                pending: None,
+            });
+            vm.frames.push(GFrame::Batch {
+                stmts: Rc::new(block.clone()),
+                i: 0,
+                env: env.clone(),
+            });
+            Ok(SStep::Pushed)
+        }
+        // yield in a position the lift did not rewrite is a parse error for
+        // sync generators; async ones reach here only at call time
         _ => Err(JsError::throw(
             "TypeError: yield in this statement position is not supported by the resumable walker",
         )),

@@ -1416,3 +1416,64 @@ Both were latent in `gen.rs` and are fixed here:
   network run is not a paired benchmark.
 - YouTube main chunk still stops at `try`/`finally` containing a yield
   (line 1290); Google `xjs` at line 946. That is step 19.2, not this one.
+
+## Try frames in generator resumption (P7 step 19.2, 2026-11-09)
+
+`yield` inside `try`/`catch`/`finally` now works. The walker keeps a
+`GFrame::Try { catch, finally, env, phase, pending }` under the block it is
+executing, so a suspension leaves the try scope live on the frame stack.
+
+- normal completion of the try block (or catch block) runs `finally`, then
+  continues;
+- a throw from a resumed section unwinds frames to the innermost try frame,
+  binds the catch parameter in a child env (the catch block may suspend), or
+  runs `finally` and rethrows;
+- `return`/`break`/`continue` unwind the same way: every `finally` between the
+  completion and its target runs first. A `break`/`continue` that leaves the
+  try resumes after the finally completes;
+- a throw inside `finally` replaces the pending completion (the frame's
+  `pending: Option<Abrupt>` is discarded);
+- `.return(v)` runs live finally blocks; if one of them suspends, `.return`
+  reports that yield (`done: false`) and the generator stays resumable, with
+  the pending return still on the Try frame;
+- budget errors are not catchable and do not run finally (a runaway finally
+  must not get another turn).
+
+### Array elisions the reference bundle exposed
+
+YouTube's ES5 chunk contains `return[,{filterRaw:...}]` - a *leading* hole in
+an array literal. The parser only handled interior holes (`[a,,b]`), so this
+failed with `unexpected token Comma`. The literal grammar now treats a comma
+at an element position as an elision (`[,a]`, `[a,,b]`, `[,]`) while a
+trailing comma still adds no hole (`[a,]` has length 1).
+
+This one character shape was worth **+92 test262 passes** on its own, because
+array-destructuring tests use leading elisions everywhere.
+
+### Measured
+
+- test262 sloppy subset: **7,078 -> 7,172** (+94: +2 try frames, +92 array
+  elisions), run/skip unchanged (17,678 run, 6,154 skip), 34-37 s for two
+  consecutive runs after a fresh build.
+- engine tests: **906** green; `generator_try_resumption` covers normal
+  completion, throw-after-resume, yield in catch, return through finally,
+  yield in finally, break through finally, `.return()` with a live finally,
+  `.return()` suspending in a finally, and a throw from finally replacing the
+  pending error; `array_basics` covers leading/interior/trailing elisions.
+- Live pages, one run each after the fix (coverage numbers, not paired
+  benchmarks; exec rises because the whole bundle now runs instead of stopping
+  at a syntax error):
+  - YouTube `kevlar_base` ES5 chunk: 442 -> 2,892 ms exec, **syntax errors 0**
+    (was: try/finally yield, then a leading elision);
+  - Google `xjs`: 303 -> 594 ms exec, **syntax errors 0** (was: try/finally
+    yield, then an inline `[,{...}]`);
+  - GitHub: 515 -> 822 ms exec, syntax errors 0 (remaining messages are
+    module-fetch 404s for bare specifiers).
+- Every reference bundle now parses end to end. The remaining live-page
+  errors are runtime gaps (missing DOM/API surface), not syntax.
+
+### One honest gap the design leaves
+
+A destructuring `yield` initializer that throws while binding (e.g.
+`let [a] = yield null`) errors before the walker resumes inside the try, so an
+enclosing catch does not see it. No reference bundle uses that shape.
