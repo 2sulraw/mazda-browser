@@ -473,6 +473,18 @@ impl<'a> Lexer<'a> {
                 let n = (1..=4)
                     .find(|n| self.src.is_char_boundary(self.pos + n))
                     .unwrap_or(1);
+                if b >= 0x80 {
+                    // a non-ASCII space or line terminator (NBSP, U+2028,
+                    // U+2029, ...) ends the identifier instead of being
+                    // swallowed into it
+                    let ch = self.src[self.pos..self.pos + n]
+                        .chars()
+                        .next()
+                        .unwrap_or('\u{fffd}');
+                    if ch.is_whitespace() || ch.is_control() {
+                        break;
+                    }
+                }
                 name.push_str(&self.src[self.pos..self.pos + n]);
                 self.pos += n;
             } else {

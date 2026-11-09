@@ -2412,3 +2412,23 @@ rejected too.
   `expressions/object` 123 -> **121**, `statements/class` 495 -> **493**. No
   directory regressed.
 - engine tests **954** green (new method-parameter test).
+
+## Non-ASCII whitespace ends an identifier (P7, 2026-11-10)
+
+The identifier scanner reads raw bytes and accepts any byte `>= 0x80`, which
+kept UTF-8 names allocation-free but also swallowed a following non-ASCII
+space or line terminator into the name: `x\u00A0+= 1` lexed as the single
+identifier `x\u00A0`, so the statement read an undeclared binding. The scan
+now decodes the next char at a multibyte position and stops on any
+whitespace/control code point (NBSP, the Zs block, U+2028/U+2029), matching
+`skip_ws`. Genuine non-ASCII identifiers (`Ä`, Greek letters) are unaffected.
+
+### Measured
+
+- test262 language subset: 14,826 -> **14,867** pass (84.1% of 17,678 run,
+  6,154 skipped).
+- `expressions/compound-assignment` 146 -> **135** (all 11 `*-whitespace`
+  cases), `expressions/assignment` 92 -> **91**; the rest of the gain is
+  identifiers followed by a non-ASCII space elsewhere. No directory
+  regressed.
+- engine tests **955** green (new lexer regression test).

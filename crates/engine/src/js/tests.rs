@@ -3107,6 +3107,20 @@ fn arrow_parameters_reject_duplicate_names() {
 }
 
 #[test]
+fn non_ascii_whitespace_ends_an_identifier() {
+    // a non-ASCII space or line terminator right after an identifier must not
+    // be swallowed into it (`x\u00A0+=`, `x\u2028+=`, ...)
+    assert_eq!(num("var x = -1; x\u{2028}+= -1; x"), -2.0);
+    assert_eq!(num("var x = -1; x\u{2029}+= -1; x"), -2.0);
+    assert_eq!(num("var x = -1; x\u{a0}+= -1; x"), -2.0);
+    assert_eq!(num("var x = -1; x \u{b}\u{c} += -1; x"), -2.0);
+    assert_eq!(num("var x = 1; x\u{a0}++ ; x"), 2.0);
+    // real non-ASCII identifiers still work
+    assert_eq!(num("var \u{c4} = 4; \u{c4}"), 4.0);
+    assert_eq!(num("var \u{3b1}\u{3b2} = 2; \u{3b1}\u{3b2}"), 2.0);
+}
+
+#[test]
 fn method_parameters_must_be_unique() {
     // MethodDefinition uses UniqueFormalParameters: no duplicate bound names
     // even in sloppy mode, unlike a plain function declaration.
