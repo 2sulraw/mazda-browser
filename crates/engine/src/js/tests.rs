@@ -1395,6 +1395,15 @@ fn primitive_and_function_prototypes_exist() {
     assert_eq!(string("String.prototype.trim.call('  x  ')"), "x");
     assert_eq!(string("String.prototype.toUpperCase.call('ab')"), "AB");
     assert_eq!(string("Number.prototype.toFixed.call(1.5, 1)"), "1.5");
+    // Number's own value properties
+    assert!(boolean("Number.POSITIVE_INFINITY === Infinity"));
+    assert!(boolean("Number.NEGATIVE_INFINITY === -Infinity"));
+    assert!(boolean("Number.NaN !== Number.NaN"));
+    assert!(boolean("Number.MAX_VALUE > 0 && Number.MAX_VALUE * 1 === Number.MAX_VALUE"));
+    assert!(boolean("Number.MIN_VALUE > 0 && Number.MIN_VALUE < 1e-300"));
+    assert!(boolean("Number.MAX_SAFE_INTEGER === 9007199254740991"));
+    assert!(boolean("Number.MIN_SAFE_INTEGER === -9007199254740991"));
+    assert!(boolean("Number.EPSILON > 0 && Number.EPSILON < 1e-15"));
     assert_eq!(
         string("Function.prototype.call.call(function (a) { return a; }, null, 4)"),
         "4"

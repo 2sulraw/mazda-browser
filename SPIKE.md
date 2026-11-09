@@ -1975,3 +1975,21 @@ already passed; the new flags cover the plain and object forms.
   6,154 skipped).
 - engine tests **932** green (rest-last assertions in the existing
   trailing-comma, array/object destructuring and assignment tests).
+
+## Number static constants (P7 fix, 2026-11-09)
+
+`Number` only exposed its prototype, so `Number.POSITIVE_INFINITY`,
+`MAX_VALUE`, `MIN_VALUE`, `NaN` and friends were `undefined`. Arithmetic
+tests using them produced `NaN` (e.g. `Number.MAX_VALUE + -0 === NaN`) and
+threw. The constructor now carries its value properties: `MAX_VALUE`,
+`MIN_VALUE` (smallest positive subnormal), `POSITIVE_INFINITY`,
+`NEGATIVE_INFINITY`, `NaN`, `EPSILON`, `MAX_SAFE_INTEGER`,
+`MIN_SAFE_INTEGER`.
+
+### Measured
+
+- test262 language subset: 13,403 -> **13,483** pass (76.3% of 17,678 run,
+  6,154 skipped).
+- `language/expressions/addition`: 27/48 -> 34/48 pass; the remaining 14 are
+  ToPrimitive / `Symbol.toPrimitive` cases.
+- engine tests **932** green.

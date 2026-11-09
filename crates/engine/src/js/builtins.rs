@@ -314,6 +314,20 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("String", Val::Native(str_id));
     e.set_global("Number", Val::Native(num_id));
     e.set_global("Boolean", Val::Native(bool_id));
+    // Number's own value properties (read-only reads only; the descriptors
+    // are not modeled). MIN_VALUE is the smallest positive subnormal.
+    for (name, v) in [
+        ("MAX_VALUE", f64::MAX),
+        ("MIN_VALUE", f64::from_bits(1)),
+        ("POSITIVE_INFINITY", f64::INFINITY),
+        ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+        ("NaN", f64::NAN),
+        ("EPSILON", f64::EPSILON),
+        ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+        ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+    ] {
+        e.set_native_prop(num_id, name, Val::Num(v));
+    }
 
     // -- BigInt ------------------------------------------------------------
     // i128-backed (the documented range); see the BigInt helpers in interp.
