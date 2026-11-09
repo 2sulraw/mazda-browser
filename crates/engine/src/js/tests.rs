@@ -1729,6 +1729,34 @@ fn private_names_are_lexically_scoped_and_unique() {
 }
 
 #[test]
+fn super_call_only_inside_constructor() {
+    for src in [
+        "class C extends Object { m() { super(); } }",
+        "class C extends Object { static m() { super(); } }",
+        "class C extends Object { *m() { super(); } }",
+        "class C extends Object { async m() { super(); } }",
+        "class C extends Object { get x() { super(); } }",
+        "class C extends Object { x = super(); }",
+        "class C extends Object { static x = super(); }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // inside the constructor it still works, including a derived class chain
+    assert_eq!(
+        num("class A { constructor() { this.a = 1 } } class B extends A { constructor() { super(); this.b = 2 } } new B().a + new B().b"),
+        3.0
+    );
+    // `super.m()` in an ordinary method remains legal
+    assert_eq!(
+        num("class A { m() { return 5 } } class B extends A { m() { return super.m() + 1 } } new B().m()"),
+        6.0
+    );
+}
+
+#[test]
 fn class_element_reserved_names() {
     for src in [
         "class C { static prototype() {} }",

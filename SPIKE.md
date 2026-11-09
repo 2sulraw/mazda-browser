@@ -1821,3 +1821,16 @@ cannot see the subclass's own private names. 12,806 -> **12,931** (+125).
 
 - test262 language subset: 12,806 -> **12,931** pass (73.1% of 17,678 run,
   6,154 skipped). Engine tests **925** green.
+
+### `super()` only inside a class constructor
+
+`super(...)` was accepted anywhere the class had a superclass, so method
+bodies that should be early errors parsed clean. `ClassCtx` now carries
+`in_constructor`, reset per class element and set only while the constructor
+body is parsed; the `super(...)` path rejects it elsewhere. `super.m()` in
+ordinary methods is untouched. 12,931 -> **12,971** (+40).
+
+### Measured
+
+- test262 language subset: 12,931 -> **12,971** pass (73.4% of 17,678 run,
+  6,154 skipped). Engine tests **926** green.

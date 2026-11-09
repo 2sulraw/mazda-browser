@@ -668,6 +668,8 @@ struct ClassCtx {
     /// private references parsed while this class is innermost; checked once
     /// the whole class body is known (forward references are legal)
     private_refs: Vec<Rc<str>>,
+    /// true while parsing the constructor body: `super()` is only legal there
+    in_constructor: bool,
 }
 
 /// Function context while parsing a body: `await` is a reserved word only
@@ -2163,6 +2165,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             private_names: Vec::new(),
             private_accessor_names: Vec::new(),
             private_refs: Vec::new(),
+            in_constructor: false,
         });
         let parsed = self.class_body(&name);
         let ctx = self.class_stack.pop();
@@ -2463,6 +2466,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             if self.eat_punct(Punct::Semi) {
                 continue;
             }
+            // `super()` is only legal in the constructor body, never in a
+            // static block, field initializer or ordinary method
+            if let Some(c) = self.class_stack.last_mut() {
+                c.in_constructor = false;
+            }
             // `static` modifier: not a method named `static` (`static()`)
             let is_static = *self.peek() == Tok::Kw(Kw::Static)
                 && *self.peek_at(1) != Tok::Punct(Punct::LParen);
@@ -2609,16 +2617,26 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     is_async,
                     is_generator: is_gen,
                 });
+                let is_ctor = !is_static && key_name.as_deref() == Some("constructor");
+                if is_ctor {
+                    if let Some(c) = self.class_stack.last_mut() {
+                        c.in_constructor = true;
+                    }
+                }
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let mut body = self.block_body()?;
+                if is_ctor {
+                    if let Some(c) = self.class_stack.last_mut() {
+                        c.in_constructor = false;
+                    }
+                }
                 self.fn_ctx.pop();
                 self.check_strict_body(&params, &body)?;
                 if is_gen {
                     self.prepare_generator_body(&mut body, is_async)?;
                 }
                 let uses_arguments = scan_uses_arguments_stmts(&body);
-                let is_ctor = !is_static && key_name.as_deref() == Some("constructor");
                 let f = Rc::new(FnDef {
                     src: self.src_id,
                     name: if is_ctor {
@@ -3701,6 +3719,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     span: self.span_from(start),
                 });
                 if self.eat_punct(Punct::LParen) {
+                    if !ctx.in_constructor {
+                        return self.err(
+                            "`super()` is only valid inside a class constructor",
+                        );
+                    }
                     let args = self.call_args()?;
                     ExprKind::SuperCall {
                         class,
