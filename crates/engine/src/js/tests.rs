@@ -1681,6 +1681,19 @@ fn trailing_comma_in_parameter_lists() {
 }
 
 #[test]
+fn unresolved_identifier_reads_throw_reference_error() {
+    assert!(matches!(err("void missingName"), JsError::Throw(_)));
+    assert!(matches!(err("missingName + 1"), JsError::Throw(_)));
+    assert!(matches!(err("missingName += 1"), JsError::Throw(_)));
+    // typeof is the exception: an undeclared name is legal there
+    assert_eq!(string("typeof missingName"), "undefined");
+    // sloppy assignment to an undeclared name still creates a global
+    assert_eq!(num("missingName = 3; missingName"), 3.0);
+    // a global property that exists holding undefined is resolvable
+    assert_eq!(string("this.foo = undefined; typeof foo"), "undefined");
+}
+
+#[test]
 fn object_destructuring_requires_coercible_value() {
     // an object pattern throws for null/undefined even with no properties
     for src in [

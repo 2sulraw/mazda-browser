@@ -1776,3 +1776,20 @@ property, so even an empty pattern throws. `bind_obj` now rejects
 
 - test262 language subset: 11,702 -> **11,824** pass (66.9% of 17,678 run,
   6,154 skipped). Engine tests **922** green.
+
+### Unresolvable identifier reads throw ReferenceError
+
+An identifier read that resolved to no binding and no global-object property
+silently returned `undefined`, which is why the `-unresolvable` destructuring
+defaults never threw. `env_get_checked` now walks the same chain and throws
+`ReferenceError: x is not defined` when the name is absent, while `typeof
+ident` and the host-facing `get_global` keep the lenient `env_get`. A global
+property that exists but holds `undefined` stays resolvable, and sloppy
+assignment still creates the global. `undefined` is now installed as a real
+global property (as are `NaN`/`Infinity` already). 11,824 -> **12,770**
+(+946).
+
+### Measured
+
+- test262 language subset: 11,824 -> **12,770** pass (72.2% of 17,678 run,
+  6,154 skipped). Engine tests **923** green.

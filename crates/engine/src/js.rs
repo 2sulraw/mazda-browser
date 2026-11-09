@@ -2472,13 +2472,50 @@ impl JsEngine {
         }
         let v = obj_get_own(&self.global_obj, name);
         // MAZDA_MISS census: an identifier that resolved NOWHERE (no binding,
-        // no global-object property) reads as `undefined` — a name the page
+        // no global-object property) reads as `undefined` - a name the page
         // expected and the engine does not have. Gate first: this is the
         // hottest read path in the interpreter.
         if js_miss_enabled() && v.is_undefined() {
             note_js_miss("global", name);
         }
         v
+    }
+
+    /// Identifier read for expression positions: an unresolvable reference is
+    /// a ReferenceError. `typeof ident` and `get_global` keep using `env_get`
+    /// (an undeclared name is legal there).
+    pub(crate) fn env_get_checked(&self, env: &Rc<Env>, name: &str) -> Result<Val, JsError> {
+        if name == "this" {
+            return Ok(Self::frame_slot(env, "this"));
+        }
+        if name == "#new.target" {
+            return Ok(Self::frame_slot(env, "#new.target"));
+        }
+        let mut cur: &Env = env;
+        loop {
+            if let Some(v) = cur.bindings.borrow().iter().find(|b| b.name.as_ref() == name) {
+                return Ok(v.val.clone());
+            }
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        // a global property that exists but holds undefined is resolvable
+        // (`window.foo = undefined`); only absence throws
+        if self.chain_has(&self.global_obj, name) {
+            let v = obj_get_own(&self.global_obj, name);
+            if js_miss_enabled() && v.is_undefined() {
+                note_js_miss("global", name);
+            }
+            return Ok(v);
+        }
+        if js_miss_enabled() {
+            note_js_miss("global", name);
+        }
+        Err(JsError::throw(&format!(
+            "ReferenceError: {name} is not defined"
+        )))
     }
 
     /// Resolve a function-frame slot (`this` or `new.target`) through the

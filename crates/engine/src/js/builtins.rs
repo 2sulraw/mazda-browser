@@ -373,6 +373,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_native_prop(fn_ctor, "prototype", fn_proto);
     e.set_global("Function", Val::Native(fn_ctor));
 
+    e.set_global("undefined", Val::Undefined);
     e.set_global("NaN", Val::Num(f64::NAN));
     e.set_global("Infinity", Val::Num(f64::INFINITY));
 

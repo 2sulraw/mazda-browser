@@ -1237,7 +1237,7 @@ pub(crate) fn eval_expr(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val
 
 fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsError> {
     match &x.kind {
-        ExprKind::Ident(name) => Ok(e.env_get(env, name)),
+        ExprKind::Ident(name) => e.env_get_checked(env, name),
         ExprKind::BigInt(n) => Ok(Val::BigInt(Rc::new(*n))),
         ExprKind::NewTarget => Ok(e.env_get(env, "#new.target")),
         ExprKind::PrivateIn { name, obj } => {
@@ -1762,7 +1762,7 @@ fn eval_args(e: &mut JsEngine, env: &Rc<Env>, args: &[CallArg]) -> Result<Vec<Va
 /// current value of an assignment target (ident or member)
 fn eval_target_value(e: &mut JsEngine, env: &Rc<Env>, target: &Expr) -> Result<Val, JsError> {
     match &target.kind {
-        ExprKind::Ident(name) => Ok(e.env_get(env, name)),
+        ExprKind::Ident(name) => e.env_get_checked(env, name),
         ExprKind::Member { base, key } => {
             let b = eval_expr(e, env, base)?;
             get_member(e, &b, key)
