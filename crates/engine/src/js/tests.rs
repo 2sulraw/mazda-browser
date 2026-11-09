@@ -2270,6 +2270,11 @@ fn destructuring_arrays() {
     assert_eq!(num("const [a, [b]] = [1, [9]]; a + b"), 10.0);
     assert_eq!(string("const [a = 'd'] = []; a"), "d");
     assert_eq!(string("const [, b] = ['x', 'y']; b"), "y");
+    // a rest element may bind a nested pattern, not just a name
+    assert_eq!(num("const [a, ...[b, c]] = [1, 2, 3]; a + b + c"), 6.0);
+    assert_eq!(num("var f = ([...[x, y, z]]) => x + y + z; f([3, 4, 5])"), 12.0);
+    assert_eq!(num("const [...{length}] = [1, 2]; length"), 2.0);
+    assert_eq!(num("let p, q; [...[p, q]] = [8, 9]; p + q"), 17.0);
 }
 
 #[test]
@@ -2278,6 +2283,10 @@ fn destructuring_objects() {
     assert_eq!(num("const { p = 7 } = {}; p"), 7.0);
     assert_eq!(string("const { list: [first] } = { list: ['A'] }; first"), "A");
     assert!(boolean("const { q, ...others } = { q: 1, r: 2 }; others.r === 2 && others.q === undefined"));
+    // a trailing comma is allowed in an object pattern (decl, param, arrow)
+    assert_eq!(num("const { a, } = { a: 1 }; a"), 1.0);
+    assert_eq!(num("function fn1({ x, }) { return x } fn1({ x: 5 })"), 5.0);
+    assert_eq!(num("var f = ({ x, }) => x; f({ x: 23 })"), 23.0);
 }
 
 #[test]

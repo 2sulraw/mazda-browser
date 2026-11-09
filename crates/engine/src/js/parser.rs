@@ -1430,10 +1430,17 @@ impl<'a> Parser<'a> {
                     }
                     if *self.peek() == Tok::Spread {
                         self.next();
-                        let t = self.parse_binding_leaf(decl_form)?;
-                        if !matches!(t, Pat::Name(_)) {
-                            return self.err("array rest must bind a simple name");
-                        }
+                        // the rest target may be a nested pattern:
+                        // `...[a, b]`, `...{a}` (the runtime binds the rest
+                        // array against that pattern)
+                        let t = if matches!(
+                            self.peek(),
+                            Tok::Punct(Punct::LBrack) | Tok::Punct(Punct::LBrace)
+                        ) {
+                            self.parse_pattern(decl_form)?
+                        } else {
+                            self.parse_binding_leaf(decl_form)?
+                        };
                         parts.push(PatPart::Rest(Box::new(t)));
                         continue;
                     }
@@ -1449,7 +1456,10 @@ impl<'a> Parser<'a> {
                         self.expect_punct(Punct::Comma)?;
                     }
                     if matches!(self.peek(), Tok::Punct(Punct::RBrace)) {
-                        break; // trailing comma
+                        // trailing comma: consume the `}` too (the loop's own
+                        // eat only runs when the comma was not consumed here)
+                        self.next();
+                        break;
                     }
                     if *self.peek() == Tok::Spread {
                         self.next();
