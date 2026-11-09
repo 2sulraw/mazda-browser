@@ -541,6 +541,17 @@ pub struct FnDef {
     pub src: u32,
 }
 
+impl FnDef {
+    /// The function's `length`: the number of formal parameters before the
+    /// first one with a default initializer; a rest parameter never counts.
+    pub fn length(&self) -> usize {
+        self.params
+            .iter()
+            .take_while(|p| p.default.is_none() && !p.rest)
+            .count()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Param {
     /// hidden env name for the received argument; for destructuring params it

@@ -2984,6 +2984,20 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn function_length_counts_leading_params() {
+    assert_eq!(num("(function (a, b) {}).length"), 2.0);
+    assert_eq!(num("(function (a, b = 1, c) {}).length"), 1.0);
+    assert_eq!(num("(function (a, ...r) {}).length"), 1.0);
+    assert_eq!(num("(function (...r) {}).length"), 0.0);
+    assert_eq!(num("((a, b = 1) => {}).length"), 1.0);
+    assert_eq!(num("var C = class { *m(a, b = 42, z) {} }; C.prototype.m.length"), 1.0);
+    assert_eq!(
+        num("var o = { set m(v = 1) {} }; Object.getOwnPropertyDescriptor(o, 'm').set.length"),
+        0.0
+    );
+}
+
+#[test]
 fn named_function_self_binding_is_immutable() {
     // a named function expression's own name cannot be reassigned (sloppy)
     assert!(boolean(

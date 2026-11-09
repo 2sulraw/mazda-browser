@@ -2062,12 +2062,9 @@ fn fn_desc(f: &Rc<Closure>, key: &str) -> Option<Val> {
             false,
             true,
         )),
-        "length" if !f.synth_deleted("length") => Some(desc_attrs(
-            Val::Num(f.def.params.len() as f64),
-            false,
-            false,
-            true,
-        )),
+        "length" if !f.synth_deleted("length") => {
+            Some(desc_attrs(Val::Num(f.def.length() as f64), false, false, true))
+        }
         // a real function's `prototype` is writable, non-enumerable and
         // non-configurable
         "prototype" if !f.is_arrow && !matches!(f.def.body, FnBody::Bound { .. }) => {

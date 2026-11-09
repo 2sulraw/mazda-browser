@@ -3327,9 +3327,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                 "bind" => Ok(Val::Method(Meth::FnBind)),
                 // a deleted `name`/`length` no longer resolves as an own slot
                 "name" if !c.synth_deleted("name") => Ok(Val::Str(c.def.name.clone())),
-                "length" if !c.synth_deleted("length") => {
-                    Ok(Val::Num(c.def.params.len() as f64))
-                }
+                "length" if !c.synth_deleted("length") => Ok(Val::Num(c.def.length() as f64)),
                 "name" | "length" => Ok(Val::Undefined),
                 _ => {
                     // class static members inherited through the function's

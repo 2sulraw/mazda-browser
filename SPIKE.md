@@ -2210,3 +2210,21 @@ self-name. Function *declarations* keep a mutable binding.
   6,154 skipped).
 - `named-no-strict-reassign-fn-name-in-body*` failures 6 -> **0**.
 - engine tests **942** green (new immutable-binding test).
+
+## Function `length` stops at the first default/rest parameter (P7, 2026-11-09)
+
+`fn.length` and its descriptor reported `params.len()`, so
+`function (a, b = 1, c) {}` claimed 3 and trailing-comma/default forms were
+off. `FnDef::length` now counts formal parameters up to the first one with a
+default initializer, never counting a rest parameter (`(a, ...r)` -> 1,
+`(...r)` -> 0, `(a, b = 1)` -> 1). Both the member read and the descriptor
+use it, which also gives setters the right answer (a setter with a default
+parameter has length 0).
+
+### Measured
+
+- test262 language subset: 14,328 -> **14,360** pass (81.2% of 17,678 run,
+  6,154 skipped).
+- Every `length descriptor` / `length is properly set` failure (31) now
+  passes.
+- engine tests **943** green (new `length` test).
