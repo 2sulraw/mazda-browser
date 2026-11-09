@@ -1598,3 +1598,64 @@ Every assertion failure previously reported `Uncaught [object Object]`, because
 `message`. `JsEngine::describe_thrown` reads `name`/`message` for the test262
 report (it never calls user code), which turned the 4,040 opaque failures into
 readable reason rows and made this whole wave measurable.
+
+## Early errors, eval, boxed primitives, and descriptors (P7, 2026-11-09)
+
+Five measured waves after the lexer/name work. Each one started from a
+reason bucket in the test262 failure dump, not from a guess.
+
+### Rest must be last in a pattern
+
+`[...a, b]` and `[{...o, x}]` are early errors. The parser accepted them as
+ordinary elements, so the immediately-invoked `assert.throws(SyntaxError, ...)`
+templates failed. `pattern_inner` now rejects any element after a rest target
+and any property after `...` (including a trailing comma) in both array and
+object patterns. 8,971 -> **9,226** (+255).
+
+### Strict directive with a non-simple parameter list
+
+`function f(a = 1) { "use strict"; }` is an early error, as are the method,
+accessor and arrow forms. `has_use_strict` looks only at the leading
+expression-statement directives, so a string after a real statement is not
+mistaken for one; `check_strict_body` / `check_strict_arrow` run once the
+parameter list is known. 9,226 -> **9,336** (+110).
+
+### `eval`
+
+Direct `eval(...)` with an `Ident("eval")` callee resolving to the intrinsic
+runs in the calling environment; every other path (an aliased variable,
+`Reflect`) goes through the `n_eval` native and uses the global environment.
+Non-string arguments are returned unchanged and syntax errors are catchable
+`SyntaxError` objects. `var`/function leakage and `let`/`const` leakage both
+follow the same env, which is a documented shortcut. 9,336 -> **9,666**
+(+330); the 355 `different error constructor` failures disappeared because
+those tests now throw the right `SyntaxError`.
+
+### Boxed primitives
+
+`new String/Number/Boolean` (and `Object(prim)`) produce
+`ObjKind::Boxed(Val)`. `to_string`/`to_number` unwrap the primitive,
+`call_method` unboxes `this`, a boxed String answers `length`/index reads,
+`Add` coerces a boxed Number/Boolean numerically, and
+`Object.prototype.toString`/`JSON.stringify` report the primitive tag/value.
+9,666 -> **10,069** (+403).
+
+### Class members are non-enumerable own properties
+
+A class method or accessor must report `enumerable: false` from
+`Object.getOwnPropertyDescriptor`, must be skipped by `Object.keys` and
+`for (k in ...)`, while still being an own property. Methods are installed by
+a new `StmtKind::DefineMethod` instead of a plain assignment, and both method
+and accessor lowering record the key in a hidden-key list. The list lives
+inside `ObjKind::Plain(Option<Box<Vec<_>>>)` and in a combined
+`ClosureMeta` (with the `extends` [[Prototype]]) so `Obj` stays 64 bytes and
+`Closure` does not grow. The implicit `prototype.constructor` back-reference
+is recorded as hidden too. 10,069 -> **10,553** (+484, 59.7% of run).
+
+### Measured
+
+- test262 language subset: 8,971 -> **10,553** pass (59.7% of 17,678 run,
+  6,154 skipped). Engine tests **913** green.
+- One reusable RAM guard: `js_allocation_units_stay_compact` caught the first
+  version of the descriptor change growing `Obj` to 72 bytes; the hidden list
+  was folded into the existing `Plain` variant instead of a new field.
