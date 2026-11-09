@@ -2263,6 +2263,23 @@ fn generator_yield_positions_still_gated() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn generator_is_iterable() {
+    // a generator object is its own iterator: spread, for-of, destructuring
+    assert_eq!(
+        string("function* g() { yield 1; yield 2 } [...g()].join(',')"),
+        "1,2"
+    );
+    assert_eq!(
+        num("function* g() { yield 3; yield 4 } const [, b] = g(); b"),
+        4.0
+    );
+    assert_eq!(
+        num("function* g() { yield 3; yield 4 } var t = 0; for (var v of g()) t += v; t"),
+        7.0
+    );
+}
+
+#[test]
 fn destructuring_arrays() {
     assert_eq!(num("const [a, b] = [10, 20]; a + b"), 30.0);
     assert_eq!(num("const [a, , c = 5] = [1, 2]; a + c"), 6.0);

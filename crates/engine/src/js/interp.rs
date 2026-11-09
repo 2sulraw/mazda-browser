@@ -977,7 +977,9 @@ pub(crate) fn get_iterator(e: &mut JsEngine, v: &Val) -> Result<Val, JsError> {
                 let b = o.borrow();
                 match &b.kind {
                     ObjKind::Array(_) | ObjKind::TypedArray(_) => Some(IterKind::Values),
-                    ObjKind::Iterator(_) => return Ok(v.clone()),
+                    // a generator is its own iterator: `[...gen]`,
+                    // `for (const x of gen)`, destructuring a call result
+                    ObjKind::Iterator(_) | ObjKind::Generator(_) => return Ok(v.clone()),
                     _ => {
                         if b.props.iter().any(|(k, _)| &**k == "__set") {
                             Some(IterKind::Values)

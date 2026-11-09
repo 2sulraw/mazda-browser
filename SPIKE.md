@@ -1477,3 +1477,48 @@ array-destructuring tests use leading elisions everywhere.
 A destructuring `yield` initializer that throws while binding (e.g.
 `let [a] = yield null`) errors before the walker resumes inside the try, so an
 enclosing catch does not see it. No reference bundle uses that shape.
+
+## Destructuring grammar and generator iterables (P7, 2026-11-09)
+
+The failure histogram after 19.2 put generated destructuring tests at the top
+of the parser queue, and they exposed two grammar holes rather than runtime
+behaviour.
+
+### Nested patterns after an array rest
+
+`[...[x, y, z]]` and `[...{length}]` are legal: the rest target is a
+BindingPattern, not just a BindingIdentifier. The parser rejected everything
+but a simple name (331 `expected binding name in pattern` failures, plus the
+same shape in arrow parameters). `pattern_inner` now parses a nested pattern
+after `...` in an array pattern; the runtime already binds the rest array
+against any pattern via `bind_arr`'s `PatPart::Rest` arm.
+
+### Trailing comma in an object pattern
+
+`const {a,} = x`, `function f({x,})` and `({x,}) => x` were rejected with an
+`unexpected token RBrace` (139 failures). The property loop consumed the
+trailing comma, then broke out; the loop's own `eat(RBrace)` only runs when
+the comma was *not* consumed inside the loop, so the `}` was left in the
+token stream. The trailing-comma arm now consumes the brace itself.
+
+### Generators are their own iterators
+
+`get_iterator` knew arrays, strings, `Iterator` objects and `[Symbol.iterator]`
+objects but not `ObjKind::Generator(_)`. A generator already has `next` (and
+`return`), so `[...g()]`, `for (const v of g())` and destructuring a
+generator's result all failed with `object is not iterable` (320 failures,
+mostly `f(g())` in the generated destructuring templates). The generator is
+now returned as its own iterator.
+
+### Measured
+
+- test262 sloppy subset: 7,172 -> **7,334** from the two parser fixes alone
+  (+162: nested rest +51, object trailing comma +111), then **7,719** (43.7%)
+  once generators become iterable (+385).
+- engine tests: **907** green; `destructuring_arrays` /
+  `destructuring_objects` cover nested rest targets and trailing commas in
+  declarations, parameters and arrows; `generator_is_iterable` covers spread,
+  for-of and destructuring of a generator.
+- The remaining generated-test failures are no longer template syntax; they
+  are runtime semantics (iterator closing, `assert` helper surface, strict
+  mode, argument-object shape).
