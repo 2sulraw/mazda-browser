@@ -1813,7 +1813,9 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                 let k = eval_expr(e, env, index)?.to_string();
                 delete_member(&b, &k)
             }
-            // sloppy mode: `delete ident` is a no-op returning false
+            // a `with` object's property is deletable; an ordinary binding is
+            // not, and an unresolvable name deletes successfully
+            ExprKind::Ident(name) => e.env_delete(env, name),
             _ => false,
         })),
     }

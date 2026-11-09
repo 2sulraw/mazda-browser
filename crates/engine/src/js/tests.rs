@@ -3034,6 +3034,20 @@ fn named_function_self_binding_is_immutable() {
 }
 
 #[test]
+fn delete_resolves_through_with() {
+    // `delete p` inside `with (o)` deletes o's property
+    assert!(boolean(
+        "var o = {a: 1}; with (o) { delete a; } o.a === undefined && !('a' in o)"
+    ));
+    // an ordinary binding is not deletable
+    assert!(boolean(
+        "var x = 1; var r; with ({}) { r = delete x; } r === false && x === 1"
+    ));
+    // an unresolvable name deletes successfully
+    assert!(boolean("delete notDeclaredAnywhere"));
+}
+
+#[test]
 fn object_cover_initialized_names() {
     // `{x = default}` in assignment destructuring
     assert_eq!(num("var x; ({x = 5} = {}); x"), 5.0);

@@ -2660,6 +2660,32 @@ impl JsEngine {
         obj_set_own(&self.global_obj, name, v);
         Ok(())
     }
+
+    /// `delete ident`: a `with` object's property is deleted (a reference to
+    /// it wins over any outer binding), a lexical binding is not deletable,
+    /// and an unresolvable name deletes successfully. Sloppy-mode only; the
+    /// parser has no strict-mode `delete ident` early error yet.
+    pub(crate) fn env_delete(&self, env: &Rc<Env>, name: &str) -> bool {
+        let mut cur: &Rc<Env> = env;
+        loop {
+            if let Some(w) = &cur.with {
+                if obj_has(w, name) {
+                    // the engine treats every property as configurable, so
+                    // deleting an own property (or a prototype hit) is true
+                    delete_member(&Val::Obj(w.clone()), name);
+                    return true;
+                }
+            }
+            if cur.bindings.borrow().iter().any(|b| b.name.as_ref() == name) {
+                return false;
+            }
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------

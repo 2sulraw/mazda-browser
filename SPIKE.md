@@ -2289,3 +2289,23 @@ CoverInit (`var o = {x = 1}`, `f({x = 1})`, `for ({x = 1}; ;)`), while
   184 -> **156** (28 now pass, the other 8 advance to separate yield/error
   checks). No other directory changed, so the total delta is the same -28.
 - engine tests **946** green (new cover-init test).
+
+## `delete` of a `with`-scoped identifier (P7, 2026-11-09)
+
+`delete ident` was a blanket no-op returning false. Inside `with (obj)`,
+`delete p` must delete the object's property: the identifier reference
+resolves to the object environment record, and the object is the base of the
+delete. `JsEngine::env_delete` walks the scope chain in resolution order
+(with object, then bindings), deletes an own property from the with object
+and reports true, refuses to delete an ordinary binding (false), and reports
+true for an unresolvable name. The interpreter's `Delete` arm now routes an
+`Ident` through it.
+
+### Measured
+
+- test262 language subset: 14,555 -> **14,598** pass (82.6% of 17,678 run,
+  6,154 skipped).
+- `statements/with` failures 72 -> **36**; `myObj.p3 === undefined` failures
+  30 -> **0**. Seven more `delete`-through-`with` cases pass elsewhere and
+  every other top directory is unchanged.
+- engine tests **947** green (new with-delete test).
