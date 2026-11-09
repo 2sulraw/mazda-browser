@@ -2582,3 +2582,21 @@ that `fetch_image` exists for.
   runs; the page variant changes per request, which moves the CPU phases by
   ~2 s — the phase number is the stable signal).
 - engine tests **960** green.
+
+## A bare module specifier is not a URL (P8c, 2026-11-10)
+
+`resolve_specifier` ran every specifier through `Url::join`, so `import * as e
+from "react"` became `https://github.githubassets.com/assets/react` -- a real
+request that 404s. Per spec a bare specifier is a *package* name: only an
+import map can resolve it, and with no import map it is a resolution error
+raised before any request. GitHub's bundle has four of these
+(`react`, `react-dom`, `react/compiler-runtime`, `react/jsx-runtime`), each
+paying a full round trip that always failed.
+
+### Measured
+
+- warm github.com: script fetch 1,740 -> **4 ms**; whole load 4,460 -> **2,746 ms**.
+- cold github.com: 17,100–18,700 -> **13,259 ms** to `[nav] worker finished`.
+- engine tests **961** green (new `bare_specifiers_do_not_invent_a_url`).
+- one 404 remains: `assets/react-dom/client` is imported *by* a module that
+  the fix now rejects earlier, so the count is down from five.

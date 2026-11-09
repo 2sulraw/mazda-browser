@@ -281,11 +281,22 @@ pub(crate) fn namespace_value(xs: &Exports) -> Val {
     })))
 }
 
-/// Absolute specifiers are used as-is; everything else joins the importing
-/// module's URL (a browser does the same; bare package names then fail).
+/// Absolute specifiers are used as-is, `./` `../` `/` join the importing
+/// module's URL. A **bare** specifier (`"react"`, `"lodash/fp"`) is a package
+/// name: only an import map can resolve it, so without one it fails *without a
+/// request*. Letting `Url::join` have it would invent a 404 URL next to the
+/// module (`/assets/react`), which is both wrong per spec and one wasted round
+/// trip per import -- GitHub's bundle imports four such names, which cost
+/// ~1.7 s of dead latency on a cold load.
 fn resolve_specifier(base: &str, spec: &str) -> Option<String> {
     if let Ok(u) = url::Url::parse(spec) {
         return Some(u.to_string());
+    }
+    let relative = spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with('/');
+    if !relative {
+        return None; // bare: an import map's job (unsupported)
     }
     url::Url::parse(base)
         .ok()?
@@ -643,6 +654,26 @@ mod tests {
         assert!(matches!(e.get_global("ok"), Val::Undefined));
         let err = e.get_global("err").to_string();
         assert!(err.contains("cannot resolve module specifier"), "{err}");
+    }
+
+    #[test]
+    fn bare_specifiers_do_not_invent_a_url() {
+        // `react` is a package name: without an import map it is a resolution
+        // error, not a request to `/assets/react` (which 404s over the wire)
+        assert!(resolve_specifier("https://mazda.test/assets/core.js", "react").is_none());
+        assert!(resolve_specifier("https://mazda.test/assets/core.js", "lodash/fp").is_none());
+        assert_eq!(
+            resolve_specifier("https://mazda.test/assets/core.js", "./chunk.js").as_deref(),
+            Some("https://mazda.test/assets/chunk.js")
+        );
+        assert_eq!(
+            resolve_specifier("https://mazda.test/assets/core.js", "/x.js").as_deref(),
+            Some("https://mazda.test/x.js")
+        );
+        assert_eq!(
+            resolve_specifier("https://mazda.test/a/core.js", "https://cdn.test/m.js").as_deref(),
+            Some("https://cdn.test/m.js")
+        );
     }
 
     #[test]
