@@ -1728,9 +1728,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         };
         let params = self.param_list()?;
         self.expect_punct(Punct::LBrace)?;
-        let body_stmts = self.block_body()?;
+        let mut body_stmts = self.block_body()?;
         if is_generator {
-            self.validate_yields(&body_stmts, is_async)?;
+            self.prepare_generator_body(&mut body_stmts, is_async)?;
         } else if stmts_use(&body_stmts, SusKind::Yield) {
             return self.err("`yield` is only valid inside generator functions");
         }
@@ -1750,21 +1750,27 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         }))
     }
 
-    /// Position check for `yield` inside a generator body: only allowed as a
-    /// whole expression statement (`yield x;`) or directly as a declarator
-    /// initializer (`let x = yield v`). Anywhere else (conditions, calls,
-    /// operators, return-expr, try blocks) is an honest SyntaxError — the
-    /// resumable walker suspends exactly at those two positions.
+    /// Position check for `yield` inside a generator body *after* the lift
+    /// pass: only a whole expression statement (`yield x;`) or a declarator
+    /// initializer (`let x = yield v`) may remain. Anything the lift cannot
+    /// rewrite (loop conditions, `return yield`, try bodies, ...) is an honest
+    /// SyntaxError.
     ///
     /// Async generators skip the parse-time check: their bodies often mix
     /// `yield` into logical expressions (stream splitters). The body parses,
     /// and the walker reports an honest error at CALL time if it reaches an
     /// unsupported yield position — module evaluation still succeeds.
-    fn validate_yields(
+    /// Generator bodies get the yield-lift pass (below) before the position
+    /// check: yields buried in expressions are rewritten to the statement
+    /// forms the resumable walker executes, so the check only ever sees what
+    /// the walker cannot reach.
+    fn prepare_generator_body(
         &mut self,
-        stmts: &[Stmt],
+        stmts: &mut Vec<Stmt>,
         is_async: bool,
     ) -> Result<(), JsError> {
+        let mut lift = YieldLift { next: 0 };
+        lift.stmts(stmts);
         if is_async {
             return Ok(());
         }
@@ -2244,7 +2250,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             if *self.peek() == Tok::Punct(Punct::LParen) {
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
-                let body = self.block_body()?;
+                let mut body = self.block_body()?;
+                if is_gen {
+                    self.prepare_generator_body(&mut body, is_async)?;
+                }
                 let uses_arguments = scan_uses_arguments_stmts(&body);
                 let is_ctor = !is_static && key_name.as_deref() == Some("constructor");
                 let f = Rc::new(FnDef {
@@ -3406,11 +3415,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let key = self.prop_name()?;
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
-                        let body = self.block_body()?;
+                        let mut body = self.block_body()?;
                         if is_gen {
                             // sync generators keep the strict yield-position
                             // check; async ones defer to call time
-                            self.validate_yields(&body, is_async)?;
+                            self.prepare_generator_body(&mut body, is_async)?;
                         }
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
@@ -4065,6 +4074,835 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
 
 fn expr_has_await_or_call_yield(e: &Expr) -> bool {
     expr_uses(e, SusKind::Yield) || expr_uses(e, SusKind::Await)
+}
+
+// ---------------------------------------------------------------------------
+// yield lifting: turn a yield inside an expression into statement-level temps
+// ---------------------------------------------------------------------------
+//
+// The resumable walker suspends only at `yield v;` and `let x = yield v`, so a
+// yield buried in an expression is rewritten into that shape before the walker
+// ever sees it:
+//
+//     f(g(), yield x, h())  ->  let $t0 = g(); let $t1 = yield x;
+//                               f($t0, $t1, h())
+//
+// Evaluation stays left to right: once a later operand can suspend, every
+// earlier operand is frozen in a temp first. `&&`/`||`/`??`/`?:` lower to
+// `if` statements that assign the result, never to booleans, because they
+// return operand values. Anything the lift cannot rewrite (yield in a loop
+// condition, a compound assignment target, `return yield`, ...) is left alone
+// and the position check below reports it honestly.
+
+/// No identifier written in source can start with NUL (the lexer rejects it),
+/// so a lifted temporary can never collide with or shadow user bindings.
+const LIFT_TEMP: &str = "\u{0}$y";
+
+fn is_lift_temp(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Ident(n) if n.starts_with(LIFT_TEMP))
+}
+
+fn lift_ident(name: Rc<str>, span: Span) -> Expr {
+    Expr {
+        kind: ExprKind::Ident(name),
+        span,
+    }
+}
+
+fn lift_let(name: Rc<str>, init: Option<Expr>, span: Span) -> Stmt {
+    Stmt {
+        kind: StmtKind::VarDecl(
+            VarKind::Let,
+            vec![Declarator {
+                name,
+                pat: None,
+                init,
+            }],
+        ),
+        span,
+    }
+}
+
+fn lift_expr_stmt(e: Expr, span: Span) -> Stmt {
+    Stmt {
+        kind: StmtKind::Expr(Box::new(e)),
+        span,
+    }
+}
+
+fn lift_block(stmts: Vec<Stmt>, span: Span) -> Stmt {
+    Stmt {
+        kind: StmtKind::Block(stmts),
+        span,
+    }
+}
+
+/// placeholder while a node is moved out for rewriting; always replaced
+fn lift_noop_expr(span: Span) -> Expr {
+    Expr {
+        kind: ExprKind::Null,
+        span,
+    }
+}
+
+fn lift_noop_stmt(span: Span) -> Stmt {
+    Stmt {
+        kind: StmtKind::List(Vec::new()),
+        span,
+    }
+}
+
+struct YieldLift {
+    next: usize,
+}
+
+impl YieldLift {
+    fn temp_name(&mut self) -> Rc<str> {
+        let name = format!("{}{}", LIFT_TEMP, self.next);
+        self.next += 1;
+        Rc::from(name.as_str())
+    }
+
+    /// `let $t = value;` and answer `$t`
+    fn bind(&mut self, value: Expr, pre: &mut Vec<Stmt>, span: Span) -> Expr {
+        let name = self.temp_name();
+        pre.push(lift_let(name.clone(), Some(value), span));
+        lift_ident(name, span)
+    }
+
+    /// `let $t;` and answer `$t` (assigned by a branch)
+    fn declare(&mut self, pre: &mut Vec<Stmt>, span: Span) -> Expr {
+        let name = self.temp_name();
+        pre.push(lift_let(name.clone(), None, span));
+        lift_ident(name, span)
+    }
+
+    // -- statements ---------------------------------------------------------
+
+    fn stmts(&mut self, stmts: &mut Vec<Stmt>) {
+        let old = std::mem::take(stmts);
+        let mut out = Vec::with_capacity(old.len());
+        for s in old {
+            self.stmt(s, &mut out);
+        }
+        *stmts = out;
+    }
+
+    /// Rewrite one statement, appending zero or more statements to `out`.
+    fn stmt(&mut self, mut s: Stmt, out: &mut Vec<Stmt>) {
+        let span = s.span;
+        match &mut s.kind {
+            StmtKind::Expr(e) => {
+                // the two shapes the walker already suspends on stay as-is
+                if matches!(e.kind, ExprKind::Yield(_)) || !expr_uses(e, SusKind::Yield) {
+                    out.push(s);
+                    return;
+                }
+                let mut pre = Vec::new();
+                let lowered =
+                    self.expr(std::mem::replace(e, lift_noop_expr(span)), &mut pre);
+                out.append(&mut pre);
+                **e = lowered;
+                out.push(s);
+            }
+            StmtKind::VarDecl(kind, ds) => {
+                let needs = ds.iter().any(|d| {
+                    d.init.as_ref().map_or(false, |i| {
+                        !matches!(i.kind, ExprKind::Yield(_)) && expr_uses(i, SusKind::Yield)
+                    })
+                });
+                if !needs {
+                    out.push(s);
+                    return;
+                }
+                // split per declarator so initializer order (and any
+                // suspension) stays exactly in source order
+                let kind = *kind;
+                let ds = std::mem::take(ds);
+                for mut d in ds {
+                    let mut pre = Vec::new();
+                    if let Some(init) = d.init.take() {
+                        if !matches!(init.kind, ExprKind::Yield(_)) {
+                            d.init = Some(if expr_uses(&init, SusKind::Yield) {
+                                self.expr(init, &mut pre)
+                            } else {
+                                init
+                            });
+                        } else {
+                            d.init = Some(init);
+                        }
+                    }
+                    out.append(&mut pre);
+                    out.push(Stmt {
+                        kind: StmtKind::VarDecl(kind, vec![d]),
+                        span,
+                    });
+                }
+            }
+            StmtKind::Block(b) | StmtKind::List(b) => {
+                self.stmts(b);
+                out.push(s);
+            }
+            StmtKind::If { test, then, other } => {
+                // the test runs exactly once, so a yield inside it lifts to
+                // statements before the `if` (loop conditions stay a gap)
+                if expr_uses(test, SusKind::Yield) {
+                    let mut pre = Vec::new();
+                    let lowered =
+                        self.expr(std::mem::replace(&mut **test, lift_noop_expr(span)), &mut pre);
+                    out.append(&mut pre);
+                    **test = lowered;
+                }
+                self.body(then);
+                if let Some(o) = other {
+                    self.body(o);
+                }
+                out.push(s);
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::For { body, .. }
+            | StmtKind::ForIn { body, .. }
+            | StmtKind::ForOf { body, .. } => {
+                self.body(body);
+                out.push(s);
+            }
+            StmtKind::Switch { cases, .. } => {
+                for c in cases {
+                    self.stmts(&mut c.body);
+                }
+                out.push(s);
+            }
+            StmtKind::Try {
+                block,
+                catch,
+                finally,
+            } => {
+                self.stmts(block);
+                if let Some(c) = catch {
+                    self.stmts(&mut c.block);
+                }
+                if let Some(f) = finally {
+                    self.stmts(f);
+                }
+                out.push(s);
+            }
+            StmtKind::Label { body, .. } => {
+                self.body(body);
+                out.push(s);
+            }
+            _ => out.push(s),
+        }
+    }
+
+    /// A nested body is one statement, so its lifted pre-statements are folded
+    /// into a block in place. `continue label` is unaffected: a labeled loop
+    /// keeps its label (only its body is rewritten).
+    fn body(&mut self, body: &mut Stmt) {
+        let span = body.span;
+        let old = std::mem::replace(body, lift_noop_stmt(span));
+        let mut seq = Vec::new();
+        self.stmt(old, &mut seq);
+        *body = if seq.len() == 1 {
+            seq.pop().unwrap()
+        } else {
+            lift_block(seq, span)
+        };
+    }
+
+    // -- expressions --------------------------------------------------------
+
+    fn expr(&mut self, x: Expr, pre: &mut Vec<Stmt>) -> Expr {
+        if !expr_uses(&x, SusKind::Yield) {
+            return x;
+        }
+        let span = x.span;
+        match x.kind {
+            ExprKind::Yield(op) => {
+                let op = op.map(|o| Box::new(self.expr(*o, pre)));
+                let y = Expr {
+                    kind: ExprKind::Yield(op),
+                    span,
+                };
+                self.bind(y, pre, span)
+            }
+            ExprKind::Binary { op, l, r } => {
+                let l = self.expr(*l, pre);
+                let l = if expr_uses(&r, SusKind::Yield) && !is_lift_temp(&l) {
+                    self.bind(l, pre, span)
+                } else {
+                    l
+                };
+                let r = self.expr(*r, pre);
+                Expr {
+                    kind: ExprKind::Binary {
+                        op,
+                        l: Box::new(l),
+                        r: Box::new(r),
+                    },
+                    span,
+                }
+            }
+            ExprKind::Logical { op, l, r } => self.logical(op, *l, *r, pre, span),
+            ExprKind::Cond { test, then, other } => self.cond(*test, *then, *other, pre, span),
+            ExprKind::Call { callee, args } => {
+                if !expr_uses(&callee, SusKind::Yield)
+                    && args.iter().any(|a| match a {
+                        CallArg::Arg(e) | CallArg::Spread(e) => expr_uses(e, SusKind::Yield),
+                    })
+                    && matches!(
+                        &callee.kind,
+                        ExprKind::SuperMember { .. }
+                            | ExprKind::SuperCall { .. }
+                            | ExprKind::OptionalChain { .. }
+                    )
+                {
+                    // binding these to a temp would lose `this`; leave the
+                    // call intact so the position check reports it
+                    return Expr {
+                        kind: ExprKind::Call { callee, args },
+                        span,
+                    };
+                }
+                let callee = if expr_uses(&callee, SusKind::Yield) {
+                    Box::new(self.expr(*callee, pre))
+                } else if args.iter().any(|a| match a {
+                    CallArg::Arg(e) | CallArg::Spread(e) => expr_uses(e, SusKind::Yield),
+                }) {
+                    Box::new(self.hold(*callee, pre, span))
+                } else {
+                    callee
+                };
+                let args = self.args(args, pre);
+                Expr {
+                    kind: ExprKind::Call { callee, args },
+                    span,
+                }
+            }
+            ExprKind::New { callee, args } => {
+                let callee = self.expr(*callee, pre);
+                let callee = if args.iter().any(|a| match a {
+                    CallArg::Arg(e) | CallArg::Spread(e) => expr_uses(e, SusKind::Yield),
+                }) && !is_lift_temp(&callee)
+                {
+                    self.bind(callee, pre, span)
+                } else {
+                    callee
+                };
+                let args = self.args(args, pre);
+                Expr {
+                    kind: ExprKind::New {
+                        callee: Box::new(callee),
+                        args,
+                    },
+                    span,
+                }
+            }
+            ExprKind::Member { base, key } => {
+                let base = self.expr(*base, pre);
+                Expr {
+                    kind: ExprKind::Member {
+                        base: Box::new(base),
+                        key,
+                    },
+                    span,
+                }
+            }
+            ExprKind::Index { base, index } => {
+                let base = self.expr(*base, pre);
+                let base = if expr_uses(&index, SusKind::Yield) && !is_lift_temp(&base) {
+                    self.bind(base, pre, span)
+                } else {
+                    base
+                };
+                let index = self.expr(*index, pre);
+                Expr {
+                    kind: ExprKind::Index {
+                        base: Box::new(base),
+                        index: Box::new(index),
+                    },
+                    span,
+                }
+            }
+            ExprKind::Unary { op, expr } => Expr {
+                kind: ExprKind::Unary {
+                    op,
+                    expr: Box::new(self.expr(*expr, pre)),
+                },
+                span,
+            },
+            ExprKind::Typeof(e) => Expr {
+                kind: ExprKind::Typeof(Box::new(self.expr(*e, pre))),
+                span,
+            },
+            ExprKind::Void(e) => Expr {
+                kind: ExprKind::Void(Box::new(self.expr(*e, pre))),
+                span,
+            },
+            ExprKind::Delete(e) => Expr {
+                kind: ExprKind::Delete(Box::new(self.expr(*e, pre))),
+                span,
+            },
+            ExprKind::Await(e) => Expr {
+                kind: ExprKind::Await(Box::new(self.expr(*e, pre))),
+                span,
+            },
+            ExprKind::Assign {
+                target,
+                op: None,
+                value,
+            } => self.assign(*target, *value, pre, span),
+            ExprKind::Seq(list) => {
+                let last = list.len().saturating_sub(1);
+                for (i, e) in list.into_iter().enumerate() {
+                    let e = self.expr(e, pre);
+                    if i == last {
+                        return e;
+                    }
+                    pre.push(lift_expr_stmt(e, span));
+                }
+                lift_noop_expr(span)
+            }
+            ExprKind::Template(segs) => Expr {
+                kind: ExprKind::Template(self.segs(segs, pre)),
+                span,
+            },
+            ExprKind::TaggedTemplate { tag, segs } => {
+                let tag = self.expr(*tag, pre);
+                let segs_suspend = segs.iter().any(|s| match s {
+                    TplSeg::Lit(_) => false,
+                    TplSeg::Expr(e) => expr_uses(e, SusKind::Yield),
+                });
+                let tag = if segs_suspend && !is_lift_temp(&tag) {
+                    self.bind(tag, pre, span)
+                } else {
+                    tag
+                };
+                Expr {
+                    kind: ExprKind::TaggedTemplate {
+                        tag: Box::new(tag),
+                        segs: self.segs(segs, pre),
+                    },
+                    span,
+                }
+            }
+            ExprKind::Array(items) => Expr {
+                kind: ExprKind::Array(self.array(items, pre)),
+                span,
+            },
+            ExprKind::Object(props) => Expr {
+                kind: ExprKind::Object(self.object(props, pre)),
+                span,
+            },
+            ExprKind::SuperCall {
+                class,
+                key,
+                static_,
+                args,
+            } => Expr {
+                kind: ExprKind::SuperCall {
+                    class: Box::new(self.expr(*class, pre)),
+                    key,
+                    static_,
+                    args: self.args(args, pre),
+                },
+                span,
+            },
+            ExprKind::SuperMember {
+                class,
+                key,
+                static_,
+            } => Expr {
+                kind: ExprKind::SuperMember {
+                    class: Box::new(self.expr(*class, pre)),
+                    key,
+                    static_,
+                },
+                span,
+            },
+            // positions the lift does not rewrite: the caller's position
+            // check turns any remaining yield into an honest SyntaxError
+            other => Expr { kind: other, span },
+        }
+    }
+
+    /// Freeze a call target without losing its reference (`obj.m(...)` must
+    /// still see `this === obj`): the base is held, the member is rebuilt.
+    fn hold(&mut self, e: Expr, pre: &mut Vec<Stmt>, span: Span) -> Expr {
+        match e.kind {
+            ExprKind::Member { base, key } => {
+                let base = self.hold_value(*base, pre, span);
+                Expr {
+                    kind: ExprKind::Member {
+                        base: Box::new(base),
+                        key,
+                    },
+                    span,
+                }
+            }
+            ExprKind::Index { base, index } => {
+                let base = self.hold_value(*base, pre, span);
+                let index = self.hold_value(*index, pre, span);
+                Expr {
+                    kind: ExprKind::Index {
+                        base: Box::new(base),
+                        index: Box::new(index),
+                    },
+                    span,
+                }
+            }
+            other => self.bind(Expr { kind: other, span }, pre, span),
+        }
+    }
+
+    /// `this` and our own temps cannot change while later operands run.
+    fn hold_value(&mut self, e: Expr, pre: &mut Vec<Stmt>, span: Span) -> Expr {
+        match e.kind {
+            ExprKind::This => Expr {
+                kind: ExprKind::This,
+                span,
+            },
+            ExprKind::Ident(n) if n.starts_with(LIFT_TEMP) => Expr {
+                kind: ExprKind::Ident(n),
+                span,
+            },
+            other => self.bind(Expr { kind: other, span }, pre, span),
+        }
+    }
+
+    fn logical(
+        &mut self,
+        op: LogOp,
+        l: Expr,
+        r: Expr,
+        pre: &mut Vec<Stmt>,
+        span: Span,
+    ) -> Expr {
+        let l = self.expr(l, pre);
+        let l = if is_lift_temp(&l) {
+            l
+        } else {
+            self.bind(l, pre, span)
+        };
+        let out = self.temp_name();
+        pre.push(lift_let(out.clone(), Some(l.clone()), span));
+        let mut body = Vec::new();
+        let r = self.expr(r, &mut body);
+        body.push(lift_expr_stmt(
+            Expr {
+                kind: ExprKind::Assign {
+                    target: Box::new(lift_ident(out.clone(), span)),
+                    op: None,
+                    value: Box::new(r),
+                },
+                span,
+            },
+            span,
+        ));
+        let test = match op {
+            LogOp::And => l,
+            LogOp::Or => Expr {
+                kind: ExprKind::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(l),
+                },
+                span,
+            },
+            LogOp::Coalesce => Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Eq,
+                    l: Box::new(l),
+                    r: Box::new(Expr {
+                        kind: ExprKind::Null,
+                        span,
+                    }),
+                },
+                span,
+            },
+        };
+        pre.push(Stmt {
+            kind: StmtKind::If {
+                test: Box::new(test),
+                then: Box::new(lift_block(body, span)),
+                other: None,
+            },
+            span,
+        });
+        lift_ident(out, span)
+    }
+
+    fn cond(
+        &mut self,
+        test: Expr,
+        then: Expr,
+        other: Expr,
+        pre: &mut Vec<Stmt>,
+        span: Span,
+    ) -> Expr {
+        let test = self.expr(test, pre);
+        let test = if is_lift_temp(&test) {
+            test
+        } else {
+            self.bind(test, pre, span)
+        };
+        let out = self.declare(pre, span);
+        let mut then_body = Vec::new();
+        let then = self.expr(then, &mut then_body);
+        then_body.push(lift_expr_stmt(
+            Expr {
+                kind: ExprKind::Assign {
+                    target: Box::new(out.clone()),
+                    op: None,
+                    value: Box::new(then),
+                },
+                span,
+            },
+            span,
+        ));
+        let mut other_body = Vec::new();
+        let other = self.expr(other, &mut other_body);
+        other_body.push(lift_expr_stmt(
+            Expr {
+                kind: ExprKind::Assign {
+                    target: Box::new(out.clone()),
+                    op: None,
+                    value: Box::new(other),
+                },
+                span,
+            },
+            span,
+        ));
+        pre.push(Stmt {
+            kind: StmtKind::If {
+                test: Box::new(test),
+                then: Box::new(lift_block(then_body, span)),
+                other: Some(Box::new(lift_block(other_body, span))),
+            },
+            span,
+        });
+        out
+    }
+
+    fn assign(&mut self, target: Expr, value: Expr, pre: &mut Vec<Stmt>, span: Span) -> Expr {
+        if expr_uses(&target, SusKind::Yield) {
+            // e.g. `(yield o).x = v`: leave it for the position check
+            return Expr {
+                kind: ExprKind::Assign {
+                    target: Box::new(target),
+                    op: None,
+                    value: Box::new(value),
+                },
+                span,
+            };
+        }
+        let target = match target.kind {
+            ExprKind::Ident(n) => lift_ident(n, span),
+            ExprKind::This => Expr {
+                kind: ExprKind::This,
+                span,
+            },
+            ExprKind::Member { base, key } => Expr {
+                kind: ExprKind::Member {
+                    base: Box::new(self.hold_value(*base, pre, span)),
+                    key,
+                },
+                span,
+            },
+            ExprKind::Index { base, index } => Expr {
+                kind: ExprKind::Index {
+                    base: Box::new(self.hold_value(*base, pre, span)),
+                    index: Box::new(self.hold_value(*index, pre, span)),
+                },
+                span,
+            },
+            other => {
+                return Expr {
+                    kind: ExprKind::Assign {
+                        target: Box::new(Expr { kind: other, span }),
+                        op: None,
+                        value: Box::new(value),
+                    },
+                    span,
+                }
+            }
+        };
+        let value = self.expr(value, pre);
+        Expr {
+            kind: ExprKind::Assign {
+                target: Box::new(target),
+                op: None,
+                value: Box::new(value),
+            },
+            span,
+        }
+    }
+
+    fn args(&mut self, args: Vec<CallArg>, pre: &mut Vec<Stmt>) -> Vec<CallArg> {
+        let last = match args
+            .iter()
+            .rposition(|a| match a {
+                CallArg::Arg(e) | CallArg::Spread(e) => expr_uses(e, SusKind::Yield),
+            }) {
+            Some(i) => i,
+            None => return args,
+        };
+        let mut out = Vec::with_capacity(args.len());
+        for (i, a) in args.into_iter().enumerate() {
+            match a {
+                CallArg::Arg(e) => {
+                    let span = e.span;
+                    let e = self.expr(e, pre);
+                    let e = if i < last && !is_lift_temp(&e) {
+                        self.bind(e, pre, span)
+                    } else {
+                        e
+                    };
+                    out.push(CallArg::Arg(e));
+                }
+                CallArg::Spread(e) => {
+                    let span = e.span;
+                    let e = self.expr(e, pre);
+                    let e = if i < last && !is_lift_temp(&e) {
+                        self.bind(e, pre, span)
+                    } else {
+                        e
+                    };
+                    out.push(CallArg::Spread(e));
+                }
+            }
+        }
+        out
+    }
+
+    fn segs(&mut self, segs: Vec<TplSeg>, pre: &mut Vec<Stmt>) -> Vec<TplSeg> {
+        let last = match segs.iter().rposition(|s| match s {
+            TplSeg::Lit(_) => false,
+            TplSeg::Expr(e) => expr_uses(e, SusKind::Yield),
+        }) {
+            Some(i) => i,
+            None => return segs,
+        };
+        segs.into_iter()
+            .enumerate()
+            .map(|(i, s)| match s {
+                TplSeg::Lit(t) => TplSeg::Lit(t),
+                TplSeg::Expr(e) => {
+                    let span = e.span;
+                    let e = self.expr(e, pre);
+                    let e = if i < last && !is_lift_temp(&e) {
+                        self.bind(e, pre, span)
+                    } else {
+                        e
+                    };
+                    TplSeg::Expr(e)
+                }
+            })
+            .collect()
+    }
+
+    fn array(&mut self, items: Vec<ArrayElem>, pre: &mut Vec<Stmt>) -> Vec<ArrayElem> {
+        let last = match items.iter().rposition(|it| match it {
+            ArrayElem::Item(e) | ArrayElem::Spread(e) => expr_uses(e, SusKind::Yield),
+            ArrayElem::Hole => false,
+        }) {
+            Some(i) => i,
+            None => return items,
+        };
+        items
+            .into_iter()
+            .enumerate()
+            .map(|(i, it)| match it {
+                ArrayElem::Hole => ArrayElem::Hole,
+                ArrayElem::Item(e) => {
+                    let span = e.span;
+                    let e = self.expr(e, pre);
+                    let e = if i < last && !is_lift_temp(&e) {
+                        self.bind(e, pre, span)
+                    } else {
+                        e
+                    };
+                    ArrayElem::Item(e)
+                }
+                ArrayElem::Spread(e) => {
+                    let span = e.span;
+                    let e = self.expr(e, pre);
+                    let e = if i < last && !is_lift_temp(&e) {
+                        self.bind(e, pre, span)
+                    } else {
+                        e
+                    };
+                    ArrayElem::Spread(e)
+                }
+            })
+            .collect()
+    }
+
+    fn object(&mut self, props: Vec<ObjElem>, pre: &mut Vec<Stmt>) -> Vec<ObjElem> {
+        let suspends = |p: &ObjElem| match p {
+            ObjElem::Prop(_, v) | ObjElem::Spread(v) => expr_uses(v, SusKind::Yield),
+            ObjElem::Computed { key, value } => {
+                expr_uses(key, SusKind::Yield) || expr_uses(value, SusKind::Yield)
+            }
+            ObjElem::Accessor { .. } => false,
+        };
+        let last = match props.iter().rposition(suspends) {
+            Some(i) => i,
+            None => return props,
+        };
+        props
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| match p {
+                ObjElem::Prop(key, v) => {
+                    let span = v.span;
+                    let v = self.expr(v, pre);
+                    let v = if i < last && !is_lift_temp(&v) {
+                        self.bind(v, pre, span)
+                    } else {
+                        v
+                    };
+                    ObjElem::Prop(key, v)
+                }
+                ObjElem::Spread(v) => {
+                    let span = v.span;
+                    let v = self.expr(v, pre);
+                    let v = if i < last && !is_lift_temp(&v) {
+                        self.bind(v, pre, span)
+                    } else {
+                        v
+                    };
+                    ObjElem::Spread(v)
+                }
+                ObjElem::Computed { key, value } => {
+                    let span = key.span;
+                    let key = self.expr(key, pre);
+                    let key = if (expr_uses(&value, SusKind::Yield) || i < last)
+                        && !is_lift_temp(&key)
+                    {
+                        self.bind(key, pre, span)
+                    } else {
+                        key
+                    };
+                    let value = self.expr(value, pre);
+                    let value = if i < last && !is_lift_temp(&value) {
+                        self.bind(value, pre, span)
+                    } else {
+                        value
+                    };
+                    ObjElem::Computed { key, value }
+                }
+                ObjElem::Accessor {
+                    key,
+                    getter,
+                    setter,
+                } => ObjElem::Accessor {
+                    key,
+                    getter,
+                    setter,
+                },
+            })
+            .collect()
+    }
 }
 
 /// Does the function body reference `arguments` outside nested functions?

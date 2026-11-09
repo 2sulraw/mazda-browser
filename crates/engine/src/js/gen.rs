@@ -1,9 +1,12 @@
 //! Generator execution: a small resumable walker over the body shapes the
-//! parser accepts for generators (the parser restricts `yield` to a whole
-//! expression statement `yield v;` or a declarator initializer
-//! `let x = yield v`, and rejects try/catch-with-yield; async generators
-//! use the same walker and run `await` blocking (yields are plain values,
-//! no promise wrapping — honest gap: `for await` is not implemented).
+//! parser leaves in a generator body. The parser's yield-lift pass first
+//! rewrites a `yield` buried in an expression into statement-level temps
+//! (`f(yield x)` -> `let $t = yield x; f($t)`), so this walker only ever sees
+//! `yield v;` as a whole expression statement or `let x = yield v` as a
+//! declarator initializer. Try/catch-with-yield is still rejected at parse
+//! time. Async generators use the same walker and run `await` blocking
+//! (yields are plain values, no promise wrapping — honest gap: `for await` is
+//! not implemented).
 //!
 //! # Design
 //! A `GenVm` holds an explicit frame stack (`GFrame`). `.next()` resumes by
@@ -20,9 +23,9 @@
 //! iteration push; capture-free, bounded by the generator body size. No
 //! native-stack growth across yields.
 //!
-//! Honest gaps (parse-time enforced where noted): `yield` in loop/if-
-//! conditions, `return yield`, try-with-yield, `.throw()`, nested generator
-//! suspension inside for-in/of heads.
+//! Honest gaps (parse-time enforced where noted): `yield` in loop conditions
+//! or switch case tests, `return yield` / `throw yield`, try-with-yield,
+//! `.throw()`, nested generator suspension inside for-in/of heads.
 
 use super::interp::{self, eval_expr, Flow};
 use super::*;
@@ -352,8 +355,23 @@ fn step_frame(e: &mut JsEngine, vm: &mut GenVm, frame: GFrame) -> Result<StepR, 
             while i < stmts.len() {
                 let st = stmts[i].clone();
                 i += 1;
+                let depth = vm.frames.len();
                 match step_stmt(e, vm, &st, &env)? {
-                    SStep::Done | SStep::Pushed => {}
+                    SStep::Done => {}
+                    SStep::Pushed => {
+                        // step_stmt pushed child frames (if/loop/switch).
+                        // The rest of this batch must run only after they
+                        // finish, so the remnant goes UNDER them.
+                        vm.frames.insert(
+                            depth,
+                            GFrame::Batch {
+                                stmts: stmts.clone(),
+                                i,
+                                env: env.clone(),
+                            },
+                        );
+                        return Ok(StepR::NewFrame);
+                    }
                     SStep::Flow(Flow::Return(v)) => return Ok(StepR::Retr(v)),
                     SStep::Flow(Flow::Break(_)) => return Ok(StepR::BreakFlow),
                     SStep::Flow(Flow::Continue(_)) => return Ok(StepR::ContinueFlow),

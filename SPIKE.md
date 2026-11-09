@@ -1358,3 +1358,61 @@ means either lowering yield-containing expressions to statement-level
 temporaries (plus a `try` frame in the VM) or moving generator bodies onto a
 bytecode state machine. That is the next scoped step; it is not another
 interpreter micro-optimization.
+
+## Generator yield lifting (P7 step 19.1, 2026-11-09)
+
+Expression-position `yield` is rewritten in the parser, not in the VM. A
+`YieldLift` pass runs over every generator body (function, method, object
+method; sync and async) before the position check. It walks each expression
+post-order and emits statement-level temporaries for everything evaluated
+before a suspension:
+
+```js
+f(g(), yield x, h())   ->  let $t0 = g();
+                           let $t1 = yield x;
+                           f($t0, $t1, h())
+
+a && (yield b)         ->  let $l = a; let $r = $l;
+                           if ($l) { let $t = yield b; $r = $t }
+```
+
+Rules that keep it honest:
+
+- evaluation stays left to right - once a later operand may suspend, every
+  earlier operand is frozen in a temp first;
+- `&&`, `||`, `??`, `?:`, and `,` lower to `if`/sequencing and assign their
+  operand value, never a boolean;
+- a call target keeps its receiver: `obj.m(yield x)` freezes `obj` and
+  rebuilds `obj.m`, so `this` is unchanged;
+- an `if` test may contain a yield (it runs once); loop conditions, switch
+  case tests, `return yield`, `throw yield`, compound-assignment targets, and
+  try bodies stay honest parse errors;
+- temporaries are named with a NUL prefix, which the lexer cannot produce
+  from source, so they cannot collide with or shadow user bindings;
+- an expression with no yield is left untouched (the pass is a no-op for
+  ordinary code).
+
+### Two VM bugs the lift exposed
+
+Both were latent in `gen.rs` and are fixed here:
+
+1. `SStep::Pushed` (an if/loop pushed child frames) made the current batch
+   continue with the statements *after* the construct. That only worked when
+   the construct was the last statement in the batch. The remnant batch is now
+   inserted *under* the child frames.
+2. The same path is what lets lifted pre-statements and the statement that
+   consumes their temps live in one batch (`let $t = yield x; f($t);`).
+
+### Measured
+
+- test262 sloppy subset: **7,073 -> 7,078** (+5), run/skip unchanged
+  (17,678 run, 6,154 skip), 16.5 s clean.
+- engine tests: **905** green (one new test exercises call-argument order,
+  short-circuit values, `?:`, nested yields, receiver preservation,
+  assignment targets, if conditions, loop bodies, and declarator splits).
+- GitHub: the page's remaining script errors are module-fetch 404s for bare
+  specifiers (`react`, `react-dom/client`) - every bundle now parses. Exec
+  328 -> 515 ms on one run each because much more of the app runs; a single
+  network run is not a paired benchmark.
+- YouTube main chunk still stops at `try`/`finally` containing a yield
+  (line 1290); Google `xjs` at line 946. That is step 19.2, not this one.

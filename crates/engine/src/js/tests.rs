@@ -949,9 +949,15 @@ fn async_generator_parsing_and_for_await() {
         string("var out = ''; async function f(){ for await (var x of [1, 2]) out += x; } f(); out"),
         "12"
     );
-    // a yield inside a logical expression parses (module evaluation
-    // succeeds); the walker errors honestly only when the body runs
-    err("async function* g(a){ (a && (yield 1)); } g(true).next()");
+    // a yield buried in a logical expression is lifted to statement-level
+    // temps, so an async generator now suspends there instead of erroring
+    assert_eq!(
+        string(
+            "var a = true; async function* g(){ (a && (yield 1)); } \
+             var it = g(); it.next().value"
+        ),
+        "1"
+    );
 }
 
 #[test]
@@ -2006,8 +2012,7 @@ fn generator_yield_inside_if_and_loop() {
         "e0;o1;e2"
     );
     // generator holds state across suspensions (locals survive .next);
-    // yield is only supported as a plain statement or decl init, so the
-    // accumulator reads the fed value into the loop's `step` first
+    // a feed value is bound by `let step = yield n` inside the loop body
     assert_eq!(
         num("function* c() { let n = 0; while (true) { let step = yield n; n += step } } const it = c(); it.next(); it.next(3).value + it.next(4).value"),
         10.0
@@ -2020,14 +2025,139 @@ fn generator_throw_unsupported() {
 }
 
 #[test]
-fn generator_yield_position_gated() {
-    // yield inside parenthesized / array-literal / condition expressions is
-    // a parse-time error (honest restriction: yield is only supported as a
-    // plain statement `yield x;` or a declaration initializer)
-    assert!(matches!(err("function* g() { const a = (yield); if (yield) {} }"), JsError::Syntax { .. }));
-    assert!(matches!(err("function* g() { const a = [yield 1] }"), JsError::Syntax { .. }));
-    // a bare decl-init yield inside a generator body is NOT gated: that is
-    // exactly the supported form, so it must exec without a SyntaxError
+fn generator_yield_lifted_out_of_expressions() {
+    // call arguments: operands before the suspension are frozen first, and
+    // everything after it still evaluates in source order on resume
+    assert_eq!(
+        string(
+            "function* g(){ var log=''; function t(x){ log+=x; return x } \
+             var r = t('a') + (yield t('b')) + t('c'); return log + '|' + r } \
+             var it = g(); it.next().value + ';' + it.next(5).value"
+        ),
+        "b;abc|a5c"
+    );
+    // `&&` / `||` return operand values and only evaluate the right side
+    // when the operator actually reaches it
+    assert_eq!(
+        string(
+            "function* g(){ var r = false && (yield 1); return 'v' + r } \
+             var it = g(); var a = it.next(); a.done + ',' + a.value"
+        ),
+        "true,vfalse"
+    );
+    assert_eq!(
+        string(
+            "function* g(){ var r = true && (yield 1); return r + 10 } \
+             var it = g(); it.next().value + ',' + it.next(5).value"
+        ),
+        "1,15"
+    );
+    assert_eq!(
+        string(
+            "function* g(){ var r = 7 || (yield 1); return r } \
+             var it = g(); var a = it.next(); a.done + ',' + a.value"
+        ),
+        "true,7"
+    );
+    // conditional expression
+    assert_eq!(
+        string(
+            "function* g(c){ var r = c ? (yield 'y') : 'n'; return r } \
+             var n = g(false); var a = n.next(); var t = g(true); \
+             a.done + ',' + a.value + ',' + t.next().value + ',' + t.next(9).value"
+        ),
+        "true,n,y,9"
+    );
+    // assignment target base is evaluated before the suspension
+    assert_eq!(
+        string(
+            "function* g(){ var o = {v:1}; o.v = (yield 3); return o.v } \
+             var it = g(); it.next().value + ',' + it.next(9).value"
+        ),
+        "3,9"
+    );
+    // a member call keeps its receiver across the lift
+    assert_eq!(
+        num(
+            "function* g(){ var o = { k: 4, m: function(x){ return this.k + x } }; \
+             var r = o.m(yield 1); return r } var it = g(); it.next(); it.next(3).value"
+        ),
+        7.0
+    );
+    // nested yields suspend in source order
+    assert_eq!(
+        string(
+            "function* g(){ var r = (yield 1) + (yield 2); return r } var it = g(); \
+             it.next().value + ',' + it.next(10).value + ',' + it.next(20).value"
+        ),
+        "1,2,30"
+    );
+    // an operand before a suspending one is read before its side effect
+    assert_eq!(
+        num(
+            "function* g(){ var x = 1; var r = x + (yield (x = 2)); return r } \
+             var it = g(); it.next(); it.next(5).value"
+        ),
+        6.0
+    );
+    // the reference-site shape: short-circuit + yield inside a loop body
+    assert_eq!(
+        string(
+            "function* g(a){ for (var i = 0; i < 2; i++) { a && (yield i) } } \
+             var it = g(true); it.next().value + ',' + it.next().value"
+        ),
+        "0,1"
+    );
+    assert!(boolean(
+        "function* g(a){ a && (yield 1) } var it = g(false); it.next().done"
+    ));
+    // declarator lists keep their order (and split when a later one suspends)
+    assert_eq!(
+        string(
+            "function* g(){ var a = 1, b = a + (yield 2); return a + ',' + b } \
+             var it = g(); it.next().value + ',' + it.next(3).value"
+        ),
+        "2,1,4"
+    );
+    // a yield in an `if` condition is evaluated once, before the branch
+    assert_eq!(
+        string(
+            "function* g(){ if (yield 1) { return 't' } return 'f' } \
+             var it = g(); it.next().value + ',' + it.next(true).value"
+        ),
+        "1,t"
+    );
+    // array literal with an element that suspends
+    assert_eq!(
+        string(
+            "function* g(){ var a = [yield 1, 2]; return a.join('-') } \
+             var it = g(); it.next(); it.next(9).value"
+        ),
+        "9-2"
+    );
+}
+
+#[test]
+fn generator_yield_positions_still_gated() {
+    // positions the lift does not rewrite stay honest parse errors
+    assert!(matches!(
+        err("function* g() { while (yield 1) {} }"),
+        JsError::Syntax { .. }
+    ));
+    assert!(matches!(
+        err("function* g() { for (; yield 1; ) {} }"),
+        JsError::Syntax { .. }
+    ));
+    assert!(matches!(
+        err("function* g() { return yield 1 }"),
+        JsError::Syntax { .. }
+    ));
+    assert!(matches!(
+        err("function* g() { throw yield 1 }"),
+        JsError::Syntax { .. }
+    ));
+    // a bare decl-init yield inside a generator body is exactly the
+    // supported form, so it must exec without a SyntaxError
     let mut e = JsEngine::new();
     assert!(matches!(
         e.exec("function* g() { const y = yield; return y } const it = g(); it.next().done"),
