@@ -2109,3 +2109,25 @@ lexer change that makes it pass.)
 - test262 language subset stays at **13,714** pass (the full run that
   produced that number already included this working-tree change).
 - engine tests **937** green.
+
+## Class name inference from binding initializers (P7, 2026-11-09)
+
+An anonymous class expression was lowered under a synthetic `__classN` name,
+so `var cls = class {}` reported `cls.name === "__class1"` instead of `"cls"`.
+`name_anon_fn` (the existing NamedEvaluation pass for function/arrow
+initializers) now also handles `ClassExpr`: it rewrites the generated
+scaffolding — the constructor's `FnDef.name`, the `prototype`/`static`
+owner references and static-field assignment targets — to the bound name and
+updates the class's internal binding. Method and constructor bodies are
+user code and are left untouched. `ClassExpr` carries an `anon` flag so an
+explicit `class Named {}` is never renamed.
+
+### Measured
+
+- test262 language subset: 13,714 -> **13,827** pass (78.2% of 17,678 run,
+  6,154 skipped).
+- `language/statements/class`: 2,703 -> **2,736** pass (3,354 run);
+  `language/expressions/class`: 2,566 -> **2,602** pass (3,048 run).
+- `language/statements/class/dstr`: 144 -> **112** fail; every
+  `*-fn-name-class` case now passes.
+- engine tests **938** green (new binding-name test).

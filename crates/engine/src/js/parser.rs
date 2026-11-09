@@ -115,6 +115,9 @@ pub enum ExprKind {
     /// class declaration in a private scope and yields the constructor
     ClassExpr {
         name: Rc<str>,
+        /// the source wrote `class { ... }` with no name: NamedEvaluation may
+        /// still give it the binding name (`var x = class {}` -> `x`)
+        anon: bool,
         stmts: Vec<Stmt>,
     },
     /// `super(...)` / `super.m(...)` � resolved at parse time against the
@@ -634,6 +637,20 @@ fn is_reserved_word(s: &str) -> bool {
 /// which covers the literal shapes real code uses; an initializer that is a
 /// parenthesized/computed expression keeps its empty name.
 fn name_anon_fn(name: &str, init: &mut Expr) {
+    // anonymous class expression: `var x = class {}` gives it the name `x`.
+    // Its constructor and prototype references were lowered under a synthetic
+    // name, so rewrite that scaffolding (bodies are user code and stay put).
+    if let ExprKind::ClassExpr { name: cname, anon, stmts } = &mut init.kind {
+        if *anon {
+            let new_name = Rc::from(name);
+            let old = cname.clone();
+            for s in stmts.iter_mut() {
+                rename_class_scaffold_stmt(&mut s.kind, &old, &new_name);
+            }
+            *cname = new_name;
+        }
+        return;
+    }
     let (def, is_arrow) = match &init.kind {
         ExprKind::Func(f) => (f.clone(), false),
         ExprKind::Arrow(f) => (f.clone(), true),
@@ -651,6 +668,61 @@ fn name_anon_fn(name: &str, init: &mut Expr) {
     } else {
         ExprKind::Func(renamed)
     };
+}
+
+/// Rewrite the generated class-name references in one lowered statement.
+/// Only the class scaffolding is touched; method/constructor bodies (user
+/// code) are opaque because an anonymous class's synthetic name is not
+/// visible to them.
+fn rename_class_scaffold_stmt(kind: &mut StmtKind, old: &Rc<str>, new_name: &Rc<str>) {
+    match kind {
+        StmtKind::FuncDecl(f) => {
+            if f.name == *old {
+                *f = Rc::new(FnDef {
+                    name: new_name.clone(),
+                    ..(**f).clone()
+                });
+            }
+        }
+        StmtKind::Expr(e) => rename_class_scaffold_expr(e, old, new_name),
+        StmtKind::DefineMethod { owner, .. } | StmtKind::DefineAcc { owner, .. } => {
+            rename_class_scaffold_expr(owner, old, new_name);
+        }
+        StmtKind::Block(b) | StmtKind::List(b) => {
+            for s in b.iter_mut() {
+                rename_class_scaffold_stmt(&mut s.kind, old, new_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_class_scaffold_expr(e: &mut Expr, old: &Rc<str>, new_name: &Rc<str>) {
+    match &mut e.kind {
+        ExprKind::Ident(n) => {
+            if n == old {
+                *n = new_name.clone();
+            }
+        }
+        ExprKind::Member { base, .. } => rename_class_scaffold_expr(base, old, new_name),
+        ExprKind::Index { base, index } => {
+            rename_class_scaffold_expr(base, old, new_name);
+            rename_class_scaffold_expr(index, old, new_name);
+        }
+        ExprKind::Call { callee, args } => {
+            rename_class_scaffold_expr(callee, old, new_name);
+            for a in args {
+                match a {
+                    CallArg::Arg(x) | CallArg::Spread(x) => {
+                        rename_class_scaffold_expr(x, old, new_name)
+                    }
+                }
+            }
+        }
+        // static field assignment target; the initializer is user code
+        ExprKind::Assign { target, .. } => rename_class_scaffold_expr(target, old, new_name),
+        _ => {}
+    }
 }
 
 /// What a `class` body accumulates. Lowered to statements once the whole
@@ -4030,16 +4102,19 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             Tok::Kw(Kw::Class) => {
                 // class expression: `const C = class extends B { ... }`
                 self.next();
-                let name = match self.peek() {
+                let (name, anon) = match self.peek() {
                     Tok::Ident(n) => {
                         let n = n.clone();
                         self.next();
-                        n
+                        (n, false)
                     }
-                    _ => Rc::from(format!("__class{}", next_class_id()).as_str()),
+                    _ => (
+                        Rc::from(format!("__class{}", next_class_id()).as_str()),
+                        true,
+                    ),
                 };
                 let stmts = self.class_rest_named(name.clone())?;
-                ExprKind::ClassExpr { name, stmts }
+                ExprKind::ClassExpr { name, anon, stmts }
             }
             Tok::Punct(Punct::LParen) => {
                 self.next();

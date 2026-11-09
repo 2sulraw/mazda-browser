@@ -2984,6 +2984,22 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn anonymous_class_takes_binding_name() {
+    assert_eq!(string("var cls = class {}; cls.name"), "cls");
+    assert_eq!(string("let cls; cls = class {}; cls.name"), "cls");
+    assert_eq!(string("const [cls = class {}] = []; cls.name"), "cls");
+    assert_eq!(string("const { cls = class {} } = {}; cls.name"), "cls");
+    assert_eq!(
+        string("function f(cls = class {}) { return cls.name } f()"),
+        "cls"
+    );
+    // an explicit name is kept
+    assert_eq!(string("var cls = class Named {}; cls.name"), "Named");
+    // shortcut: parentheses are not preserved in the AST, so a parenthesized
+    // class is named too (the function path has the same limitation)
+}
+
+#[test]
 fn computed_object_accessors() {
     assert_eq!(
         num("var k = 'x'; var o = { get [k]() { return 5 } }; o.x"),

@@ -1380,7 +1380,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
         }
         // class expression: lower in a private scope so a named class
         // expression's binding never leaks to the enclosing scope
-        ExprKind::ClassExpr { name, stmts } => {
+        ExprKind::ClassExpr { name, stmts, .. } => {
             let cenv = Env::child(env);
             for s in stmts {
                 eval_stmt(e, &cenv, s)?;
