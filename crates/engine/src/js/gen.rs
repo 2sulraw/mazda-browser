@@ -529,7 +529,20 @@ fn unwind_error(e: &mut JsEngine, vm: &mut GenVm, err: JsError) -> Unwound {
                         // turn must be able to record its own location
                         e.err_located = false;
                         let cenv = Env::child(&env);
-                        cenv.declare(c.name.clone(), v, false);
+                        match &c.pat {
+                            Some(p) => {
+                                if let Err(err) = interp::bind_pat(
+                                    e,
+                                    &cenv,
+                                    p,
+                                    v,
+                                    interp::BindKind::Decl(parser::VarKind::Let),
+                                ) {
+                                    return Unwound::Propagate(err);
+                                }
+                            }
+                            None => cenv.declare(c.name.clone(), v, false),
+                        }
                         vm.frames.push(GFrame::Try {
                             catch: None,
                             finally,

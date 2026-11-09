@@ -1709,3 +1709,16 @@ such a member. 11,187 -> **11,379** (+192).
 
 - test262 language subset: 11,187 -> **11,379** pass (64.4% of 17,678 run,
   6,154 skipped). Engine tests **916** green.
+
+### Destructuring catch parameters
+
+`catch ([a, b])` / `catch ({ x })` are legal catch parameter forms. The
+catch clause now carries an optional `Pat` and binds the caught value with
+the existing `bind_pat` machinery (`BindKind::Decl(Let)`); the interpreter
+and the resumable generator walker both use it, and the simple-name and
+no-binding forms are unchanged. 11,379 -> **11,440** (+61).
+
+### Measured
+
+- test262 language subset: 11,379 -> **11,440** pass (64.7% of 17,678 run,
+  6,154 skipped). Engine tests **917** green.

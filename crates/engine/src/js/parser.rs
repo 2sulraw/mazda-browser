@@ -473,6 +473,9 @@ pub struct SwitchCase {
 #[derive(Clone, Debug)]
 pub struct CatchClause {
     pub name: Rc<str>,
+    /// destructuring catch parameter (`catch ([a, b])`); `name` is a hidden
+    /// placeholder then
+    pub pat: Option<Pat>,
     pub block: Vec<Stmt>,
 }
 
@@ -1386,16 +1389,25 @@ impl<'a> Parser<'a> {
                 if self.eat_kw(Kw::Catch) {
                     // `catch { }` (no binding) is legal since ES2019; the
                     // hidden non-lexable name keeps the block shape uniform
-                    let name = if self.eat_punct(Punct::LParen) {
-                        let n = self.expect_ident()?;
+                    let (name, pat) = if self.eat_punct(Punct::LParen) {
+                        let (n, p) = match self.peek() {
+                            Tok::Punct(Punct::LBrack) | Tok::Punct(Punct::LBrace) => {
+                                (Rc::from("#catch"), Some(self.parse_pattern(true)?))
+                            }
+                            _ => (self.expect_ident()?, None),
+                        };
                         self.expect_punct(Punct::RParen)?;
-                        n
+                        (n, p)
                     } else {
-                        Rc::from("#catch")
+                        (Rc::from("#catch"), None)
                     };
                     self.expect_punct(Punct::LBrace)?;
                     let cbody = self.block_body()?;
-                    catch = Some(Box::new(CatchClause { name, block: cbody }));
+                    catch = Some(Box::new(CatchClause {
+                        name,
+                        pat,
+                        block: cbody,
+                    }));
                 }
                 if self.eat_kw(Kw::Finally) {
                     self.expect_punct(Punct::LBrace)?;

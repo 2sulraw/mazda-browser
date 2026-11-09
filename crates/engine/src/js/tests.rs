@@ -1660,8 +1660,21 @@ fn escaped_await_yield_in_function_contexts() {
 }
 
 #[test]
-fn delete_of_a_private_reference_is_an_early_error() {
-    for src in [
+fn catch_parameter_destructuring() {
+    assert_eq!(
+        num("var r; try { throw [1, 2] } catch ([a, b]) { r = a + b } r"),
+        3.0
+    );
+    assert_eq!(
+        string("var r; try { throw { x: 'hi' } } catch ({ x }) { r = x } r"),
+        "hi"
+    );
+    assert_eq!(num("var r = 9; try { throw 1 } catch { r = 0 } r"), 0.0);
+    assert_eq!(num("var r; try { throw 5 } catch (e) { r = e } r"), 5.0);
+}
+
+#[test]
+fn delete_of_a_private_reference_is_an_early_error() {    for src in [
         r"class C { #x; m() { delete this.#x; } }",
         r"class C { #m() {}; x = delete this.#m(); }",
         r"class C { #x; x = delete (this.#x); }",

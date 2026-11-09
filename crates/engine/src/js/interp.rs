@@ -474,7 +474,10 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
                 // be able to record its own location
                 e.err_located = false;
                 let cenv = Env::child(env);
-                cenv.declare(cat.name.clone(), v, false);
+                match &cat.pat {
+                    Some(p) => bind_pat(e, &cenv, p, v, BindKind::Decl(VarKind::Let))?,
+                    None => cenv.declare(cat.name.clone(), v, false),
+                }
                 result = run_block(e, &cenv, &cat.block);
             }
             if let Some(fin) = finally {
