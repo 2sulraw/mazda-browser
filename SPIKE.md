@@ -1884,3 +1884,18 @@ resume; `yield*` outside a generator is still a SyntaxError. 13,238 ->
   6,154 skipped). Engine tests **929** green.
 - Honest gaps: `.throw()` forwarding to the delegate and calling the
   delegate's `return()` on a `.return()` are not implemented yet.
+
+### `arguments` in class field initializers
+
+Field initializers run with no `arguments` binding, so any reference — including
+one reached through an arrow inside the initializer — is a SyntaxError.
+`scan_expr_arguments` now treats arrows as transparent (their `arguments` is
+the enclosing function's, which also fixes functions that only referenced
+`arguments` through an arrow) and still stops at plain function boundaries.
+A field initializer containing one is rejected at parse time. 13,305 ->
+**13,363** (+58).
+
+### Measured
+
+- test262 language subset: 13,305 -> **13,363** pass (75.6% of 17,678 run,
+  6,154 skipped). Engine tests **930** green.

@@ -2823,7 +2823,16 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                 }
                 let init = if self.eat_op(Op::Assign) {
-                    Some(self.assign_expr()?)
+                    let e = self.assign_expr()?;
+                    // FieldDefinition : ClassElementName Initializer — the
+                    // initializer runs with no `arguments` binding, so a
+                    // reference (even through an arrow) is an early error
+                    if scan_expr_arguments(&e) {
+                        return self.err(
+                            "`arguments` is not allowed in a class field initializer",
+                        );
+                    }
+                    Some(e)
                 } else {
                     None
                 };
@@ -5813,7 +5822,15 @@ fn scan_expr_arguments(e: &Expr) -> bool {
             scan_expr_arguments(target) || scan_expr_arguments(value)
         }
         ClassExpr { stmts, .. } => scan_uses_arguments_stmts(stmts),
-        Func(_) | Arrow(_) => false,
+        // an arrow has no `arguments` of its own, so a reference inside its
+        // body belongs to the enclosing non-arrow function (which must then
+        // materialize one); a plain function body is opaque
+        Arrow(f) => match &f.body {
+            FnBody::Block(b) => scan_uses_arguments_stmts(b),
+            FnBody::Expr(e) => scan_expr_arguments(e),
+            FnBody::Bound { .. } => false,
+        },
+        Func(_) => false,
         Seq(list) => list.iter().any(scan_expr_arguments),
         Template(segs) => segs.iter().any(|s| match s {
             TplSeg::Lit(_) => false,

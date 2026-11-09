@@ -2468,6 +2468,32 @@ fn generator_yield_inside_if_and_loop() {
 }
 
 #[test]
+fn class_field_initializer_arguments_is_early_error() {
+    for src in [
+        "class C { x = arguments }",
+        "class C { static x = arguments }",
+        "class C { x = true ? {} : arguments }",
+        "class C { [x] = arguments }",
+        "class C { x = () => arguments }",
+        "class C { x = () => { var t = () => arguments } }",
+        "class C { #x = typeof arguments }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // a nested plain function owns its `arguments`, so it is legal
+    run("class C { x = function () { return arguments.length } }");
+    // and an arrow outside a field initializer still sees the function's
+    // arguments object
+    assert_eq!(
+        num("function f(){ var g = () => arguments.length; return g() } f(1, 2, 3)"),
+        3.0
+    );
+}
+
+#[test]
 fn generator_yield_star_delegates() {
     // delegated values are forwarded in order, then the outer body continues
     assert_eq!(
