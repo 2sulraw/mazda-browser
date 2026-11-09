@@ -739,6 +739,29 @@ fn optional_chaining() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn boxed_primitives() {
+    assert_eq!(num("new Boolean(true) + true"), 2.0);
+    assert_eq!(num("true + new Boolean(true)"), 2.0);
+    assert_eq!(num("new Boolean(true) + new Boolean(true)"), 2.0);
+    assert_eq!(num("new Number(2) * 3"), 6.0);
+    assert_eq!(num("new Number(1) + new Number(2)"), 3.0);
+    assert_eq!(string("new String('a') + 'b'"), "ab");
+    assert_eq!(string("String(new String('q'))"), "q");
+    assert_eq!(num("new String('abc').length"), 3.0);
+    assert_eq!(string("new String('abc')[1]"), "b");
+    assert_eq!(string("new String('abc').toUpperCase()"), "ABC");
+    assert_eq!(string("typeof new String('x')"), "object");
+    assert!(boolean("new String('x') instanceof String"));
+    assert!(boolean("new Number(4) !== 4 && new Number(4) == 4"));
+    assert!(boolean("Boolean(new Boolean(false))"));
+    assert_eq!(
+        string("Object.prototype.toString.call(new Number(1))"),
+        "[object Number]"
+    );
+    assert_eq!(string("JSON.stringify(new Number(3))"), "3");
+}
+
+#[test]
 fn eval_runs_in_the_calling_scope() {
     assert_eq!(num("eval('1 + 2')"), 3.0);
     // `var` from a direct eval lands in the caller's environment

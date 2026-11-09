@@ -180,6 +180,11 @@ pub struct ErrorData {
 #[derive(Debug)]
 pub enum ObjKind {
     Plain,
+    /// boxed primitive: `new String("x")`, `new Number(1)`, `new Boolean(true)`
+    /// (and `Object(prim)`). `Val::to_string`/`to_number` unwrap it, and
+    /// String boxes answer `length`/index reads. Methods live on the ordinary
+    /// prototype (`String.prototype` etc.), so `call_method` unwraps `this`.
+    Boxed(Val),
     /// array exotic: dense element storage; `length` and integer keys map
     /// onto it, everything else goes through `props`.
     Array(Vec<Val>),
@@ -661,7 +666,10 @@ impl Val {
             // and `Number(1n)` is an explicit conversion handled by the
             // builtin, so this is only the lossy fallback.
             Val::BigInt(n) => **n as f64,
-            Val::Obj(_) => str_to_number(&self.to_string()),
+            Val::Obj(o) => match &o.borrow().kind {
+                ObjKind::Boxed(v) => v.to_number(),
+                _ => str_to_number(&self.to_string()),
+            },
             _ => f64::NAN,
         }
     }
@@ -688,6 +696,7 @@ impl Val {
             Val::Obj(o) => {
                 let b = o.borrow();
                 match &b.kind {
+                    ObjKind::Boxed(v) => v.coerce(depth + 1),
                     ObjKind::Array(items) => items
                         .iter()
                         .map(|v| match v {
@@ -742,6 +751,7 @@ impl Val {
             Val::Obj(o) => {
                 let b = o.borrow();
                 match &b.kind {
+                    ObjKind::Boxed(v) => v.to_string_d(depth + 1),
                     ObjKind::Array(items) => items
                         .iter()
                         .map(|v| match v {
@@ -3208,6 +3218,24 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                             return Ok(v.clone());
                         }
                     }
+                }
+            }
+            // boxed String: `length` and index reads behave like the
+            // primitive; everything else (methods) falls through to the
+            // String.prototype chain.
+            let boxed_str = match &o.borrow().kind {
+                ObjKind::Boxed(Val::Str(s)) => Some(s.clone()),
+                _ => None,
+            };
+            if let Some(s) = boxed_str {
+                if key == "length" {
+                    return Ok(Val::Num(s.chars().count() as f64));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    return Ok(match s.chars().nth(i) {
+                        Some(c) => Val::Str(Rc::from(c.to_string())),
+                        None => Val::Undefined,
+                    });
                 }
             }
             // lazy prototype attach: engine-created arrays (literals,

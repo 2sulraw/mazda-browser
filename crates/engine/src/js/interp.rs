@@ -1905,12 +1905,15 @@ fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> 
     }
     Ok(match op {
         Add => {
-            // string concat if either side is (or stringifies to) a string
-            let strish = |v: &Val| {
-                matches!(
-                    v,
-                    Val::Str(_) | Val::Obj(_) | Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_)
-                )
+            // string concat if either side is (or stringifies to) a string;
+            // a boxed Number/Boolean coerces numerically instead
+            let strish = |v: &Val| match v {
+                Val::Str(_) | Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_) => true,
+                Val::Obj(o) => !matches!(
+                    o.borrow().kind,
+                    ObjKind::Boxed(Val::Num(_)) | ObjKind::Boxed(Val::Bool(_))
+                ),
+                _ => false,
             };
             if strish(l) || strish(r) {
                 Val::Str(Rc::from(format!("{}{}", l.to_string(), r.to_string())))
@@ -2199,6 +2202,17 @@ pub(crate) fn call_method(
     args: &[Val],
 ) -> Result<Val, JsError> {
     use Meth::*;
+    // a boxed primitive's prototype method sees the primitive as `this`
+    let unboxed = match this {
+        Val::Obj(o) => match &o.borrow().kind {
+            ObjKind::Boxed(v) => Some(v.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(v) = unboxed {
+        return call_method(e, m, &v, args);
+    }
     match m {
         // -- string methods ------------------------------------------------
         StrToUpper => Ok(Val::Str(Rc::from(

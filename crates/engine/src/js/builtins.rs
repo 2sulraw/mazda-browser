@@ -1053,6 +1053,8 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                 ObjKind::Iterator(_) | ObjKind::ArrayBuffer(_) => {
                     out.push_str("{}");
                 }
+                // a boxed primitive serializes as the primitive itself
+                ObjKind::Boxed(v) => return json_write(e, v, depth, out),
                 // typed arrays serialize their indexed elements, like arrays
                 ObjKind::TypedArray(ta) => {
                     out.push('{');
@@ -1762,6 +1764,11 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
         OP_TOSTRING => Ok(Val::Str(Rc::from(match this {
             Val::Obj(o) => match &o.borrow().kind {
                 ObjKind::Plain => "[object Object]",
+                ObjKind::Boxed(v) => match v {
+                    Val::Str(_) => "[object String]",
+                    Val::Num(_) => "[object Number]",
+                    _ => "[object Boolean]",
+                },
                 ObjKind::Array(_) => "[object Array]",
                 ObjKind::Error(_) => "[object Error]",
                 ObjKind::Date(_) => "[object Date]",
@@ -2733,11 +2740,24 @@ fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<V
 
 fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let v = args.first().cloned().unwrap_or(Val::Undefined);
-    // boxed primitives (`new String(..)`) are unsupported: throw honestly
+    // `new String(..)` / `new Number(..)` / `new Boolean(..)` box the
+    // primitive. Methods live on the ordinary prototype, so the box carries
+    // that prototype explicitly (no lazy attach: a boxed primitive must not
+    // pick up Object.prototype).
     if is_ctor_call(e, this) {
-        return Err(JsError::throw(
-            "TypeError: String/Number/Boolean are not constructors (boxed primitives unsupported)",
-        ));
+        let (prim, ctor) = match idx {
+            0 => (Val::Str(Rc::from(v.to_string().as_str())), "String"),
+            1 => (Val::Num(v.to_number()), "Number"),
+            _ => (Val::Bool(v.to_bool()), "Boolean"),
+        };
+        let proto = e
+            .native_id(ctor)
+            .and_then(|id| e.native_prop(id, "prototype"))
+            .and_then(|p| match p {
+                Val::Obj(o) => Some(o),
+                _ => None,
+            });
+        return Ok(Val::Obj(new_obj(ObjKind::Boxed(prim), Vec::new(), proto)));
     }
     Ok(match idx {
         0 => Val::Str(Rc::from(v.to_string().as_str())),
