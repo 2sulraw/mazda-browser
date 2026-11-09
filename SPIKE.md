@@ -2531,3 +2531,33 @@ caught the first attempt, which grew it to 72).
   poisoned-`Object.prototype` one). No directory regressed.
 - engine tests **960** green (new literal-prototype test, incl. `create(null)`
   and `setPrototypeOf(o, null)`).
+
+## Preload a page's scripts and stylesheets in parallel (P8, 2026-11-10)
+
+A cold github.com load took 28 s here. `MAZDA_TIME` showed where it went:
+scripts 6.8 s (fetch 6.4), stylesheet collection ~7 s (not even staged), image
+probe 6.1, media probe 2.0 -- and every one of those was a single HTTP/1.1
+request at a time. The `[net]` instrumentation added with this change shows why
+that matters: on this network a request costs ~300 ms and a fresh TLS
+handshake ~700 ms (TCP connect is 8 ms; ping is 81 ms), so 41 sequential
+requests are 24.6 s of pure round-trip wait. Chrome hides this with HTTP/2
+multiplexing (its github load is 84 resources over `h2`); ureq is HTTP/1.1, so
+the equivalent is several connections.
+
+Rule: after parse, fetch the markup's own subresources (`<link rel=stylesheet>`
+hrefs and `<script src>`, module entries included, `nomodule` fallbacks skipped
+when a module build exists) on a 6-lane pool, then let the existing sequential
+phases read them from the disk cache. 6 lanes is the browser budget for HTTP/1.1
+per origin; more only queues in the server's accept backlog.
+
+### Measured
+
+- cold github.com: 28,011 -> **21,973 ms** to `[nav] worker finished`.
+- `[time] preload: 3991 ms (25 requests, 6 lanes)` replaces ~7 s of sequential
+  stylesheet fetches plus most of the script fetches; the script phase drops
+  6,835 -> **3,529 ms** (its remaining fetch time is module *imports*, which
+  only become known once the entry module parses).
+- remaining serial network: image probe 6.4 s, media probe 2.1 s, module
+  imports 2.9 s.
+- engine tests **960** green (no test change: this is I/O scheduling, not
+  language behaviour).

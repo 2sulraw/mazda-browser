@@ -5695,8 +5695,40 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
     let dom = html::parse(&source);
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
     snapshot_write(url, &dom);
+    // overlap the page's subresource round trips before the sequential
+    // phases start asking for them (see `preload`)
+    preload(&subresource_urls(&dom, url));
     let (css_text, faces) = styles_for(&dom, url);
     (dom, css_text, faces)
+}
+
+/// The markup's own subresources: external stylesheets and `<script src>`
+/// (module entries included, a `nomodule` fallback skipped when the page has
+/// a module build — it never runs, so it is never worth a request).
+fn subresource_urls(dom: &html::Dom, url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut sheets = Vec::new();
+    collect_sheets(dom, 0, &mut sheets);
+    for s in &sheets {
+        if let SheetSrc::Link(href) = s {
+            if let Some(abs) = resolve(url, href) {
+                out.push(abs);
+            }
+        }
+    }
+    let scripts = crate::script::collect_scripts(dom);
+    let has_modules = scripts.iter().any(|s| s.is_module);
+    for s in &scripts {
+        if s.is_nomodule && has_modules {
+            continue;
+        }
+        if let Some(src) = &s.src {
+            if let Some(abs) = resolve(url, src) {
+                out.push(abs);
+            }
+        }
+    }
+    out
 }
 
 /// Cascade + box tree + layout + image decode — the re-runnable half.
@@ -6995,6 +7027,53 @@ fn http_agent() -> &'static ureq::Agent {
     })
 }
 
+/// Page loads fetch subresources one at a time, and a round trip to a CDN is
+/// ~300 ms from here: a 40-request page spent 12 s waiting on RTTs a browser
+/// overlaps. Chrome multiplexes everything over one HTTP/2 connection; we
+/// speak HTTP/1.1, so overlap means several connections. Preload the markup's
+/// subresources on a small pool right after parse -- the sequential phases
+/// that follow (stylesheets, `<script src>`, image probes) then hit the cache.
+///
+/// The pool is deliberately tiny: browsers use 6 per origin for HTTP/1.1, and
+/// a bigger burst only queues in the server's accept backlog.
+const PRELOAD_THREADS: usize = 6;
+
+/// Fetch `urls` concurrently (deduped, order irrelevant). Errors are logged
+/// and swallowed: a failed preload just means the later sequential fetch
+/// retries and reports the failure in its own phase.
+fn preload(urls: &[String]) {
+    let mut seen = std::collections::HashSet::new();
+    let todo: Vec<&str> = urls
+        .iter()
+        .map(|u| u.as_str())
+        .filter(|u| seen.insert(*u))
+        .collect();
+    if todo.len() < 2 {
+        return; // one request: the sequential path is already one round trip
+    }
+    let t0 = Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..PRELOAD_THREADS.min(todo.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(url) = todo.get(i) else { break };
+                if let Err(e) = fetch(url) {
+                    eprintln!("[preload] {} failed: {e}", log_url(url));
+                }
+            });
+        }
+    });
+    if std::env::var_os("MAZDA_TIME").is_some() {
+        eprintln!(
+            "[time] preload: {:.0} ms ({} requests, {} lanes)",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            todo.len(),
+            PRELOAD_THREADS.min(todo.len())
+        );
+    }
+}
+
 fn fetch_accept(
     url: &str,
     accept: Option<&str>,
@@ -7008,6 +7087,7 @@ fn fetch_accept(
         eprintln!("[cache] hit {url}");
         return Ok(hit);
     }
+    let t_net = Instant::now();
     let mut req = http_agent().get(url);
     for (name, value) in net::request_headers(accept) {
         req = req.set(name, &value);
@@ -7031,6 +7111,14 @@ fn fetch_accept(
         buf.extend_from_slice(&chunk[..n]);
     }
     cache_write_in(&dir, url, now_secs(), &buf, content_type.as_deref());
+    if std::env::var_os("MAZDA_TIME").is_some() {
+        eprintln!(
+            "[net] {:6.1} ms {:8} B {}",
+            t_net.elapsed().as_secs_f64() * 1000.0,
+            buf.len(),
+            log_url(url)
+        );
+    }
     Ok((buf, content_type))
 }
 
