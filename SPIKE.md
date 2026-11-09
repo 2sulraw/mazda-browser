@@ -1556,3 +1556,45 @@ changed; the cost is one object allocation when a script actually catches.
 - engine tests: **907** green; the error-family test now checks caught
   engine errors (`instanceof`, `name`, `message`, `constructor`) and the
   three added classes.
+
+## Lexer escapes, hashbang, and function names (P7, 2026-11-09)
+
+### Private names with escapes
+
+The lexer already modelled `#field` as an ordinary identifier with a `#`
+prefix (so member access and class members reuse the normal property path),
+but it only accepted a literal identifier character after `#`. The 551
+remaining `unexpected character #` failures were all generated
+private-membership tests using `#\u{6F}_`-style escaped names. `read_ident`
+was split into a decoding core (`read_ident_name`) reused by the private-name
+arm, so escapes resolve exactly as they do for public identifiers. This
+alone moved 8,368 -> **8,530**.
+
+### Hashbang
+
+`#!...` at byte 0 is a comment (`comments/hashbang`). Two of the five cases
+pass; the rest require strict-mode parsing or LS/PS line terminators in the
+hashbang line, which are unaffected by this change. It is kept because Node
+launchers put one in real bundles.
+
+### NamedEvaluation for anonymous initializers
+
+`var fn = function () {}`, `gen = function* () {}`, `arrow = () => {}`,
+destructuring defaults, object-pattern defaults, parameter defaults and plain
+`x = function () {}` assignment now give the anonymous function the bound
+name, so `.name` is `'fn'` instead of `''`. The parser helper
+`name_anon_fn` rewrites the `FnDef` name at parse time; ClassExpression
+inference (`cls = class {}` -> `.name === 'cls'`) is still absent because the
+class lowering needs its generated binding name, and parenthesized or computed
+initializers keep the empty name.
+
+Measured: 8,530 -> **8,971** (50.7% of run), +441 (110 each for `fn`, `gen`,
+`arrow`, and the mixed generated defaults). Engine tests **909** green.
+
+### Measurement-tool visibility
+
+Every assertion failure previously reported `Uncaught [object Object]`, because
+`Val::to_string` prints that for a user error object whose text lives in
+`message`. `JsEngine::describe_thrown` reads `name`/`message` for the test262
+report (it never calls user code), which turned the 4,040 opaque failures into
+readable reason rows and made this whole wave measurable.
