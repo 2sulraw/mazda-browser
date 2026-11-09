@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 /// on one broken page cannot spin forever. Governor reclaims do not count.
 const MAX_RESTARTS: u32 = 5;
 const GOVERNOR_PERIOD: Duration = Duration::from_secs(3);
-const RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
 
 // Custom chrome. The window has no OS decorations: the titlebar, tabs and
 // window buttons are ours, so the tab strip can live where the title goes.
@@ -97,12 +96,8 @@ impl Renderer {
             ("TEMP", tmp.as_os_str().to_owned()),
             ("LOCALAPPDATA", local.as_os_str().to_owned()),
         ];
-        let memory_mb = std::env::var("MAZDA_RENDERER_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(512);
+        // no memory cap: the renderer must stay lean by what it allocates
         let limits = mazda_sandbox::Limits {
-            memory_mb,
             allow_network: true,
         };
         let sandboxed = std::env::var("MAZDA_SANDBOX").map(|v| v != "off").unwrap_or(true);
@@ -685,12 +680,9 @@ struct Shell {
     /// Without this, a slow load's title landed on whichever tab was active
     /// when it finished (the one-tab lag measured by `measure-tabs.ps1`).
     inflight: VecDeque<(usize, String, bool)>,
-    // governor
-    budget_mb: f64,
+    // renderer memory sampling (reported by `status`; no cap)
     last_sample: Instant,
     last_mb: f64,
-    over: u32,
-    last_reclaim: Instant,
 }
 
 impl Shell {
@@ -704,10 +696,6 @@ impl Shell {
         let active = active.min(tabs.len() - 1);
         let start = tabs[active].url.clone();
         let r = Renderer::spawn(exe, (!start.is_empty()).then_some(start.as_str()))?;
-        let budget_mb = std::env::var("MAZDA_BUDGET_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(280.0);
         let url_edit = tabs[active].url.clone();
         let mut inflight = VecDeque::new();
         if !start.is_empty() {
@@ -749,12 +737,8 @@ impl Shell {
             url_focused: false,
             focus_url: false,
             ctl: spawn_control(),
-            budget_mb,
             last_sample: Instant::now(),
             last_mb: 0.0,
-            over: 0,
-            // allow the first reclaim immediately (tests set a tiny budget)
-            last_reclaim: Instant::now() - RECLAIM_COOLDOWN,
         })
     }
 
@@ -1238,50 +1222,15 @@ impl Shell {
         }
     }
 
-    /// Restart the renderer to give its heap back, then replay the active tab
-    /// from its snapshot. This is the governor's only real lever while one
-    /// renderer serves every tab.
-    fn reclaim(&mut self) {
-        if !self.r.restart() {
-            self.err = Some("memory governor could not restart the renderer".into());
-            return;
-        }
-        // a reclaim is not a crash: it must not eat the crash budget
-        self.r.restarts = 0;
-        self.map = None;
-        self.map_path.clear();
-        self.tex = None;
-        self.seq = 0;
-        self.size = (0, 0);
-        self.inflight.clear();
-        self.r.send(Command::Zoom(self.zoom));
-        self.printing = None;
-        let url = self.active_tab().url.clone();
-        self.pending_restore = (!url.is_empty()).then_some(url);
-        self.pending_scroll = Some(self.scroll);
-        self.loading = true;
-        println!("[gov] reclaimed renderer");
-    }
-
+    /// Sample renderer memory for `status`. There is no budget and no reclaim:
+    /// a heavy page is allowed to finish, and the engine is kept lean instead.
     fn govern(&mut self) {
         if self.last_sample.elapsed() < GOVERNOR_PERIOD {
             return;
         }
         self.last_sample = Instant::now();
-        let Some(mb) = process_private_mb(self.r.pid()) else {
-            return;
-        };
-        self.last_mb = mb;
-        if mb > self.budget_mb {
-            self.over += 1;
-            if self.over >= 2 && !self.loading && self.last_reclaim.elapsed() > RECLAIM_COOLDOWN {
-                self.over = 0;
-                self.last_reclaim = Instant::now();
-                println!("[gov] renderer {mb:.1} MB > budget {:.0} MB", self.budget_mb);
-                self.reclaim();
-            }
-        } else {
-            self.over = 0;
+        if let Some(mb) = process_private_mb(self.r.pid()) {
+            self.last_mb = mb;
         }
     }
 

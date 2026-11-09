@@ -2,8 +2,8 @@
 //!
 //! Windows: a restricted token (the user and Administrators SIDs are
 //! deny-only, so the renderer cannot open the user's own files), low
-//! integrity, and a Job Object that kills the renderer with the shell, allows
-//! one process, and caps committed memory.
+//! integrity, and a Job Object that kills the renderer with the shell and
+//! allows one process.
 //!
 //! Linux: `no_new_privs`, `RLIMIT_AS`, and a seccomp filter that refuses
 //! `execve`/`execveat` (threads still work; child processes do not).
@@ -32,20 +32,19 @@ mod platform;
 pub use platform::Process;
 
 /// Resource limits for one renderer process.
+///
+/// There is deliberately no memory cap: the renderer is expected to stay lean
+/// by what it allocates, not by being killed at a threshold. The job object
+/// still enforces one process and kills it with the shell.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Committed-memory cap, in MiB.
-    pub memory_mb: u32,
     /// Keep network access (the renderer fetches pages).
     pub allow_network: bool,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self {
-            memory_mb: 512,
-            allow_network: true,
-        }
+        Self { allow_network: true }
     }
 }
 

@@ -6,9 +6,9 @@ layout, and paint — is written from scratch in Rust.
 
 Phase S proved the process split is worth its cost (see `SPIKE.md`). **P1 is
 in place**: a real IPC protocol, double-buffered shared-memory frames, a
-renderer supervisor, tabs, snapshot restore, and a memory governor. **P2 is in
+renderer supervisor, tabs, and snapshot restore. **P2 is in
 place too**: the renderer runs in an OS sandbox (AppContainer + Job Object on
-Windows, `no_new_privs` + seccomp + `RLIMIT_AS` on Linux). **P3 is in place**:
+Windows, `no_new_privs` + seccomp on Linux). **P3 is in place**:
 `<video>`/`<audio>` play through Media Foundation + WASAPI, decoded by a
 pure-Rust media crate, with DRM refused before any decoder is created. **P4 has
 started**: `<a download>` streams to disk with a progress panel and lands in the
@@ -28,7 +28,7 @@ crates/media-probe media self-test (plain + sandboxed decode/audio/DRM)
 crates/renderer   headless renderer process
 crates/sandbox    OS containment for the renderer + `sandbox-probe` self-test
 crates/shell      trusted shell (eframe/egui), owns the window and input
-tools/            memory, reload-soak, tab, sandbox and governor harnesses
+tools/            memory, reload-soak, tab and sandbox harnesses
 ```
 
 The engine still carries `engine::app` — the old single-process shell and
@@ -65,12 +65,13 @@ the tab's snapshot.
 
 Sandbox behaviour (P2):
 
-- **Windows**: AppContainer with only `internetClient`; a Job Object caps
-  committed memory (`MAZDA_RENDERER_MB`, default 512), allows one process,
-  blocks UI/clipboard/desktop access, and kills the renderer with the shell.
+- **Windows**: AppContainer with only `internetClient`; a Job Object allows
+  one process, blocks UI/clipboard/desktop access, and kills the renderer with
+  the shell. There is no memory cap: the renderer is kept lean by what it
+  allocates.
   `%TMP%`/`%LOCALAPPDATA%` point at a directory granted to the package SID, so
   the frame file and cache work while the real user profile stays unreadable.
-- **Linux**: `no_new_privs`, `RLIMIT_AS`, and a seccomp filter that refuses
+- **Linux**: `no_new_privs` and a seccomp filter that refuses
   `execve`/`execveat`. Landlock/net-namespace filesystem isolation is the next
   increment; the code is compile-checked but not yet run on Linux here.
 - `MAZDA_SANDBOX=off` is a debugging escape hatch (local test servers,
@@ -155,9 +156,8 @@ Single-process reference (the pre-split app):
 .\tools\measure-sites.ps1            # Google, GitHub, YouTube: old vs split + scroll latency
 .\tools\measure-tabs.ps1             # 10 tabs, one renderer, <= 300 MB (P1 gate)
 .\tools\reload-soak.ps1 -Cycles 100  # 100 reloads, RSS plateau / live-heap leak gate
-.\tools\governor-check.ps1           # tiny budget -> reclaim + snapshot restore
 .\tools\crash-check.ps1              # kill the renderer -> supervisor restarts + restores
-.\tools\sandbox-check.ps1            # home unreadable, no child, network, memory cap (P2 gate)
+.\tools\sandbox-check.ps1            # home unreadable, no child, network (P2 gate)
 .\tools\screenshot-shell.ps1 -Url https://example.com   # capture the real window
 .\tools\ui-smoke.ps1                 # click print/star/clock, assert stores + screenshots
 .\target\release\js-bench.exe --iterations 10 --warmup 3   # JS engine speed (P5)

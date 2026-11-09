@@ -1914,3 +1914,21 @@ forms are unchanged, and `\u0067et: 7` stays a legal property. 13,363 ->
 
 - test262 language subset: 13,363 -> **13,387** pass (75.7% of 17,678 run,
   6,154 skipped). Engine tests **931** green.
+
+## No memory cap
+
+The renderer job no longer sets `JOB_OBJECT_LIMIT_PROCESS_MEMORY`/
+`JOB_OBJECT_LIMIT_JOB_MEMORY` and the Linux sandbox no longer sets `RLIMIT_AS`;
+the shell's governor no longer has a budget or reclaims. The 512 MB job cap was
+what turned a heavy page into a killed renderer at 508 MB, and a cap hides the
+real problem instead of fixing it: the renderer must stay lean by what it
+allocates. The job still allows one process and kills the renderer with the
+shell.
+
+### Measured
+
+- cold `renderer.exe https://github.com --once` (fresh cache): 32 s, peak
+  private 133 MB; stages: scripts 7.9 s, css parse 154 ms, cascade + box tree
+  7.9 s, image probe 5.1 s, media probe 3.2 s, layout 4 ms.
+- uncapped `shell.exe https://github.com`: first page at 27 s, shell peak
+  68 MB, renderer peak 164 MB.

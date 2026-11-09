@@ -77,7 +77,6 @@ fn outside(file: &str) -> std::io::Result<()> {
     std::fs::copy(file, &inside_file)?;
 
     let limits = Limits {
-        memory_mb: 512,
         allow_network: false,
     };
     let env = [

@@ -1,10 +1,8 @@
 //! Sandbox self-test.
 //!
-//! `sandbox-probe --canary <path> [--memory-mb N]` spawns itself through the
-//! sandbox, then checks from the inside that the user's file is unreadable,
-//! child processes are refused, the network still works, and the temp
-//! directory is writable. A second sandboxed run proves the memory cap: it
-//! tries to commit more than the job allows and must die.
+//! `sandbox-probe --canary <path>` spawns itself through the sandbox, then
+//! checks from the inside that the user's file is unreadable, child processes
+//! are refused, the network still works, and the temp directory is writable.
 //!
 //! Exit code 0 means every check passed.
 
@@ -25,21 +23,18 @@ fn main() {
     };
 
     if args.iter().any(|a| a == "--inside") {
-        inside(get("--canary"), get("--alloc-mb"));
+        inside(get("--canary"));
         return;
     }
 
     let canary = get("--canary").expect("--canary <path> is required");
-    let memory_mb = get("--memory-mb")
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(96);
-    if let Err(e) = outside(&canary, memory_mb) {
+    if let Err(e) = outside(&canary) {
         eprintln!("sandbox probe failed: {e}");
         std::process::exit(1);
     }
 }
 
-fn outside(canary: &str, memory_mb: u32) -> std::io::Result<()> {
+fn outside(canary: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let base = std::env::temp_dir().join(format!("mazda-sandbox-probe-{}", std::process::id()));
     let tmp = base.join("tmp");
@@ -49,7 +44,6 @@ fn outside(canary: &str, memory_mb: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(&local)?;
 
     let limits = Limits {
-        memory_mb,
         allow_network: true,
     };
     let env = [
@@ -58,7 +52,7 @@ fn outside(canary: &str, memory_mb: u32) -> std::io::Result<()> {
         ("LOCALAPPDATA", local.as_os_str().to_owned()),
     ];
 
-    let mut inside_args: Vec<OsString> = vec!["--inside".into(), "--canary".into(), canary.into()];
+    let inside_args: Vec<OsString> = vec!["--inside".into(), "--canary".into(), canary.into()];
     let child = spawn(&exe, &inside_args, &env, &limits)?;
     let (_stdin, stdout, stderr, mut proc) = child.into_parts();
     let mut out = String::new();
@@ -85,50 +79,11 @@ fn outside(canary: &str, memory_mb: u32) -> std::io::Result<()> {
         return Err(std::io::Error::other("inside checks failed"));
     }
 
-    // memory: a second sandboxed run must be killed while committing
-    inside_args = vec![
-        "--inside".into(),
-        "--alloc-mb".into(),
-        (memory_mb as u64 + 128).to_string().into(),
-    ];
-    let child = spawn(&exe, &inside_args, &env, &limits)?;
-    let (_stdin, stdout, stderr, mut proc) = child.into_parts();
-    let out: Vec<String> = BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .collect();
-    for line in &out {
-        println!("{line}");
-    }
-    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-        eprintln!("{line}");
-    }
-    proc.wait();
-
-    // wait() returns after exit; probe the exit code through a fresh check:
-    // a killed process prints neither "alloc survived" nor "alloc denied".
-    if out.iter().any(|l| l.contains("alloc survived")) {
-        eprintln!("FAIL: memory cap did not stop a {} MB commit", memory_mb + 128);
-        return Err(std::io::Error::other("memory limit not enforced"));
-    }
-    println!("memory cap enforced");
     let _ = std::fs::remove_dir_all(&base);
     Ok(())
 }
 
-fn inside(canary: Option<String>, alloc_mb: Option<String>) {
-    if let Some(mb) = alloc_mb {
-        let n = mb.parse::<usize>().unwrap_or(0) * 1024 * 1024;
-        let mut v: Vec<u8> = Vec::new();
-        if v.try_reserve_exact(n).is_err() {
-            println!("alloc denied");
-            std::process::exit(3);
-        }
-        v.resize(n, 7); // commits the pages; the job cap aborts the process
-        println!("alloc survived");
-        std::process::exit(0);
-    }
-
+fn inside(canary: Option<String>) {
     if let Some(path) = canary {
         match std::fs::read_to_string(&path) {
             Ok(_) => println!("FAIL home readable"),

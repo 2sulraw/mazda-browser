@@ -3,7 +3,7 @@
 //! The renderer runs in an AppContainer with only the `internetClient`
 //! capability. Its token therefore cannot open the user profile, cannot write
 //! outside the paths granted to its package SID, and cannot touch the desktop;
-//! the Job Object caps committed memory, allows exactly one process, and kills
+//! the Job Object allows exactly one process and kills
 //! the renderer when the shell exits.
 //!
 //! `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` is used
@@ -38,8 +38,8 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_UILIMIT_DESKTOP,
     JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
@@ -194,7 +194,7 @@ pub fn spawn(
             Reserved: 0,
         };
 
-        let job = create_job(limits)?;
+        let job = create_job()?;
 
         // child reads stdin_r / writes stdout_w + stderr_w; the parent keeps
         // the other ends and clears their inherit flag before the spawn
@@ -429,22 +429,17 @@ fn grant(path: &Path, sid: PSID, dir: bool) -> io::Result<()> {
     Ok(())
 }
 
-unsafe fn create_job(limits: &Limits) -> io::Result<HANDLE> {
+unsafe fn create_job() -> io::Result<HANDLE> {
     let job = CreateJobObjectW(null(), null());
     if job.is_null() {
         return Err(ctx("create job"));
     }
 
-    let bytes = limits.memory_mb as u64 * 1024 * 1024;
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_JOB_MEMORY;
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
     info.BasicLimitInformation.ActiveProcessLimit = 1;
-    info.ProcessMemoryLimit = bytes as usize;
-    info.JobMemoryLimit = bytes as usize;
     if SetInformationJobObject(
         job,
         JobObjectExtendedLimitInformation,

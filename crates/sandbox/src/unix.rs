@@ -3,7 +3,7 @@
 //!
 //! Filesystem isolation (Landlock) and network namespaces are the next
 //! increment; this stage already gives the acceptance shape: no child
-//! processes, a hard memory cap, and no privilege gain.
+//! processes and no privilege gain.
 
 use std::ffi::OsString;
 use std::io;
@@ -42,7 +42,7 @@ pub fn spawn(
     exe: &Path,
     args: &[OsString],
     env: &[(&str, OsString)],
-    limits: &Limits,
+    _limits: &Limits,
 ) -> io::Result<crate::Child> {
     let mut cmd = Command::new(exe);
     cmd.args(args);
@@ -53,9 +53,8 @@ pub fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let memory_mb = limits.memory_mb as u64;
     unsafe {
-        cmd.pre_exec(move || harden(memory_mb));
+        cmd.pre_exec(harden);
     }
 
     let mut child = cmd.spawn()?;
@@ -73,7 +72,7 @@ pub fn spawn(
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn harden(memory_mb: u64) -> io::Result<()> {
+unsafe fn harden() -> io::Result<()> {
     const PR_SET_NO_NEW_PRIVS: i32 = 38;
     const PR_SET_SECCOMP: i32 = 22;
     const SECCOMP_MODE_FILTER: u64 = 2;
@@ -94,15 +93,6 @@ unsafe fn harden(memory_mb: u64) -> io::Result<()> {
     }
 
     if libc::prctl(PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let bytes = memory_mb * 1024 * 1024;
-    let lim = libc::rlimit {
-        rlim_cur: bytes as libc::rlim_t,
-        rlim_max: bytes as libc::rlim_t,
-    };
-    if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -157,7 +147,7 @@ unsafe fn harden(memory_mb: u64) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-unsafe fn harden(_memory_mb: u64) -> io::Result<()> {
+unsafe fn harden() -> io::Result<()> {
     Ok(())
 }
 
