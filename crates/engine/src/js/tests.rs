@@ -3034,6 +3034,43 @@ fn named_function_self_binding_is_immutable() {
 }
 
 #[test]
+fn lexical_declarations_need_a_block() {
+    // LexicalDeclaration and ClassDeclaration are not Statements
+    for src in [
+        "if (true) let x = 1;",
+        "if (true) const x = 1;",
+        "if (true) {} else let x = 1;",
+        "while (false) let x;",
+        "do let x; while (false)",
+        "for (;;) const x = 1;",
+        "with ({}) let x = 1;",
+        "l: let x = 1;",
+        "if (true) class C {}",
+    ] {
+        assert!(
+            err(src).to_string().contains("SyntaxError"),
+            "expected SyntaxError for: {src}"
+        );
+    }
+    // a block body may contain one
+    assert!(boolean("if (true) { let x = 1; } true"));
+    assert!(boolean("while (false) { const x = 1; } true"));
+}
+
+#[test]
+fn const_requires_an_initializer() {
+    for src in ["const x;", "const x = 1, y;", "for (const x;;) {}"] {
+        assert!(
+            err(src).to_string().contains("SyntaxError"),
+            "expected SyntaxError for: {src}"
+        );
+    }
+    // a for-in/of binding is not a LexicalDeclaration
+    assert_eq!(num("var n = 0; for (const x in {a: 1}) n++; n"), 1.0);
+    assert_eq!(num("var n = 0; for (const x of [1, 2]) n++; n"), 2.0);
+}
+
+#[test]
 fn direct_eval_cannot_hoist_var_over_param_bindings() {
     // a parameter default's eval must not declare a var over the implicit
     // `arguments` object (EvalDeclarationInstantiation's collision walk)

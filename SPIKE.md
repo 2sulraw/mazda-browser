@@ -2350,3 +2350,25 @@ have. Strict eval gets a fresh variable environment and is skipped.
   141 -> **5** (the five left are arrow-body `arguments` resolution, a
   different gap). No directory regressed.
 - engine tests **949** green (new collision test).
+
+## Lexical declarations need a block, and `const` needs an initializer (P7, 2026-11-10)
+
+Two ES2015 early errors the parser was missing. `LexicalDeclaration` (and
+`ClassDeclaration`) is not a `Statement`, so a bare `let`/`const`/`class`
+cannot be the body of `if`/`else`, `while`, `do`, `for`, `with` or a label;
+only a block may contain one. The parser now routes every single-statement
+body position through `sub_stmt`, which rejects those three tokens before
+parsing. Separately, a `const` declarator requires an initializer
+(`const x;`, `const x = 1, y;`, `for (const x;;)`), checked in statement,
+classic-`for`-head and `export` positions; `for (const x in/of ...)` binds
+through a ForBinding and stays legal.
+
+### Measured
+
+- test262 language subset: 14,749 -> **14,804** pass (83.7% of 17,678 run,
+  6,154 skipped).
+- "expected SyntaxError, got string" failures 445 -> **374**;
+  `statements/const/syntax` and `statements/let/syntax` are clean, with
+  `statements/for-of` 137 -> 135 and `statements/for-in` 45 -> 43 as
+  side effects. No directory regressed.
+- engine tests **951** green (two new early-error tests).

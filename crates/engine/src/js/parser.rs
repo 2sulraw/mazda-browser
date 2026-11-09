@@ -1364,6 +1364,9 @@ impl<'a> Parser<'a> {
         if let Some(k) = decl_kind {
             self.next();
             let ds = self.declarators()?;
+            if k == VarKind::Const && ds.iter().any(|d| d.init.is_none()) {
+                return self.err("missing initializer in const declaration");
+            }
             let mut leaves = Vec::new();
             for d in &ds {
                 match &d.pat {
@@ -1425,6 +1428,19 @@ impl<'a> Parser<'a> {
         r
     }
 
+    /// Single-statement body position (`if (x) <here>`, a loop body, `with`,
+    /// a label). `LexicalDeclaration` and `ClassDeclaration` are not
+    /// `Statement`s, so a bare `let`/`const`/`class` is a SyntaxError here;
+    /// only a block may contain one.
+    fn sub_stmt(&mut self) -> Result<Stmt, JsError> {
+        match self.peek() {
+            Tok::Kw(Kw::Let) | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Class) => {
+                self.err("a lexical declaration is not allowed as a statement body")
+            }
+            _ => self.statement(),
+        }
+    }
+
     fn statement_inner(&mut self) -> Result<Stmt, JsError> {
         let start = self.pos;
         let kind = match self.peek().clone() {
@@ -1455,6 +1471,11 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Const) => {
                 self.next();
                 let ds = self.declarators()?;
+                // `const` needs an initializer (a `for (const x in/of ...)`
+                // binding is not a LexicalDeclaration and is parsed elsewhere)
+                if ds.iter().any(|d| d.init.is_none()) {
+                    return self.err("missing initializer in const declaration");
+                }
                 self.note_declarators(VarKind::Const, &ds);
                 StmtKind::VarDecl(VarKind::Const, ds)
             }
@@ -1490,9 +1511,9 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::LParen)?;
                 let test = self.expr()?;
                 self.expect_punct(Punct::RParen)?;
-                let then = Box::new(self.statement()?);
+                let then = Box::new(self.sub_stmt()?);
                 let other = if self.eat_kw(Kw::Else) {
-                    Some(Box::new(self.statement()?))
+                    Some(Box::new(self.sub_stmt()?))
                 } else {
                     None
                 };
@@ -1507,7 +1528,7 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::LParen)?;
                 let test = self.expr()?;
                 self.expect_punct(Punct::RParen)?;
-                let body = Box::new(self.statement()?);
+                let body = Box::new(self.sub_stmt()?);
                 StmtKind::While {
                     test: Box::new(test),
                     body,
@@ -1515,7 +1536,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Do) => {
                 self.next();
-                let body = Box::new(self.statement()?);
+                let body = Box::new(self.sub_stmt()?);
                 if !self.eat_kw(Kw::While) {
                     return self.err("expected `while` after do-body");
                 }
@@ -1538,7 +1559,7 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::LParen)?;
                 let f = self.for_rest()?;
                 self.expect_punct(Punct::RParen)?;
-                let body = Box::new(self.statement()?);
+                let body = Box::new(self.sub_stmt()?);
                 match f {
                     ForHead::Classic { init, cond, upd } => StmtKind::For {
                         init,
@@ -1605,7 +1626,7 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::LParen)?;
                 let obj = self.expr()?;
                 self.expect_punct(Punct::RParen)?;
-                let body = Box::new(self.statement()?);
+                let body = Box::new(self.sub_stmt()?);
                 StmtKind::With {
                     obj: Box::new(obj),
                     body,
@@ -1730,7 +1751,7 @@ impl<'a> Parser<'a> {
                 let name = name.clone();
                 self.next(); // the label
                 self.next(); // `:`
-                let body = self.statement()?;
+                let body = self.sub_stmt()?;
                 StmtKind::Label {
                     name,
                     body: Box::new(body),
@@ -2155,6 +2176,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         return Ok(ForHead::Of { kind, target, iter });
                     }
                 }
+            }
+            // classic `for` head: a `const` declarator needs an initializer
+            // (`for (const x in/of ...)` returned above as a binding form)
+            if kind == Some(VarKind::Const) && decls.iter().any(|d| d.init.is_none()) {
+                return self.err("missing initializer in const declaration");
             }
             let init = Some(Box::new(Stmt {
                 kind: StmtKind::VarDecl(kind.unwrap_or(VarKind::Var), decls),
