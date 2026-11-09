@@ -2439,16 +2439,26 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
     }
 
     fn param_list(&mut self) -> Result<Vec<Param>, JsError> {
+        self.param_list_with(false)
+    }
+
+    /// `UniqueFormalParameters`: method and accessor parameter lists reject
+    /// duplicate bound names even when the list is simple (`foo(a, a) {}`).
+    fn param_list_unique(&mut self) -> Result<Vec<Param>, JsError> {
+        self.param_list_with(true)
+    }
+
+    fn param_list_with(&mut self, unique: bool) -> Result<Vec<Param>, JsError> {
         self.expect_punct(Punct::LParen)?;
         let mut idx = 0usize;
         let params = self.params_after_lparen(&mut idx)?;
         // BoundNames of a non-simple parameter list must not repeat
         // (`(x = 0, x) => {}`); a simple list may (`function f(x, x)` in
-        // sloppy mode).
+        // sloppy mode). Methods always need unique names.
         let simple = params
             .iter()
             .all(|p| p.pat.is_none() && p.default.is_none() && !p.rest);
-        if !simple {
+        if unique || !simple {
             let mut names = Vec::new();
             for p in &params {
                 match &p.pat {
@@ -2869,7 +2879,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                 }
                 self.fn_ctx.push(FnCtx::default());
-                let params = self.param_list()?;
+                let params = self.param_list_unique()?;
                 self.expect_punct(Punct::LBrace)?;
                 let body = self.fn_block_body()?;
                 self.fn_ctx.pop();
@@ -2958,7 +2968,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         c.in_constructor = true;
                     }
                 }
-                let params = self.param_list()?;
+                let params = self.param_list_unique()?;
                 self.expect_punct(Punct::LBrace)?;
                 let mut body = self.fn_block_body()?;
                 if is_ctor {
@@ -4338,7 +4348,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             is_async,
                             is_generator: is_gen,
                         });
-                        let params = self.param_list()?;
+                        let params = self.param_list_unique()?;
                         self.expect_punct(Punct::LBrace)?;
                         let mut body = self.fn_block_body()?;
                         self.fn_ctx.pop();
@@ -4376,7 +4386,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let value = if *self.peek() == Tok::Punct(Punct::LParen) {
                             // computed method shorthand
                             self.fn_ctx.push(FnCtx::default());
-                            let params = self.param_list()?;
+                            let params = self.param_list_unique()?;
                             self.expect_punct(Punct::LBrace)?;
                             let body = self.fn_block_body()?;
                             self.fn_ctx.pop();
@@ -4443,7 +4453,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             None => self.prop_name()?,
                         };
                         self.fn_ctx.push(FnCtx::default());
-                        let params = self.param_list()?;
+                        let params = self.param_list_unique()?;
                         self.expect_punct(Punct::LBrace)?;
                         let body = self.fn_block_body()?;
                         self.fn_ctx.pop();
@@ -4480,7 +4490,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     let key = self.prop_name()?;
                     if *self.peek() == Tok::Punct(Punct::LParen) {
                         self.fn_ctx.push(FnCtx::default());
-                        let params = self.param_list()?;
+                        let params = self.param_list_unique()?;
                         self.expect_punct(Punct::LBrace)?;
                         let body = self.fn_block_body()?;
                         self.fn_ctx.pop();

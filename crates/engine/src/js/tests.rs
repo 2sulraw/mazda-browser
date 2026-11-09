@@ -3107,6 +3107,31 @@ fn arrow_parameters_reject_duplicate_names() {
 }
 
 #[test]
+fn method_parameters_must_be_unique() {
+    // MethodDefinition uses UniqueFormalParameters: no duplicate bound names
+    // even in sloppy mode, unlike a plain function declaration.
+    for src in [
+        "({ foo(a, a) {} });",
+        "({ async foo(a, a) {} });",
+        "({ *foo(a, a) {} });",
+        "({ ['x'](a, a) {} });",
+        "({ foo({a}, [a]) {} });",
+        "(class { m(a, a) {} });",
+        "(class { constructor(a, a) {} });",
+    ] {
+        assert!(
+            err(src).to_string().contains("SyntaxError"),
+            "expected SyntaxError for: {src:?}"
+        );
+    }
+    // plain functions still allow it in sloppy mode
+    let mut e = JsEngine::new();
+    assert!(e.exec("function f(a, a) { return a; }").is_ok());
+    // a method may still use distinct names, including a non-simple list
+    assert_eq!(num("({ m(a, b = 2) { return a + b; } }).m(1)"), 3.0);
+}
+
+#[test]
 fn direct_eval_cannot_hoist_var_over_param_bindings() {
     // a parameter default's eval must not declare a var over the implicit
     // `arguments` object (EvalDeclarationInstantiation's collision walk)

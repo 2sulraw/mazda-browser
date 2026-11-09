@@ -2393,3 +2393,22 @@ line-terminator restriction.
   `expressions/arrow-function` 33 -> **17** (two further fixes elsewhere). No
   directory regressed.
 - engine tests **953** green (two new early-error tests).
+
+## Method parameter lists are unique (P7, 2026-11-10)
+
+`MethodDefinition` and accessors use `UniqueFormalParameters`, so a duplicate
+bound name is an early error even in sloppy mode, where a plain function
+declaration may still repeat a name. The parser's parameter-list builder now
+takes a `unique` flag; object-literal methods (plain, computed, `async`,
+generator), object accessors and class methods/accessors/constructors request
+the unique form. Destructured and rest leaves count, so `m({a}, [a])` is
+rejected too.
+
+### Measured
+
+- test262 language subset: 14,822 -> **14,826** pass (83.9% of 17,678 run,
+  6,154 skipped).
+- "expected SyntaxError, got string" failures 356 -> **352**;
+  `expressions/object` 123 -> **121**, `statements/class` 495 -> **493**. No
+  directory regressed.
+- engine tests **954** green (new method-parameter test).
