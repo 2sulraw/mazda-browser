@@ -3127,6 +3127,64 @@ fn nested_pattern_elements_with_a_default() {
 }
 
 #[test]
+fn object_literal_proto_setter() {
+    // the colon form sets the prototype instead of creating an own property
+    assert_eq!(num("var o = { __proto__: { a: 1 } }; o.a"), 1.0);
+    assert_eq!(
+        num("var o = { __proto__: null }; Object.getPrototypeOf(o) === null ? 1 : 0"),
+        1.0
+    );
+    assert_eq!(num("var o = { '__proto__': { a: 2 } }; o.a"), 2.0);
+    assert_eq!(
+        num("var o = { __proto__: 5 }; o.hasOwnProperty('__proto__') ? 1 : 0"),
+        0.0
+    );
+    // a symbol is a primitive, not a prototype
+    assert!(boolean(
+        "var o = { __proto__: Symbol('s') }; \
+         Object.getPrototypeOf(o) === Object.prototype"
+    ));
+    // an inherited `__proto__` setter must not run
+    assert_eq!(
+        num("Object.defineProperty(Object.prototype, '__proto__', \
+             { set: function(){ throw 'bad'; } }); \
+             var o = { __proto__: { a: 5 } }; o.a"),
+        5.0
+    );
+    // shorthand and computed forms are ordinary properties
+    assert_eq!(
+        num("var __proto__ = { a: 3 }; var o = { __proto__ }; \
+             o.hasOwnProperty('__proto__') ? o.__proto__.a : -1"),
+        3.0
+    );
+    assert_eq!(
+        num("var o = { __proto__: {a:1}, ['__proto__']: {b:2} }; o.__proto__.b + o.a"),
+        3.0
+    );
+    // duplicate colon-form `__proto__` is an early error
+    assert!(matches!(
+        err("({ __proto__: 1, __proto__: 2 })"),
+        JsError::Syntax { .. }
+    ));
+    assert!(matches!(
+        err("({ __proto__: 1, 'other': 0, '__proto__': 2 })"),
+        JsError::Syntax { .. }
+    ));
+    // in a pattern it is an ordinary property key, and may repeat
+    assert_eq!(
+        num("var src = {}; src.__proto__ = 7; var a, b; \
+             ({ __proto__: a, __proto__: b } = src); a + b"),
+        14.0
+    );
+    // an explicitly null prototype is remembered, not lazily filled in
+    assert!(boolean("Object.getPrototypeOf(Object.create(null)) === null"));
+    assert!(boolean(
+        "var o = {}; Object.setPrototypeOf(o, null); \
+         Object.getPrototypeOf(o) === null"
+    ));
+}
+
+#[test]
 fn yield_is_an_identifier_outside_generators() {
     // sloppy mode: `yield` is an ordinary IdentifierReference / BindingIdentifier
     assert_eq!(num("var yield = 5; yield + 1"), 6.0);

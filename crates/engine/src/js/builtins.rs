@@ -1100,7 +1100,7 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                     }
                     out.push('}');
                 }
-                ObjKind::Plain(_) => {
+                ObjKind::Plain(..) => {
                     out.push('{');
                     let mut first = true;
                     for (k, val) in b.props.iter() {
@@ -1491,7 +1491,7 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                             .props
                             .iter()
                             .filter(|(k, _)| {
-                                !matches!(&b.kind, ObjKind::Plain(Some(h))
+                                !matches!(&b.kind, ObjKind::Plain(Some(h), _)
                                     if h.iter().any(|x| x == k))
                             })
                             .map(|(k, v)| (k.clone(), v.clone()))
@@ -1561,9 +1561,24 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
             };
             match &target {
                 Val::Obj(o) => {
-                    o.borrow_mut().proto = match proto {
-                        Val::Obj(p) => Some(p),
-                        _ => None,
+                    let mut b = o.borrow_mut();
+                    // remember an explicit null separately from "not attached
+                    // yet" (`Obj.proto == None` means both)
+                    match proto {
+                        Val::Obj(p) => {
+                            b.proto = Some(p);
+                            if let ObjKind::Plain(h, _) = &b.kind {
+                                b.kind = ObjKind::Plain(h.clone(), false);
+                            }
+                        }
+                        Val::Null => {
+                            b.proto = None;
+                            if let ObjKind::Plain(h, _) = &b.kind {
+                                b.kind = ObjKind::Plain(h.clone(), true);
+                            }
+                        }
+                        // any other value leaves the prototype alone
+                        _ => {}
                     }
                 }
                 Val::Func(f) => f.set_proto(next),
@@ -1689,14 +1704,22 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
             Ok(out)
         }
         O_CREATE => {
-            // shortcut: a `null` prototype is stored as "not attached yet", so
-            // the new object still picks up Object.prototype on first access
-            // (this engine only enumerates own props, so dictionaries behave).
-            let proto = match args.first() {
-                Some(Val::Obj(p)) => Some(p.clone()),
-                _ => None,
-            };
-            Ok(Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), proto)))
+            // a `null` prototype is recorded in the object kind: the object
+            // has no prototype to walk, and `getPrototypeOf` must answer null
+            // instead of lazily attaching Object.prototype
+            match args.first() {
+                Some(Val::Obj(p)) => Ok(Val::Obj(new_obj(
+                    ObjKind::Plain(None, false),
+                    Vec::new(),
+                    Some(p.clone()),
+                ))),
+                Some(Val::Null) | None => Ok(Val::Obj(new_obj(
+                    ObjKind::Plain(None, true),
+                    Vec::new(),
+                    None,
+                ))),
+                _ => Ok(Val::Obj(new_obj(ObjKind::Plain(None, false), Vec::new(), None))),
+            }
         }
         O_PROP_NAMES => {
             let o = args.first().cloned().unwrap_or(Val::Undefined);
@@ -1821,7 +1844,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
     match idx {
         OP_TOSTRING => Ok(Val::Str(Rc::from(match this {
             Val::Obj(o) => match &o.borrow().kind {
-                ObjKind::Plain(_) => "[object Object]",
+                ObjKind::Plain(..) => "[object Object]",
                 ObjKind::Boxed(v) => match v {
                     Val::Str(_) => "[object String]",
                     Val::Num(_) => "[object Number]",
@@ -2034,7 +2057,7 @@ fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
             .map(|(_, v)| v.clone())
     })?;
     let hidden = match &b.kind {
-        ObjKind::Plain(Some(h)) => h.iter().any(|x| x.as_ref() == key),
+        ObjKind::Plain(Some(h), _) => h.iter().any(|x| x.as_ref() == key),
         _ => false,
     };
     Some(desc_with_enumerable(v, !hidden))
@@ -3448,7 +3471,7 @@ const P_VALUES: u16 = 11;
 
 /// A fresh plain object pointing at `proto`.
 fn proto_instance(proto: Option<Rc<RefCell<Obj>>>) -> Val {
-    Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), proto))
+    Val::Obj(new_obj(ObjKind::Plain(None, false), Vec::new(), proto))
 }
 
 /// The serialized query of a URLSearchParams value.

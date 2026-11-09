@@ -1010,7 +1010,7 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
         Val::Obj(o) => {
             let b = o.borrow();
             let hidden = match &b.kind {
-                ObjKind::Plain(Some(h)) => Some(h.as_slice()),
+                ObjKind::Plain(Some(h), _) => Some(h.as_slice()),
                 _ => None,
             };
             let visible = |k: &Rc<str>| !hidden.is_some_and(|h| h.iter().any(|x| x == k));
@@ -1770,6 +1770,34 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                         let val = eval_expr(e, env, v)?;
                         obj_set_own(&orc, k, val);
                     }
+                    // `__proto__: v` (colon form only) sets the prototype of
+                    // the literal; a non-object value is ignored, and it never
+                    // runs an inherited `__proto__` setter
+                    ObjElem::Proto(v) => {
+                        let val = eval_expr(e, env, v)?;
+                        let mut b = orc.borrow_mut();
+                        match val {
+                            Val::Obj(p) => {
+                                // a symbol is a primitive; it stands in as a
+                                // plain object with a hidden `__symbol`, and
+                                // never sets a prototype
+                                if !p.borrow().props.iter().any(|(k, _)| &**k == "__symbol") {
+                                    b.proto = Some(p);
+                                    if let ObjKind::Plain(h, _) = &b.kind {
+                                        b.kind = ObjKind::Plain(h.clone(), false);
+                                    }
+                                }
+                            }
+                            Val::Null => {
+                                b.proto = None;
+                                if let ObjKind::Plain(h, _) = &b.kind {
+                                    b.kind = ObjKind::Plain(h.clone(), true);
+                                }
+                            }
+                            // any other value is ignored
+                            _ => {}
+                        }
+                    }
                     // unreachable: a surviving cover form is a parse error, so
                     // an object literal in value position never carries one
                     ObjElem::CoverInit(k, v) => {
@@ -2055,7 +2083,7 @@ pub(crate) fn construct(e: &mut JsEngine, f: Val, argvals: Vec<Val>) -> Result<V
     let fresh = match &f {
         Val::Func(c) => {
             let proto = ensure_prototype(c);
-            Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), Some(proto)))
+            Val::Obj(new_obj(ObjKind::Plain(None, false), Vec::new(), Some(proto)))
         }
         _ => Val::new_object(),
     };
@@ -2085,7 +2113,7 @@ pub(crate) fn ensure_prototype(c: &Rc<Closure>) -> Rc<RefCell<Obj>> {
         }
     }
     let proto = new_obj(
-        ObjKind::Plain(None),
+        ObjKind::Plain(None, false),
         vec![(Rc::from("constructor"), Val::Func(c.clone()))],
         None,
     );

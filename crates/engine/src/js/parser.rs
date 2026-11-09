@@ -234,8 +234,11 @@ pub enum ObjElem {
     /// rejects a surviving CoverInit in value position. `expr_to_pat` turns it
     /// into a `Prop` with a default.
     CoverInit(Rc<str>, Expr),
+    /// `__proto__: expr` in the colon form sets the prototype instead of
+    /// creating an own property (computed/shorthand/method forms do not).
+    Proto(Expr),
     /// `...expr`; the flag marks a trailing comma after the spread
-    /// (`{...a,}`) — legal in an object literal, an early error in a pattern.
+    /// (`{...a,}`) - legal in an object literal, an early error in a pattern.
     Spread(Expr, bool),
     /// `[expr]: v` � key evaluated at object-creation time
     Computed { key: Expr, value: Expr },
@@ -2276,6 +2279,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         if expr_has_cover_init(&e) {
             return self.err("`{x = default}` is only valid in a destructuring pattern");
         }
+        if expr_has_dup_proto(&e) {
+            return self.err("duplicate `__proto__` in an object literal");
+        }
         let init = Some(Box::new(Stmt {
             kind: StmtKind::Expr(Box::new(e)),
             span: self.span_from(self.pos),
@@ -3142,6 +3148,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         // (its literal stayed an expression) is a SyntaxError
         if self.cover_depth == 0 && expr_has_cover_init(&e) {
             return self.err("`{x = default}` is only valid in a destructuring pattern");
+        }
+        // likewise `{__proto__: a, __proto__: b}` outside a pattern
+        if self.cover_depth == 0 && expr_has_dup_proto(&e) {
+            return self.err("duplicate `__proto__` in an object literal");
         }
         Ok(e)
     }
@@ -4585,7 +4595,16 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         self.cover_depth += 1;
                         let v = self.assign_expr();
                         self.cover_depth -= 1;
-                        props.push(ObjElem::Prop(key, v?));
+                        let v = v?;
+                        // `__proto__: v` (the colon form only) sets the
+                        // prototype rather than creating an own property; a
+                        // duplicate is an early error, but only when this
+                        // literal stays an expression (see `assign_expr`)
+                        if &*key == "__proto__" {
+                            props.push(ObjElem::Proto(v));
+                        } else {
+                            props.push(ObjElem::Prop(key, v));
+                        }
                     } else if *self.peek() == Tok::Op(Op::Assign) {
                         // `{x = default}` — CoverInitializedName. Only a valid
                         // pattern element; the assign_expr guard rejects it if
@@ -4649,28 +4668,48 @@ enum ForHead {
 /// pattern position. Functions/classes are opaque (their bodies were parsed
 /// and checked separately), so the fallback is `false`.
 fn expr_has_cover_init(e: &Expr) -> bool {
+    expr_scan_objects(e, &|props| {
+        props.iter().any(|p| matches!(p, ObjElem::CoverInit(..)))
+    })
+}
+
+/// A literal that defines its prototype twice is an early error - but only in
+/// expression position: in a destructuring pattern the two keys are ordinary
+/// properties (`({__proto__: a, __proto__: b} = o)` is legal).
+fn expr_has_dup_proto(e: &Expr) -> bool {
+    expr_scan_objects(e, &|props| {
+        props.iter().filter(|p| matches!(p, ObjElem::Proto(..))).count() > 1
+    })
+}
+
+/// Visit every object literal in an expression tree; nested function and
+/// class bodies are opaque (they were parsed and validated on their own).
+fn expr_scan_objects(e: &Expr, hit: &dyn Fn(&[ObjElem]) -> bool) -> bool {
     match &e.kind {
-        ExprKind::Object(props) => props.iter().any(|p| match p {
-            ObjElem::CoverInit(..) => true,
-            ObjElem::Prop(_, v) | ObjElem::Spread(v, _) => expr_has_cover_init(v),
-            ObjElem::Computed { key, value } => {
-                expr_has_cover_init(key) || expr_has_cover_init(value)
-            }
-            ObjElem::ComputedAccessor { key, .. } => expr_has_cover_init(key),
-            ObjElem::Accessor { .. } => false,
-        }),
+        ExprKind::Object(props) => {
+            hit(props)
+                || props.iter().any(|p| match p {
+                    ObjElem::Prop(_, v)
+                    | ObjElem::Proto(v)
+                    | ObjElem::CoverInit(_, v)
+                    | ObjElem::Spread(v, _) => expr_scan_objects(v, hit),
+                    ObjElem::Computed { key, value } => {
+                        expr_scan_objects(key, hit) || expr_scan_objects(value, hit)
+                    }
+                    ObjElem::ComputedAccessor { key, .. } => expr_scan_objects(key, hit),
+                    ObjElem::Accessor { .. } => false,
+                })
+        }
         ExprKind::Array(items) => items.iter().any(|i| match i {
-            ArrayElem::Item(x) | ArrayElem::Spread(x, _) => expr_has_cover_init(x),
+            ArrayElem::Item(x) | ArrayElem::Spread(x, _) => expr_scan_objects(x, hit),
             ArrayElem::Hole => false,
         }),
-        ExprKind::Assign { target, value, .. } => {
-            expr_has_cover_init(target) || expr_has_cover_init(value)
-        }
-        ExprKind::LogicalAssign { target, value, .. } => {
-            expr_has_cover_init(target) || expr_has_cover_init(value)
+        ExprKind::Assign { target, value, .. }
+        | ExprKind::LogicalAssign { target, value, .. } => {
+            expr_scan_objects(target, hit) || expr_scan_objects(value, hit)
         }
         ExprKind::Logical { l, r, .. } | ExprKind::Binary { l, r, .. } => {
-            expr_has_cover_init(l) || expr_has_cover_init(r)
+            expr_scan_objects(l, hit) || expr_scan_objects(r, hit)
         }
         ExprKind::Unary { expr, .. }
         | ExprKind::Postfix { target: expr, .. }
@@ -4679,56 +4718,60 @@ fn expr_has_cover_init(e: &Expr) -> bool {
         | ExprKind::Delete(expr)
         | ExprKind::Await(expr)
         | ExprKind::YieldStar(expr)
-        | ExprKind::PrivateIn { obj: expr, .. } => expr_has_cover_init(expr),
-        ExprKind::Yield(Some(expr)) => expr_has_cover_init(expr),
+        | ExprKind::PrivateIn { obj: expr, .. } => expr_scan_objects(expr, hit),
+        ExprKind::Yield(Some(expr)) => expr_scan_objects(expr, hit),
         ExprKind::Yield(None) => false,
         ExprKind::Cond { test, then, other } => {
-            expr_has_cover_init(test)
-                || expr_has_cover_init(then)
-                || expr_has_cover_init(other)
+            expr_scan_objects(test, hit)
+                || expr_scan_objects(then, hit)
+                || expr_scan_objects(other, hit)
         }
-        ExprKind::Seq(list) => list.iter().any(expr_has_cover_init),
+        ExprKind::Seq(list) => list.iter().any(|x| expr_scan_objects(x, hit)),
         ExprKind::Call { callee, args } | ExprKind::New { callee, args } => {
-            expr_has_cover_init(callee) || args.iter().any(arg_has_cover_init)
+            expr_scan_objects(callee, hit) || args.iter().any(|a| arg_scan_objects(a, hit))
         }
-        ExprKind::Member { base, .. } => expr_has_cover_init(base),
+        ExprKind::Member { base, .. } => expr_scan_objects(base, hit),
         ExprKind::Index { base, index } => {
-            expr_has_cover_init(base) || expr_has_cover_init(index)
+            expr_scan_objects(base, hit) || expr_scan_objects(index, hit)
         }
         ExprKind::OptionalChain { base, steps } => {
-            expr_has_cover_init(base)
+            expr_scan_objects(base, hit)
                 || steps.iter().any(|s| match s {
                     ChainStep::Member { .. } => false,
-                    ChainStep::Index { index, .. } => expr_has_cover_init(index),
-                    ChainStep::Call { args, .. } => args.iter().any(arg_has_cover_init),
-                    ChainStep::Tagged { segs } => segs.iter().any(tpl_has_cover_init),
+                    ChainStep::Index { index, .. } => expr_scan_objects(index, hit),
+                    ChainStep::Call { args, .. } => {
+                        args.iter().any(|a| arg_scan_objects(a, hit))
+                    }
+                    ChainStep::Tagged { segs } => {
+                        segs.iter().any(|s| tpl_scan_objects(s, hit))
+                    }
                 })
         }
         ExprKind::SuperCall { class, args, .. } => {
-            expr_has_cover_init(class) || args.iter().any(arg_has_cover_init)
+            expr_scan_objects(class, hit) || args.iter().any(|a| arg_scan_objects(a, hit))
         }
-        ExprKind::SuperMember { class, .. } => expr_has_cover_init(class),
-        ExprKind::Template(segs) => segs.iter().any(tpl_has_cover_init),
+        ExprKind::SuperMember { class, .. } => expr_scan_objects(class, hit),
+        ExprKind::Template(segs) => segs.iter().any(|s| tpl_scan_objects(s, hit)),
         ExprKind::TaggedTemplate { tag, segs } => {
-            expr_has_cover_init(tag) || segs.iter().any(tpl_has_cover_init)
+            expr_scan_objects(tag, hit) || segs.iter().any(|s| tpl_scan_objects(s, hit))
         }
-        ExprKind::PatAssign { value, .. } => expr_has_cover_init(value),
+        ExprKind::PatAssign { value, .. } => expr_scan_objects(value, hit),
         // a function/class body was parsed and validated on its own
         ExprKind::Func(_) | ExprKind::Arrow(_) | ExprKind::ClassExpr { .. } => false,
         _ => false,
     }
 }
 
-fn arg_has_cover_init(a: &CallArg) -> bool {
+fn arg_scan_objects(a: &CallArg, hit: &dyn Fn(&[ObjElem]) -> bool) -> bool {
     match a {
-        CallArg::Arg(e) | CallArg::Spread(e) => expr_has_cover_init(e),
+        CallArg::Arg(e) | CallArg::Spread(e) => expr_scan_objects(e, hit),
     }
 }
 
-fn tpl_has_cover_init(s: &TplSeg) -> bool {
+fn tpl_scan_objects(s: &TplSeg, hit: &dyn Fn(&[ObjElem]) -> bool) -> bool {
     match s {
         TplSeg::Lit(_) => false,
-        TplSeg::Expr(e) => expr_has_cover_init(e),
+        TplSeg::Expr(e) => expr_scan_objects(e, hit),
     }
 }
 
@@ -4802,25 +4845,16 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                                 .map_err(|_| String::from("rest target must be a simple binding"))?,
                         ));
                     }
+                    // in a pattern `__proto__: target` is an ordinary property
+                    ObjElem::Proto(v) => {
+                        let part = pattern_value_part(v)?;
+                        parts.push(ObjPatPart::Prop {
+                            key: Rc::from("__proto__"),
+                            part,
+                        });
+                    }
                     ObjElem::Prop(key, v) => {
-                        let part = match &v.kind {
-                            ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. } => {
-                                PatPart::Bind(Box::new(expr_to_pat(v)?), None)
-                            }
-                            ExprKind::Assign {
-                                target,
-                                op: None,
-                                value,
-                            } => PatPart::Bind(Box::new(expr_to_pat(target)?), Some((**value).clone())),
-                            // a nested pattern with a default, already resolved
-                            ExprKind::PatAssign { pat, value } => {
-                                PatPart::Bind(Box::new(pat.clone()), Some((**value).clone()))
-                            }
-                            ExprKind::Array(_) | ExprKind::Object(_) => {
-                                PatPart::Bind(Box::new(expr_to_pat(v)?), None)
-                            }
-                            _ => return Err("invalid destructuring binding".into()),
-                        };
+                        let part = pattern_value_part(v)?;
                         parts.push(ObjPatPart::Prop { key: key.clone(), part });
                     }
                     ObjElem::CoverInit(key, v) => {
@@ -4837,20 +4871,7 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                     }
                     ObjElem::Computed { key, value } => {
                         // `{[expr]: target}` in an assignment/loop pattern
-                        let part = match &value.kind {
-                            ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. } => {
-                                PatPart::Bind(Box::new(expr_to_pat(value)?), None)
-                            }
-                            ExprKind::Assign {
-                                target,
-                                op: None,
-                                value: v,
-                            } => PatPart::Bind(Box::new(expr_to_pat(target)?), Some((**v).clone())),
-                            ExprKind::Array(_) | ExprKind::Object(_) => {
-                                PatPart::Bind(Box::new(expr_to_pat(value)?), None)
-                            }
-                            _ => return Err("invalid destructuring binding".into()),
-                        };
+                        let part = pattern_value_part(value)?;
                         parts.push(ObjPatPart::ComputedProp {
                             key: key.clone(),
                             part,
@@ -4865,6 +4886,29 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
         }
         _ => Err("not a destructuring pattern".into()),
     }
+}
+
+/// One object/array pattern element value: a target, `target = default`, or a
+/// nested pattern (with or without a default).
+fn pattern_value_part(v: &Expr) -> Result<PatPart, String> {
+    Ok(match &v.kind {
+        ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. } => {
+            PatPart::Bind(Box::new(expr_to_pat(v)?), None)
+        }
+        ExprKind::Assign {
+            target,
+            op: None,
+            value,
+        } => PatPart::Bind(Box::new(expr_to_pat(target)?), Some((**value).clone())),
+        // a nested pattern with a default, already resolved by the parser
+        ExprKind::PatAssign { pat, value } => {
+            PatPart::Bind(Box::new(pat.clone()), Some((**value).clone()))
+        }
+        ExprKind::Array(_) | ExprKind::Object(_) => {
+            PatPart::Bind(Box::new(expr_to_pat(v)?), None)
+        }
+        _ => return Err("invalid destructuring binding".into()),
+    })
 }
 
 fn check_assign_target(e: &Expr) -> Result<(), JsError> {
@@ -5017,6 +5061,7 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
         }),
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => expr_uses(v, k),
+            ObjElem::Proto(v) => expr_uses(v, k),
             ObjElem::CoverInit(_, v) => expr_uses(v, k),
             ObjElem::Spread(v, _) => expr_uses(v, k),
             ObjElem::Computed { key, value } => expr_uses(key, k) || expr_uses(value, k),
@@ -6066,7 +6111,7 @@ impl YieldLift {
 
     fn object(&mut self, props: Vec<ObjElem>, pre: &mut Vec<Stmt>) -> Vec<ObjElem> {
         let suspends = |p: &ObjElem| match p {
-            ObjElem::Prop(_, v) | ObjElem::Spread(v, _) => expr_uses(v, SusKind::Yield),
+            ObjElem::Prop(_, v) | ObjElem::Proto(v) | ObjElem::Spread(v, _) => expr_uses(v, SusKind::Yield),
             ObjElem::CoverInit(_, v) => expr_uses(v, SusKind::Yield),
             ObjElem::Computed { key, value } => {
                 expr_uses(key, SusKind::Yield) || expr_uses(value, SusKind::Yield)
@@ -6101,6 +6146,16 @@ impl YieldLift {
                         v
                     };
                     ObjElem::CoverInit(key, v)
+                }
+                ObjElem::Proto(v) => {
+                    let span = v.span;
+                    let v = self.expr(v, pre);
+                    let v = if i < last && !is_lift_temp(&v) {
+                        self.bind(v, pre, span)
+                    } else {
+                        v
+                    };
+                    ObjElem::Proto(v)
                 }
                 ObjElem::Spread(v, trailing) => {
                     let span = v.span;
@@ -6333,6 +6388,7 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         }),
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => scan_expr_arguments(v),
+        ObjElem::Proto(v) => scan_expr_arguments(v),
             ObjElem::CoverInit(_, v) => scan_expr_arguments(v),
             ObjElem::Spread(v, _) => scan_expr_arguments(v),
             ObjElem::Computed { key, value } => {

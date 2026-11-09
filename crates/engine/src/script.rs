@@ -1415,7 +1415,7 @@ fn proto_instance(proto: Val) -> Val {
         _ => None,
     };
     Val::Obj(Rc::new(RefCell::new(js::Obj {
-        kind: js::ObjKind::Plain(None),
+        kind: js::ObjKind::Plain(None, false),
         props: Vec::new(),
         proto,
     })))
@@ -1486,7 +1486,7 @@ fn install_event_types(e: &mut JsEngine, ids: Nids) {
     e.set_global("Event", Val::Native(ids.ev_ctor));
 
     let cev_proto = Val::Obj(Rc::new(RefCell::new(js::Obj {
-        kind: js::ObjKind::Plain(None),
+        kind: js::ObjKind::Plain(None, false),
         props: Vec::new(),
         proto: match &ev_proto {
             Val::Obj(o) => Some(o.clone()),

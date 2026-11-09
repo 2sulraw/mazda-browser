@@ -181,8 +181,11 @@ pub struct ErrorData {
 pub enum ObjKind {
     /// `Some` carries own keys that are non-enumerable (class methods and
     /// accessors, the implicit `constructor` back-reference). Kept inside
-    /// the existing variant so `Obj` itself does not grow.
-    Plain(Option<Box<Vec<Rc<str>>>>),
+    /// the existing variant so `Obj` itself does not grow. The flag marks an
+    /// explicitly null [[Prototype]] (`Object.create(null)`,
+    /// `{__proto__: null}`); `Obj.proto == None` alone cannot say so, because
+    /// `None` also means "the default prototype attaches lazily on access".
+    Plain(Option<Box<Vec<Rc<str>>>>, bool),
     /// boxed primitive: `new String("x")`, `new Number(1)`, `new Boolean(true)`
     /// (and `Object(prim)`). `Val::to_string`/`to_number` unwrap it, and
     /// String boxes answer `length`/index reads. Methods live on the ordinary
@@ -699,7 +702,7 @@ impl Val {
     }
 
     pub fn new_object() -> Val {
-        Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), None))
+        Val::Obj(new_obj(ObjKind::Plain(None, false), Vec::new(), None))
     }
 
     pub fn new_array(items: Vec<Val>) -> Val {
@@ -803,7 +806,7 @@ impl Val {
                     ObjKind::Iterator(_) => "[object Iterator]".into(),
                     ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
                     ObjKind::TypedArray(ta) => typed_join(ta),
-                    ObjKind::Plain(_) => {
+                    ObjKind::Plain(..) => {
                         // symbols are unique objects with a hidden
                         // `__symbol` description (see builtins)
                         match b.props.iter().find(|(k, _)| &**k == "__symbol") {
@@ -854,7 +857,7 @@ impl Val {
                         Some(Ok(_)) => "Promise { <fulfilled> }".into(),
                         Some(Err(_)) => "Promise { <rejected> }".into(),
                     },
-                    ObjKind::Plain(_) => {
+                    ObjKind::Plain(..) => {
                         // symbols are unique objects with a hidden
                         // `__symbol` description (see builtins)
                         if let Some((_, Val::Str(desc))) =
@@ -1731,7 +1734,7 @@ impl Drop for JsEngine {
         if let Ok(mut o) = self.global_obj.try_borrow_mut() {
             o.props.clear();
             o.proto = None;
-            o.kind = ObjKind::Plain(None);
+            o.kind = ObjKind::Plain(None, false);
         }
         self.native_props.clear();
         self.timers.clear();
@@ -1826,7 +1829,7 @@ impl JsEngine {
         // table so a long session keeps interning the CURRENT page's keys
         clear_key_intern();
         let page = page_start();
-        let global_obj = new_obj(ObjKind::Plain(None), Vec::new(), None);
+        let global_obj = new_obj(ObjKind::Plain(None, false), Vec::new(), None);
         // global code's `this` is the global object (sloppy mode)
         let global_env = Env::with_page(page, Some(Val::Obj(global_obj.clone())));
         let mut e = JsEngine {
@@ -2340,6 +2343,11 @@ impl JsEngine {
     /// `u.next` off a `null` iterator prototype and threw).
     pub(crate) fn proto_of(&self, o: &Rc<RefCell<Obj>>) -> Option<Rc<RefCell<Obj>>> {
         let b = o.borrow();
+        // an explicitly null [[Prototype]] must not fall through to the lazy
+        // default below
+        if matches!(b.kind, ObjKind::Plain(_, true)) {
+            return None;
+        }
         if let Some(p) = &b.proto {
             return Some(p.clone());
         }
@@ -3240,7 +3248,7 @@ pub(crate) fn obj_of(v: &Val) -> Rc<RefCell<Obj>> {
 /// `for-in`, `Object.keys`) consult this list.
 pub(crate) fn obj_hide(o: &Rc<RefCell<Obj>>, key: &Rc<str>) {
     let mut b = o.borrow_mut();
-    let ObjKind::Plain(slot) = &mut b.kind else {
+    let ObjKind::Plain(slot, _) = &mut b.kind else {
         return;
     };
     let list = slot.get_or_insert_with(|| Box::new(Vec::new()));
@@ -3546,7 +3554,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             // receiver, and a miss still takes the full path.
             {
                 let b = o.borrow();
-                if matches!(b.kind, ObjKind::Plain(_)) {
+                if matches!(b.kind, ObjKind::Plain(..)) {
                     if let Some((_, v)) = b.props.iter().find(|(k, _)| k.as_ref() == key) {
                         if !matches!(v, Val::Acc(_)) {
                             return Ok(v.clone());
@@ -3988,7 +3996,7 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
             // the prototype for setters and handles array exotics.
             {
                 let mut b = o.borrow_mut();
-                if matches!(b.kind, ObjKind::Plain(_)) {
+                if matches!(b.kind, ObjKind::Plain(..)) {
                     if let Some((_, slot)) = b.props.iter_mut().find(|(k, _)| k.as_ref() == key) {
                         if !matches!(&*slot, Val::Acc(_)) {
                             *slot = v;

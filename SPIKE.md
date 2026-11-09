@@ -2503,3 +2503,31 @@ arrow/parameter handling and the strict `"use strict"` prologue are unchanged
   `expressions/object` 121 -> **114**, `statements/class` 493 -> **492**,
   `expressions/class` 324 -> **323**. No directory regressed.
 - engine tests **959** green (new sloppy-`yield` test).
+
+## Object literal `__proto__` sets the prototype (P7, 2026-11-10)
+
+`{__proto__: v}` is not an ordinary property: the colon form with a StringValue
+of `__proto__` performs `SetPrototypeOf` on the new object (only when `v` is an
+object or null) and creates no own property, and it must not run an inherited
+`__proto__` setter. Only the colon form counts — shorthand `{__proto__}`,
+computed `{['__proto__']: v}` and a method named `__proto__` are ordinary
+properties. Two colon-form entries in one literal are an early error, but only
+while the literal stays an expression: in a destructuring pattern the keys are
+plain properties (`({__proto__: a, __proto__: b} = o)` is legal), so the check
+runs after the cover grammar resolves, reusing the walker that rejects a
+surviving `{x = default}`.
+
+Null prototypes had no representation: `Obj.proto == None` also means "the
+default prototype attaches lazily on first access", so `Object.create(null)` and
+`{__proto__: null}` still reported `Object.prototype`. The flag rides in the
+existing `ObjKind::Plain` payload, so `Obj` stays 64 bytes (the allocation test
+caught the first attempt, which grew it to 72).
+
+### Measured
+
+- test262 language subset: 14,994 -> **15,000** pass (84.9% of 17,678 run,
+  6,154 skipped).
+- `expressions/object` 114 -> **108** (all six `__proto__-*` cases including the
+  poisoned-`Object.prototype` one). No directory regressed.
+- engine tests **960** green (new literal-prototype test, incl. `create(null)`
+  and `setPrototypeOf(o, null)`).
