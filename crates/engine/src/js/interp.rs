@@ -11,8 +11,8 @@
 
 use super::gen;
 use super::parser::{
-    ArrayElem, BinOp, BindTgt, CallArg, Declarator, Expr, ExprKind, FnBody, FnDef, ForTarget,
-    LogOp, ObjElem, ObjPatPart, Pat, PatPart, Stmt, StmtKind, TplSeg, UnaryOp, VarKind,
+    ArrayElem, BinOp, BindTgt, CallArg, ClassKey, Declarator, Expr, ExprKind, FnBody, FnDef,
+    ForTarget, LogOp, ObjElem, ObjPatPart, Pat, PatPart, Stmt, StmtKind, TplSeg, UnaryOp, VarKind,
 };
 use super::regex;
 use super::*;
@@ -542,6 +542,13 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
             setter,
         } => {
             let o = eval_expr(e, env, owner)?;
+            let key = match &**key {
+                ClassKey::Name(k) => k.clone(),
+                // computed accessor key: ToPropertyKey, which this engine
+                // models with `to_string` (symbols stringify to their stand-in
+                // name, matching SYMBOL_ITERATOR).
+                ClassKey::Computed(x) => Rc::from(eval_expr(e, env, x)?.to_string().as_str()),
+            };
             let getter_v = getter
                 .as_ref()
                 .map(|f| make_val_closure(e, env, f, false));
@@ -553,7 +560,7 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
                 setter: setter_v,
             }));
             match &o {
-                Val::Obj(ob) => obj_set_own(ob, key, acc),
+                Val::Obj(ob) => obj_set_own(ob, &key, acc),
                 // static accessor: installed on the class function object
                 Val::Func(c) => c.props.borrow_mut().push((key.clone(), acc)),
                 _ => {

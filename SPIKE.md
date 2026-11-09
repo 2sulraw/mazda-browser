@@ -1290,5 +1290,71 @@ $env:MAZDA_TIME="1"
 Remove-Item Env:MAZDA_TIME
 ```
 
+## Parser coverage from the reference sites (2026-11-09)
 
+P5's page-level measurement located the next bottleneck: the reference bundles
+abort at parse before the call/property code the interpreter optimizations
+target can run. Two parser gaps are closed; both are parser-only changes, and
+the runtime paths are untouched.
 
+### Unicode escapes in identifiers
+
+Bundles write property names with `\u` escapes: YouTube's main chunk contains
+`v.id.\u0275prov` (Angular's `ɵ` prefix) and GitHub's `pb` bundle has the same
+shape. The lexer accepted raw non-ASCII identifier bytes but not escapes, so
+both bundles died with ``unexpected character `\` in source``.
+
+`read_ident` now decodes `\uXXXX` and `\u{...}` at identifier start and
+continuation positions. A name that used an escape is deliberately not matched
+against the keyword table: per the spec, a reserved word cannot be written as
+an escape, so `\u0069f` is an identifier named `if`, not the statement keyword.
+Invalid or lone-surrogate escapes are a syntax error, not a panic.
+
+test262: **6,950 -> 7,003** (+53 pass, same run/skip counts).
+
+### Computed class accessors
+
+`class C { get[Symbol.toStringTag]() { ... } }` was read as a field named
+`get`, then rejected with ``expected `;` after class field``. Accessor
+detection now scans a computed key to its matching `]` and requires `(` after
+it; `ClassItem::Accessor` and `StmtKind::DefineAcc` carry a `ClassKey`
+(name or computed expression, boxed to keep `Stmt` at 72 bytes). Computed keys
+are evaluated at class-definition time. Duplicate computed accessors are not
+detected statically (the spec throws at definition); ours installs in order,
+so the last definition wins.
+
+test262: **7,003 -> 7,073** (+70 pass).
+
+### Progress against the live bundles
+
+Same pages, same host, error line/column from the renderer:
+
+| bundle | before | after |
+|---|---|---|
+| GitHub `pb-2530...js` | line 136, ``\`` in source | line 214, `yield` form (365 lines) |
+| GitHub `core-1244...js` | line 27, `yield` form | unchanged |
+| YouTube main chunk | line 1323, ``\`` in source | line 1290, `yield` in `try` (32,041 lines) |
+| Google `xjs` | line 946, `yield` in `try` | unchanged |
+
+Exec time on a single run each rose (Google 167 ms, YouTube 351 ms, GitHub
+328 ms) because more source now parses and runs; those are not regressions and
+not comparable to the paired P5 numbers.
+
+### Remaining blocker: generator resumption
+
+Every remaining site error is the same feature: `yield` used as an expression
+and/or inside `try`/`finally`.
+
+```text
+GitHub core:    ... && (yield [a, b])          line 27
+GitHub pb:      "part" === n.type && (yield new h(...))
+YouTube:        v in k || w(yield b(v))        inside try { } finally { }
+Google xjs:     e(yield d(b.get()))            inside try { } finally { }
+```
+
+The generator VM (`gen.rs`) resumes at statement boundaries only, and its
+parser validation rejects yields in other positions. Supporting these shapes
+means either lowering yield-containing expressions to statement-level
+temporaries (plus a `try` frame in the VM) or moving generator bodies onto a
+bytecode state machine. That is the next scoped step; it is not another
+interpreter micro-optimization.

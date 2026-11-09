@@ -10,9 +10,10 @@
 //!   state, so pathological spacing like `var r = {a:1} /2` (object literal
 //!   then division) would mislex as a regex — such shapes are vanishingly
 //!   rare in real code and produce a regex-parse error, not silent misbehavior.
-//! - identifiers are ASCII-only (`A-Za-z_$` + digits). Non-ASCII bytes outside
-//!   strings/comments/templates are a syntax error. Unicode identifiers are a
-//!   later wave.
+//! - identifiers are `A-Za-z_$` + digits plus any non-ASCII byte (UTF-8 is
+//!   consumed whole), with `\uXXXX` / `\u{...}` escapes decoded. This is
+//!   deliberately looser than Unicode ID_Start/ID_Continue (symbols pass too);
+//!   it keeps real bundles lexing without a Unicode tables dependency.
 //! - keywords are strict (no contextual keywords): `let`/`of`/`in` etc. can
 //!   never be used as identifiers.
 //! - BigInt literals (`123n`) are a syntax error, not silently misparsed.
@@ -274,6 +275,21 @@ fn is_ident_char(b: u8) -> bool {
     is_ident_start(b) || b.is_ascii_digit()
 }
 
+/// Identifier code points that arrive through a `\u` escape. Mirrors the byte
+/// rule above: ASCII letters/`_`/`$` at the start, digits after, and any
+/// non-ASCII non-space (the spec is stricter — ID_Start/ID_Continue — but the
+/// loose rule costs nothing here and needs no Unicode tables).
+fn is_ident_start_char(c: char) -> bool {
+    c.is_ascii_alphabetic()
+        || c == '_'
+        || c == '$'
+        || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+}
+
+fn is_ident_char_char(c: char) -> bool {
+    is_ident_start_char(c) || c.is_ascii_digit()
+}
+
 impl<'a> Lexer<'a> {
     fn err<T>(&self, msg: &str, offset: usize) -> Result<T, LexError> {
         Err(LexError {
@@ -347,15 +363,11 @@ impl<'a> Lexer<'a> {
             Some(b) => b,
         };
         let tok = if is_ident_start(b) {
-            self.pos += 1;
-            while matches!(self.peek(), Some(c) if is_ident_char(c)) {
-                self.pos += 1;
-            }
-            let s = &self.src[start..self.pos];
-            match kw_of(s) {
-                Some(k) => Tok::Kw(k),
-                None => Tok::Ident(Rc::from(s)),
-            }
+            self.read_ident()?
+        } else if b == b'\\' && self.peek2() == Some(b'u') {
+            // `\uXXXX` / `\u{...}` at an identifier position: bundles write
+            // property names like `v.id.\u0275prov` (Angular's ɵ prefix)
+            self.read_ident()?
         } else if b.is_ascii_digit() {
             self.read_number(start)?
         } else if b == b'.' && matches!(self.peek2(), Some(c) if c.is_ascii_digit()) {
@@ -382,6 +394,73 @@ impl<'a> Lexer<'a> {
             end: end as u32,
             nl,
         })
+    }
+
+    /// Read an identifier, decoding `\uXXXX` / `\u{...}` escapes. A name that
+    /// used an escape is never a keyword: reserved words match on literal
+    /// source characters, so `\u0069f` is an identifier, not `if`.
+    fn read_ident(&mut self) -> Result<Tok, LexError> {
+        let mut name = String::new();
+        let mut escaped = false;
+        let mut first = true;
+        loop {
+            let b = match self.peek() {
+                Some(b) => b,
+                None => break,
+            };
+            if b == b'\\' {
+                if self.peek2() != Some(b'u') {
+                    break;
+                }
+                let (c, n) = self.ident_escape(self.pos).ok_or_else(|| LexError {
+                    msg: "bad identifier escape".into(),
+                    offset: self.pos as u32,
+                })?;
+                let ok = if first {
+                    is_ident_start_char(c)
+                } else {
+                    is_ident_char_char(c)
+                };
+                if !ok {
+                    return self.err("invalid identifier escape", self.pos);
+                }
+                name.push(c);
+                escaped = true;
+                self.pos += n;
+            } else if if first { is_ident_start(b) } else { is_ident_char(b) } {
+                // copy one whole char: the byte rule accepts any byte >= 0x80,
+                // so a UTF-8 identifier must advance by its full width
+                let n = (1..=4)
+                    .find(|n| self.src.is_char_boundary(self.pos + n))
+                    .unwrap_or(1);
+                name.push_str(&self.src[self.pos..self.pos + n]);
+                self.pos += n;
+            } else {
+                break;
+            }
+            first = false;
+        }
+        if !escaped {
+            if let Some(k) = kw_of(&name) {
+                return Ok(Tok::Kw(k));
+            }
+        }
+        Ok(Tok::Ident(Rc::from(name.as_str())))
+    }
+
+    /// Decode a `\uXXXX` or `\u{...}` escape at `at`; returns the code point
+    /// and the number of source bytes it occupies.
+    fn ident_escape(&self, at: usize) -> Option<(char, usize)> {
+        let rest = self.src.get(at + 2..)?;
+        if let Some(body) = rest.strip_prefix('{') {
+            let close = body.find('}')?;
+            let v = u32::from_str_radix(&body[..close], 16).ok()?;
+            Some((char::from_u32(v)?, 4 + close))
+        } else {
+            let h = rest.get(..4)?;
+            let v = u16::from_str_radix(h, 16).ok()?;
+            Some((char::from_u32(v as u32)?, 6))
+        }
     }
 
     fn read_number(&mut self, start: usize) -> Result<Tok, LexError> {

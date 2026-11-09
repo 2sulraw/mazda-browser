@@ -1437,6 +1437,22 @@ fn template_literals() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn unicode_identifier_escapes() {
+    // property names like Angular's `ɵ` prefix are written as escapes
+    assert_eq!(
+        num(r"var o = {}; o.\u0275prov = 7; o.\u0275prov"),
+        7.0
+    );
+    assert_eq!(num(r"var \u0061bc = 3; abc"), 3.0);
+    // an escaped keyword is an identifier, not the keyword
+    assert_eq!(string(r"var \u0069f = 1; typeof \u0069f"), "number");
+    // `\u{...}` form, including a char outside the BMP
+    assert_eq!(num(r"var \u{1d49c} = 4; \u{1d49c}"), 4.0);
+    // a bad escape is a syntax error, not a panic
+    assert!(matches!(err(r"var o = {}; o.\u12"), JsError::Syntax { .. }));
+}
+
+#[test]
 fn template_line_continuation_and_unicode_escapes() {
     // `\` + U+2028/U+2029 is a line continuation. The lexer used to advance
     // one byte into the three-byte terminator and panic while slicing.
@@ -2081,6 +2097,29 @@ fn class_accessors() {
             "class T { constructor() { this.n = 0 } get d() { return this.n + 1 } set d(v) { this.n = v * 2 } } const t = new T(); t.d = 4; t.d"
         ),
         9.0
+    );
+}
+
+#[test]
+fn computed_class_accessors() {
+    // `get [expr]()` / `set [expr]()` and the static form
+    assert_eq!(
+        num("var k = 'v'; class C { get [k]() { return 7 } } new C().v"),
+        7.0
+    );
+    assert_eq!(
+        num("var k = 'v'; class C { set [k](x) { this._x = x } } var c = new C(); c.v = 3; c._x"),
+        3.0
+    );
+    assert_eq!(
+        num("var k = 's'; class C { static get [k]() { return 5 } } C.s"),
+        5.0
+    );
+    // duplicate computed accessors are not detected statically (the spec
+    // throws at class definition); ours installs in order, so the last wins
+    assert_eq!(
+        num("var k = 'v'; class C { get [k]() { return 1 } get [k]() { return 2 } } new C().v"),
+        2.0
     );
 }
 

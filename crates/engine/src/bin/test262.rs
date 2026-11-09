@@ -328,8 +328,12 @@ fn run() -> ExitCode {
         }
         // A panic is an engine bug, but it must not end the measurement: one
         // bad file is one failure, the rest still run.
+        let t0 = Instant::now();
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_one(path, &harness)));
+        if std::env::var_os("MAZDA_TEST262_SLOW").is_some() && t0.elapsed().as_millis() >= 50 {
+            eprintln!("slow {:>6} ms {}", t0.elapsed().as_millis(), rel.display());
+        }
         match outcome {
             Ok(Err(e)) => {
                 stats.failures.push((rel.to_path_buf(), e));

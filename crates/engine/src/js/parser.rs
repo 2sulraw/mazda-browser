@@ -404,7 +404,8 @@ pub enum StmtKind {
     /// (`Object`-style, no full property-descriptor model — shortcut)
     DefineAcc {
         owner: Box<Expr>,
-        key: Rc<str>,
+        /// boxed: `Stmt` is kept compact, and accessor definitions are rare
+        key: Box<ClassKey>,
         getter: Option<Rc<FnDef>>,
         setter: Option<Rc<FnDef>>,
     },
@@ -543,7 +544,7 @@ pub type Program = Vec<Stmt>;
 /// members keep their own relative order).
 /// A class member name: a literal key or `[expr]`.
 #[derive(Clone, Debug)]
-enum ClassKey {
+pub(crate) enum ClassKey {
     Name(Rc<str>),
     Computed(Expr),
 }
@@ -551,7 +552,7 @@ enum ClassKey {
 #[derive(Clone, Debug)]
 enum ClassItem {
     Method(ClassKey, Rc<FnDef>),
-    Accessor(Rc<str>, Option<Rc<FnDef>>, Option<Rc<FnDef>>),
+    Accessor(ClassKey, Option<Rc<FnDef>>, Option<Rc<FnDef>>),
     /// field: `Class.name = init` (static) / `this.name = init` (instance)
     Field(ClassKey, Option<Expr>),
 }
@@ -2045,7 +2046,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             } else {
                                 proto_of(&name)
                             }),
-                            key,
+                            key: Box::new(key),
                             getter,
                             setter,
                         },
@@ -2071,6 +2072,46 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         out.extend(lower(instance, false));
         out.extend(lower(statics, true));
         Ok(out)
+    }
+
+    /// `get [expr]()`: scan to the matching `]` (tokens are already flat here,
+    /// so nested brackets inside the expression still count) and require `(`
+    /// after it. Without this, `get [Symbol.toStringTag]()` reads as a field
+    /// named `get` and then fails on the bracket.
+    fn computed_accessor_ahead(&self) -> bool {
+        let mut depth = 1usize;
+        let mut i = self.pos + 2; // after `get`/`set` and `[`
+        while let Some(t) = self.toks.get(i) {
+            match &t.tok {
+                Tok::Punct(Punct::LBrack) => depth += 1,
+                Tok::Punct(Punct::RBrack) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self
+                            .toks
+                            .get(i + 1)
+                            .map_or(false, |t| matches!(&t.tok, Tok::Punct(Punct::LParen)));
+                    }
+                }
+                Tok::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Class member name: `[expr]` or a literal/property name.
+    fn class_member_key(&mut self) -> Result<ClassKey, JsError> {
+        if *self.peek() == Tok::Punct(Punct::LBrack) {
+            // computed member name: `[Symbol.iterator]() {}`
+            self.next();
+            let e = self.expr()?;
+            self.expect_punct(Punct::RBrack)?;
+            Ok(ClassKey::Computed(e))
+        } else {
+            Ok(ClassKey::Name(self.prop_name()?))
+        }
     }
 
     /// Parse the inside of a class body. Callers have pushed the class
@@ -2129,24 +2170,30 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 is_gen = true;
             }
             // accessor: `get X(...)` / `set X(...)` (a method NAMED get/set
-            // has `(` directly after the name)
+            // has `(` directly after the name). Also `get [expr]()`, which is
+            // how bundles install `Symbol.toStringTag` getters.
             let is_acc = matches!(
                 self.peek(),
                 Tok::Ident(s) if s.as_ref() == "get" || s.as_ref() == "set"
-            ) && matches!(
+            ) && (matches!(
                 self.peek_at(1),
                 Tok::Ident(_) | Tok::Kw(_) | Tok::Str(_) | Tok::Num(_)
-            ) && *self.peek_at(2) == Tok::Punct(Punct::LParen);
+            ) && *self.peek_at(2) == Tok::Punct(Punct::LParen)
+                || *self.peek_at(1) == Tok::Punct(Punct::LBrack)
+                    && self.computed_accessor_ahead());
             if is_acc {
                 let getset = self.expect_ident()?;
-                let key = self.prop_name()?;
+                let key = self.class_member_key()?;
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let body = self.block_body()?;
                 let uses_arguments = scan_uses_arguments_stmts(&body);
                 let f = Rc::new(FnDef {
                     src: self.src_id,
-                    name: key.clone(),
+                    name: match &key {
+                        ClassKey::Name(k) => k.clone(),
+                        ClassKey::Computed(_) => Rc::from(""),
+                    },
                     params,
                     body: FnBody::Block(body),
                     uses_arguments,
@@ -2158,20 +2205,24 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 let mut found = false;
                 for it in list.iter_mut() {
                     if let ClassItem::Accessor(k, g, s) = it {
-                        if *k == key {
-                            if getset.as_ref() == "get" {
-                                if g.is_some() {
-                                    return self.err("duplicate accessor getter");
+                        // computed keys cannot be compared statically; they
+                        // always get their own slot (first one wins at install)
+                        if let (ClassKey::Name(a), ClassKey::Name(b)) = (&*k, &key) {
+                            if a == b {
+                                if getset.as_ref() == "get" {
+                                    if g.is_some() {
+                                        return self.err("duplicate accessor getter");
+                                    }
+                                    *g = Some(f.clone());
+                                } else {
+                                    if s.is_some() {
+                                        return self.err("duplicate accessor setter");
+                                    }
+                                    *s = Some(f.clone());
                                 }
-                                *g = Some(f.clone());
-                            } else {
-                                if s.is_some() {
-                                    return self.err("duplicate accessor setter");
-                                }
-                                *s = Some(f.clone());
+                                found = true;
+                                break;
                             }
-                            found = true;
-                            break;
                         }
                     }
                 }
@@ -2185,15 +2236,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
                 continue;
             }
-            let key = if *self.peek() == Tok::Punct(Punct::LBrack) {
-                // computed member name: `[Symbol.iterator]() {}`
-                self.next();
-                let e = self.expr()?;
-                self.expect_punct(Punct::RBrack)?;
-                ClassKey::Computed(e)
-            } else {
-                ClassKey::Name(self.prop_name()?)
-            };
+            let key = self.class_member_key()?;
             let key_name: Option<Rc<str>> = match &key {
                 ClassKey::Name(k) => Some(k.clone()),
                 ClassKey::Computed(_) => None,
