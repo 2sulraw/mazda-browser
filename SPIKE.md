@@ -1953,3 +1953,25 @@ they also select the light-DOM nodes projected into the slot.
 - `shell.exe https://github.com`: renderer settles at **75 MB private** and
   stays flat for a minute (no timer/RAF growth).
 - engine tests **932** green (new rule-index test).
+
+## Destructuring rest early errors (P7, 2026-11-09)
+
+`AssignmentRestElement` / `AssignmentRestProperty` must be the last element of
+a destructuring assignment and take no trailing comma. The literal parsers
+already accept `[...a,]` and `{...a,}` (legal as expressions), so
+`ArrayElem::Spread` / `ObjElem::Spread` now carry a `trailing_comma` flag and
+`expr_to_pat` rejects a non-final spread or one followed by a comma. A rest
+parameter must likewise be the last parameter, so `params_after_lparen`
+rejects `function f(a, ...b, c) {}` (the `(...a,)` case lands on the same
+check). `array-rest-nested-array-invalid` and `array-rest-nested-obj-invalid`
+already passed; the new flags cover the plain and object forms.
+
+### Measured
+
+- `language/rest-parameters`: 8 -> **9** pass (11 run); only unrelated
+  `arguments.length` / `Array` constructor failures remain.
+- `language/expressions/assignment/dstr`: 228 -> **233** pass (340 run).
+- test262 language subset: 13,387 -> **13,403** pass (75.8% of 17,678 run,
+  6,154 skipped).
+- engine tests **932** green (rest-last assertions in the existing
+  trailing-comma, array/object destructuring and assignment tests).

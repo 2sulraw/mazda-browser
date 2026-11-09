@@ -185,7 +185,10 @@ pub enum TplSeg {
 pub enum ArrayElem {
     Item(Expr),
     Hole,
-    Spread(Expr),
+    /// `...expr`. The flag records a trailing comma right after the spread
+    /// (`[...a,]`): legal in an array literal, an early error once the
+    /// literal is used as a destructuring pattern.
+    Spread(Expr, bool),
 }
 
 /// one postfix step of an optional chain (`?.` may appear on any of them)
@@ -223,7 +226,9 @@ pub enum CallArg {
 pub enum ObjElem {
     /// key -> value (shorthand `{a}` desugars to Prop("a", Ident("a")))
     Prop(Rc<str>, Expr),
-    Spread(Expr),
+    /// `...expr`; the flag marks a trailing comma after the spread
+    /// (`{...a,}`) — legal in an object literal, an early error in a pattern.
+    Spread(Expr, bool),
     /// `[expr]: v` � key evaluated at object-creation time
     Computed { key: Expr, value: Expr },
     /// `get x(){}` / `set x(v){}` (both sides optional when a later literal
@@ -2268,6 +2273,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
             }
             params.push(Param { name, pat, default, rest });
+            // a rest parameter must be the last one (`f(a, ...b, c)` is an
+            // early error); the trailing-comma case `(...a,)` lands here too
+            if rest && !matches!(self.peek(), Tok::Punct(Punct::RParen)) {
+                return self.err("a rest parameter must be last");
+            }
         }
         Ok(params)
     }
@@ -4055,7 +4065,15 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                     if *self.peek() == Tok::Spread {
                         self.next();
-                        items.push(ArrayElem::Spread(self.assign_expr()?));
+                        let e = self.assign_expr()?;
+                        // `[...a,]`: the trailing comma is legal here but not
+                        // once this literal is a destructuring pattern
+                        let trailing = matches!(self.peek(), Tok::Punct(Punct::Comma))
+                            && matches!(
+                                self.toks.get(self.pos + 1).map(|t| &t.tok),
+                                Some(Tok::Punct(Punct::RBrack))
+                            );
+                        items.push(ArrayElem::Spread(e, trailing));
                     } else {
                         items.push(ArrayElem::Item(self.assign_expr()?));
                     }
@@ -4084,7 +4102,15 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                     if *self.peek() == Tok::Spread {
                         self.next();
-                        props.push(ObjElem::Spread(self.assign_expr()?));
+                        let e = self.assign_expr()?;
+                        // `{...a,}`: trailing comma is legal as an expression
+                        // but not when the literal becomes a pattern
+                        let trailing = matches!(self.peek(), Tok::Punct(Punct::Comma))
+                            && matches!(
+                                self.toks.get(self.pos + 1).map(|t| &t.tok),
+                                Some(Tok::Punct(Punct::RBrace))
+                            );
+                        props.push(ObjElem::Spread(e, trailing));
                         continue;
                     }
                     // `async m(){}` / `async *m(){}` / `*m(){}` method
@@ -4333,12 +4359,20 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
         })),
         ExprKind::Array(elems) => {
             let mut parts = Vec::new();
-            for el in elems {
+            for (i, el) in elems.iter().enumerate() {
                 let part = match el {
                     ArrayElem::Hole => PatPart::Hole,
-                    ArrayElem::Spread(s) => PatPart::Rest(Box::new(
-                        expr_to_pat(s).map_err(|_| String::from("rest target must be a simple binding"))?,
-                    )),
+                    ArrayElem::Spread(s, trailing) => {
+                        // AssignmentRestElement must be the last element and
+                        // takes no trailing comma (`[...a, b]`, `[...a,]`).
+                        if *trailing || i + 1 != elems.len() {
+                            return Err(String::from("rest element must be last"));
+                        }
+                        PatPart::Rest(Box::new(
+                            expr_to_pat(s)
+                                .map_err(|_| String::from("rest target must be a simple binding"))?,
+                        ))
+                    }
                     ArrayElem::Item(x) => match &x.kind {
                         ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. } => {
                             PatPart::Bind(Box::new(expr_to_pat(x)?), None)
@@ -4360,11 +4394,17 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
         }
         ExprKind::Object(props) => {
             let mut parts = Vec::new();
-            for el in props {
+            for (i, el) in props.iter().enumerate() {
                 match el {
-                    ObjElem::Spread(s) => {
+                    ObjElem::Spread(s, trailing) => {
+                        // AssignmentRestProperty must be last and takes no
+                        // trailing comma (`{...a, b}`, `{...a,}`).
+                        if *trailing || i + 1 != props.len() {
+                            return Err(String::from("rest element must be last"));
+                        }
                         parts.push(ObjPatPart::Rest(
-                            expr_to_pat(s).map_err(|_| String::from("rest target must be a simple binding"))?,
+                            expr_to_pat(s)
+                                .map_err(|_| String::from("rest target must be a simple binding"))?,
                         ));
                     }
                     ObjElem::Prop(key, v) => {
@@ -4543,12 +4583,12 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
                 })
         }
         Array(items) => items.iter().any(|i| match i {
-            ArrayElem::Item(x) | ArrayElem::Spread(x) => expr_uses(x, k),
+            ArrayElem::Item(x) | ArrayElem::Spread(x, _) => expr_uses(x, k),
             ArrayElem::Hole => false,
         }),
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => expr_uses(v, k),
-            ObjElem::Spread(v) => expr_uses(v, k),
+            ObjElem::Spread(v, _) => expr_uses(v, k),
             ObjElem::Computed { key, value } => expr_uses(key, k) || expr_uses(value, k),
             // accessor bodies are nested functions: their own trees
             ObjElem::Accessor { .. } => false,
@@ -5558,7 +5598,7 @@ impl YieldLift {
 
     fn array(&mut self, items: Vec<ArrayElem>, pre: &mut Vec<Stmt>) -> Vec<ArrayElem> {
         let last = match items.iter().rposition(|it| match it {
-            ArrayElem::Item(e) | ArrayElem::Spread(e) => expr_uses(e, SusKind::Yield),
+            ArrayElem::Item(e) | ArrayElem::Spread(e, _) => expr_uses(e, SusKind::Yield),
             ArrayElem::Hole => false,
         }) {
             Some(i) => i,
@@ -5579,7 +5619,7 @@ impl YieldLift {
                     };
                     ArrayElem::Item(e)
                 }
-                ArrayElem::Spread(e) => {
+                ArrayElem::Spread(e, trailing) => {
                     let span = e.span;
                     let e = self.expr(e, pre);
                     let e = if i < last && !is_lift_temp(&e) {
@@ -5587,7 +5627,7 @@ impl YieldLift {
                     } else {
                         e
                     };
-                    ArrayElem::Spread(e)
+                    ArrayElem::Spread(e, trailing)
                 }
             })
             .collect()
@@ -5595,7 +5635,7 @@ impl YieldLift {
 
     fn object(&mut self, props: Vec<ObjElem>, pre: &mut Vec<Stmt>) -> Vec<ObjElem> {
         let suspends = |p: &ObjElem| match p {
-            ObjElem::Prop(_, v) | ObjElem::Spread(v) => expr_uses(v, SusKind::Yield),
+            ObjElem::Prop(_, v) | ObjElem::Spread(v, _) => expr_uses(v, SusKind::Yield),
             ObjElem::Computed { key, value } => {
                 expr_uses(key, SusKind::Yield) || expr_uses(value, SusKind::Yield)
             }
@@ -5619,7 +5659,7 @@ impl YieldLift {
                     };
                     ObjElem::Prop(key, v)
                 }
-                ObjElem::Spread(v) => {
+                ObjElem::Spread(v, trailing) => {
                     let span = v.span;
                     let v = self.expr(v, pre);
                     let v = if i < last && !is_lift_temp(&v) {
@@ -5627,7 +5667,7 @@ impl YieldLift {
                     } else {
                         v
                     };
-                    ObjElem::Spread(v)
+                    ObjElem::Spread(v, trailing)
                 }
                 ObjElem::Computed { key, value } => {
                     let span = key.span;
@@ -5827,12 +5867,12 @@ fn scan_expr_arguments(e: &Expr) -> bool {
                 })
         }
         Array(items) => items.iter().any(|i| match i {
-            ArrayElem::Item(x) | ArrayElem::Spread(x) => scan_expr_arguments(x),
+            ArrayElem::Item(x) | ArrayElem::Spread(x, _) => scan_expr_arguments(x),
             ArrayElem::Hole => false,
         }),
         Object(props) => props.iter().any(|p| match p {
             ObjElem::Prop(_, v) => scan_expr_arguments(v),
-            ObjElem::Spread(v) => scan_expr_arguments(v),
+            ObjElem::Spread(v, _) => scan_expr_arguments(v),
             ObjElem::Computed { key, value } => {
                 scan_expr_arguments(key) || scan_expr_arguments(value)
             }

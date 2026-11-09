@@ -1097,14 +1097,14 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
         Array(items) => items
             .iter()
             .any(|i| match i {
-                parser::ArrayElem::Item(x) | parser::ArrayElem::Spread(x) => expr_has_yield(x),
+                parser::ArrayElem::Item(x) | parser::ArrayElem::Spread(x, _) => expr_has_yield(x),
                 parser::ArrayElem::Hole => false,
             }),
         Object(props) => props
             .iter()
             .any(|p| match p {
                 parser::ObjElem::Prop(_, v) => expr_has_yield(v),
-                parser::ObjElem::Spread(v) => expr_has_yield(v),
+                parser::ObjElem::Spread(v, _) => expr_has_yield(v),
                 parser::ObjElem::Computed { key, value } => {
                     expr_has_yield(key) || expr_has_yield(value)
                 }

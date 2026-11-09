@@ -1551,7 +1551,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                 match i {
                     ArrayElem::Item(x) => vals.push(eval_expr(e, env, x)?),
                     ArrayElem::Hole => vals.push(Val::Undefined), // hole -> undefined (dense shortcut)
-                    ArrayElem::Spread(sp) => {
+                    ArrayElem::Spread(sp, _) => {
                         let src = eval_expr(e, env, sp)?;
                         vals.extend(iter_src(e, &src)?);
                     }
@@ -1572,7 +1572,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                     // their dense items as index keys; accessors invoke their
                     // getters — matching real spread semantics closely enough
                     // for the honest scope of this wave)
-                    ObjElem::Spread(sp) => {
+                    ObjElem::Spread(sp, _) => {
                         let src = eval_expr(e, env, sp)?;
                         if let Val::Obj(s) = &src {
                             let entries: Vec<(Rc<str>, Val)> = {

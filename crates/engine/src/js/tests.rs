@@ -1678,6 +1678,17 @@ fn trailing_comma_in_parameter_lists() {
         err("function f(...a,) {}"),
         JsError::Syntax { .. }
     ));
+    // ...and must be the last parameter
+    for src in [
+        "function f(a, ...b, c) {}",
+        "var f = (a, ...b, c) => 0",
+        "var o = { m(a, ...b, c) {} }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
 }
 
 #[test]
@@ -2846,6 +2857,17 @@ fn destructuring_objects() {
         err("const { ...a, b } = {}"),
         JsError::Syntax { .. }
     ));
+    assert!(matches!(
+        err("0, { ...a, b } = {}"),
+        JsError::Syntax { .. }
+    ));
+    assert!(matches!(
+        err("0, { ...a, } = {}"),
+        JsError::Syntax { .. }
+    ));
+    // ...but both are legal expressions
+    assert_eq!(num("var a = { x: 1 }; ({ ...a, }).x"), 1.0);
+    assert_eq!(num("var a = [1, 2]; [...a,].length"), 2.0);
 }
 
 #[test]
@@ -2865,6 +2887,13 @@ fn destructuring_assignment() {
     assert_eq!(num("let p, q; ({ p, q } = { p: 2, q: 5 }); p * q"), 10.0);
     // member targets work as leaves
     assert_eq!(num("const o = {}; [o.a, o.b] = [3, 4]; o.a + o.b"), 7.0);
+    // an array rest target must be last and takes no trailing comma
+    for src in ["0, [...a, b] = []", "0, [...a,] = []"] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
 }
 
 #[test]
