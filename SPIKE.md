@@ -2309,3 +2309,20 @@ true for an unresolvable name. The interpreter's `Delete` arm now routes an
   30 -> **0**. Seven more `delete`-through-`with` cases pass elsewhere and
   every other top directory is unchanged.
 - engine tests **947** green (new with-delete test).
+
+## `with` boxes a primitive head (P7, 2026-11-09)
+
+`with (2)` threw `TypeError: with requires an object`. The head is
+`ToObject(expr)`, so a Number/String/Boolean primitive becomes its wrapper
+object. The `with` arm now builds a boxed primitive (`ObjKind::Boxed`) with
+the matching intrinsic prototype, then uses it as the object environment
+record; `null`/`undefined` still throw. A wrapper with no `foo` makes
+`with (2) { foo = 42 }` fall through to the enclosing scope, as the spec
+requires.
+
+### Measured
+
+- test262 language subset: 14,598 -> **14,601** pass (82.6% of 17,678 run,
+  6,154 skipped).
+- `with requires an object` failures 3 -> **0** (`12.10-2-1/2/3`).
+- engine tests **948** green (new primitive-boxing test).

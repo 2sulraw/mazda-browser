@@ -3034,6 +3034,21 @@ fn named_function_self_binding_is_immutable() {
 }
 
 #[test]
+fn with_primitive_boxes_to_an_object() {
+    // ToObject: the wrapper has no `foo`, so the assignment falls through
+    assert!(boolean("var o = 2, foo = 1; with (o) { foo = 42; } foo === 42"));
+    assert!(boolean(
+        "var o = true, foo = 1; with (o) { foo = 42; } foo === 42"
+    ));
+    assert!(boolean(
+        "var o = 'str', foo = 1; with (o) { foo = 42; } foo === 42"
+    ));
+    // null/undefined still throw (ToObject has no nullish object)
+    assert!(err("with (null) {}").to_string().contains("TypeError"));
+    assert!(err("with (void 0) {}").to_string().contains("TypeError"));
+}
+
+#[test]
 fn delete_resolves_through_with() {
     // `delete p` inside `with (o)` deletes o's property
     assert!(boolean(

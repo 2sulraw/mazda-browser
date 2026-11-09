@@ -276,6 +276,20 @@ pub(crate) fn run_block(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) -> Resu
     Ok(Flow::Normal)
 }
 
+/// ToObject for a `with` head: a boxed primitive carrying the matching
+/// intrinsic prototype, so method lookups behave like the wrapper object the
+/// spec builds.
+fn boxed_with_obj(e: &JsEngine, prim: Val, ctor: &str) -> Rc<RefCell<Obj>> {
+    let proto = e
+        .native_id(ctor)
+        .and_then(|id| e.native_prop(id, "prototype"))
+        .and_then(|p| match p {
+            Val::Obj(o) => Some(o),
+            _ => None,
+        });
+    new_obj(ObjKind::Boxed(prim), Vec::new(), proto)
+}
+
 pub(crate) fn eval_stmt(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, JsError> {
     e.cur_span = s.span.start as usize; // budget error names this statement
     // a throw that a previous statement caught must not label this one
@@ -327,9 +341,14 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
             run_block(e, &benv, stmts)
         }
         StmtKind::With { obj, body } => {
-            let o = eval_expr(e, env, obj)?;
-            let o = match o {
+            let v = eval_expr(e, env, obj)?;
+            let o = match v {
                 Val::Obj(o) => o,
+                // `with (primitive)` performs ToObject: the object
+                // environment record is the primitive's wrapper
+                Val::Str(s) => boxed_with_obj(e, Val::Str(s), "String"),
+                Val::Num(n) => boxed_with_obj(e, Val::Num(n), "Number"),
+                Val::Bool(b) => boxed_with_obj(e, Val::Bool(b), "Boolean"),
                 _ => {
                     return Err(JsError::throw(
                         "TypeError: `with` requires an object",
