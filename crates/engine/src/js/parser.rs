@@ -4708,6 +4708,11 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                             op: None,
                             value,
                         } => PatPart::Bind(Box::new(expr_to_pat(target)?), Some((**value).clone())),
+                        // a nested pattern with a default was already resolved
+                        // into a PatAssign by the assignment parser
+                        ExprKind::PatAssign { pat, value } => {
+                            PatPart::Bind(Box::new(pat.clone()), Some((**value).clone()))
+                        }
                         ExprKind::Array(_) | ExprKind::Object(_) => {
                             PatPart::Bind(Box::new(expr_to_pat(x)?), None)
                         }
@@ -4743,6 +4748,10 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                                 op: None,
                                 value,
                             } => PatPart::Bind(Box::new(expr_to_pat(target)?), Some((**value).clone())),
+                            // a nested pattern with a default, already resolved
+                            ExprKind::PatAssign { pat, value } => {
+                                PatPart::Bind(Box::new(pat.clone()), Some((**value).clone()))
+                            }
                             ExprKind::Array(_) | ExprKind::Object(_) => {
                                 PatPart::Bind(Box::new(expr_to_pat(v)?), None)
                             }
@@ -4762,13 +4771,29 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                             ),
                         });
                     }
-                    ObjElem::Computed { .. }
-                    | ObjElem::Accessor { .. }
-                    | ObjElem::ComputedAccessor { .. } => {
-                        return Err(
-                            "computed/accessor keys are not supported in a destructuring pattern"
-                                .into(),
-                        )
+                    ObjElem::Computed { key, value } => {
+                        // `{[expr]: target}` in an assignment/loop pattern
+                        let part = match &value.kind {
+                            ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. } => {
+                                PatPart::Bind(Box::new(expr_to_pat(value)?), None)
+                            }
+                            ExprKind::Assign {
+                                target,
+                                op: None,
+                                value: v,
+                            } => PatPart::Bind(Box::new(expr_to_pat(target)?), Some((**v).clone())),
+                            ExprKind::Array(_) | ExprKind::Object(_) => {
+                                PatPart::Bind(Box::new(expr_to_pat(value)?), None)
+                            }
+                            _ => return Err("invalid destructuring binding".into()),
+                        };
+                        parts.push(ObjPatPart::ComputedProp {
+                            key: key.clone(),
+                            part,
+                        });
+                    }
+                    ObjElem::Accessor { .. } | ObjElem::ComputedAccessor { .. } => {
+                        return Err("an accessor is not a destructuring pattern".into())
                     }
                 }
             }

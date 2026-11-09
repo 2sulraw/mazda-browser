@@ -2432,3 +2432,23 @@ whitespace/control code point (NBSP, the Zs block, U+2028/U+2029), matching
   identifiers followed by a non-ASCII space elsewhere. No directory
   regressed.
 - engine tests **955** green (new lexer regression test).
+
+## Computed keys and nested defaults in assignment patterns (P7, 2026-11-10)
+
+A loop head or assignment target destructures through the cover grammar: the
+left side is parsed as an object/array literal and then converted by
+`expr_to_pat`. That conversion rejected two legal shapes. `{[expr]: target}`
+fell into the "computed keys are not supported" arm even though
+`ObjPatPart::ComputedProp` and its runtime already existed — it now converts
+into that variant. And a nested pattern with a default (`[ {} = 1 ]`,
+`{a: [x] = []}`) had already been resolved into a `PatAssign` node by the
+assignment parser, which the array/object arms did not recognise; it now
+becomes a bound part carrying that default.
+
+### Measured
+
+- test262 language subset: 14,867 -> **14,889** pass (84.2% of 17,678 run,
+  6,154 skipped).
+- `statements/for-of` 135 -> **124**, `expressions/assignment` 91 -> **80**;
+  the 16 `invalid for-of target` failures are gone. No directory regressed.
+- engine tests **957** green (two new pattern tests).

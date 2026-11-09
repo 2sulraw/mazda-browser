@@ -3107,6 +3107,46 @@ fn arrow_parameters_reject_duplicate_names() {
 }
 
 #[test]
+fn nested_pattern_elements_with_a_default() {
+    // a nested pattern element with a default was parsed as a PatAssign and
+    // must still convert into a loop/assignment pattern
+    for src in [
+        "for ([{} = 1] of [[2]]) {}",
+        "for ([{} = 1] of []) {}",
+        "var a = []; [{} = 1] = a;",
+        "var a = [1]; var x; [{} = 1, x = 2] = a;",
+        "for ({a: {} = 1} of []) {}",
+        "for ({a: [ {} = 1 ]} of []) {}",
+    ] {
+        let mut e = JsEngine::new();
+        if let Err(err) = e.exec(src) {
+            panic!("failed: {src}\n  {err}");
+        }
+    }
+}
+
+#[test]
+fn computed_keys_in_assignment_patterns() {
+    // `{[expr]: target}` in an assignment/loop destructuring pattern
+    assert_eq!(
+        num("var x, n = 0; for ({['x']: x} of [{x: 7}]) n += x; n"),
+        7.0
+    );
+    assert_eq!(
+        num("var a = 'foo', b, rest, n = 0; \
+             for ({[a]: b, ...rest} of [{foo: 1, bar: 2, baz: 3}]) n = b + rest.bar + rest.baz; n"),
+        6.0
+    );
+    assert_eq!(num("var k = 'a', v = 0; ({[k]: v} = {a: 9}); v"), 9.0);
+    assert_eq!(num("var k = 'a', v = 0; ({[k]: v = 5} = {}); v"), 5.0);
+    // a nested pattern element with a default
+    assert_eq!(
+        num("var n = 0; for ([ {} = 1 ] of [[2]]) n++; n"),
+        1.0
+    );
+}
+
+#[test]
 fn non_ascii_whitespace_ends_an_identifier() {
     // a non-ASCII space or line terminator right after an identifier must not
     // be swallowed into it (`x\u00A0+=`, `x\u2028+=`, ...)
