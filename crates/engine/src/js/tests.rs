@@ -725,6 +725,13 @@ fn optional_chaining() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn hashbang_comment_at_source_start() {
+    assert_eq!(num("#! /usr/bin/env node\nvar a = 1; a"), 1.0);
+    // only at position 0; a `#` later in the source is still an error
+    assert!(matches!(err("var a = 1; #!x"), JsError::Syntax { .. }));
+}
+
+#[test]
 fn array_basics() {
     assert_eq!(num("let a = [1, 2, 3]; a.length"), 3.0);
     assert_eq!(num("let a = [1, 2, 3]; a[1]"), 2.0);
@@ -1171,6 +1178,11 @@ fn new_target_and_private_brand_checks() {
     assert!(boolean(
         "function F() { this.ok = (() => new.target === F)(); } new F().ok"
     ));
+    // a private name may use `\u` escapes (`#\u{6F}_`)
+    assert_eq!(
+        num("class C { #\\u{6F}_ = 7; get() { return this.#\\u{6F}_ } } new C().get()"),
+        7.0
+    );
     // a plain nested call shadows it with undefined rather than inheriting
     assert!(boolean(
         "function F() { function g() { return new.target } this.ok = g() === undefined } new F().ok"

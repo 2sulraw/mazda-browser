@@ -310,6 +310,17 @@ impl<'a> Lexer<'a> {
     fn skip_ws(&mut self) -> bool {
         let mut nl = false;
         loop {
+            // HashbangComment: `#!...` is a comment only at the very start of
+            // the source (node-style launchers; test262 `hashbang` cases).
+            if self.pos == 0 && self.peek() == Some(b'#') && self.peek2() == Some(b'!') {
+                while let Some(b) = self.peek() {
+                    if b == b'\n' || b == b'\r' {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                continue;
+            }
             match self.peek() {
                 Some(b'\n') | Some(b'\r') => {
                     nl = true;
@@ -400,6 +411,19 @@ impl<'a> Lexer<'a> {
     /// used an escape is never a keyword: reserved words match on literal
     /// source characters, so `\u0069f` is an identifier, not `if`.
     fn read_ident(&mut self) -> Result<Tok, LexError> {
+        let (name, escaped) = self.read_ident_name()?;
+        if !escaped {
+            if let Some(k) = kw_of(&name) {
+                return Ok(Tok::Kw(k));
+            }
+        }
+        Ok(Tok::Ident(Rc::from(name.as_str())))
+    }
+
+    /// The decoded text of an identifier (escapes resolved) plus whether an
+    /// escape was used (an escaped name never matches a keyword). Split out so
+    /// a private name (`#ident`) can reuse it.
+    fn read_ident_name(&mut self) -> Result<(String, bool), LexError> {
         let mut name = String::new();
         let mut escaped = false;
         let mut first = true;
@@ -440,12 +464,7 @@ impl<'a> Lexer<'a> {
             }
             first = false;
         }
-        if !escaped {
-            if let Some(k) = kw_of(&name) {
-                return Ok(Tok::Kw(k));
-            }
-        }
-        Ok(Tok::Ident(Rc::from(name.as_str())))
+        Ok((name, escaped))
     }
 
     /// Decode a `\uXXXX` or `\u{...}` escape at `at`; returns the code point
@@ -1016,18 +1035,14 @@ impl<'a> Lexer<'a> {
             }
             // private class name: `#field` / `#method`. Kept as an ordinary
             // identifier with a `#` prefix so member access, class members
-            // and `this.#x` reuse the normal property machinery. shortcut:
-            // private names are per-property, not per-class, so same-named
-            // privates of a base and a derived class collide.
-            b'#' if matches!(self.peek2(), Some(c) if is_ident_start(c)) => {
+            // and `this.#x` reuse the normal property machinery. The name may
+            // use `\u` escapes (`#\u{6F}_`), so decode it like an identifier.
+            // shortcut: private names are per-property, not per-class, so
+            // same-named privates of a base and a derived class collide.
+            b'#' if matches!(self.peek2(), Some(c) if is_ident_start(c) || c == b'\\') => {
                 self.pos += 1; // `#`
-                let name_start = self.pos;
-                self.pos += 1;
-                while matches!(self.peek(), Some(c) if is_ident_char(c)) {
-                    self.pos += 1;
-                }
-                let s = &self.src[name_start..self.pos];
-                return Ok(Tok::Ident(Rc::from(format!("#{}", s).as_str())));
+                let (name, _) = self.read_ident_name()?;
+                return Ok(Tok::Ident(Rc::from(format!("#{name}").as_str())));
             }
             _ => {
                 let ch_len = (1..=4)
