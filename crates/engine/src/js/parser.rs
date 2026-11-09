@@ -3155,6 +3155,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         while !self.eat_punct(Punct::RParen) {
             if !args.is_empty() {
                 self.expect_punct(Punct::Comma)?;
+                // trailing comma in an argument list is legal: `f(a,)`
+                if self.eat_punct(Punct::RParen) {
+                    break;
+                }
             }
             if *self.peek() == Tok::Spread {
                 self.next();

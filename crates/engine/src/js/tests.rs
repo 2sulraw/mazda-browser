@@ -350,6 +350,10 @@ fn function_declaration_and_call() {
     // default params
     assert_eq!(num("function f(a, b = 10) { return a + b } f(5)"), 15.0);
     assert_eq!(num("function f(a, b = 10) { return a + b } f(5, 1)"), 6.0);
+    // a trailing comma is legal in a call or `new` argument list
+    assert_eq!(num("function f(a, b) { return a + b } f(1, 2,)"), 3.0);
+    assert_eq!(num("function C(v) { this.v = v } new C(7,).v"), 7.0);
+    assert_eq!(num("var o = { f(a) { return a * 3 } }; o.f(4,)"), 12.0);
 }
 
 #[test]
