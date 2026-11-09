@@ -2094,3 +2094,18 @@ an `Acc` entry under it, matching the static accessor path. Yield lifting,
   6,154 skipped).
 - `language/expressions/object`: 742/935 -> **763/935** pass.
 - engine tests **937** green (new computed-accessor test).
+## BigInt legacy leading-zero rejection (P7 fix, 2026-11-09)
+
+A decimal BigInt literal could carry a leading zero (`00n`, `01n`, `08n`,
+`0008n`). Those are legacy-octal / non-octal forms and have no BigInt
+spelling, so they are SyntaxErrors. The scanner rejects a decimal BigInt
+whose digit text starts with `0` and is longer than one character. (The
+matching test landed with the computed-accessor commit; this commit adds the
+lexer change that makes it pass.)
+
+### Measured
+
+- `language/literals/bigint`: 52/59 -> **59/59** pass.
+- test262 language subset stays at **13,714** pass (the full run that
+  produced that number already included this working-tree change).
+- engine tests **937** green.

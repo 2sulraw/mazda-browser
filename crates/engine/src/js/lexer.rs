@@ -616,6 +616,11 @@ impl<'a> Lexer<'a> {
                 return self.err("identifier directly after number", start);
             }
             let text = raw.chars().filter(|c| *c != '_').collect::<String>();
+            // a decimal BigInt may not use a leading zero (`00n`, `08n`):
+            // those are legacy-octal/non-octal forms, which have no BigInt
+            if text.len() > 1 && text.starts_with('0') {
+                return self.err("invalid BigInt literal", start);
+            }
             return match text.parse::<i128>() {
                 Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
                 Err(_) => self.err("BigInt literal too large", start),
