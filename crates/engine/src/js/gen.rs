@@ -48,6 +48,9 @@ enum PendBind {
         kind: parser::VarKind,
         pat: parser::Pat,
     },
+    /// the resume value of a `yield*`: forwarded to the delegated
+    /// iterator's `next(arg)` rather than bound to a declarator
+    Delegate,
 }
 
 enum GFrame {
@@ -105,6 +108,15 @@ enum GFrame {
     SwitchBody {
         batch: Rc<Vec<parser::Stmt>>,
         env: Rc<Env>,
+    },
+    /// an active `yield*`: each step calls `next(arg)` and forwards the result
+    Delegate {
+        iter: Val,
+        next: Val,
+        env: Rc<Env>,
+        /// bind the delegate's final value when it completes
+        /// (`let x = yield* it`)
+        done_bind: Option<PendBind>,
     },
 }
 
@@ -168,6 +180,8 @@ pub(crate) struct GenVm {
     done: bool,
     running: bool,
     pending: Option<(PendBind, Rc<Env>)>,
+    /// value fed to `.next(arg)` while a `GFrame::Delegate` is on top
+    delegate_arg: Option<Val>,
 }
 
 impl std::fmt::Debug for GenVm {
@@ -210,6 +224,7 @@ pub(crate) fn gen_object(e: &mut JsEngine, def: &Rc<FnDef>, env: &Rc<Env>) -> Re
                 done: false,
                 running: false,
                 pending: None,
+                delegate_arg: None,
             }
         }
         None => {
@@ -272,18 +287,12 @@ pub(crate) fn gen_next(e: &mut JsEngine, this: &Val, arg: Val) -> Result<Val, Js
     // deliver the resume value to the suspended yield's declarator (if any)
     let bind_res = if let Some((bind, env)) = vm.pending.take() {
         match bind {
-            PendBind::Name { kind, name } => match kind {
-                parser::VarKind::Var => e.env_set(&env, &name, arg),
-                // let/const in a resumed loop body must replace the prior
-                // iteration's binding, not append a shadowed duplicate
-                k => {
-                    env.rebind(name, arg);
-                    Ok(())
-                }
-            },
-            PendBind::Pat { kind, pat } => {
-                interp::bind_pat(e, &env, &pat, arg, interp::BindKind::Decl(kind))
+            // a delegated yield forwards the resume value to `next(arg)`
+            PendBind::Delegate => {
+                vm.delegate_arg = Some(arg);
+                Ok(())
             }
+            other => apply_pend_bind(e, &env, other, arg),
         }
     } else {
         Ok(())
@@ -648,6 +657,35 @@ fn step_frame(e: &mut JsEngine, vm: &mut GenVm, frame: GFrame) -> Result<StepR, 
             while j < ds.len() {
                 let d = ds[j].clone();
                 j += 1;
+                if let Some(parser::ExprKind::YieldStar(x)) = d.init.as_ref().map(|x| &x.kind) {
+                    let v = eval_expr(e, &env, x)?;
+                    let iter = interp::get_iterator(e, &v)?;
+                    let next = get_member(e, &iter, "next")?;
+                    let bind = match &d.pat {
+                        None => PendBind::Name {
+                            kind,
+                            name: d.name.clone(),
+                        },
+                        Some(p) => PendBind::Pat {
+                            kind,
+                            pat: p.clone(),
+                        },
+                    };
+                    // the delegate runs first, then the remaining declarators
+                    vm.frames.push(GFrame::Decls {
+                        kind,
+                        ds: ds.clone(),
+                        j,
+                        env: env.clone(),
+                    });
+                    vm.frames.push(GFrame::Delegate {
+                        iter,
+                        next,
+                        env: env.clone(),
+                        done_bind: Some(bind),
+                    });
+                    return Ok(StepR::NewFrame);
+                }
                 let yield_init = matches!(
                     d.init.as_ref().map(|x| &x.kind),
                     Some(parser::ExprKind::Yield(_))
@@ -875,6 +913,59 @@ fn step_frame(e: &mut JsEngine, vm: &mut GenVm, frame: GFrame) -> Result<StepR, 
             // the frame inside drive); post-continue the switch is finished
             Ok(StepR::Finished)
         }
+        GFrame::Delegate {
+            iter,
+            next,
+            env,
+            done_bind,
+        } => {
+            let arg = vm.delegate_arg.take().unwrap_or(Val::Undefined);
+            let step = e.call(next.clone(), iter.clone(), vec![arg])?;
+            let done = get_member(e, &step, "done")?.to_bool();
+            let v = get_member(e, &step, "value")?;
+            if done {
+                if let Some(bind) = done_bind {
+                    apply_pend_bind(e, &env, bind, v)?;
+                }
+                Ok(StepR::Finished)
+            } else {
+                // suspend on the delegated value; the next `.next(arg)`
+                // resumes this frame and forwards `arg` to `iter.next`
+                vm.pending = Some((PendBind::Delegate, env.clone()));
+                vm.frames.push(GFrame::Delegate {
+                    iter,
+                    next,
+                    env,
+                    done_bind,
+                });
+                Ok(StepR::Susp(v))
+            }
+        }
+    }
+}
+
+/// Bind a resume value to a suspended yield target (`x = yield v` /
+/// destructuring patterns).
+fn apply_pend_bind(
+    e: &mut JsEngine,
+    env: &Rc<Env>,
+    bind: PendBind,
+    v: Val,
+) -> Result<(), JsError> {
+    match bind {
+        PendBind::Name { kind, name } => match kind {
+            parser::VarKind::Var => e.env_set(env, &name, v),
+            // let/const in a resumed loop body must replace the prior
+            // iteration's binding, not append a shadowed duplicate
+            k => {
+                env.rebind(name, v);
+                Ok(())
+            }
+        },
+        PendBind::Pat { kind, pat } => {
+            interp::bind_pat(e, env, &pat, v, interp::BindKind::Decl(kind))
+        }
+        PendBind::Delegate => Ok(()),
     }
 }
 
@@ -959,6 +1050,7 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
     use parser::ExprKind::*;
     match &x.kind {
         Yield(_) => true,
+        YieldStar(_) => true,
         Ident(_) | Num(_) | BigInt(_) | Str(_) | Bool(_) | Null | This | Regex { .. } => false,
         Unary { expr, .. } | Typeof(expr) | Void(expr) | Delete(expr) | Await(expr) => {
             expr_has_yield(expr)
@@ -1073,6 +1165,17 @@ fn step_stmt(
                     None => Val::Undefined,
                 };
                 Ok(SStep::Yield(v))
+            } else if let parser::ExprKind::YieldStar(x) = &x.kind {
+                let v = eval_expr(e, env, x)?;
+                let iter = interp::get_iterator(e, &v)?;
+                let next = get_member(e, &iter, "next")?;
+                vm.frames.push(GFrame::Delegate {
+                    iter,
+                    next,
+                    env: env.clone(),
+                    done_bind: None,
+                });
+                Ok(SStep::Pushed)
             } else {
                 // sync generators reject this at parse time; async
                 // generators defer it to call time (see parser docs)

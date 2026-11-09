@@ -2468,6 +2468,45 @@ fn generator_yield_inside_if_and_loop() {
 }
 
 #[test]
+fn generator_yield_star_delegates() {
+    // delegated values are forwarded in order, then the outer body continues
+    assert_eq!(
+        string(
+            "function* inner(){ yield 1; yield 2 } \
+             function* outer(){ yield* inner(); yield 3 } \
+             [...outer()].join(',')"
+        ),
+        "1,2,3"
+    );
+    // the `.next(arg)` value is forwarded to the delegate; its return value
+    // becomes the value of the `yield*` expression
+    assert_eq!(
+        num(
+            "function* inner(){ var x = yield 1; return x * 2 } \
+             function* outer(){ var r = yield* inner(); return r + 1 } \
+             var it = outer(); it.next(); it.next(5).value"
+        ),
+        11.0
+    );
+    // any iterable works, and the delegate's final value binds normally
+    assert_eq!(
+        string(
+            "function* g(){ var r = yield* [7, 8]; return 'r' + r } \
+             var it = g(); it.next().value + ',' + it.next().value + ',' + it.next().done"
+        ),
+        "7,8,true"
+    );
+    assert_eq!(string("function* g(){ yield* 'ab' } [...g()].join('-')"), "a-b");
+    // a non-iterable operand throws a TypeError at first resume
+    assert!(matches!(
+        err("function* g(){ yield* 5 } g().next()"),
+        JsError::Throw(_)
+    ));
+    // `yield*` is still a generator-only construct
+    assert!(matches!(err("function f(){ yield* [1] }"), JsError::Syntax { .. }));
+}
+
+#[test]
 fn generator_throw_unsupported() {
     assert!(matches!(err("function* g() { yield 1 } const it = g(); it.throw(1)"), JsError::Throw(_)));
 }

@@ -147,6 +147,8 @@ pub enum ExprKind {
     /// `yield` — legal only where the generator walker supports it (plain
     /// expression statement or a declarator initializer)
     Yield(Option<Box<Expr>>),
+    /// `yield* iterable` — delegate the iteration to another iterator
+    YieldStar(Box<Expr>),
     /// `await expr` — only inside async functions
     Await(Box<Expr>),
     Func(Rc<FnDef>),
@@ -3942,17 +3944,27 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 if *self.peek() == Tok::Eof {
                     return self.err("unterminated yield expression");
                 }
-                // yield's operand is an AssignmentExpression (`yield a + b`
-                // yields a+b) per JS grammar
-                let v = match self.peek() {
-                    Tok::Punct(Punct::Semi)
-                    | Tok::Punct(Punct::RParen)
-                    | Tok::Punct(Punct::RBrace)
-                    | Tok::Punct(Punct::RBrack)
-                    | Tok::Punct(Punct::Comma) => None,
-                    _ => Some(Box::new(self.assign_expr()?)),
-                };
-                ExprKind::Yield(v)
+                // `yield* x` delegates to another iterator; `*` cannot start
+                // an operand, so it is never ambiguous with multiplication
+                if self.eat_op(Op::Mul) {
+                    if *self.peek() == Tok::Eof {
+                        return self.err("unterminated `yield*` expression");
+                    }
+                    let v = self.assign_expr()?;
+                    ExprKind::YieldStar(Box::new(v))
+                } else {
+                    // yield's operand is an AssignmentExpression (`yield a + b`
+                    // yields a+b) per JS grammar
+                    let v = match self.peek() {
+                        Tok::Punct(Punct::Semi)
+                        | Tok::Punct(Punct::RParen)
+                        | Tok::Punct(Punct::RBrace)
+                        | Tok::Punct(Punct::RBrack)
+                        | Tok::Punct(Punct::Comma) => None,
+                        _ => Some(Box::new(self.assign_expr()?)),
+                    };
+                    ExprKind::Yield(v)
+                }
             }
             Tok::Kw(Kw::Await) => {
                 self.next();
@@ -4446,7 +4458,7 @@ enum SusKind {
 
 fn scan_kind(e: &Expr, k: SusKind) -> bool {
     match &e.kind {
-        ExprKind::Yield(_) => k == SusKind::Yield,
+        ExprKind::Yield(_) | ExprKind::YieldStar(_) => k == SusKind::Yield,
         ExprKind::Await(_) => k == SusKind::Await,
         _ => false,
     }
@@ -4458,6 +4470,7 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
     use ExprKind::*;
     match &e.kind {
         Yield(op) => k == SusKind::Yield || op.as_deref().map_or(false, |x| expr_uses(x, k)),
+        YieldStar(x) => k == SusKind::Yield || expr_uses(x, k),
         Await(inner) => k == SusKind::Await || expr_uses(inner, k),
         Unary { expr, .. } | Typeof(expr) | Void(expr) | Delete(expr) => expr_uses(expr, k),
         Postfix { target, .. } => expr_uses(target, k),
@@ -4648,7 +4661,7 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
     use StmtKind::*;
     match &s.kind {
         Expr(e) => match &e.kind {
-            ExprKind::Yield(_) => Ok(()),
+            ExprKind::Yield(_) | ExprKind::YieldStar(_) => Ok(()),
             _ => {
                 if expr_uses(e, SusKind::Yield) {
                     Err("yield is only supported as a plain statement (`yield x;`)".into())
@@ -4660,7 +4673,8 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
         VarDecl(_, ds) => {
             for d in ds {
                 match &d.init {
-                    Some(x) if matches!(x.kind, ExprKind::Yield(_)) => {}
+                    Some(x)
+                        if matches!(x.kind, ExprKind::Yield(_) | ExprKind::YieldStar(_)) => {}
                     Some(x) if expr_uses(x, SusKind::Yield) => {
                         return Err("yield is only supported as `let x = yield v`".into())
                     }
@@ -4891,7 +4905,9 @@ impl YieldLift {
         match &mut s.kind {
             StmtKind::Expr(e) => {
                 // the two shapes the walker already suspends on stay as-is
-                if matches!(e.kind, ExprKind::Yield(_)) || !expr_uses(e, SusKind::Yield) {
+                if matches!(e.kind, ExprKind::Yield(_) | ExprKind::YieldStar(_))
+                    || !expr_uses(e, SusKind::Yield)
+                {
                     out.push(s);
                     return;
                 }
@@ -4905,7 +4921,8 @@ impl YieldLift {
             StmtKind::VarDecl(kind, ds) => {
                 let needs = ds.iter().any(|d| {
                     d.init.as_ref().map_or(false, |i| {
-                        !matches!(i.kind, ExprKind::Yield(_)) && expr_uses(i, SusKind::Yield)
+                        !matches!(i.kind, ExprKind::Yield(_) | ExprKind::YieldStar(_))
+                            && expr_uses(i, SusKind::Yield)
                     })
                 });
                 if !needs {
@@ -4919,7 +4936,7 @@ impl YieldLift {
                 for mut d in ds {
                     let mut pre = Vec::new();
                     if let Some(init) = d.init.take() {
-                        if !matches!(init.kind, ExprKind::Yield(_)) {
+                        if !matches!(init.kind, ExprKind::Yield(_) | ExprKind::YieldStar(_)) {
                             d.init = Some(if expr_uses(&init, SusKind::Yield) {
                                 self.expr(init, &mut pre)
                             } else {
@@ -5019,6 +5036,14 @@ impl YieldLift {
                 let op = op.map(|o| Box::new(self.expr(*o, pre)));
                 let y = Expr {
                     kind: ExprKind::Yield(op),
+                    span,
+                };
+                self.bind(y, pre, span)
+            }
+            ExprKind::YieldStar(x) => {
+                let x = Box::new(self.expr(*x, pre));
+                let y = Expr {
+                    kind: ExprKind::YieldStar(x),
                     span,
                 };
                 self.bind(y, pre, span)
@@ -5782,6 +5807,7 @@ fn scan_expr_arguments(e: &Expr) -> bool {
         }),
         Yield(Some(v)) => scan_expr_arguments(v),
         Yield(None) => false,
+        YieldStar(v) => scan_expr_arguments(v),
         PatAssign { pat, value } => pat_scan_args(pat) || scan_expr_arguments(value),
         LogicalAssign { target, value, .. } => {
             scan_expr_arguments(target) || scan_expr_arguments(value)

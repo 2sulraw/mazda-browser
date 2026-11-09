@@ -1687,7 +1687,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                 None,
             )))
         }
-        ExprKind::Yield(_) => Err(JsError::throw(
+        ExprKind::Yield(_) | ExprKind::YieldStar(_) => Err(JsError::throw(
             "SyntaxError: yield is only valid inside generator functions",
         )),
         ExprKind::Await(inner) => {

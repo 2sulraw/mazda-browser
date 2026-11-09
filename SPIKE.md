@@ -1866,3 +1866,21 @@ outer binding. `var` inside the body still hoists. 13,128 -> **13,238**
 
 - test262 language subset: 13,128 -> **13,238** pass (74.9% of 17,678 run,
   6,154 skipped). Engine tests **928** green.
+
+### `yield*` delegation
+
+`yield*` did not parse (`unexpected token Mul`): the parser read `yield`
+and then failed on the `*`. It is now a distinct `YieldStar` expression. The
+generator walker gained a `Delegate` frame: each resume calls the iterator's
+`next(arg)` (forwarding the value fed to the outer `.next`), forwards the
+yielded values, and binds the delegate's final `value` when `done` is true
+(`let x = yield* it`). Non-iterable operands throw a TypeError at first
+resume; `yield*` outside a generator is still a SyntaxError. 13,238 ->
+**13,305** (+67).
+
+### Measured
+
+- test262 language subset: 13,238 -> **13,305** pass (75.3% of 17,678 run,
+  6,154 skipped). Engine tests **929** green.
+- Honest gaps: `.throw()` forwarding to the delegate and calling the
+  delegate's `return()` on a `.return()` are not implemented yet.
