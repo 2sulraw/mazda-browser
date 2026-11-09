@@ -682,6 +682,18 @@ struct FnCtx {
     is_generator: bool,
 }
 
+/// One StatementList's declaration bookkeeping for the early error
+/// "LexicallyDeclaredNames of StatementList must not intersect
+/// VarDeclaredNames, and must not contain duplicates" (blocks, switch
+/// CaseBlocks, function bodies and the program).
+struct BlockScope {
+    lex: Vec<Rc<str>>,
+    vars: Vec<Rc<str>>,
+    /// program / function body: `var` names stop here and a function
+    /// declaration at this level is var-scoped
+    top: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -704,6 +716,7 @@ pub fn parse(source: &str, src_id: u32) -> Result<Program, JsError> {
         class_stack: Vec::new(),
         fn_ctx: Vec::new(),
         no_in: false,
+        block_scopes: Vec::new(),
     };
     p.program()
 }
@@ -741,6 +754,9 @@ struct Parser<'a> {
     /// inside a `for` head: `in` is part of the head grammar, so it must not
     /// be consumed as the binary operator (cleared inside parentheses)
     no_in: bool,
+    /// open StatementLists, innermost last, for the lexical/var redeclaration
+    /// early error
+    block_scopes: Vec<BlockScope>,
 }
 
 /// nesting cap; deep enough for any real page, shallow enough to stay far
@@ -941,10 +957,23 @@ impl<'a> Parser<'a> {
     }
 
     fn program(&mut self) -> Result<Program, JsError> {
+        self.block_scopes.push(BlockScope {
+            lex: Vec::new(),
+            vars: Vec::new(),
+            top: true,
+        });
         let mut out = Vec::new();
         while *self.peek() != Tok::Eof {
-            out.push(self.statement()?);
+            match self.statement() {
+                Ok(s) => out.push(s),
+                Err(e) => {
+                    self.block_scopes.pop();
+                    return Err(e);
+                }
+            }
         }
+        let scope = self.block_scopes.pop().expect("program scope");
+        self.check_block_scope(&scope)?;
         Ok(out)
     }
 
@@ -1288,15 +1317,21 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Var) => {
                 self.next();
-                StmtKind::VarDecl(VarKind::Var, self.declarators()?)
+                let ds = self.declarators()?;
+                self.note_declarators(VarKind::Var, &ds);
+                StmtKind::VarDecl(VarKind::Var, ds)
             }
             Tok::Kw(Kw::Let) => {
                 self.next();
-                StmtKind::VarDecl(VarKind::Let, self.declarators()?)
+                let ds = self.declarators()?;
+                self.note_declarators(VarKind::Let, &ds);
+                StmtKind::VarDecl(VarKind::Let, ds)
             }
             Tok::Kw(Kw::Const) => {
                 self.next();
-                StmtKind::VarDecl(VarKind::Const, self.declarators()?)
+                let ds = self.declarators()?;
+                self.note_declarators(VarKind::Const, &ds);
+                StmtKind::VarDecl(VarKind::Const, ds)
             }
             Tok::Kw(Kw::Function) => {
                 self.next();
@@ -1305,6 +1340,7 @@ impl<'a> Parser<'a> {
                     self.next(); // `*`
                 }
                 let f = self.function_rest(true, false, is_gen)?;
+                self.declare_fn(&f.name);
                 StmtKind::FuncDecl(f)
             }
             Tok::Kw(Kw::Async) => {
@@ -1315,6 +1351,7 @@ impl<'a> Parser<'a> {
                     // walker runs the body blocking (see gen.rs docs)
                     let is_gen = self.eat_op(Op::Mul);
                     let f = self.function_rest(true, true, is_gen)?;
+                    self.declare_fn(&f.name);
                     StmtKind::FuncDecl(f)
                 } else {
                     // async arrow / plain expression starting with `async`
@@ -1404,6 +1441,12 @@ impl<'a> Parser<'a> {
                 let disc = self.expr()?;
                 self.expect_punct(Punct::RParen)?;
                 self.expect_punct(Punct::LBrace)?;
+                // all cases share one lexical scope (CaseBlock early error)
+                self.block_scopes.push(BlockScope {
+                    lex: Vec::new(),
+                    vars: Vec::new(),
+                    top: false,
+                });
                 let mut cases = Vec::new();
                 while !self.eat_punct(Punct::RBrace) {
                     let test = if self.eat_kw(Kw::Case) {
@@ -1425,6 +1468,8 @@ impl<'a> Parser<'a> {
                     }
                     cases.push(SwitchCase { test, body });
                 }
+                let scope = self.block_scopes.pop().expect("switch scope");
+                self.check_block_scope(&scope)?;
                 StmtKind::Switch {
                     disc: Box::new(disc),
                     cases,
@@ -1509,7 +1554,9 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Class) => {
                 self.next();
-                let list = self.class_rest()?;
+                let name = self.expect_ident()?;
+                self.declare_lexical(&name);
+                let list = self.class_rest_named(name)?;
                 return Ok(Stmt {
                     kind: StmtKind::List(list),
                     span: self.span_from(start),
@@ -1566,20 +1613,107 @@ impl<'a> Parser<'a> {
     }
 
     fn block_body(&mut self) -> Result<Vec<Stmt>, JsError> {
+        self.stmt_list(false)
+    }
+
+    /// A function body: same grammar as a block, but `var` names stop here and
+    /// a function declaration at this level is var-scoped.
+    fn fn_block_body(&mut self) -> Result<Vec<Stmt>, JsError> {
+        self.stmt_list(true)
+    }
+
+    fn stmt_list(&mut self, top: bool) -> Result<Vec<Stmt>, JsError> {
         // A function body is its own grammar: `in` is a normal operator again
         // even when the function expression sits in a for-head initializer
         // (`for (var f = function () { "x" in y; };;)`). Same for class bodies.
         let prev_no_in = self.no_in;
         self.no_in = false;
+        self.block_scopes.push(BlockScope {
+            lex: Vec::new(),
+            vars: Vec::new(),
+            top,
+        });
         let mut out = Vec::new();
         while !self.eat_punct(Punct::RBrace) {
             if *self.peek() == Tok::Eof {
+                self.block_scopes.pop();
+                self.no_in = prev_no_in;
                 return self.err("unterminated block (missing `}`)");
             }
-            out.push(self.statement()?);
+            match self.statement() {
+                Ok(s) => out.push(s),
+                Err(e) => {
+                    self.block_scopes.pop();
+                    self.no_in = prev_no_in;
+                    return Err(e);
+                }
+            }
         }
         self.no_in = prev_no_in;
+        let scope = self.block_scopes.pop().expect("block scope stack");
+        self.check_block_scope(&scope)?;
         Ok(out)
+    }
+
+    /// Mark a name as lexically declared in the innermost StatementList.
+    fn declare_lexical(&mut self, name: &Rc<str>) {
+        if let Some(s) = self.block_scopes.last_mut() {
+            s.lex.push(name.clone());
+        }
+    }
+
+    /// Mark a `var` name in the innermost StatementList and every enclosing
+    /// one up to (and including) the nearest function body or program.
+    fn declare_var(&mut self, name: &Rc<str>) {
+        for s in self.block_scopes.iter_mut().rev() {
+            s.vars.push(name.clone());
+            if s.top {
+                break;
+            }
+        }
+    }
+
+    /// A function declaration: lexical in a block, var-scoped at the top of a
+    /// function body or the program.
+    fn declare_fn(&mut self, name: &Rc<str>) {
+        match self.block_scopes.last() {
+            Some(s) if !s.top => self.declare_lexical(name),
+            _ => self.declare_var(name),
+        }
+    }
+
+    /// LexicallyDeclaredNames must be duplicate-free and disjoint from
+    /// VarDeclaredNames (Block / CaseBlock / FunctionBody early error).
+    fn check_block_scope(&mut self, scope: &BlockScope) -> Result<(), JsError> {
+        for (i, l) in scope.lex.iter().enumerate() {
+            if scope.lex[..i].contains(l) {
+                return self.err(format!("`{l}` is declared more than once"));
+            }
+            if scope.vars.iter().any(|v| v == l) {
+                return self.err(format!(
+                    "`{l}` is declared both lexically and with `var` in the same block"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the names bound by a variable declaration in the open
+    /// StatementList (lexical for `let`/`const`, var-propagating for `var`).
+    fn note_declarators(&mut self, kind: VarKind, ds: &[Declarator]) {
+        let mut names = Vec::new();
+        for d in ds {
+            match &d.pat {
+                Some(p) => pat_binding_names(p, &mut names),
+                None => names.push(d.name.clone()),
+            }
+        }
+        for n in names {
+            match kind {
+                VarKind::Var => self.declare_var(&n),
+                _ => self.declare_lexical(&n),
+            }
+        }
     }
 
     fn declarators(&mut self) -> Result<Vec<Declarator>, JsError> {
@@ -1993,7 +2127,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         });
         let params = self.param_list()?;
         self.expect_punct(Punct::LBrace)?;
-        let mut body_stmts = self.block_body()?;
+        let mut body_stmts = self.fn_block_body()?;
         self.fn_ctx.pop();
         self.check_strict_body(&params, &body_stmts)?;
         if is_generator {
@@ -2536,7 +2670,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 self.fn_ctx.push(FnCtx::default());
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
-                let body = self.block_body()?;
+                let body = self.fn_block_body()?;
                 self.fn_ctx.pop();
                 self.check_strict_body(&params, &body)?;
                 let uses_arguments = scan_uses_arguments_stmts(&body);
@@ -2625,7 +2759,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
-                let mut body = self.block_body()?;
+                let mut body = self.fn_block_body()?;
                 if is_ctor {
                     if let Some(c) = self.class_stack.last_mut() {
                         c.in_constructor = false;
@@ -2936,7 +3070,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
 
     fn arrow_body(&mut self) -> Result<FnBody, JsError> {
         if self.eat_punct(Punct::LBrace) {
-            Ok(FnBody::Block(self.block_body()?))
+            Ok(FnBody::Block(self.fn_block_body()?))
         } else {
             Ok(FnBody::Expr(self.assign_expr()?))
         }
@@ -3014,6 +3148,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 is_generator: self.fn_ctx.last().is_some_and(|c| c.is_generator),
             }],
             no_in: false,
+            block_scopes: Vec::new(),
         };
         let mut idx = 0usize;
         let params = sub.params_after_lparen(&mut idx)?;
@@ -3661,6 +3796,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         class_stack: self.class_stack.clone(),
                         fn_ctx: self.fn_ctx.clone(),
                         no_in: false,
+                        block_scopes: Vec::new(),
                     };
                     let e = sub.expr()?;
                     segs.push(TplSeg::Expr(e));
@@ -3934,7 +4070,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         });
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
-                        let mut body = self.block_body()?;
+                        let mut body = self.fn_block_body()?;
                         self.fn_ctx.pop();
                         self.check_strict_body(&params, &body)?;
                         if is_gen {
@@ -3972,7 +4108,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             self.fn_ctx.push(FnCtx::default());
                             let params = self.param_list()?;
                             self.expect_punct(Punct::LBrace)?;
-                            let body = self.block_body()?;
+                            let body = self.fn_block_body()?;
                             self.fn_ctx.pop();
                             self.check_strict_body(&params, &body)?;
                             let uses_arguments = scan_uses_arguments_stmts(&body);
@@ -4016,7 +4152,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         self.fn_ctx.push(FnCtx::default());
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
-                        let body = self.block_body()?;
+                        let body = self.fn_block_body()?;
                         self.fn_ctx.pop();
                         self.check_strict_body(&params, &body)?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
@@ -4044,7 +4180,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         self.fn_ctx.push(FnCtx::default());
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
-                        let body = self.block_body()?;
+                        let body = self.fn_block_body()?;
                         self.fn_ctx.pop();
                         self.check_strict_body(&params, &body)?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);

@@ -1729,6 +1729,45 @@ fn private_names_are_lexically_scoped_and_unique() {
 }
 
 #[test]
+fn block_scope_lexical_and_var_redeclaration() {
+    for src in [
+        "{ let f; var f }",
+        "{ var f; let f }",
+        "{ let f; { var f } }",
+        "{ let f; let f }",
+        "{ const f = 1; var f }",
+        "{ class f {} var f }",
+        "{ function f() {} let f }",
+        "{ function f() {} function f() {} }",
+        "{ function f() {} { var f } }",
+        "switch (0) { case 0: let f; case 1: var f }",
+        "switch (0) { case 0: let f; case 1: let f }",
+        "function g() { let f; var f }",
+        "let f; var f",
+        "let f; let f",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // legal: repeated `var`, sibling/nested scopes, a nested function body,
+    // and a for-head `let` shadowing an enclosing `let`
+    for src in [
+        "{ var f; var f }",
+        "{ let f; { let f } }",
+        "{ let f; function g() { var f } }",
+        "{ let f; for (let f = 0; f < 1; f++) {} }",
+        "function f() {} function f() {}",
+        "switch (0) { case 0: var f; case 1: var f }",
+        "{ let f; } { let f; }",
+        "for (let f = 0; f < 1; f++) { var g; }",
+    ] {
+        run(src);
+    }
+}
+
+#[test]
 fn super_call_only_inside_constructor() {
     for src in [
         "class C extends Object { m() { super(); } }",

@@ -1834,3 +1834,19 @@ ordinary methods is untouched. 12,931 -> **12,971** (+40).
 
 - test262 language subset: 12,931 -> **12,971** pass (73.4% of 17,678 run,
   6,154 skipped). Engine tests **926** green.
+
+### Block / switch lexical redeclaration early errors
+
+A StatementList may not declare the same name both lexically (`let`/`const`/
+`class`/block-level function) and with `var`, and its lexical names must not
+repeat. The parser now keeps a stack of StatementLists (program, function
+bodies, blocks, switch CaseBlocks), records declaration names as they are
+parsed, propagates `var` names outward until the nearest function body or the
+program, and checks the scope when it closes. Function declarations are
+var-scoped at the top of a function body/program and lexical inside a block.
+12,971 -> **13,128** (+157).
+
+### Measured
+
+- test262 language subset: 12,971 -> **13,128** pass (74.3% of 17,678 run,
+  6,154 skipped). Engine tests **927** green.
