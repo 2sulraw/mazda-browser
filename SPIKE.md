@@ -2247,3 +2247,20 @@ compile per literal.
 - `language/literals/regexp` failures 197 -> **40**; the total failure count
   dropped by exactly the same 157, so no other area regressed.
 - engine tests **944** green (new parse-time validation test).
+
+## CRLF line continuations in string literals (P7, 2026-11-09)
+
+The string scanner skipped an escape with a flat `pos += 2`. For a line
+continuation written as backslash + CRLF that skipped the backslash and the
+CR but left the LF, which the scanner then reported as "unterminated string
+literal". The escape path now consumes the whole CRLF pair when present
+(and still a single byte otherwise). The unescaper already dropped
+backslash + line terminator from the value.
+
+### Measured
+
+- test262 language subset: 14,517 -> **14,527** pass (82.2% of 17,678 run,
+  6,154 skipped).
+- `unterminated string literal` failures 20 -> **2**; the NIST
+  `line-continuation-single`/`-double` cases pass.
+- engine tests **945** green (new continuation test).

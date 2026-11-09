@@ -2984,6 +2984,16 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn string_line_continuations() {
+    // LF-only and CRLF continuations both vanish from the value
+    assert_eq!(string("var s = 'a\\\nb'; s"), "ab");
+    assert_eq!(string("var s = 'a\\\r\nb'; s"), "ab");
+    assert_eq!(string("var s = \"x\\\r\ny\\\rz\"; s"), "xyz");
+    // an escaped quote still terminates the escape, not the string
+    assert_eq!(string("var s = 'a\\'b'; s"), "a'b");
+}
+
+#[test]
 fn regex_literals_validate_at_parse_time() {
     // an invalid pattern is a SyntaxError even if the literal never runs
     assert!(matches!(err("var r = /(/;"), JsError::Syntax { .. }));

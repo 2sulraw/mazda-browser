@@ -658,7 +658,16 @@ impl<'a> Lexer<'a> {
                     return self.err("unterminated string literal", start)
                 }
                 Some(b'\\') => {
-                    self.pos += 2; // skip escaped char (may over-shoot on EOF; caught next loop)
+                    // skip the backslash and the escaped char; a CRLF line
+                    // continuation is two bytes and must be skipped whole
+                    self.pos += 1;
+                    if self.peek() == Some(b'\r')
+                        && self.src.as_bytes().get(self.pos + 1) == Some(&b'\n')
+                    {
+                        self.pos += 2;
+                    } else {
+                        self.pos += 1; // may over-shoot on EOF; caught next loop
+                    }
                 }
                 Some(b) if b == delim => {
                     let raw = &self.src[body_start..self.pos];
