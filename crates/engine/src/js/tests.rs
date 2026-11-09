@@ -739,6 +739,29 @@ fn optional_chaining() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn eval_runs_in_the_calling_scope() {
+    assert_eq!(num("eval('1 + 2')"), 3.0);
+    // `var` from a direct eval lands in the caller's environment
+    assert_eq!(num("function f() { eval('var x = 7'); return x } f()"), 7.0);
+    assert_eq!(num("eval('var y = 4'); y"), 4.0);
+    // a non-string argument is returned unchanged
+    assert_eq!(num("eval(42)"), 42.0);
+    assert_eq!(string("eval('\"a\" + \"b\"')"), "ab");
+    // a syntax error inside eval is a catchable SyntaxError
+    assert!(boolean(
+        "var ok = false; try { eval('var') } catch (e) { ok = e instanceof SyntaxError } ok"
+    ));
+    // indirect eval (through a variable) also runs, in global scope
+    assert_eq!(num("var e2 = eval; e2('var z = 9'); z"), 9.0);
+    // a shadowed `eval` is an ordinary call
+    assert_eq!(
+        num("function g(ev) { return ev('abc') } g(function (s) { return s.length })"),
+        3.0
+    );
+    assert_eq!(string("typeof eval"), "function");
+}
+
+#[test]
 fn strict_directive_needs_a_simple_parameter_list() {
     // a default/rest/destructuring parameter list may not opt into strict
     // mode with a `"use strict"` directive

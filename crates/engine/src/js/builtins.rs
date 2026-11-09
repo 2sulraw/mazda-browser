@@ -376,6 +376,9 @@ pub(crate) fn install(e: &mut JsEngine) {
     e.set_global("isNaN", Val::Native(ie));
     e.set_global("isFinite", Val::Native(ifn));
 
+    let ev = e.register_native("eval", n_eval, 0);
+    e.set_global("eval", Val::Native(ev));
+
     let enc = e.register_native("encodeURIComponent", n_uri, 0);
     let dec = e.register_native("decodeURIComponent", n_uri, 1);
     e.set_global("encodeURIComponent", Val::Native(enc));
@@ -2837,6 +2840,16 @@ fn n_num_globals(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Resu
 }
 
 // -- URI encoding -----------------------------------------------------------
+
+/// Indirect `eval`: reached when the intrinsic is called through any path
+/// other than a direct `eval(...)` (a variable, `Reflect.apply`, ...). Spec
+/// runs those in the global scope, which is also what the interpreter's
+/// direct-eval hook leaves for this function.
+fn n_eval(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let env = e.global_env.clone();
+    let arg = args.first().cloned().unwrap_or(Val::Undefined);
+    super::interp::eval_source(e, &env, arg)
+}
 
 fn n_uri(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let s = args.first().map_or("".to_string(), |v| v.to_string());

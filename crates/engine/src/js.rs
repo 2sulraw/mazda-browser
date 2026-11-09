@@ -1767,32 +1767,41 @@ impl JsEngine {
     /// (JS `eval` completion-value semantics; declarations contribute
     /// nothing). Handy for embedder/tests; not observable from script code.
     pub fn exec(&mut self, source: &str) -> Result<Val, JsError> {
-        let src_id = self.register_source(source);
-        let program: Program = parser::parse(source, src_id)?;
         self.call_depth = 0;
         self.steps = 0;
+        let env = self.global_env.clone();
+        let last = self.run_program(source, &env)?;
+        // microtask quiescence at the end of every execution turn (idempotent
+        // with the embedder's own drain later)
+        self.run_microtasks(MAX_MICROTASKS)?;
+        Ok(last)
+    }
+
+    /// Parse, hoist and run `source` against `env`. Shared by a top-level
+    /// turn (`exec`, global scope) and direct `eval` (the calling scope);
+    /// neither resets the step budget nor drains microtasks, so an eval runs
+    /// inside the caller's turn.
+    pub(crate) fn run_program(&mut self, source: &str, env: &Rc<Env>) -> Result<Val, JsError> {
+        let src_id = self.register_source(source);
+        let program: Program = parser::parse(source, src_id)?;
         self.cur_span = 0;
         self.cur_src = src_id;
         self.err_located = false;
         self.err_decorated = false;
-        let env = self.global_env.clone();
-        interp::hoist(self, &env, &program);
+        interp::hoist(self, env, &program);
         let mut last = Val::Undefined;
         for st in program.iter() {
             // a Budget error from this turn names the spinning statement;
             // `finish_error` resolves the recorded offset to line/col
             self.err_located = false;
             let r = match &st.kind {
-                parser::StmtKind::Expr(e) => interp::eval_expr(self, &env, e).map(|v| {
+                parser::StmtKind::Expr(e) => interp::eval_expr(self, env, e).map(|v| {
                     last = v;
                 }),
-                _ => interp::eval_stmt(self, &env, st).map(|_| ()),
+                _ => interp::eval_stmt(self, env, st).map(|_| ()),
             };
             r.map_err(|err| self.finish_error(err, source))?;
         }
-        // microtask quiescence at the end of every execution turn (idempotent
-        // with the embedder's own drain later)
-        self.run_microtasks(MAX_MICROTASKS)?;
         Ok(last)
     }
 

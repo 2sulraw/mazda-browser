@@ -590,6 +590,27 @@ fn make_val_closure(e: &mut JsEngine, env: &Rc<Env>, f: &Rc<FnDef>, arrow: bool)
 /// caught engine error becomes a real Error object of the right class.
 /// User-thrown strings are left alone unless they look exactly like an engine
 /// message (no realistic page throws `"TypeError: ..."` as a value).
+/// Direct `eval(source)` against the calling scope. The source runs in the
+/// caller's environment (so `var`/function declarations land there) and its
+/// completion value is the result. A non-string argument is returned
+/// unchanged, per spec.
+pub(crate) fn eval_source(e: &mut JsEngine, env: &Rc<Env>, arg: Val) -> Result<Val, JsError> {
+    let Val::Str(src) = &arg else { return Ok(arg) };
+    match e.run_program(src, env) {
+        Ok(v) => Ok(v),
+        // a syntax error inside eval is a catchable SyntaxError, not a
+        // failed turn
+        Err(JsError::Syntax { msg, line, col }) => {
+            let text = format!("SyntaxError: {msg} (line {line}, col {col})");
+            Err(JsError::Throw(caught_value(
+                e,
+                Val::Str(Rc::from(text.as_str())),
+            )))
+        }
+        Err(other) => Err(other),
+    }
+}
+
 pub(crate) fn caught_value(e: &mut JsEngine, v: Val) -> Val {
     let Val::Str(s) = v else { return v };
     let Some((name, msg)) = s.split_once(": ") else {
@@ -1316,6 +1337,16 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                 }
                 _ => {
                     let f = eval_expr(e, env, callee)?;
+                    // direct eval: `eval(...)` with the intrinsic in scope
+                    // runs against the calling environment
+                    if let ExprKind::Ident(name) = &callee.kind {
+                        if &**name == "eval"
+                            && matches!(&f, Val::Native(id) if e.native_id("eval") == Some(*id))
+                        {
+                            let arg = argvals.into_iter().next().unwrap_or(Val::Undefined);
+                            return eval_source(e, env, arg);
+                        }
+                    }
                     // sloppy mode: plain calls get the global object as this
                     let this = Val::Obj(e.global_obj.clone());
                     e.call(f, this, argvals)
