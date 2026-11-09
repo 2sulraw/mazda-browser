@@ -703,8 +703,16 @@ pub(crate) fn bind_pat(
     match pat {
         Pat::Name(t) => bind_target(e, env, t, value, kind),
         Pat::Arr(parts) => {
-            let items = iter_src(e, &value)?;
-            bind_arr(e, env, parts, &items, kind)
+            // only consume what the pattern needs; a rest element drains the
+            // remainder. An iterator that is not exhausted is closed.
+            let drain = parts.iter().any(|p| matches!(p, PatPart::Rest(_)));
+            let limit = if drain { None } else { Some(parts.len()) };
+            let (items, done, it) = iter_limited(e, &value, limit)?;
+            let r = bind_arr(e, env, parts, &items, kind);
+            if !done {
+                close_iterator(e, &it)?;
+            }
+            r
         }
         Pat::Obj(parts) => bind_obj(e, env, parts, &value, kind),
     }
@@ -1199,6 +1207,78 @@ pub(crate) fn for_of_items(e: &mut JsEngine, v: &Val) -> Result<Vec<Val>, JsErro
     Err(JsError::throw(
         "RangeError: iterator produced too many values",
     ))
+}
+
+/// Pull at most `limit` values from an iterable (destructuring must not drain
+/// an iterator it does not need). Returns the values, whether the iterator
+/// signalled `done`, and the iterator object so the caller can close it.
+fn iter_limited(
+    e: &mut JsEngine,
+    v: &Val,
+    limit: Option<usize>,
+) -> Result<(Vec<Val>, bool, Val), JsError> {
+    let it = get_iterator(e, v)?;
+    let mut out = Vec::new();
+    // fast path: engine iterator object, no `.next()` call overhead
+    if let Val::Obj(o) = &it {
+        let mut fast = false;
+        let mut done = false;
+        {
+            let mut b = o.borrow_mut();
+            if let ObjKind::Iterator(state) = &mut b.kind {
+                fast = true;
+                loop {
+                    if limit.is_some_and(|l| out.len() >= l) {
+                        break;
+                    }
+                    match iter_step(state) {
+                        Some(v) => {
+                            if out.len() >= ITER_CAP {
+                                return Err(JsError::throw(
+                                    "RangeError: iterator produced too many values",
+                                ));
+                            }
+                            out.push(v);
+                        }
+                        None => {
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if fast {
+            return Ok((out, done, it));
+        }
+    }
+    // generic protocol: call `.next()` as needed
+    let next = get_member(e, &it, "next")?;
+    loop {
+        if limit.is_some_and(|l| out.len() >= l) {
+            return Ok((out, false, it));
+        }
+        if out.len() >= ITER_CAP {
+            return Err(JsError::throw(
+                "RangeError: iterator produced too many values",
+            ));
+        }
+        let step = e.call(next.clone(), it.clone(), Vec::new())?;
+        if get_member(e, &step, "done")?.to_bool() {
+            return Ok((out, true, it));
+        }
+        out.push(get_member(e, &step, "value")?);
+    }
+}
+
+/// `IteratorClose`: call the iterator's `return` hook (a no-op for the
+/// engine's built-in iterators, which have none).
+fn close_iterator(e: &mut JsEngine, it: &Val) -> Result<(), JsError> {
+    let ret = get_member(e, it, "return")?;
+    if is_callable(&ret) {
+        e.call(ret, it.clone(), Vec::new())?;
+    }
+    Ok(())
 }
 
 

@@ -1886,16 +1886,15 @@ impl<'a> Parser<'a> {
             Tok::Punct(Punct::LBrack) => {
                 self.next();
                 let mut parts = Vec::new();
-                while !self.eat_punct(Punct::RBrack) {
-                    if !parts.is_empty() {
-                        self.expect_punct(Punct::Comma)?;
+                loop {
+                    if self.eat_punct(Punct::RBrack) {
+                        break;
                     }
-                    let trailing = matches!(
-                        self.peek(),
-                        Tok::Punct(Punct::RBrack) | Tok::Punct(Punct::Comma)
-                    );
-                    if trailing {
-                        parts.push(PatPart::Hole); // leading/trailing hole
+                    // a comma at an element position is an elision (leading
+                    // `[,a]`, interior `[a,,b]`, `[,]`); the comma separator
+                    // after an element is consumed below
+                    if self.eat_punct(Punct::Comma) {
+                        parts.push(PatPart::Hole);
                         continue;
                     }
                     if *self.peek() == Tok::Spread {
@@ -1914,12 +1913,18 @@ impl<'a> Parser<'a> {
                         parts.push(PatPart::Rest(Box::new(t)));
                         // `BindingRestElement` must be the last element;
                         // `[...a, b]` and `[...a,]` are early errors.
-                        if *self.peek() == Tok::Punct(Punct::Comma) {
+                        if !matches!(self.peek(), Tok::Punct(Punct::RBrack)) {
                             return self.err("rest element must be last in a pattern");
                         }
                         continue;
                     }
                     parts.push(self.pat_part(decl_form)?);
+                    // after an element: `,` starts the next slot, `]` ends
+                    if !self.eat_punct(Punct::Comma)
+                        && !matches!(self.peek(), Tok::Punct(Punct::RBrack))
+                    {
+                        self.expect_punct(Punct::Comma)?;
+                    }
                 }
                 Ok(Pat::Arr(parts))
             }

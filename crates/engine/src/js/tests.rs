@@ -2984,6 +2984,31 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn array_destructuring_pulls_lazily_and_closes() {
+    // only as many `next()` calls as the pattern needs
+    assert!(boolean(
+        "var c = 0; function* g() { c++; yield 1; c++; yield 2 } var [a] = g(); a === 1 && c === 1"
+    ));
+    // an elision steps once, it does not drain the iterator
+    assert!(boolean(
+        "var c = 0; function* g() { c++; yield; c++; yield } var [,] = g(); c === 1"
+    ));
+    // an exhausted iterator is not closed; an unfinished one is
+    assert!(boolean(
+        "var closed = 0; var iter = {}; iter[Symbol.iterator] = function () { return { next: function () { return { value: 1, done: false } }, return: function () { closed++; return {} } } }; var [x] = iter; x === 1 && closed === 1"
+    ));
+    assert!(boolean(
+        "var closed = 0; var iter = {}; iter[Symbol.iterator] = function () { return { next: function () { return { value: 1, done: true } }, return: function () { closed++; return {} } } }; var [x] = iter; x === undefined && closed === 0"
+    ));
+    // elision counts: a trailing comma is not extra hole
+    assert_eq!(num("[1,].length"), 1.0);
+    assert_eq!(num("[,].length"), 1.0);
+    assert_eq!(num("[,,].length"), 2.0);
+    assert_eq!(num("var [a, b,] = [1, 2]; a + b"), 3.0);
+    assert_eq!(num("[1, 2,].length"), 2.0);
+}
+
+#[test]
 fn object_rest_reads_getters_and_skips_hidden() {
     // an accessor runs once, and its value lands on the rest object
     assert_eq!(

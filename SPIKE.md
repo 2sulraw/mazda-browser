@@ -2150,3 +2150,26 @@ now honors an explicit `enumerable: false` by recording the key as hidden
 - Every `*-obj-ptrn-rest-getter` and `*-obj-ptrn-rest-skip-non-enumerable`
   case now passes (0 failures, was 56 each).
 - engine tests **939** green (new object-rest/spread test).
+
+## Lazy array destructuring with IteratorClose (P7, 2026-11-09)
+
+`bind_pat` for an array pattern called `iter_src`, which drained the whole
+iterator. That over-consumed side-effecting generators (an elision such as
+`[,]` ran the body twice) and never closed a partially-used iterator, so
+`{ next(), return() }` objects never saw `return`. The binder now uses
+`iter_limited`: it pulls exactly `parts.len()` values (all of them when a
+rest element is present), tracks whether the iterator signalled `done`, and
+calls the iterator's `return` hook when it stopped early. The array-pattern
+parser was also off by one: `[,]` parsed as two holes and `[a,]` as a hole
+after the binding, because it treated a trailing comma as an elision. It now
+consumes a comma at an element position as one hole, matching the array
+literal parser, so `[a,]`, `[,]` and `[a,,b]` count correctly.
+
+### Measured
+
+- test262 language subset: 13,960 -> **14,261** pass (80.7% of 17,678 run,
+  6,154 skipped).
+- `ary-ptrn-elision`, `ary-ptrn-empty`, `ary-init-iter-close`,
+  `ary-ptrn-elem-ary-elision-init` and `ary-ptrn-elem-ary-empty-init` all
+  drop to **0 failures** (was 56 each).
+- engine tests **940** green (new lazy/close test).
