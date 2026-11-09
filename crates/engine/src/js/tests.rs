@@ -1660,6 +1660,14 @@ fn escaped_await_yield_in_function_contexts() {
 }
 
 #[test]
+fn delete_removes_own_function_properties() {
+    assert!(boolean("class C { static m() {} }; delete C.m"));
+    assert!(boolean(
+        "class C { static m() {} }; delete C.m; !Object.prototype.hasOwnProperty.call(C, 'm')"
+    ));
+}
+
+#[test]
 fn trailing_comma_in_parameter_lists() {
     assert_eq!(num("function f(a, b,) { return a + b } f(1, 2)"), 3.0);
     assert_eq!(num("((a,) => a)(7)"), 7.0);

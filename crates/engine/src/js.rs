@@ -3865,6 +3865,14 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
             b.props.retain(|(k, _)| k.as_ref() != key);
             b.props.len() != before
         }
+        // functions are objects too: `delete C.staticMethod` must remove the
+        // own property (verifyProperty's configurable check relies on it)
+        Val::Func(c) => {
+            let mut p = c.props.borrow_mut();
+            let before = p.len();
+            p.retain(|(k, _)| k.as_ref() != key);
+            p.len() != before
+        }
         _ => false, // primitives: silent false (sloppy)
     }
 }

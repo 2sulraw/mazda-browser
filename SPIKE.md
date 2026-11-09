@@ -1734,3 +1734,17 @@ rest element. 11,440 -> **11,470** (+30).
 
 - test262 language subset: 11,440 -> **11,470** pass (64.9% of 17,678 run,
   6,154 skipped). Engine tests **918** green.
+
+### `delete` removes own properties of functions
+
+`delete_member` only handled `Val::Obj`, so `delete C.staticMethod` on a
+class constructor silently returned false. Functions are objects: the
+closure's own-property list is now pruned too. This is what
+`verifyProperty`'s configurable check exercises, so the class member
+descriptor tests stop reporting `m descriptor should be configurable`.
+11,470 -> **11,588** (+118).
+
+### Measured
+
+- test262 language subset: 11,470 -> **11,588** pass (65.6% of 17,678 run,
+  6,154 skipped). Engine tests **919** green.
