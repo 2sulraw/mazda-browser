@@ -1659,3 +1659,40 @@ is recorded as hidden too. 10,069 -> **10,553** (+484, 59.7% of run).
 - One reusable RAM guard: `js_allocation_units_stay_compact` caught the first
   version of the descriptor change growing `Obj` to 72 bytes; the hidden list
   was folded into the existing `Plain` variant instead of a new field.
+
+## Import grammar, escaped reserved words, and function contexts (P7, 2026-11-09)
+
+Three more measured waves, all driven by the refreshed failure histogram.
+
+### Dynamic-import call grammar
+
+`ImportCall` takes exactly one argument plus optional import attributes.
+The parser accepted `import()`, a second/third argument, a spread, and bare
+`import` / `import.x` / `new import(...)`. Those shapes are now rejected;
+`import(...)` and `import.meta` still parse. 10,553 -> **10,836** (+283).
+
+### Escaped reserved words, duplicate params, `void yield`
+
+Escaped identifiers (`\u0062reak`) decode to the same StringValue, so they
+are rejected as identifiers, bindings and shorthand properties, while
+staying legal as property names (`o.\u0275prov`). A non-simple parameter
+list may not repeat a bound name; a simple list still may in sloppy mode.
+A `yield` expression is not a unary operand (`void yield`). 10,836 ->
+**11,037** (+201).
+
+### Escaped `await` / `yield` in async and generator contexts
+
+`await` is a reserved word only inside async functions and `yield` only
+inside generators. The escaped spellings lex as identifiers, so the parser
+now keeps a `fn_ctx` stack (`is_async`, `is_generator`) pushed around
+function, method, accessor and arrow bodies (arrow parameters inherit
+`yield`, async arrow parameters reserve `await`). `check_ctx_ident` runs
+on identifier references, bindings, parameters, labels and shorthand
+properties. A nested non-async/non-generator function gets a fresh context,
+so `async function f() { function g() { var \u0061wait; } }` still parses.
+11,037 -> **11,187** (+150).
+
+### Measured
+
+- test262 language subset: 10,553 -> **11,187** pass (63.3% of 17,678 run,
+  6,154 skipped). Engine tests **915** green.

@@ -659,6 +659,16 @@ struct ClassCtx {
     is_static: bool,
 }
 
+/// Function context while parsing a body: `await` is a reserved word only
+/// inside async functions and `yield` only inside generators. Escaped
+/// spellings (`\u0061wait`) lex as identifiers, so they need this context to
+/// be rejected.
+#[derive(Clone, Copy, Default)]
+struct FnCtx {
+    is_async: bool,
+    is_generator: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -679,6 +689,7 @@ pub fn parse(source: &str, src_id: u32) -> Result<Program, JsError> {
         pos: 0,
         depth: 0,
         class_stack: Vec::new(),
+        fn_ctx: Vec::new(),
         no_in: false,
     };
     p.program()
@@ -711,6 +722,9 @@ struct Parser<'a> {
     /// enclosing class contexts (innermost last); `super` resolves against
     /// the top entry
     class_stack: Vec<ClassCtx>,
+    /// enclosing function contexts (innermost last): which escaped names are
+    /// reserved words here
+    fn_ctx: Vec<FnCtx>,
     /// inside a `for` head: `in` is part of the head grammar, so it must not
     /// be consumed as the binary operator (cleared inside parentheses)
     no_in: bool,
@@ -811,6 +825,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Reject an escaped identifier that is a reserved word in the given
+    /// function context (`\u0061wait` in async code, `\u0079ield` in a
+    /// generator). Unescaped spellings lex as keywords and never reach here.
+    fn check_reserved_in(&self, s: &str, ctx: FnCtx) -> Result<(), JsError> {
+        if ctx.is_async && s == "await" {
+            return self.err("`await` is not a valid identifier in an async function");
+        }
+        if ctx.is_generator && s == "yield" {
+            return self.err("`yield` is not a valid identifier in a generator function");
+        }
+        Ok(())
+    }
+
+    fn check_ctx_ident(&self, s: &str) -> Result<(), JsError> {
+        self.check_reserved_in(s, self.fn_ctx.last().copied().unwrap_or_default())
+    }
+
     fn expect_ident(&mut self) -> Result<Rc<str>, JsError> {
         match self.peek().clone() {
             Tok::Ident(s) => {
@@ -819,6 +850,7 @@ impl<'a> Parser<'a> {
                 if is_reserved_word(&s) {
                     return self.err(format!("`{s}` is a reserved word"));
                 }
+                self.check_ctx_ident(&s)?;
                 self.next();
                 Ok(s)
             }
@@ -1449,6 +1481,7 @@ impl<'a> Parser<'a> {
             }
             // `label: stmt` (only a bare identifier can start a label)
             Tok::Ident(name) if *self.peek_at(1) == Tok::Punct(Punct::Colon) => {
+                self.check_ctx_ident(&name)?;
                 let name = name.clone();
                 self.next(); // the label
                 self.next(); // `:`
@@ -1628,6 +1661,7 @@ impl<'a> Parser<'a> {
                         if is_reserved_word(&key) {
                             return self.err(format!("`{key}` is a reserved word"));
                         }
+                        self.check_ctx_ident(&key)?;
                         if *self.peek() == Tok::Op(Op::Assign) {
                             self.next();
                             let mut d = self.assign_expr()?;
@@ -1879,14 +1913,20 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         let name = if named {
             self.expect_ident()?
         } else if let Tok::Ident(s) = self.peek().clone() {
+            self.check_ctx_ident(&s)?;
             self.next();
             s
         } else {
             Rc::from("")
         };
+        self.fn_ctx.push(FnCtx {
+            is_async,
+            is_generator,
+        });
         let params = self.param_list()?;
         self.expect_punct(Punct::LBrace)?;
         let mut body_stmts = self.block_body()?;
+        self.fn_ctx.pop();
         self.check_strict_body(&params, &body_stmts)?;
         if is_generator {
             self.prepare_generator_body(&mut body_stmts, is_async)?;
@@ -1957,6 +1997,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             };
             let (name, pat) = match self.peek().clone() {
                 Tok::Ident(s) => {
+                    self.check_ctx_ident(&s)?;
                     self.next();
                     (s, None)
                 }
@@ -2373,9 +2414,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             if is_acc {
                 let getset = self.expect_ident()?;
                 let key = self.class_member_key()?;
+                self.fn_ctx.push(FnCtx::default());
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let body = self.block_body()?;
+                self.fn_ctx.pop();
                 self.check_strict_body(&params, &body)?;
                 let uses_arguments = scan_uses_arguments_stmts(&body);
                 let f = Rc::new(FnDef {
@@ -2432,9 +2475,14 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 ClassKey::Computed(_) => None,
             };
             if *self.peek() == Tok::Punct(Punct::LParen) {
+                self.fn_ctx.push(FnCtx {
+                    is_async,
+                    is_generator: is_gen,
+                });
                 let params = self.param_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let mut body = self.block_body()?;
+                self.fn_ctx.pop();
                 self.check_strict_body(&params, &body)?;
                 if is_gen {
                     self.prepare_generator_body(&mut body, is_async)?;
@@ -2531,9 +2579,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         // arrow with single ident param: `x => ...` / `async x => ...`
         if let Tok::Ident(s) = self.peek().clone() {
             if *self.peek_at(1) == Tok::Op(Op::Arrow) {
+                self.check_ctx_ident(&s)?;
                 self.next();
                 self.next(); // =>
-                let body = self.arrow_body()?;
+                let body = self.arrow_body_ctx(false)?;
                 let params = vec![Param {
                     name: s,
                     pat: None,
@@ -2560,10 +2609,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             // `async x => ...`
             if let Tok::Ident(s) = self.peek_at(1).clone() {
                 if *self.peek_at(2) == Tok::Op(Op::Arrow) {
+                    let mut pc = self.fn_ctx.last().copied().unwrap_or_default();
+                    pc.is_async = true;
+                    self.check_reserved_in(&s, pc)?;
                     self.next(); // async
                     self.next(); // ident
                     self.next(); // =>
-                    let body = self.arrow_body()?;
+                    let body = self.arrow_body_ctx(true)?;
                     let params = vec![Param {
                         name: s,
                         pat: None,
@@ -2589,7 +2641,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             // `async (a, b) => ...`
             if *self.peek_at(1) == Tok::Punct(Punct::LParen) {
                 if let Some(params) = self.try_arrow_params(true)? {
-                    let body = self.arrow_body()?;
+                    let body = self.arrow_body_ctx(true)?;
                     self.check_strict_arrow(&params, &body)?;
                     return Ok(Expr {
                         kind: ExprKind::Arrow(Rc::new(FnDef {
@@ -2610,7 +2662,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         // arrow with parenthesized params: `(a, b) => ...`
         if *self.peek() == Tok::Punct(Punct::LParen) {
             if let Some(params) = self.try_arrow_params(false)? {
-                let body = self.arrow_body()?;
+                let body = self.arrow_body_ctx(false)?;
                 self.check_strict_arrow(&params, &body)?;
                 return Ok(Expr {
                     kind: ExprKind::Arrow(Rc::new(FnDef {
@@ -2735,6 +2787,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         }
     }
 
+    /// Arrow bodies are their own function context: `await` is reserved only
+    /// in an async arrow, and `yield` never (ConciseBody is `~Yield, ~Await`).
+    fn arrow_body_ctx(&mut self, is_async: bool) -> Result<FnBody, JsError> {
+        self.fn_ctx.push(FnCtx {
+            is_async,
+            is_generator: false,
+        });
+        let r = self.arrow_body();
+        self.fn_ctx.pop();
+        r
+    }
+
     /// Lookahead: if the upcoming `( ... )` is `=>`-headed, parse its contents
     /// as an arrow parameter list and return it; otherwise leave the cursor
     /// untouched and return None (callers parse it as a parenthesized
@@ -2788,6 +2852,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             pos: 0,
             depth: 0,
             class_stack: Vec::new(),
+            // arrow parameters inherit `yield` from the enclosing function;
+            // an async arrow reserves `await` in its parameters too
+            fn_ctx: vec![FnCtx {
+                is_async: after_async,
+                is_generator: self.fn_ctx.last().is_some_and(|c| c.is_generator),
+            }],
             no_in: false,
         };
         let mut idx = 0usize;
@@ -3416,6 +3486,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         pos: 0,
                         depth: 0,
                         class_stack: Vec::new(),
+                        fn_ctx: self.fn_ctx.clone(),
                         no_in: false,
                     };
                     let e = sub.expr()?;
@@ -3518,6 +3589,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 if is_reserved_word(&s) {
                     return self.err(format!("`{s}` is a reserved word"));
                 }
+                self.check_ctx_ident(&s)?;
                 self.next();
                 ExprKind::Ident(s)
             }
@@ -3675,9 +3747,14 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     if is_async || is_gen {
                         let key_tok = self.pos;
                         let key = self.prop_name()?;
+                        self.fn_ctx.push(FnCtx {
+                            is_async,
+                            is_generator: is_gen,
+                        });
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
                         let mut body = self.block_body()?;
+                        self.fn_ctx.pop();
                         self.check_strict_body(&params, &body)?;
                         if is_gen {
                             // sync generators keep the strict yield-position
@@ -3711,9 +3788,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         self.expect_punct(Punct::RBrack)?;
                         let value = if *self.peek() == Tok::Punct(Punct::LParen) {
                             // computed method shorthand
+                            self.fn_ctx.push(FnCtx::default());
                             let params = self.param_list()?;
                             self.expect_punct(Punct::LBrace)?;
                             let body = self.block_body()?;
+                            self.fn_ctx.pop();
                             self.check_strict_body(&params, &body)?;
                             let uses_arguments = scan_uses_arguments_stmts(&body);
                             Expr {
@@ -3753,9 +3832,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         let is_setter = matches!(self.peek(), Tok::Ident(s) if &**s == "set");
                         self.next(); // `get` / `set`
                         let key = self.prop_name()?;
+                        self.fn_ctx.push(FnCtx::default());
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
                         let body = self.block_body()?;
+                        self.fn_ctx.pop();
                         self.check_strict_body(&params, &body)?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
@@ -3779,9 +3860,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     let save = self.pos;
                     let key = self.prop_name()?;
                     if *self.peek() == Tok::Punct(Punct::LParen) {
+                        self.fn_ctx.push(FnCtx::default());
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
                         let body = self.block_body()?;
+                        self.fn_ctx.pop();
                         self.check_strict_body(&params, &body)?;
                         let uses_arguments = scan_uses_arguments_stmts(&body);
                         let f = Rc::new(FnDef {
@@ -3812,6 +3895,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         if is_reserved_word(&key) {
                             return self.err(format!("`{key}` is a reserved word"));
                         }
+                        self.check_ctx_ident(&key)?;
                         props.push(ObjElem::Prop(
                             key.clone(),
                             Expr {

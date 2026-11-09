@@ -1622,6 +1622,44 @@ fn unicode_identifier_escapes() {
 }
 
 #[test]
+fn escaped_await_yield_in_function_contexts() {
+    // `await` is reserved in an async function and `yield` in a generator;
+    // the escaped spellings lex as identifiers, so the parser's function
+    // context has to reject them as bindings, references and labels.
+    for src in [
+        r"var f = async function () { var \u0061wait; };",
+        r"var f = async function () { void \u0061wait; };",
+        r"var f = async function () { \u0061wait: ; };",
+        r"var f = async () => { var \u0061wait; };",
+        r"var f = async () => { void \u0061wait; };",
+        r"var g = function *() { var \u0079ield; };",
+        r"var g = function *() { void \u0079ield; };",
+        r"var g = function *() { \u0079ield: ; };",
+        r"var o = { *m() { var \u0079ield; } };",
+        r"var o = { async m() { void \u0061wait; } };",
+        r"class C { *m() { var \u0079ield; } }",
+        r"class C { async m() { void \u0061wait; } }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // a nested non-async/non-generator function gets a fresh context
+    assert_eq!(
+        num(r"var f = async function () { function g() { var \u0061wait = 1; return \u0061wait } return g() }; f(); 7"),
+        7.0
+    );
+    assert_eq!(
+        num(r"var g = function *() { function h() { var \u0079ield = 2; return \u0079ield } }; g(); 7"),
+        7.0
+    );
+    // property names and sloppy-mode labels stay legal
+    assert_eq!(num(r"var o = { \u0061wait: 5 }; o.\u0061wait"), 5.0);
+    assert_eq!(num(r"var o = {}; o.\u0079ield = 6; o.\u0079ield"), 6.0);
+}
+
+#[test]
 fn template_line_continuation_and_unicode_escapes() {
     // `\` + U+2028/U+2029 is a line continuation. The lexer used to advance
     // one byte into the three-byte terminator and panic while slicing.
