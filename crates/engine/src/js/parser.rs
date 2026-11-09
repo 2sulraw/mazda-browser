@@ -1999,6 +1999,14 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         while !self.eat_punct(Punct::RParen) {
             if !params.is_empty() {
                 self.expect_punct(Punct::Comma)?;
+                // trailing comma: `(a, b,)` is legal, but not after a rest
+                // parameter (`(...a,)` is an early error)
+                if self.eat_punct(Punct::RParen) {
+                    if params.iter().any(|p: &Param| p.rest) {
+                        return self.err("a rest parameter cannot have a trailing comma");
+                    }
+                    break;
+                }
             }
             let rest = match self.peek() {
                 Tok::Spread => {

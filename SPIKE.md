@@ -1722,3 +1722,15 @@ no-binding forms are unchanged. 11,379 -> **11,440** (+61).
 
 - test262 language subset: 11,379 -> **11,440** pass (64.7% of 17,678 run,
   6,154 skipped). Engine tests **917** green.
+
+### Trailing comma in parameter lists
+
+`function f(a, b,) {}`, `(a, b = 2,) => ...` and `m(a,) {}` are legal;
+a rest parameter may not be followed by a comma (`(...a,)`). The shared
+`params_after_lparen` accepts the trailing comma and rejects it after a
+rest element. 11,440 -> **11,470** (+30).
+
+### Measured
+
+- test262 language subset: 11,440 -> **11,470** pass (64.9% of 17,678 run,
+  6,154 skipped). Engine tests **918** green.

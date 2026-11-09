@@ -1660,8 +1660,20 @@ fn escaped_await_yield_in_function_contexts() {
 }
 
 #[test]
-fn catch_parameter_destructuring() {
-    assert_eq!(
+fn trailing_comma_in_parameter_lists() {
+    assert_eq!(num("function f(a, b,) { return a + b } f(1, 2)"), 3.0);
+    assert_eq!(num("((a,) => a)(7)"), 7.0);
+    assert_eq!(num("((a, b = 2,) => a + b)(1)"), 3.0);
+    assert_eq!(num("var o = { m(a,) { return a } }; o.m(4)"), 4.0);
+    // a rest parameter cannot be followed by a comma
+    assert!(matches!(
+        err("function f(...a,) {}"),
+        JsError::Syntax { .. }
+    ));
+}
+
+#[test]
+fn catch_parameter_destructuring() {    assert_eq!(
         num("var r; try { throw [1, 2] } catch ([a, b]) { r = a + b } r"),
         3.0
     );
