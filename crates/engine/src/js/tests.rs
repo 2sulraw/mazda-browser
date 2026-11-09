@@ -613,6 +613,40 @@ fn class_static_members() {
 }
 
 #[test]
+fn class_members_are_not_enumerable() {
+    // a class method is an own, non-enumerable property of the prototype
+    assert!(boolean(
+        "let C = class { m() { return 5 } }; new C().m() === 5"
+    ));
+    assert!(!boolean(
+        "let C = class { m() {} }; Object.getOwnPropertyDescriptor(C.prototype, 'm').enumerable"
+    ));
+    assert_eq!(
+        string("let C = class { m() {} }; Object.keys(C.prototype).length"),
+        "0"
+    );
+    // for-in skips it, while an ordinary own property still shows up
+    assert_eq!(
+        string(
+            "let C = class { m() {} }; let o = new C(); o.x = 1; let s = []; for (let k in o) s.push(k); s.join(',')"
+        ),
+        "x"
+    );
+    // accessors and static members are hidden the same way
+    assert!(!boolean(
+        "let C = class { get g() { return 1 } }; Object.getOwnPropertyDescriptor(C.prototype, 'g').enumerable"
+    ));
+    assert!(!boolean(
+        "let C = class { static s() {} }; Object.getOwnPropertyDescriptor(C, 's').enumerable"
+    ));
+    // plain object literals keep their enumerable properties
+    assert!(boolean(
+        "Object.getOwnPropertyDescriptor({ a: 1 }, 'a').enumerable"
+    ));
+    assert_eq!(string("Object.keys({ a: 1 }).join(',')"), "a");
+}
+
+#[test]
 fn object_assign_accepts_function_target() {
     // a class/function target is a legitimate assignee (`Object.assign(C, ...)`);
     // it must not hit the "builtin installed on non-object" path

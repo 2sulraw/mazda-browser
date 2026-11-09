@@ -1071,7 +1071,7 @@ fn json_write(e: &mut JsEngine, v: &Val, depth: u32, out: &mut String) -> Result
                     }
                     out.push('}');
                 }
-                ObjKind::Plain => {
+                ObjKind::Plain(_) => {
                     out.push('{');
                     let mut first = true;
                     for (k, val) in b.props.iter() {
@@ -1435,7 +1435,16 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect(),
-                        _ => b.props.clone(),
+                        // class methods/accessors are own but not enumerable
+                        _ => b
+                            .props
+                            .iter()
+                            .filter(|(k, _)| {
+                                !matches!(&b.kind, ObjKind::Plain(Some(h))
+                                    if h.iter().any(|x| x == k))
+                            })
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     }
                 }
                 _ => Vec::new(),
@@ -1506,7 +1515,7 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                         _ => None,
                     }
                 }
-                Val::Func(f) => *f.proto.borrow_mut() = next,
+                Val::Func(f) => f.set_proto(next),
                 _ => {}
             }
             Ok(target)
@@ -1520,9 +1529,7 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 // class `extends` stores a function as the [[Prototype]];
                 // otherwise it is Function.prototype
                 Val::Func(f) => f
-                    .proto
-                    .borrow()
-                    .clone()
+                    .proto()
                     .or_else(|| e.function_proto.clone().map(Val::Obj))
                     .unwrap_or(Val::Null),
                 Val::Native(_) | Val::Method(_) | Val::Acc(_) => {
@@ -1638,7 +1645,7 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 Some(Val::Obj(p)) => Some(p.clone()),
                 _ => None,
             };
-            Ok(Val::Obj(new_obj(ObjKind::Plain, Vec::new(), proto)))
+            Ok(Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), proto)))
         }
         O_PROP_NAMES => {
             let o = args.first().cloned().unwrap_or(Val::Undefined);
@@ -1763,7 +1770,7 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
     match idx {
         OP_TOSTRING => Ok(Val::Str(Rc::from(match this {
             Val::Obj(o) => match &o.borrow().kind {
-                ObjKind::Plain => "[object Object]",
+                ObjKind::Plain(_) => "[object Object]",
                 ObjKind::Boxed(v) => match v {
                     Val::Str(_) => "[object String]",
                     Val::Num(_) => "[object Number]",
@@ -1912,8 +1919,12 @@ fn obj_has_own(o: &Rc<RefCell<Obj>>, key: &str) -> bool {
 }
 
 /// Descriptor object for a data property (the engine tracks no writability /
-/// enumerability, so those always report `true`) or an accessor pair.
+/// enumerability except the class-member hidden list) or an accessor pair.
 fn desc_from_value(v: Val) -> Val {
+    desc_with_enumerable(v, true)
+}
+
+fn desc_with_enumerable(v: Val, enumerable: bool) -> Val {
     let d = Val::new_object();
     match v {
         Val::Acc(a) => {
@@ -1933,13 +1944,14 @@ fn desc_from_value(v: Val) -> Val {
             obj_set_own(own(&d), "writable", Val::Bool(true));
         }
     }
-    obj_set_own(own(&d), "enumerable", Val::Bool(true));
+    obj_set_own(own(&d), "enumerable", Val::Bool(enumerable));
     obj_set_own(own(&d), "configurable", Val::Bool(true));
     d
 }
 
 /// `Object.getOwnPropertyDescriptor` shape: data properties always report
-/// writable/enumerable/configurable (the engine tracks none of those).
+/// writable/configurable (the engine tracks neither); enumerability is false
+/// for a class method/accessor.
 fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
     let b = o.borrow();
     let v = if let ObjKind::Array(items) = &b.kind {
@@ -1957,7 +1969,11 @@ fn own_desc(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
             .find(|(k, _)| k.as_ref() == key)
             .map(|(_, v)| v.clone())
     })?;
-    Some(desc_from_value(v))
+    let hidden = match &b.kind {
+        ObjKind::Plain(Some(h)) => h.iter().any(|x| x.as_ref() == key),
+        _ => false,
+    };
+    Some(desc_with_enumerable(v, !hidden))
 }
 
 /// Own descriptor on a closure (function) — its props plus the implicit
@@ -1970,10 +1986,11 @@ fn fn_desc(f: &Rc<Closure>, key: &str) -> Option<Val> {
         .find(|(k, _)| k.as_ref() == key)
         .map(|(_, v)| v.clone());
     match found {
-        Some(v) => Some(desc_from_value(v)),
-        None if key == "prototype" => {
-            Some(desc_from_value(Val::Obj(super::interp::ensure_prototype(f))))
-        }
+        Some(v) => Some(desc_with_enumerable(v, !f.is_hidden(key))),
+        None if key == "prototype" => Some(desc_with_enumerable(
+            Val::Obj(super::interp::ensure_prototype(f)),
+            false,
+        )),
         None => None,
     }
 }
@@ -3321,7 +3338,7 @@ const P_VALUES: u16 = 11;
 
 /// A fresh plain object pointing at `proto`.
 fn proto_instance(proto: Option<Rc<RefCell<Obj>>>) -> Val {
-    Val::Obj(new_obj(ObjKind::Plain, Vec::new(), proto))
+    Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), proto))
 }
 
 /// The serialized query of a URLSearchParams value.

@@ -409,6 +409,13 @@ pub enum StmtKind {
         getter: Option<Rc<FnDef>>,
         setter: Option<Rc<FnDef>>,
     },
+    /// class method desugar: install `func` on `owner[key]` and mark the
+    /// property non-enumerable (class methods are not own enumerable props)
+    DefineMethod {
+        owner: Box<Expr>,
+        key: Box<ClassKey>,
+        func: Rc<FnDef>,
+    },
     /// `import ... from "..."`. Only a module loader resolves these; the
     /// interpreter rejects one so a classic script fails honestly instead of
     /// silently skipping it.
@@ -2134,23 +2141,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             items
                 .into_iter()
                 .map(|it| match it {
-                    ClassItem::Method(key, f) => {
-                        let owner = if is_static { ident(&name) } else { proto_of(&name) };
-                        let target = match key {
-                            ClassKey::Name(k) => member(owner, &k),
-                            ClassKey::Computed(k) => Expr {
-                                kind: ExprKind::Index {
-                                    base: Box::new(owner),
-                                    index: Box::new(k),
-                                },
-                                span,
-                            },
-                        };
-                        assign(target, Expr {
-                            kind: ExprKind::Func(f),
-                            span,
-                        })
-                    }
+                    ClassItem::Method(key, f) => Stmt {
+                        kind: StmtKind::DefineMethod {
+                            owner: Box::new(if is_static {
+                                ident(&name)
+                            } else {
+                                proto_of(&name)
+                            }),
+                            key: Box::new(key),
+                            func: f,
+                        },
+                        span,
+                    },
                     ClassItem::Accessor(key, getter, setter) => Stmt {
                         kind: StmtKind::DefineAcc {
                             owner: Box::new(if is_static {
@@ -4040,6 +4042,9 @@ fn stmt_uses(s: &Stmt, k: SusKind) -> bool {
                 || getter.as_ref().map_or(false, |f| fnbody_uses(&f.body, k))
                 || setter.as_ref().map_or(false, |f| fnbody_uses(&f.body, k))
         }
+        DefineMethod { owner, func, .. } => {
+            expr_uses(owner, k) || fnbody_uses(&func.body, k)
+        }
     }
 }
 
@@ -4198,7 +4203,7 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
             }
             Ok(())
         }
-        Break(_) | Continue(_) | FuncDecl(_) | DefineAcc { .. } => Ok(()),
+        Break(_) | Continue(_) | FuncDecl(_) | DefineAcc { .. } | DefineMethod { .. } => Ok(()),
         Label { body, .. } => check_y_clean(body),
         PatAssign { pat, value } => {
             if pat_uses(pat, SusKind::Yield) || expr_uses(value, SusKind::Yield) {
@@ -5113,6 +5118,14 @@ fn scan_stmt_arguments(s: &Stmt) -> bool {
                     FnBody::Expr(e) => scan_expr_arguments(e),
                     _ => false,
                 })
+        }
+        DefineMethod { owner, func, .. } => {
+            scan_expr_arguments(owner)
+                || match &func.body {
+                    FnBody::Block(b) => scan_uses_arguments_stmts(b),
+                    FnBody::Expr(e) => scan_expr_arguments(e),
+                    _ => false,
+                }
         }
     }
 }

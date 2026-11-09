@@ -179,7 +179,10 @@ pub struct ErrorData {
 
 #[derive(Debug)]
 pub enum ObjKind {
-    Plain,
+    /// `Some` carries own keys that are non-enumerable (class methods and
+    /// accessors, the implicit `constructor` back-reference). Kept inside
+    /// the existing variant so `Obj` itself does not grow.
+    Plain(Option<Box<Vec<Rc<str>>>>),
     /// boxed primitive: `new String("x")`, `new Number(1)`, `new Boolean(true)`
     /// (and `Object(prim)`). `Val::to_string`/`to_number` unwrap it, and
     /// String boxes answer `length`/index reads. Methods live on the ordinary
@@ -522,9 +525,58 @@ pub struct Closure {
     pub this: Option<Box<Val>>,
     pub is_arrow: bool,
     pub props: RefCell<Vec<(Rc<str>, Val)>>,
-    /// [[Prototype]] of the function object itself (class `extends` sets it
-    /// so static members inherit); objects use `Obj::proto`.
-    pub proto: RefCell<Option<Val>>,
+    /// Rare function-object metadata: the `extends` [[Prototype]] chain and
+    /// own non-enumerable keys (a class's static methods). Combined behind one
+    /// pointer so the common closure pays a single slot, not two.
+    pub meta: RefCell<Option<Box<ClosureMeta>>>,
+}
+
+/// See [`Closure::meta`].
+#[derive(Debug, Default)]
+pub struct ClosureMeta {
+    /// [[Prototype]] of the function object itself (class `extends` links a
+    /// subclass constructor to its superclass). `None` inherits from
+    /// `Function.prototype`.
+    pub proto: Option<Val>,
+    /// Own keys that are non-enumerable (static class methods/accessors).
+    pub hidden: Vec<Rc<str>>,
+}
+
+impl Closure {
+    /// [[Prototype]] of the function object itself.
+    pub(crate) fn proto(&self) -> Option<Val> {
+        self.meta.borrow().as_ref().and_then(|m| m.proto.clone())
+    }
+
+    pub(crate) fn set_proto(&self, p: Option<Val>) {
+        let mut meta = self.meta.borrow_mut();
+        match meta.as_mut() {
+            Some(m) => m.proto = p,
+            None if p.is_some() => {
+                *meta = Some(Box::new(ClosureMeta {
+                    proto: p,
+                    hidden: Vec::new(),
+                }))
+            }
+            None => {}
+        }
+    }
+
+    /// Record `key` as an own non-enumerable property.
+    pub(crate) fn hide(&self, key: &Rc<str>) {
+        let mut meta = self.meta.borrow_mut();
+        let m = meta.get_or_insert_with(|| Box::new(ClosureMeta::default()));
+        if !m.hidden.iter().any(|k| k == key) {
+            m.hidden.push(key.clone());
+        }
+    }
+
+    pub(crate) fn is_hidden(&self, key: &str) -> bool {
+        self.meta
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.hidden.iter().any(|k| k.as_ref() == key))
+    }
 }
 
 impl std::fmt::Debug for Closure {
@@ -612,7 +664,7 @@ impl Val {
     }
 
     pub fn new_object() -> Val {
-        Val::Obj(new_obj(ObjKind::Plain, Vec::new(), None))
+        Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), None))
     }
 
     pub fn new_array(items: Vec<Val>) -> Val {
@@ -716,7 +768,7 @@ impl Val {
                     ObjKind::Iterator(_) => "[object Iterator]".into(),
                     ObjKind::ArrayBuffer(_) => "[object ArrayBuffer]".into(),
                     ObjKind::TypedArray(ta) => typed_join(ta),
-                    ObjKind::Plain => {
+                    ObjKind::Plain(_) => {
                         // symbols are unique objects with a hidden
                         // `__symbol` description (see builtins)
                         match b.props.iter().find(|(k, _)| &**k == "__symbol") {
@@ -767,7 +819,7 @@ impl Val {
                         Some(Ok(_)) => "Promise { <fulfilled> }".into(),
                         Some(Err(_)) => "Promise { <rejected> }".into(),
                     },
-                    ObjKind::Plain => {
+                    ObjKind::Plain(_) => {
                         // symbols are unique objects with a hidden
                         // `__symbol` description (see builtins)
                         if let Some((_, Val::Str(desc))) =
@@ -1080,7 +1132,7 @@ pub(crate) fn new_closure(
         this,
         is_arrow,
         props: RefCell::new(Vec::new()),
-        proto: RefCell::new(None),
+        meta: RefCell::new(None),
     });
     let page = current_page();
     LIVE_FNS.with(|r| {
@@ -1225,8 +1277,8 @@ fn clear_page_graph(page: u64) {
                 if let Ok(mut props) = c.props.try_borrow_mut() {
                     props.clear();
                 }
-                if let Ok(mut proto) = c.proto.try_borrow_mut() {
-                    *proto = None;
+                if let Ok(mut meta) = c.meta.try_borrow_mut() {
+                    *meta = None;
                 }
             }
             false
@@ -1582,7 +1634,7 @@ impl Drop for JsEngine {
         if let Ok(mut o) = self.global_obj.try_borrow_mut() {
             o.props.clear();
             o.proto = None;
-            o.kind = ObjKind::Plain;
+            o.kind = ObjKind::Plain(None);
         }
         self.native_props.clear();
         self.timers.clear();
@@ -1676,7 +1728,7 @@ impl JsEngine {
         // table so a long session keeps interning the CURRENT page's keys
         clear_key_intern();
         let page = page_start();
-        let global_obj = new_obj(ObjKind::Plain, Vec::new(), None);
+        let global_obj = new_obj(ObjKind::Plain(None), Vec::new(), None);
         // global code's `this` is the global object (sloppy mode)
         let global_env = Env::with_page(page, Some(Val::Obj(global_obj.clone())));
         let mut e = JsEngine {
@@ -2922,6 +2974,25 @@ pub(crate) fn obj_of(v: &Val) -> Rc<RefCell<Obj>> {
     }
 }
 
+/// Record an own property as non-enumerable (class methods and accessors).
+/// The property still lives in `props`; readers that care (descriptors,
+/// `for-in`, `Object.keys`) consult this list.
+pub(crate) fn obj_hide(o: &Rc<RefCell<Obj>>, key: &Rc<str>) {
+    let mut b = o.borrow_mut();
+    let ObjKind::Plain(slot) = &mut b.kind else {
+        return;
+    };
+    let list = slot.get_or_insert_with(|| Box::new(Vec::new()));
+    if !list.iter().any(|k| k == key) {
+        list.push(key.clone());
+    }
+}
+
+/// The function-object counterpart of [`obj_hide`] (static class members).
+pub(crate) fn clo_hide(c: &Rc<Closure>, key: &Rc<str>) {
+    c.hide(key);
+}
+
 /// Own-property write (array exotic handles integer keys + length).
 pub fn obj_set_own(o: &Rc<RefCell<Obj>>, key: &str, v: Val) {
     let mut b = o.borrow_mut();
@@ -3100,7 +3171,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                 _ => {
                     // class static members inherited through the function's
                     // own [[Prototype]] (`class B extends A` links B -> A)
-                    let mut cur = c.proto.borrow().clone();
+                    let mut cur = c.proto();
                     for _ in 0..100 {
                         let p = match cur {
                             None => break,
@@ -3128,7 +3199,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                                         v => Ok(v.clone()),
                                     };
                                 }
-                                f.proto.borrow().clone()
+                                f.proto()
                             }
                             _ => None,
                         };
@@ -3212,7 +3283,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
             // receiver, and a miss still takes the full path.
             {
                 let b = o.borrow();
-                if matches!(b.kind, ObjKind::Plain) {
+                if matches!(b.kind, ObjKind::Plain(_)) {
                     if let Some((_, v)) = b.props.iter().find(|(k, _)| k.as_ref() == key) {
                         if !matches!(v, Val::Acc(_)) {
                             return Ok(v.clone());
@@ -3654,7 +3725,7 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
             // the prototype for setters and handles array exotics.
             {
                 let mut b = o.borrow_mut();
-                if matches!(b.kind, ObjKind::Plain) {
+                if matches!(b.kind, ObjKind::Plain(_)) {
                     if let Some((_, slot)) = b.props.iter_mut().find(|(k, _)| k.as_ref() == key) {
                         if !matches!(&*slot, Val::Acc(_)) {
                             *slot = v;
@@ -3758,7 +3829,7 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
                     .iter()
                     .find(|(k, _)| k.as_ref() == key)
                     .map(|(_, x)| x.clone());
-                cur = f.proto.borrow().clone();
+                cur = f.proto();
                 if let Some(ex) = found {
                     if let Val::Acc(acc) = &ex {
                         let s = acc.setter.clone().unwrap_or(Val::Undefined);
@@ -3811,7 +3882,7 @@ pub(crate) fn has_member(e: &JsEngine, v: &Val, key: &str) -> Result<bool, JsErr
                 || key == "length"
                 || (key == "prototype" && !c.is_arrow)
                 || c.props.borrow().iter().any(|(k, _)| k.as_ref() == key);
-            let mut cur = c.proto.borrow().clone();
+            let mut cur = c.proto();
             if !found {
                 for _ in 0..100 {
                     match cur {

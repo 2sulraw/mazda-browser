@@ -572,6 +572,36 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
                     ))
                 }
             }
+            // class accessors are not own enumerable properties
+            match &o {
+                Val::Obj(ob) => obj_hide(ob, &key),
+                Val::Func(c) => clo_hide(c, &key),
+                _ => {}
+            }
+            Ok(Flow::Normal)
+        }
+        StmtKind::DefineMethod { owner, key, func } => {
+            let o = eval_expr(e, env, owner)?;
+            let key = match &**key {
+                ClassKey::Name(k) => k.clone(),
+                ClassKey::Computed(x) => Rc::from(eval_expr(e, env, x)?.to_string().as_str()),
+            };
+            let f = make_val_closure(e, env, func, false);
+            match &o {
+                Val::Obj(ob) => {
+                    obj_set_own(ob, &key, f);
+                    obj_hide(ob, &key);
+                }
+                Val::Func(c) => {
+                    c.props.borrow_mut().push((key.clone(), f));
+                    clo_hide(c, &key);
+                }
+                _ => {
+                    return Err(JsError::throw(
+                        "TypeError: methods can only be installed on objects",
+                    ))
+                }
+            }
             Ok(Flow::Normal)
         }
     }
@@ -847,12 +877,22 @@ pub(crate) fn for_in_keys(v: &Val) -> Vec<Rc<str>> {
     match v {
         Val::Obj(o) => {
             let b = o.borrow();
+            let hidden = match &b.kind {
+                ObjKind::Plain(Some(h)) => Some(h.as_slice()),
+                _ => None,
+            };
+            let visible = |k: &Rc<str>| !hidden.is_some_and(|h| h.iter().any(|x| x == k));
             match &b.kind {
                 ObjKind::Array(items) => (0..items.len())
                     .map(|i| Rc::from(i.to_string()))
                     .collect(),
                 ObjKind::ModuleNs(xs) => xs.borrow().keys().cloned().collect(),
-                _ => b.props.iter().map(|(k, _)| k.clone()).collect(),
+                _ => b
+                    .props
+                    .iter()
+                    .map(|(k, _)| k.clone())
+                    .filter(|k| visible(k))
+                    .collect(),
             }
         }
         _ => Vec::new(),
@@ -1729,7 +1769,7 @@ pub(crate) fn construct(e: &mut JsEngine, f: Val, argvals: Vec<Val>) -> Result<V
     let fresh = match &f {
         Val::Func(c) => {
             let proto = ensure_prototype(c);
-            Val::Obj(new_obj(ObjKind::Plain, Vec::new(), Some(proto)))
+            Val::Obj(new_obj(ObjKind::Plain(None), Vec::new(), Some(proto)))
         }
         _ => Val::new_object(),
     };
@@ -1759,10 +1799,12 @@ pub(crate) fn ensure_prototype(c: &Rc<Closure>) -> Rc<RefCell<Obj>> {
         }
     }
     let proto = new_obj(
-        ObjKind::Plain,
+        ObjKind::Plain(None),
         vec![(Rc::from("constructor"), Val::Func(c.clone()))],
         None,
     );
+    // the implicit `constructor` back-reference is non-enumerable
+    obj_hide(&proto, &Rc::from("constructor"));
     c.props
         .borrow_mut()
         .push((Rc::from("prototype"), Val::Obj(proto.clone())));
