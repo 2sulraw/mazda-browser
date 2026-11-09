@@ -5822,6 +5822,12 @@ fn layout_page(
 
     let mut root_box = layout::build_scoped(dom, root, body.style, body.bx, &sheet, body.vars.as_ref());
     stage!("cascade + box tree");
+    if timing {
+        let (tested, matched, decls) = css::cascade_stats_take();
+        eprintln!(
+            "[css] {tested} candidates tested, {matched} matched, {decls} declarations applied"
+        );
+    }
     eprintln!(
         "[mem] after box tree: {:.1} MB ({} boxes)",
         working_set_mb(),

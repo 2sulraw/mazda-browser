@@ -2600,3 +2600,35 @@ paying a full round trip that always failed.
 - engine tests **961** green (new `bare_specifiers_do_not_invent_a_url`).
 - one 404 remains: `assets/react-dom/client` is imported *by* a module that
   the fix now rejects earlier, so the count is down from five.
+
+## Key the cascade on attributes and `:is()` (P8d, 2026-11-10)
+
+The rightmost-compound index only knew ids, classes and tags, so every rule
+whose last compound was `input[type=checkbox]`, `[data-color-mode=dark]` or
+`svg:is(...)` sat in the universal bucket and was tested against every element:
+2,640 of 15,788 universal entries on GitHub's 31,564 rules, 1.34 M candidate
+tests per page. Three keys were missing:
+
+- **attribute**: `input[type=x]` can only match an element carrying `type`.
+- **`:is()`/`:where()`**: the element must match ONE alternative, so each
+  alternative's own key covers everything the rule matches. If *any* alternate
+  yields no key the rule could match an unkeyed element and stays universal.
+- **tag fallback**: a compound like `*` plus a pseudo-class has no key at all;
+  dropping it from every bucket would lose matches (`MAZDA_TIME` run that did
+  exactly that: universal 2,640, 3.04 M candidate tests -- a 2.3x regression).
+
+A rule can now be filed under several buckets (`:is(.a, .b)`), so `candidates`
+sorts and dedups before the walk. `[css]` counters (`cascade_stats_take`) print
+tested/matched/declarations under `MAZDA_TIME`, which is what showed the
+universal split in the first place.
+
+### Measured
+
+- candidates tested: 1,344,659 -> **491,572** (2.7x fewer); universal bucket
+  2,640 -> 262 entries, `attrs` 46, `tags` 102.
+- `[time] cascade + box tree`, same binary with the old keying behind a
+  temporary `MAZDA_CASCADE_OLD` switch, alternating runs on one cached page
+  variant: old 3,330/3,532/3,636/3,700 ms vs new
+  **2,734/2,798/2,847/3,076 ms** (~0.7 s per load).
+- engine tests **961** green (the existing index test now also covers `:is()`
+  alternatives and case-insensitive attribute buckets).

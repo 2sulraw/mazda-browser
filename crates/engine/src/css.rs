@@ -1480,46 +1480,130 @@ struct Rule {
     order: u32,
 }
 
+thread_local! {
+    /// Cascade profiling counters, cheap enough to always run: candidate rules
+    /// tested, rules matched, declarations those matches applied. `MAZDA_TIME`
+    /// prints them once per load; they say whether the cost is the index
+    /// handing out too many candidates or the per-declaration work.
+    static CASCADE_STATS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Take (and reset) the cascade counters (tested, matched, declarations).
+pub fn cascade_stats_take() -> (usize, usize, usize) {
+    CASCADE_STATS.with(|c| c.replace((0, 0, 0)))
+}
+
 /// Rightmost-compound buckets over one cascade-ordered rule list.
 ///
-/// A selector can only match an element if its LAST compound's id, class or
-/// tag does, so the cascade tests just the buckets the element falls into
-/// instead of the whole list (GitHub ships ~33k rules; walking all of them for
-/// every node cost ~8 s per page). Each rule lands in exactly one bucket — the
-/// most selective necessary key — so the candidate indices never repeat, and
-/// each bucket keeps rule order.
+/// A selector can only match an element if its LAST compound's id, class,
+/// attribute or tag does, so the cascade tests just the buckets the element
+/// falls into instead of the whole list (GitHub ships ~33k rules; walking all
+/// of them for every node cost ~8 s per page). A rule lands in the single most
+/// selective bucket its last compound guarantees, except `:is()`/`:where()`,
+/// which files the rule under one key per alternative; `candidates` therefore
+/// sorts and dedups. Each bucket keeps rule order.
 #[derive(Default)]
 struct RuleIndex {
     ids: std::collections::HashMap<String, Vec<u32>>,
     classes: std::collections::HashMap<String, Vec<u32>>,
+    attrs: std::collections::HashMap<String, Vec<u32>>,
     tags: std::collections::HashMap<String, Vec<u32>>,
     universal: Vec<u32>,
+}
+
+/// One bucket key: a fact about the element that any matching rule's rightmost
+/// compound must require.
+enum Key {
+    Id(String),
+    Class(String),
+    Attr(String),
+    Tag(String),
+}
+
+/// Collect every bucket key that covers `seg` (the rightmost compound): its id
+/// wins over a class, a class over an attribute, an attribute over the tag.
+/// `:is()`/`:where()` is where keys multiply: the element must match ONE
+/// alternative, so each alternative's own key covers everything the rule can
+/// match -- but only when *every* alternative yields one, otherwise the rule
+/// could match an element no key names and has to stay universal.
+fn keys_of(seg: &Seg, out: &mut Vec<Key>) -> bool {
+    if let Some(id) = &seg.id {
+        out.push(Key::Id(id.clone()));
+        return true;
+    }
+    if let Some(c) = seg.classes.first() {
+        out.push(Key::Class(c.clone()));
+        return true;
+    }
+    if let Some((n, _, _)) = seg.attrs.first() {
+        // attribute names are case-insensitive in HTML; bucket them lowercase
+        // so `[DATA-X]` and `data-x="1"` find each other
+        out.push(Key::Attr(n.to_ascii_lowercase()));
+        return true;
+    }
+    for p in &seg.pseudos {
+        if let Pseudo::Is(alts, _) = p {
+            if alts.is_empty() {
+                return false;
+            }
+            for alt in alts {
+                let Some(last) = alt.last() else { return false };
+                if !keys_of(last, out) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    if let Some(t) = &seg.tag {
+        out.push(Key::Tag(t.clone()));
+        return true;
+    }
+    false
 }
 
 impl RuleIndex {
     fn build(rules: &[Rule]) -> Self {
         let mut ix = RuleIndex::default();
+        let mut keys: Vec<Key> = Vec::new();
         for (i, r) in rules.iter().enumerate() {
             let i = i as u32;
             let Some(last) = r.segs.last() else {
                 ix.universal.push(i);
                 continue;
             };
-            if let Some(id) = &last.id {
-                ix.ids.entry(id.clone()).or_default().push(i);
-            } else if let Some(c) = last.classes.first() {
-                ix.classes.entry(c.clone()).or_default().push(i);
-            } else if last.tag.as_deref() == Some("slot")
+            if last.tag.as_deref() == Some("slot")
                 && last.attrs.iter().any(|(n, _, _)| n == "name")
             {
                 // `slot[name=X]` also selects the light-DOM nodes projected
                 // into it (see `seg_matches`), so a tag key would miss them
                 ix.universal.push(i);
-            } else if let Some(t) = &last.tag {
-                ix.tags.entry(t.clone()).or_default().push(i);
-            } else {
-                ix.universal.push(i);
+                continue;
             }
+            keys.clear();
+            if !keys_of(last, &mut keys) || keys.is_empty() {
+                ix.universal.push(i);
+                continue;
+            }
+            for k in &keys {
+                match k {
+                    Key::Id(s) => ix.ids.entry(s.clone()).or_default().push(i),
+                    Key::Class(s) => ix.classes.entry(s.clone()).or_default().push(i),
+                    Key::Attr(s) => ix.attrs.entry(s.clone()).or_default().push(i),
+                    Key::Tag(s) => ix.tags.entry(s.clone()).or_default().push(i),
+                }
+            }
+        }
+        if std::env::var_os("MAZDA_TIME").is_some() {
+            eprintln!(
+                "[css] index: universal {}, ids {}, classes {}, attrs {}, tags {}",
+                ix.universal.len(),
+                ix.ids.len(),
+                ix.classes.len(),
+                ix.attrs.len(),
+                ix.tags.len()
+            );
         }
         ix
     }
@@ -1544,7 +1628,20 @@ impl RuleIndex {
                 }
             }
         }
+        // `:is()` alternatives can file one rule under several classes/attrs,
+        // so the same index may arrive twice
+        if !self.attrs.is_empty() {
+            if let NodeKind::Element(_, attrs) = &dom.nodes[node as usize].kind {
+                for (n, _) in attrs.iter() {
+                    let lower = n.to_ascii_lowercase();
+                    if let Some(v) = self.attrs.get(&lower) {
+                        out.extend_from_slice(v);
+                    }
+                }
+            }
+        }
         out.sort_unstable();
+        out.dedup();
     }
 }
 
@@ -2632,6 +2729,7 @@ impl Sheet {
         RULE_SCRATCH.with(|scratch| {
             let mut cand = scratch.borrow_mut();
             self.index.candidates(dom, node, &mut cand);
+            let mut stats = (cand.len(), 0usize, 0usize);
             let mut ci = 0usize;
             let mut hi = 0usize;
             loop {
@@ -2660,6 +2758,8 @@ impl Sheet {
                 if !matches(dom, node, &rule.segs, self.hovered.get()) {
                     continue;
                 }
+                stats.1 += 1;
+                stats.2 += rule.decls.len();
                 for d in &rule.decls {
                     color_declared |= d.0 == "color";
                     let sd = self.subst_scoped(d, vars.as_deref());
@@ -2670,6 +2770,10 @@ impl Sheet {
                     }
                 }
             }
+            CASCADE_STATS.with(|c| {
+                let (a, b, d) = c.get();
+                c.set((a + stats.0, b + stats.1, d + stats.2));
+            });
         });
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
@@ -8701,6 +8805,15 @@ mod tests {
         let dom = dom_of("<div><span slot=x id=s></span><slot name=x></slot></div>");
         let s = by_attr(&dom, "id", "s");
         assert_eq!(sheet.resolve(&dom, s, Style::new(), None).style.color, 0x333333);
+        // `:is()` files the rule under one key per alternative, so it still
+        // matches an element carrying only the second one
+        let sheet = parse(":is(.aa, .bb) { color: #444444 }");
+        let dom = dom_of("<div class=bb></div>");
+        assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0x444444);
+        // attribute names are case-insensitive on both sides of the bucket
+        let sheet = parse("[DATA-ROLE=x] { color: #555555 }");
+        let dom = dom_of("<div data-role=x></div>");
+        assert_eq!(style_for_tag(&sheet, &dom, "div").color, 0x555555);
     }
 
     #[test]
