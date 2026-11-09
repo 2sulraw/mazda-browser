@@ -2131,3 +2131,22 @@ explicit `class Named {}` is never renamed.
 - `language/statements/class/dstr`: 144 -> **112** fail; every
   `*-fn-name-class` case now passes.
 - engine tests **938** green (new binding-name test).
+
+## Own-enumerable semantics for object rest and spread (P7, 2026-11-09)
+
+Object-rest (`{...r} = src`) and object spread (`{...src}`) copied the raw
+`props` entries: an accessor was copied as an `Acc` value instead of being
+invoked, and non-enumerable own props were copied too. Both paths now walk
+`for_in_keys` (own, enumerable, hidden keys filtered) and read each value
+through `get_member`, so a getter runs exactly once and a prop created with
+`Object.defineProperty(..., { enumerable: false })` is skipped. `define_prop`
+now honors an explicit `enumerable: false` by recording the key as hidden
+(`obj_hide`/`clo_hide`) instead of ignoring the flag.
+
+### Measured
+
+- test262 language subset: 13,827 -> **13,960** pass (79.0% of 17,678 run,
+  6,154 skipped).
+- Every `*-obj-ptrn-rest-getter` and `*-obj-ptrn-rest-skip-non-enumerable`
+  case now passes (0 failures, was 56 each).
+- engine tests **939** green (new object-rest/spread test).

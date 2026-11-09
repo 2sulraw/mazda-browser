@@ -2984,6 +2984,23 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn object_rest_reads_getters_and_skips_hidden() {
+    // an accessor runs once, and its value lands on the rest object
+    assert_eq!(
+        num("var c = 0; var r; ({ ...r } = { get v() { c++; return 2 } }); c === 1 && r.v === 2 ? 1 : 0"),
+        1.0
+    );
+    // non-enumerable own props are not copied by object rest
+    assert!(boolean(
+        "var o = { a: 1 }; Object.defineProperty(o, 'x', { value: 4, enumerable: false }); var r = { ...o }; !('x' in r) && r.a === 1"
+    ));
+    // ...nor by Object.keys / for-in
+    assert!(boolean(
+        "var o = {}; Object.defineProperty(o, 'x', { value: 4, enumerable: false }); Object.keys(o).length === 0"
+    ));
+}
+
+#[test]
 fn anonymous_class_takes_binding_name() {
     assert_eq!(string("var cls = class {}; cls.name"), "cls");
     assert_eq!(string("let cls; cls = class {}; cls.name"), "cls");

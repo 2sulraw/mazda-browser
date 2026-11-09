@@ -812,20 +812,17 @@ fn bind_obj(
                 (k, part)
             }
             ObjPatPart::Rest(p) => {
-                // remaining own properties as an object
+                // remaining own *enumerable* properties as an object. Read
+                // each one through get_member so an accessor runs exactly
+                // once (and a non-enumerable prop is skipped entirely).
                 let o = Val::new_object();
                 let orc = obj_of(&o);
-                if let Val::Obj(src) = value {
-                    let entries: Vec<(Rc<str>, Val)> = {
-                        let b = src.borrow();
-                        b.props.clone()
-                    };
-                    for (k, v) in entries {
-                        if used.iter().any(|u| *u == k) {
-                            continue;
-                        }
-                        obj_set_own(&orc, &k, v.clone());
+                for k in for_in_keys(value) {
+                    if used.iter().any(|u| *u == k) {
+                        continue;
                     }
+                    let v = get_member(e, value, &k)?;
+                    obj_set_own(&orc, &k, v);
                 }
                 bind_pat(e, env, p, o, kind)?;
                 continue;
@@ -1574,26 +1571,11 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                     // for the honest scope of this wave)
                     ObjElem::Spread(sp, _) => {
                         let src = eval_expr(e, env, sp)?;
-                        if let Val::Obj(s) = &src {
-                            let entries: Vec<(Rc<str>, Val)> = {
-                                let b = s.borrow();
-                                match &b.kind {
-                                    ObjKind::Array(items) => {
-                                        let mut v = Vec::with_capacity(items.len());
-                                        for (i, item) in items.iter().enumerate() {
-                                            v.push((
-                                                Rc::from(i.to_string()),
-                                                item.clone(),
-                                            ));
-                                        }
-                                        v
-                                    }
-                                    _ => b.props.clone(),
-                                }
-                            };
-                            for (k, v) in entries {
-                                obj_set_own(&orc, &k, v);
-                            }
+                        // own enumerable props only; read through get_member
+                        // so an accessor runs instead of copying its `Acc`
+                        for k in for_in_keys(&src) {
+                            let v = get_member(e, &src, &k)?;
+                            obj_set_own(&orc, &k, v);
                         }
                     }
                     ObjElem::Computed { key, value } => {

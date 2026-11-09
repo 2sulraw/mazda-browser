@@ -1418,12 +1418,34 @@ fn define_prop(
             }
         }
     };
+    // `enumerable: false` makes the property invisible to `for-in`,
+    // `Object.keys` and object-rest; only an explicit `false` is honored
+    // (the common flags-less descriptor keeps the permissive default).
+    let hidden = match d {
+        Some(Val::Obj(ob)) => ob
+            .borrow()
+            .props
+            .iter()
+            .find(|(k, _)| k.as_ref() == "enumerable")
+            .map(|(_, v)| !v.to_bool())
+            .unwrap_or(false),
+        _ => false,
+    };
     match target {
-        Val::Obj(o) => obj_set_own(o, key, v),
+        Val::Obj(o) => {
+            obj_set_own(o, key, v);
+            if hidden {
+                obj_hide(o, &intern_key(key));
+            }
+        }
         Val::Func(f) => {
             let mut props = f.props.borrow_mut();
             props.retain(|(k, _)| k.as_ref() != key);
             props.push((intern_key(key), v));
+            drop(props);
+            if hidden {
+                clo_hide(f, &intern_key(key));
+            }
         }
         // built-in constructors keep their own props in the native side
         // table; polyfills legitimately patch them (`Object.defineProperty(
