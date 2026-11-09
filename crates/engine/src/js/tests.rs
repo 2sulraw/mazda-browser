@@ -2984,6 +2984,28 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn function_name_and_length_descriptors() {
+    // name/length are non-writable, non-enumerable, configurable own props
+    assert!(boolean(
+        "var f = function foo() {}; var d = Object.getOwnPropertyDescriptor(f, 'name'); d.value === 'foo' && d.writable === false && d.enumerable === false && d.configurable === true"
+    ));
+    assert!(boolean(
+        "var f = function (a, b) {}; var d = Object.getOwnPropertyDescriptor(f, 'length'); d.value === 2 && d.writable === false && d.enumerable === false && d.configurable === true"
+    ));
+    // a sloppy assignment to a non-writable slot is a silent no-op
+    assert!(boolean(
+        "var f = function () {}; f.name = 'other'; f.length = 9; f.name === 'f' && f.length === 0"
+    ));
+    assert!(boolean(
+        "var f = function () {}; !Object.prototype.propertyIsEnumerable.call(f, 'name')"
+    ));
+    // deleting the synthesized slot removes it for good
+    assert!(boolean(
+        "var f = function () {}; delete f.name; !Object.prototype.hasOwnProperty.call(f, 'name') && f.name === undefined && Object.getOwnPropertyDescriptor(f, 'name') === undefined"
+    ));
+}
+
+#[test]
 fn array_destructuring_pulls_lazily_and_closes() {
     // only as many `next()` calls as the pattern needs
     assert!(boolean(

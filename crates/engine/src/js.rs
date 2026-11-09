@@ -540,6 +540,10 @@ pub struct ClosureMeta {
     pub proto: Option<Val>,
     /// Own keys that are non-enumerable (static class methods/accessors).
     pub hidden: Vec<Rc<str>>,
+    /// Synthesized own keys that were deleted (`delete fn.name`). Bit 0 is
+    /// `name`, bit 1 is `length`: the slots are normally materialized on read,
+    /// so a later descriptor/hasOwn must remember they were removed.
+    pub deleted: u8,
 }
 
 impl Closure {
@@ -556,6 +560,7 @@ impl Closure {
                 *meta = Some(Box::new(ClosureMeta {
                     proto: p,
                     hidden: Vec::new(),
+                    deleted: 0,
                 }))
             }
             None => {}
@@ -576,6 +581,36 @@ impl Closure {
             .borrow()
             .as_ref()
             .is_some_and(|m| m.hidden.iter().any(|k| k.as_ref() == key))
+    }
+
+    /// The synthesized-slot bit for `key` (`name` = 0, `length` = 1).
+    fn synth_bit(key: &str) -> Option<u8> {
+        match key {
+            "name" => Some(0),
+            "length" => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Has the synthesized own slot `key` been deleted from this function?
+    pub(crate) fn synth_deleted(&self, key: &str) -> bool {
+        match Self::synth_bit(key) {
+            Some(b) => self
+                .meta
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.deleted & (1 << b) != 0),
+            None => false,
+        }
+    }
+
+    /// Record that the synthesized own slot `key` was deleted.
+    pub(crate) fn mark_synth_deleted(&self, key: &str) {
+        if let Some(b) = Self::synth_bit(key) {
+            let mut meta = self.meta.borrow_mut();
+            let m = meta.get_or_insert_with(|| Box::new(ClosureMeta::default()));
+            m.deleted |= 1 << b;
+        }
     }
 }
 
@@ -3261,8 +3296,12 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                 "call" => Ok(Val::Method(Meth::FnCall)),
                 "apply" => Ok(Val::Method(Meth::FnApply)),
                 "bind" => Ok(Val::Method(Meth::FnBind)),
-                "name" => Ok(Val::Str(c.def.name.clone())),
-                "length" => Ok(Val::Num(c.def.params.len() as f64)),
+                // a deleted `name`/`length` no longer resolves as an own slot
+                "name" if !c.synth_deleted("name") => Ok(Val::Str(c.def.name.clone())),
+                "length" if !c.synth_deleted("length") => {
+                    Ok(Val::Num(c.def.params.len() as f64))
+                }
+                "name" | "length" => Ok(Val::Undefined),
                 _ => {
                     // class static members inherited through the function's
                     // own [[Prototype]] (`class B extends A` links B -> A)
@@ -3939,7 +3978,14 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
             let mut ps = c.props.borrow_mut();
             match ps.iter_mut().find(|(k, _)| k.as_ref() == key) {
                 Some((_, slot)) => *slot = v,
-                None => ps.push((intern_key(key), v)),
+                None => {
+                    // `name`/`length` are non-writable own slots: a sloppy
+                    // assignment is a silent no-op until the slot is deleted
+                    if (key == "name" || key == "length") && !c.synth_deleted(key) {
+                        return Ok(());
+                    }
+                    ps.push((intern_key(key), v));
+                }
             }
             Ok(())
         }
@@ -3963,6 +4009,16 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
         // functions are objects too: `delete C.staticMethod` must remove the
         // own property (verifyProperty's configurable check relies on it)
         Val::Func(c) => {
+            // deleting a synthesized slot must also hide the synthesized read
+            if key == "name" || key == "length" {
+                let mut p = c.props.borrow_mut();
+                p.retain(|(k, _)| k.as_ref() != key);
+                if c.synth_deleted(key) {
+                    return true;
+                }
+                c.mark_synth_deleted(key);
+                return true;
+            }
             let mut p = c.props.borrow_mut();
             let before = p.len();
             p.retain(|(k, _)| k.as_ref() != key);
@@ -3981,8 +4037,7 @@ pub(crate) fn has_member(e: &JsEngine, v: &Val, key: &str) -> Result<bool, JsErr
         Val::Obj(o) => e.chain_has(o, key),
         // functions are objects: `"name" in f`, `"prototype" in f`
         Val::Func(c) => {
-            let mut found = key == "name"
-                || key == "length"
+            let mut found = ((key == "name" || key == "length") && !c.synth_deleted(key))
                 || (key == "prototype" && !c.is_arrow)
                 || c.props.borrow().iter().any(|(k, _)| k.as_ref() == key);
             let mut cur = c.proto();

@@ -1870,7 +1870,10 @@ fn n_objproto(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Va
                 // function own props: `name`/`length` always, `prototype`
                 // only on real functions (arrows and bound wrappers lack it)
                 Val::Func(c) => match key.as_str() {
-                    "name" | "length" => true,
+                    "name" | "length" => {
+                        !c.synth_deleted(&key)
+                            || c.props.borrow().iter().any(|(k, _)| k.as_ref() == key.as_str())
+                    }
                     "prototype" => {
                         !c.is_arrow && !matches!(c.def.body, FnBody::Bound { .. })
                     }
@@ -1979,6 +1982,13 @@ fn desc_from_value(v: Val) -> Val {
 }
 
 fn desc_with_enumerable(v: Val, enumerable: bool) -> Val {
+    desc_attrs(v, true, enumerable, true)
+}
+
+/// Descriptor object with explicit attribute values (the engine tracks no
+/// writability/configurability per ordinary property, so callers pass the
+/// spec answer for the handful of synthesized slots that need it).
+fn desc_attrs(v: Val, writable: bool, enumerable: bool, configurable: bool) -> Val {
     let d = Val::new_object();
     match v {
         Val::Acc(a) => {
@@ -1995,11 +2005,11 @@ fn desc_with_enumerable(v: Val, enumerable: bool) -> Val {
         }
         other => {
             obj_set_own(own(&d), "value", other);
-            obj_set_own(own(&d), "writable", Val::Bool(true));
+            obj_set_own(own(&d), "writable", Val::Bool(writable));
         }
     }
     obj_set_own(own(&d), "enumerable", Val::Bool(enumerable));
-    obj_set_own(own(&d), "configurable", Val::Bool(true));
+    obj_set_own(own(&d), "configurable", Val::Bool(configurable));
     d
 }
 
@@ -2039,13 +2049,36 @@ fn fn_desc(f: &Rc<Closure>, key: &str) -> Option<Val> {
         .iter()
         .find(|(k, _)| k.as_ref() == key)
         .map(|(_, v)| v.clone());
-    match found {
-        Some(v) => Some(desc_with_enumerable(v, !f.is_hidden(key))),
-        None if key == "prototype" => Some(desc_with_enumerable(
-            Val::Obj(super::interp::ensure_prototype(f)),
+    if let Some(v) = found {
+        // an ordinary function property is writable/configurable; class
+        // members are only non-enumerable
+        return Some(desc_with_enumerable(v, !f.is_hidden(key)));
+    }
+    match key {
+        // `name` and `length` are non-writable, non-enumerable, configurable
+        "name" if !f.synth_deleted("name") => Some(desc_attrs(
+            Val::Str(f.def.name.clone()),
             false,
+            false,
+            true,
         )),
-        None => None,
+        "length" if !f.synth_deleted("length") => Some(desc_attrs(
+            Val::Num(f.def.params.len() as f64),
+            false,
+            false,
+            true,
+        )),
+        // a real function's `prototype` is writable, non-enumerable and
+        // non-configurable
+        "prototype" if !f.is_arrow && !matches!(f.def.body, FnBody::Bound { .. }) => {
+            Some(desc_attrs(
+                Val::Obj(super::interp::ensure_prototype(f)),
+                true,
+                false,
+                false,
+            ))
+        }
+        _ => None,
     }
 }
 

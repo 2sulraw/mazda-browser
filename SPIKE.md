@@ -2173,3 +2173,23 @@ literal parser, so `[a,]`, `[,]` and `[a,,b]` count correctly.
   `ary-ptrn-elem-ary-elision-init` and `ary-ptrn-elem-ary-empty-init` all
   drop to **0 failures** (was 56 each).
 - engine tests **940** green (new lazy/close test).
+
+## Function `name`/`length` own-property descriptors (P7, 2026-11-09)
+
+`Object.getOwnPropertyDescriptor(fn, "name")` returned `undefined`: the
+synthesized `name`/`length` slots were readable through member access but
+invisible to descriptors, so test262's `verifyProperty` died reading
+`.value` of `undefined`. `fn_desc` now materializes both slots with the
+spec attributes (non-writable, non-enumerable, configurable) and reports a
+real function's `prototype` as writable/non-enumerable/non-configurable.
+`set_member` treats a write to an undeleted `name`/`length` as a silent
+sloppy no-op, and `delete` records the deletion in a small `ClosureMeta`
+bitmask so later reads, `hasOwnProperty`, `in` and descriptors all agree
+the slot is gone.
+
+### Measured
+
+- test262 language subset: 14,261 -> **14,320** pass (81.0% of 17,678 run,
+  6,154 skipped).
+- `fn-name` failures 77 -> **36**; `init-fn-name` failures 30 -> **10**.
+- engine tests **941** green (new descriptor test).
