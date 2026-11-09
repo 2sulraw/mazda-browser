@@ -660,6 +660,14 @@ enum ClassItem {
 struct ClassCtx {
     super_name: Option<Rc<str>>,
     is_static: bool,
+    /// private names declared in this class body (`#x`, `#m`)
+    private_names: Vec<Rc<str>>,
+    /// subset of `private_names` that came from get/set accessors: a getter
+    /// and setter may share one private name, a field or method may not
+    private_accessor_names: Vec<Rc<str>>,
+    /// private references parsed while this class is innermost; checked once
+    /// the whole class body is known (forward references are legal)
+    private_refs: Vec<Rc<str>>,
 }
 
 /// Function context while parsing a body: `await` is a reserved word only
@@ -843,6 +851,46 @@ impl<'a> Parser<'a> {
 
     fn check_ctx_ident(&self, s: &str) -> Result<(), JsError> {
         self.check_reserved_in(s, self.fn_ctx.last().copied().unwrap_or_default())
+    }
+
+    /// Record a private member declaration (`#x` / `#m`). A duplicate name in
+    /// the same class body is an early error; the two halves of a private
+    /// accessor are the one exception.
+    fn note_private_decl(&mut self, key: &ClassKey, is_accessor: bool) -> Result<(), JsError> {
+        let ClassKey::Name(k) = key else {
+            return Ok(());
+        };
+        if !k.starts_with('#') {
+            return Ok(());
+        }
+        if let Some(ctx) = self.class_stack.last_mut() {
+            let taken = ctx.private_names.iter().any(|n| n == k);
+            if taken && !(is_accessor && ctx.private_accessor_names.iter().any(|n| n == k)) {
+                return self.err(format!("private name `{k}` is declared more than once"));
+            }
+            if !taken {
+                ctx.private_names.push(k.clone());
+            }
+            if is_accessor && !ctx.private_accessor_names.iter().any(|n| n == k) {
+                ctx.private_accessor_names.push(k.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a private reference (`obj.#x`, `#x in obj`). It is validated when
+    /// the enclosing class body ends.
+    fn note_private_ref(&mut self, name: &str) -> Result<(), JsError> {
+        if !name.starts_with('#') {
+            return Ok(());
+        }
+        match self.class_stack.last_mut() {
+            Some(ctx) => {
+                ctx.private_refs.push(Rc::from(name));
+                Ok(())
+            }
+            None => self.err("a private name is only valid inside a class"),
+        }
     }
 
     fn expect_ident(&mut self) -> Result<Rc<str>, JsError> {
@@ -1663,6 +1711,11 @@ impl<'a> Parser<'a> {
                         Some(_) => None,
                         None => Some(self.prop_name()?),
                     };
+                    if let Some(k) = &key {
+                        if k.starts_with('#') {
+                            return self.err("a private name is not valid in an object pattern");
+                        }
+                    }
                     let part = if self.eat_punct(Punct::Colon) {
                         self.pat_part(decl_form)?
                     } else if computed.is_some() {
@@ -1744,6 +1797,7 @@ impl<'a> Parser<'a> {
                     Tok::Punct(Punct::Dot) => {
                         self.next();
                         let key = self.prop_name()?;
+                        self.note_private_ref(&key)?;
                         e = Expr {
                             kind: ExprKind::Member { base: Box::new(e), key },
                             span: Span { start: 0, end: 0 },
@@ -2106,9 +2160,30 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         self.class_stack.push(ClassCtx {
             super_name: super_name.clone(),
             is_static: false,
+            private_names: Vec::new(),
+            private_accessor_names: Vec::new(),
+            private_refs: Vec::new(),
         });
         let parsed = self.class_body(&name);
-        self.class_stack.pop();
+        let ctx = self.class_stack.pop();
+        // every private reference must name a private member of this class or
+        // of an enclosing one (forward references inside the body are legal)
+        if let Some(ctx) = &ctx {
+            for r in &ctx.private_refs {
+                let mut found = ctx.private_names.iter().any(|n| n == r);
+                if !found {
+                    for outer in self.class_stack.iter().rev() {
+                        if outer.private_names.iter().any(|n| n == r) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    return self.err(format!("private name `{r}` is not declared in this class"));
+                }
+            }
+        }
         let (ctor, instance, statics, fields) = parsed?;
 
         let span = Span { start: 0, end: 0 };
@@ -2433,7 +2508,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     && self.computed_accessor_ahead());
             if is_acc {
                 let getset = self.expect_ident()?;
+                let private_key =
+                    matches!(self.peek(), Tok::Ident(s) if s.starts_with('#'));
                 let key = self.class_member_key()?;
+                if private_key {
+                    self.note_private_decl(&key, true)?;
+                }
                 if let ClassKey::Name(k) = &key {
                     if &**k == "#constructor" {
                         return self.err("`#constructor` is not a valid private name");
@@ -2500,7 +2580,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 }
                 continue;
             }
+            let private_key = matches!(self.peek(), Tok::Ident(s) if s.starts_with('#'));
             let key = self.class_member_key()?;
+            if private_key {
+                self.note_private_decl(&key, false)?;
+            }
             let key_name: Option<Rc<str>> = match &key {
                 ClassKey::Name(k) => Some(k.clone()),
                 ClassKey::Computed(_) => None,
@@ -2904,7 +2988,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             toks: inner,
             pos: 0,
             depth: 0,
-            class_stack: Vec::new(),
+            class_stack: self.class_stack.clone(),
             // arrow parameters inherit `yield` from the enclosing function;
             // an async arrow reserves `await` in its parameters too
             fn_ctx: vec![FnCtx {
@@ -3078,11 +3162,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             if matches!(self.peek(), Tok::Kw(Kw::In) if !self.no_in) {
                 if let ExprKind::Ident(name) = &l.kind {
                     if name.starts_with('#') {
+                        let pname = name.clone();
                         self.next(); // `in`
+                        self.note_private_ref(&pname)?;
                         let obj = self.shift_expr()?;
                         l = Expr {
                             kind: ExprKind::PrivateIn {
-                                name: name.clone(),
+                                name: pname,
                                 obj: Box::new(obj),
                             },
                             span: self.span_from(start),
@@ -3302,6 +3388,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
             while self.eat_punct(Punct::Dot) {
                 let key = self.prop_name()?;
+                self.note_private_ref(&key)?;
                 c = Expr {
                     kind: ExprKind::Member {
                         base: Box::new(c),
@@ -3348,6 +3435,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                 Tok::Punct(Punct::Dot) => {
                     self.next();
                     let key = self.prop_name()?;
+                    self.note_private_ref(&key)?;
                     if steps.is_empty()
                         && matches!(&e.kind, ExprKind::Ident(n) if n.as_ref() == "import")
                         && key.as_ref() != "meta"
@@ -3389,6 +3477,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         _ => {
                             // `a?.b`: a property name follows the dot
                             let key = self.prop_name()?;
+                            self.note_private_ref(&key)?;
                             steps.push(ChainStep::Member {
                                 key,
                                 optional: true,
@@ -3551,7 +3640,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                         toks,
                         pos: 0,
                         depth: 0,
-                        class_stack: Vec::new(),
+                        class_stack: self.class_stack.clone(),
                         fn_ctx: self.fn_ctx.clone(),
                         no_in: false,
                     };
@@ -3621,6 +3710,9 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     }
                 } else if self.eat_punct(Punct::Dot) {
                     let key = self.prop_name()?;
+                    if key.starts_with('#') {
+                        return self.err("a private name cannot be accessed through `super`");
+                    }
                     ExprKind::SuperMember {
                         class,
                         key,

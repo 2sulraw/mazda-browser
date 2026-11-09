@@ -1805,3 +1805,19 @@ member names, and a `constructor` cannot be an accessor, generator or async.
 
 - test262 language subset: 12,770 -> **12,806** pass (72.4% of 17,678 run,
   6,154 skipped). Engine tests **924** green.
+
+### Private name scope and uniqueness
+
+Each class body now records its declared private names and the private
+references parsed inside it. When the body ends, every reference must name a
+member of that class or an enclosing one, so `something.#x` with no `#x`
+declaration is a SyntaxError (forward references stay legal). Duplicate
+private names are rejected, except the getter/setter halves of one accessor;
+`super.#m` and private keys in object patterns are rejected outright.
+Heritage expressions are parsed before the class context is pushed, so they
+cannot see the subclass's own private names. 12,806 -> **12,931** (+125).
+
+### Measured
+
+- test262 language subset: 12,806 -> **12,931** pass (73.1% of 17,678 run,
+  6,154 skipped). Engine tests **925** green.

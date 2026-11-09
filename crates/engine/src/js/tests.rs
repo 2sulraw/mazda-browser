@@ -1681,6 +1681,54 @@ fn trailing_comma_in_parameter_lists() {
 }
 
 #[test]
+fn private_names_are_lexically_scoped_and_unique() {
+    // forward references are legal
+    assert_eq!(
+        num("class C { m() { return this.#x } #x = 1 }; new C().m()"),
+        1.0
+    );
+    // a private reference with no declaration in the class is an early error
+    for src in [
+        "class C { m() { return this.#x } }",
+        "class C extends Object { m() { return something.#x } }",
+        "class C { #y; m() { return this.#y.#z } }",
+        "class C { f = this.#missing }",
+        "class C { #x; m() { return #y in this } }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // duplicate private names are an early error (get/set pair is not)
+    for src in [
+        "class C { #x; #x; }",
+        "class C { #x() {} #x; }",
+        "class C { static #x; #x; }",
+        "class C { get #x() {} #x() {} }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // private names may not appear through super or as pattern keys
+    assert!(matches!(
+        err("class A { #m() {} }; class C extends A { m() { return super.#m } }"),
+        JsError::Syntax { .. }
+    ));
+    assert!(matches!(
+        err("class C { #x = 1; m() { const { #x: y } = this; } }"),
+        JsError::Syntax { .. }
+    ));
+    // a getter/setter pair and ordinary private members still work
+    assert_eq!(
+        num("class C { get #x() { return 4 } set #x(v) {} m() { return this.#x } }; new C().m()"),
+        4.0
+    );
+}
+
+#[test]
 fn class_element_reserved_names() {
     for src in [
         "class C { static prototype() {} }",
