@@ -2078,3 +2078,19 @@ a number or BigInt suffix.
   6,154 skipped).
 - `language/literals/numeric`: 144/146 -> **146/146** pass.
 - engine tests **936** green.
+## Computed accessor names in object literals (P7, 2026-11-09)
+
+`get [expr]() {}` / `set [expr](v) {}` were not recognized as accessors: the
+`get`/`set` lookahead only accepted literal property names, so the literal
+fell through to shorthand and failed with `expected Comma, found LBrack`.
+`ObjElem` now has `ComputedAccessor { key, getter, setter }`; the key is
+evaluated once when the object is created and the getter/setter pair installs
+an `Acc` entry under it, matching the static accessor path. Yield lifting,
+`yield`/`arguments` scanning and pattern rejection cover the new variant.
+
+### Measured
+
+- test262 language subset: 13,683 -> **13,714** pass (77.6% of 17,678 run,
+  6,154 skipped).
+- `language/expressions/object`: 742/935 -> **763/935** pass.
+- engine tests **937** green (new computed-accessor test).

@@ -238,6 +238,12 @@ pub enum ObjElem {
         getter: Option<Rc<FnDef>>,
         setter: Option<Rc<FnDef>>,
     },
+    /// `get [expr](){}` / `set [expr](v){}` — key evaluated at creation time
+    ComputedAccessor {
+        key: Expr,
+        getter: Option<Rc<FnDef>>,
+        setter: Option<Rc<FnDef>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -4228,7 +4234,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             !self.ident_escaped(self.pos)
                                 && matches!(
                                     self.peek_at(1),
-                                    Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::Kw(_)
+                                    Tok::Ident(_)
+                                        | Tok::Str(_)
+                                        | Tok::Num(_)
+                                        | Tok::Kw(_)
+                                        | Tok::Punct(Punct::LBrack)
                                 )
                         }
                         _ => false,
@@ -4236,7 +4246,18 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     if accessor {
                         let is_setter = matches!(self.peek(), Tok::Ident(s) if &**s == "set");
                         self.next(); // `get` / `set`
-                        let key = self.prop_name()?;
+                        let computed_key = if *self.peek() == Tok::Punct(Punct::LBrack) {
+                            self.next();
+                            let e = self.assign_expr()?;
+                            self.expect_punct(Punct::RBrack)?;
+                            Some(e)
+                        } else {
+                            None
+                        };
+                        let key = match &computed_key {
+                            Some(_) => Rc::from(if is_setter { "set" } else { "get" }),
+                            None => self.prop_name()?,
+                        };
                         self.fn_ctx.push(FnCtx::default());
                         let params = self.param_list()?;
                         self.expect_punct(Punct::LBrace)?;
@@ -4254,11 +4275,20 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                             is_generator: false,
                             has_yield: false,
                         });
-                        props.push(ObjElem::Accessor {
-                            key,
-                            getter: if is_setter { None } else { Some(f.clone()) },
-                            setter: if is_setter { Some(f) } else { None },
-                        });
+                        let getter = if is_setter { None } else { Some(f.clone()) };
+                        let setter = if is_setter { Some(f) } else { None };
+                        match computed_key {
+                            Some(key) => props.push(ObjElem::ComputedAccessor {
+                                key,
+                                getter,
+                                setter,
+                            }),
+                            None => props.push(ObjElem::Accessor {
+                                key,
+                                getter,
+                                setter,
+                            }),
+                        }
                         continue;
                     }
                     // method shorthand: `m(){}` / `"m"(){}`
@@ -4424,7 +4454,9 @@ pub fn expr_to_pat(e: &Expr) -> Result<Pat, String> {
                         };
                         parts.push(ObjPatPart::Prop { key: key.clone(), part });
                     }
-                    ObjElem::Computed { .. } | ObjElem::Accessor { .. } => {
+                    ObjElem::Computed { .. }
+                    | ObjElem::Accessor { .. }
+                    | ObjElem::ComputedAccessor { .. } => {
                         return Err(
                             "computed/accessor keys are not supported in a destructuring pattern"
                                 .into(),
@@ -4590,7 +4622,8 @@ fn expr_uses(e: &Expr, k: SusKind) -> bool {
             ObjElem::Prop(_, v) => expr_uses(v, k),
             ObjElem::Spread(v, _) => expr_uses(v, k),
             ObjElem::Computed { key, value } => expr_uses(key, k) || expr_uses(value, k),
-            // accessor bodies are nested functions: their own trees
+            // computed accessor keys are evaluated here; bodies are nested
+            ObjElem::ComputedAccessor { key, .. } => expr_uses(key, k),
             ObjElem::Accessor { .. } => false,
         }),
         PatAssign { pat, value } => pat_uses(pat, k) || expr_uses(value, k),
@@ -5639,6 +5672,7 @@ impl YieldLift {
             ObjElem::Computed { key, value } => {
                 expr_uses(key, SusKind::Yield) || expr_uses(value, SusKind::Yield)
             }
+            ObjElem::ComputedAccessor { key, .. } => expr_uses(key, SusKind::Yield),
             ObjElem::Accessor { .. } => false,
         };
         let last = match props.iter().rposition(suspends) {
@@ -5686,6 +5720,24 @@ impl YieldLift {
                         value
                     };
                     ObjElem::Computed { key, value }
+                }
+                ObjElem::ComputedAccessor {
+                    key,
+                    getter,
+                    setter,
+                } => {
+                    let span = key.span;
+                    let key = self.expr(key, pre);
+                    let key = if i < last && !is_lift_temp(&key) {
+                        self.bind(key, pre, span)
+                    } else {
+                        key
+                    };
+                    ObjElem::ComputedAccessor {
+                        key,
+                        getter,
+                        setter,
+                    }
                 }
                 ObjElem::Accessor {
                     key,
@@ -5876,7 +5928,7 @@ fn scan_expr_arguments(e: &Expr) -> bool {
             ObjElem::Computed { key, value } => {
                 scan_expr_arguments(key) || scan_expr_arguments(value)
             }
-            // accessor bodies are nested functions: their own trees
+            ObjElem::ComputedAccessor { key, .. } => scan_expr_arguments(key),
             ObjElem::Accessor { .. } => false,
         }),
         Yield(Some(v)) => scan_expr_arguments(v),

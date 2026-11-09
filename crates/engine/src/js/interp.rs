@@ -1621,6 +1621,27 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                             })),
                         );
                     }
+                    ObjElem::ComputedAccessor {
+                        key,
+                        getter,
+                        setter,
+                    } => {
+                        let k = eval_expr(e, env, key)?.to_string();
+                        let getter_v = getter
+                            .as_ref()
+                            .map(|f| make_val_closure(e, env, f, false));
+                        let setter_v = setter
+                            .as_ref()
+                            .map(|f| make_val_closure(e, env, f, false));
+                        obj_set_own(
+                            &orc,
+                            &k,
+                            Val::Acc(Rc::new(AccEntry {
+                                getter: getter_v,
+                                setter: setter_v,
+                            })),
+                        );
+                    }
                 }
             }
             Ok(o)

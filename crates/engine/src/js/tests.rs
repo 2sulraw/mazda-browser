@@ -1473,6 +1473,14 @@ fn numeric_separators() {
     assert!(boolean("1_0n === 10n"));
     // separators hold no value of their own
     assert_eq!(num("1_2_3"), 123.0);
+    // legacy leading-zero forms cannot be BigInts
+    for src in ["var x = 00n", "var x = 01n", "var x = 08n", "var x = 0008n"] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    assert!(boolean("0n === 0n"));
     // illegal placements are syntax errors
     for src in [
         "var x = 1_",
@@ -2973,6 +2981,28 @@ fn destructuring_objects() {
     // ...but both are legal expressions
     assert_eq!(num("var a = { x: 1 }; ({ ...a, }).x"), 1.0);
     assert_eq!(num("var a = [1, 2]; [...a,].length"), 2.0);
+}
+
+#[test]
+fn computed_object_accessors() {
+    assert_eq!(
+        num("var k = 'x'; var o = { get [k]() { return 5 } }; o.x"),
+        5.0
+    );
+    assert_eq!(
+        num("var k = 'y'; var o = { set [k](v) { this.v = v } }; o.y = 7; o.v"),
+        7.0
+    );
+    // the key expression is evaluated once, at object creation
+    assert_eq!(
+        num("var n = 0; var o = { get ['a' + (n++)]() { return 1 } }; n"),
+        1.0
+    );
+    // a computed accessor pair shares the key
+    assert_eq!(
+        num("var k = 'z'; var o = { get [k]() { return this._v }, set [k](v) { this._v = v } }; o.z = 9; o.z"),
+        9.0
+    );
 }
 
 #[test]

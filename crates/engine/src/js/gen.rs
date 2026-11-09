@@ -1108,6 +1108,7 @@ fn expr_has_yield(x: &parser::Expr) -> bool {
                 parser::ObjElem::Computed { key, value } => {
                     expr_has_yield(key) || expr_has_yield(value)
                 }
+                parser::ObjElem::ComputedAccessor { key, .. } => expr_has_yield(key),
                 // accessor bodies are nested functions: their own trees
                 parser::ObjElem::Accessor { .. } => false,
             }),
