@@ -2468,6 +2468,29 @@ fn generator_yield_inside_if_and_loop() {
 }
 
 #[test]
+fn escaped_accessor_and_async_modifiers_are_not_keywords() {
+    for src in [
+        "({ \\u0067\\u0065\\u0074 m() {} })",
+        "({ \\u0073et m(v) {} })",
+        "({ \\u0061sync m() {} })",
+        "({ \\u0061sync *m() {} })",
+        "class C { g\\u0065t value() {} }",
+        "class C { s\\u0065t value(v) {} }",
+        "class C { a\\u0073ync value() {} }",
+        "class C { static a\\u0073ync value() {} }",
+    ] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+    // unescaped forms still work, and an escaped `get`/`async` stays a legal
+    // property name when used as one
+    assert_eq!(num("({ get x() { return 1 } }).x"), 1.0);
+    assert_eq!(num("({ \\u0067et: 7 }).get"), 7.0);
+}
+
+#[test]
 fn class_field_initializer_arguments_is_early_error() {
     for src in [
         "class C { x = arguments }",

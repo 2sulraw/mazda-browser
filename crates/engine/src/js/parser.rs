@@ -918,6 +918,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True when the identifier token at `pos` was written with a `\u` escape.
+    /// Escaped spellings never lex as keywords, so `\u0067et` / `\u0061sync`
+    /// are ordinary property names, not accessor/modifier keywords.
+    fn ident_escaped(&self, pos: usize) -> bool {
+        match self.toks.get(pos) {
+            Some(t) if matches!(t.tok, Tok::Ident(_)) => self
+                .src
+                .get(t.start as usize..t.end as usize)
+                .is_some_and(|s| s.contains('\\')),
+            _ => false,
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<Rc<str>, JsError> {
         match self.peek().clone() {
             Tok::Ident(s) => {
@@ -2637,9 +2650,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             // `async()` is a method named `async`.
             let mut is_async = false;
             let mut is_gen = false;
-            if matches!(self.peek(), Tok::Kw(Kw::Async))
-                || matches!(self.peek(), Tok::Ident(s) if s.as_ref() == "async")
-            {
+            let async_ident = match self.peek() {
+                Tok::Kw(Kw::Async) => true,
+                Tok::Ident(s) if s.as_ref() == "async" => !self.ident_escaped(self.pos),
+                _ => false,
+            };
+            if async_ident {
                 let is_async_method = !self.toks[(self.pos + 1).min(self.toks.len() - 1)].nl
                     && matches!(
                         self.peek_at(1),
@@ -2660,12 +2676,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             let is_acc = matches!(
                 self.peek(),
                 Tok::Ident(s) if s.as_ref() == "get" || s.as_ref() == "set"
-            ) && (matches!(
-                self.peek_at(1),
-                Tok::Ident(_) | Tok::Kw(_) | Tok::Str(_) | Tok::Num(_)
-            ) && *self.peek_at(2) == Tok::Punct(Punct::LParen)
-                || *self.peek_at(1) == Tok::Punct(Punct::LBrack)
-                    && self.computed_accessor_ahead());
+            ) && !self.ident_escaped(self.pos)
+                && (matches!(
+                    self.peek_at(1),
+                    Tok::Ident(_) | Tok::Kw(_) | Tok::Str(_) | Tok::Num(_)
+                ) && *self.peek_at(2) == Tok::Punct(Punct::LParen)
+                    || *self.peek_at(1) == Tok::Punct(Punct::LBrack)
+                        && self.computed_accessor_ahead());
             if is_acc {
                 let getset = self.expect_ident()?;
                 let private_key =
@@ -4076,9 +4093,14 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     // `}` next, so it is not consumed as a modifier.
                     let mut is_async = false;
                     let mut is_gen = false;
-                    if matches!(self.peek(), Tok::Kw(Kw::Async))
-                        || matches!(self.peek(), Tok::Ident(s) if s.as_ref() == "async")
-                    {
+                    let async_ident = match self.peek() {
+                        Tok::Kw(Kw::Async) => true,
+                        Tok::Ident(s) if s.as_ref() == "async" => {
+                            !self.ident_escaped(self.pos)
+                        }
+                        _ => false,
+                    };
+                    if async_ident {
                         let is_async_method =
                             !self.toks[(self.pos + 1).min(self.toks.len() - 1)].nl
                                 && matches!(
@@ -4176,10 +4198,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     // property name follows, so `{get: 1}` and `{get(){}}`
                     // stay ordinary properties/methods.
                     let accessor = match self.peek() {
-                        Tok::Ident(s) if &**s == "get" || &**s == "set" => matches!(
-                            self.peek_at(1),
-                            Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::Kw(_)
-                        ),
+                        Tok::Ident(s) if (&**s == "get" || &**s == "set") => {
+                            !self.ident_escaped(self.pos)
+                                && matches!(
+                                    self.peek_at(1),
+                                    Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::Kw(_)
+                                )
+                        }
                         _ => false,
                     };
                     if accessor {

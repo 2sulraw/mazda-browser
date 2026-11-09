@@ -1899,3 +1899,18 @@ A field initializer containing one is rejected at parse time. 13,305 ->
 
 - test262 language subset: 13,305 -> **13,363** pass (75.6% of 17,678 run,
   6,154 skipped). Engine tests **930** green.
+
+### Escaped `get` / `set` / `async` are not modifiers
+
+Escaped spellings never lex as keywords, so `\u0067et m() {}` in an object
+literal or a class body is an ordinary property named `get` followed by junk —
+a SyntaxError — not an accessor. The parser now checks the raw token text for
+an escape before treating an identifier as the `get`/`set` accessor keyword or
+the `async` method modifier (object literals and class bodies). Unescaped
+forms are unchanged, and `\u0067et: 7` stays a legal property. 13,363 ->
+**13,387** (+24).
+
+### Measured
+
+- test262 language subset: 13,363 -> **13,387** pass (75.7% of 17,678 run,
+  6,154 skipped). Engine tests **931** green.
