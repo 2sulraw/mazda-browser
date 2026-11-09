@@ -3071,6 +3071,42 @@ fn const_requires_an_initializer() {
 }
 
 #[test]
+fn arrow_parameters_cannot_be_split_from_the_arrow() {
+    // ArrowParameters [no LineTerminator here] =>
+    for src in [
+        "var af = x\n=> {};",
+        "var af = x\n=> x;",
+        "var af = ()\n=> {};",
+        "var af = (a, b)\n=> {};",
+    ] {
+        assert!(
+            err(src).to_string().contains("SyntaxError"),
+            "expected SyntaxError for: {src:?}"
+        );
+    }
+    // same line is fine, and a newline in the *body* is fine
+    assert_eq!(num("var af = x => x + 1; af(2)"), 3.0);
+    assert_eq!(num("var af = (a, b) =>\n a + b; af(2, 3)"), 5.0);
+}
+
+#[test]
+fn arrow_parameters_reject_duplicate_names() {
+    // arrows reject duplicate bound names in every mode
+    for src in [
+        "var af = (x, x) => 1;",
+        "var af = (x, [x]) => 1;",
+        "var af = ({y: x, x}) => 1;",
+        "var af = (x, ...x) => 1;",
+    ] {
+        assert!(
+            err(src).to_string().contains("SyntaxError"),
+            "expected SyntaxError for: {src:?}"
+        );
+    }
+    assert_eq!(num("var af = (x, y) => x + y; af(1, 2)"), 3.0);
+}
+
+#[test]
 fn direct_eval_cannot_hoist_var_over_param_bindings() {
     // a parameter default's eval must not declare a var over the implicit
     // `arguments` object (EvalDeclarationInstantiation's collision walk)

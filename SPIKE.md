@@ -2372,3 +2372,24 @@ through a ForBinding and stays legal.
   `statements/for-of` 137 -> 135 and `statements/for-in` 45 -> 43 as
   side effects. No directory regressed.
 - engine tests **951** green (two new early-error tests).
+
+## Arrow parameter early errors (P7, 2026-11-10)
+
+Two ArrowParameters rules. Arrows are stricter than functions: duplicate
+bound names across the whole parameter list (including destructuring leaves
+and rest) are an early error in every mode, so `(x, x)`, `(x, [x])`,
+`({y: x, x})` and `(x, ...x)` are rejected at parse time. The grammar also
+carries `ArrowParameters [no LineTerminator here] =>`, so a newline between
+the parameters and `=>` ends the expression through ASI instead
+(`var af = x\n=> {}` is a SyntaxError). All three arrow detection paths —
+single-identifier, `async x =>`, and the parenthesised scan — now honour the
+line-terminator restriction.
+
+### Measured
+
+- test262 language subset: 14,804 -> **14,822** pass (83.8% of 17,678 run,
+  6,154 skipped).
+- "expected SyntaxError, got string" failures 374 -> **356**;
+  `expressions/arrow-function` 33 -> **17** (two further fixes elsewhere). No
+  directory regressed.
+- engine tests **953** green (two new early-error tests).

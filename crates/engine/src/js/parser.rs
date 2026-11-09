@@ -952,6 +952,22 @@ impl<'a> Parser<'a> {
     /// Arrow-function form of [`Parser::check_strict_body`] (a concise body
     /// has no directive prologue).
     fn check_strict_arrow(&self, params: &[Param], body: &FnBody) -> Result<(), JsError> {
+        // arrows are stricter than functions: duplicate bound names in the
+        // parameter list are an early error in every mode
+        let mut seen: Vec<Rc<str>> = Vec::new();
+        for p in params {
+            let mut names = Vec::new();
+            match &p.pat {
+                Some(pat) => pat_binding_names(pat, &mut names),
+                None => names.push(p.name.clone()),
+            }
+            for n in names {
+                if seen.iter().any(|s| *s == n) {
+                    return self.err("duplicate parameter name in arrow function");
+                }
+                seen.push(n);
+            }
+        }
         if let FnBody::Block(stmts) = body {
             self.check_strict_body(params, stmts)?;
         }
@@ -3065,9 +3081,11 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
 
     fn assign_expr_inner(&mut self) -> Result<Expr, JsError> {
         let start = self.pos;
-        // arrow with single ident param: `x => ...` / `async x => ...`
+        // arrow with single ident param: `x => ...` / `async x => ...`.
+        // `[no LineTerminator here] =>` means a newline before `=>` ends the
+        // expression instead (ASI), so this is not an arrow.
         if let Tok::Ident(s) = self.peek().clone() {
-            if *self.peek_at(1) == Tok::Op(Op::Arrow) {
+            if *self.peek_at(1) == Tok::Op(Op::Arrow) && !self.toks[self.pos + 1].nl {
                 self.check_ctx_ident(&s)?;
                 self.next();
                 self.next(); // =>
@@ -3097,7 +3115,7 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
         if *self.peek() == Tok::Kw(Kw::Async) {
             // `async x => ...`
             if let Tok::Ident(s) = self.peek_at(1).clone() {
-                if *self.peek_at(2) == Tok::Op(Op::Arrow) {
+                if *self.peek_at(2) == Tok::Op(Op::Arrow) && !self.toks[self.pos + 2].nl {
                     let mut pc = self.fn_ctx.last().copied().unwrap_or_default();
                     pc.is_async = true;
                     self.check_reserved_in(&s, pc)?;
@@ -3317,6 +3335,10 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             i += 1;
         };
         if self.toks.get(close + 1).map(|t| &t.tok) != Some(&Tok::Op(Op::Arrow)) {
+            return Ok(None);
+        }
+        // a LineTerminator before `=>` breaks the arrow (ASI restriction)
+        if self.toks[close + 1].nl {
             return Ok(None);
         }
         // parse the slice between parens as a parameter list; append the
