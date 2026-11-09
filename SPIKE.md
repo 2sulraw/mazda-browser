@@ -2063,3 +2063,18 @@ parsed.
   6,154 skipped).
 - `language/literals/numeric`: 114/146 -> **144/146** pass.
 - engine tests **935** green (new numeric-separator test).
+## Numeric literal edges (P7, 2026-11-09)
+
+Two lexer gaps kept `literals/numeric` from passing: Annex B legacy octal
+(`070` was read as decimal 70 instead of 56) and a numeric literal running
+straight into an identifier (`3in []`, `1foo`, `0x1g` were accepted). The
+scanner now parses a leading-zero run of octal digits as base 8 (while
+`08`/`09` stay decimal), and rejects an identifier start or digit right after
+a number or BigInt suffix.
+
+### Measured
+
+- test262 language subset: 13,681 -> **13,683** pass (77.4% of 17,678 run,
+  6,154 skipped).
+- `language/literals/numeric`: 144/146 -> **146/146** pass.
+- engine tests **936** green.

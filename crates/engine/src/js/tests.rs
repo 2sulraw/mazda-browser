@@ -1495,6 +1495,24 @@ fn numeric_separators() {
 }
 
 #[test]
+fn numeric_literal_edges() {
+    // Annex B legacy octal (sloppy), and non-octal decimals
+    assert_eq!(num("070"), 56.0);
+    assert_eq!(num("001"), 1.0);
+    assert_eq!(num("077"), 63.0);
+    assert_eq!(num("08"), 8.0);
+    assert_eq!(num("0o70"), 56.0);
+    assert_eq!(string("1..toString()"), "1");
+    // a numeric literal may not run straight into an identifier
+    for src in ["3in []", "var x = 1foo", "var x = 0x1g", "var x = 1.toString()"] {
+        assert!(
+            matches!(err(src), JsError::Syntax { .. }),
+            "expected a SyntaxError for {src}"
+        );
+    }
+}
+
+#[test]
 fn unicode_whitespace_and_line_terminators() {
     // NBSP, BOM and the U+2028/U+2029 terminators are not identifiers
     assert_eq!(num("1\u{a0}+ 2"), 3.0);

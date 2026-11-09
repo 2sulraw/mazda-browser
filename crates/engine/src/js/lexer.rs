@@ -528,6 +528,21 @@ impl<'a> Lexer<'a> {
         self.src[start..self.pos].chars().filter(|c| *c != '_').collect()
     }
 
+    /// A numeric literal may not be immediately followed by an identifier
+    /// start or a digit (`3in []`, `1foo`, `0x1g` are SyntaxErrors).
+    fn bad_number_suffix(&self) -> bool {
+        match self.peek() {
+            Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b.is_ascii_digit() => {
+                true
+            }
+            Some(b) if b >= 0x80 => {
+                let ch = self.src[self.pos..].chars().next().unwrap_or('\u{fffd}');
+                is_ident_start_char(ch)
+            }
+            _ => false,
+        }
+    }
+
     fn read_number(&mut self, start: usize) -> Result<Tok, LexError> {
         let b0 = self.peek();
         if b0 == Some(b'0') {
@@ -545,10 +560,16 @@ impl<'a> Lexer<'a> {
                     let digits = self.digits_text(dstart);
                     if self.peek() == Some(b'n') {
                         self.pos += 1;
+                        if self.bad_number_suffix() {
+                            return self.err("identifier directly after number", start);
+                        }
                         return match i128::from_str_radix(&digits, radix) {
                             Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
                             Err(_) => self.err("BigInt literal too large", start),
                         };
+                    }
+                    if self.bad_number_suffix() {
+                        return self.err("identifier directly after number", start);
                     }
                     return match u64::from_str_radix(&digits, radix) {
                         Ok(v) => Ok(Tok::Num(v as f64)),
@@ -563,10 +584,13 @@ impl<'a> Lexer<'a> {
         let allow_sep = !(b0 == Some(b'0')
             && matches!(self.peek2(), Some(c) if c.is_ascii_digit() || c == b'_'));
         self.scan_digits(|c| c.is_ascii_digit(), allow_sep, start)?;
+        let mut had_dot = false;
         if self.peek() == Some(b'.') {
+            had_dot = true;
             self.pos += 1;
             self.scan_digits(|c| c.is_ascii_digit(), allow_sep, start)?;
         }
+        let mut had_exp = false;
         if matches!(self.peek(), Some(b'e') | Some(b'E')) {
             let save = self.pos;
             self.pos += 1;
@@ -574,6 +598,7 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
             if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                had_exp = true;
                 self.scan_digits(|c| c.is_ascii_digit(), true, start)?;
             } else {
                 self.pos = save; // `1e` is just `1` followed by ident `e`
@@ -583,17 +608,35 @@ impl<'a> Lexer<'a> {
             // `123n` is a BigInt literal; a fraction or exponent before the
             // suffix is a syntax error (`1.5n`, `1e3n`)
             let raw = &self.src[start..self.pos];
-            if raw.contains(['.', 'e', 'E']) {
+            if had_dot || had_exp {
                 return self.err("invalid BigInt literal", start);
             }
             self.pos += 1; // `n`
+            if self.bad_number_suffix() {
+                return self.err("identifier directly after number", start);
+            }
             let text = raw.chars().filter(|c| *c != '_').collect::<String>();
             return match text.parse::<i128>() {
                 Ok(v) => Ok(Tok::BigInt(Rc::from(v.to_string().as_str()))),
                 Err(_) => self.err("BigInt literal too large", start),
             };
         }
+        if self.bad_number_suffix() {
+            return self.err("identifier directly after number", start);
+        }
         let s = self.digits_text(start);
+        // Annex B legacy octal: `070` is 56 in sloppy mode (the `0` prefix
+        // followed only by octal digits). `08`/`09` stay decimal.
+        if !had_dot
+            && !had_exp
+            && b0 == Some(b'0')
+            && self.pos - start > 1
+            && s.bytes().all(|c| (b'0'..=b'7').contains(&c))
+        {
+            if let Ok(v) = u64::from_str_radix(&s, 8) {
+                return Ok(Tok::Num(v as f64));
+            }
+        }
         match s.parse::<f64>() {
             Ok(v) => Ok(Tok::Num(v)),
             Err(_) => self.err("malformed numeric literal", start),
