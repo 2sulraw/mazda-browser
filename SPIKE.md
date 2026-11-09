@@ -2228,3 +2228,22 @@ parameter has length 0).
 - Every `length descriptor` / `length is properly set` failure (31) now
   passes.
 - engine tests **943** green (new `length` test).
+
+## Regex literals are validated at parse time (P7, 2026-11-09)
+
+A regex literal kept its raw pattern until first evaluation, so an invalid
+pattern was neither a parse error nor a runtime error until the literal was
+reached. test262's parse-phase negative cases evaluate `$DONOTEVALUATE()`
+first and reported "expected SyntaxError, got string". The parser now runs
+`regex::compile` over each `Tok::Regex` and turns a `RegexError` into a
+SyntaxError with the pattern/flags in the message. Compilation is cached per
+(pattern, flags) by the evaluator anyway, so validating early costs one
+compile per literal.
+
+### Measured
+
+- test262 language subset: 14,360 -> **14,517** pass (82.1% of 17,678 run,
+  6,154 skipped).
+- `language/literals/regexp` failures 197 -> **40**; the total failure count
+  dropped by exactly the same 157, so no other area regressed.
+- engine tests **944** green (new parse-time validation test).

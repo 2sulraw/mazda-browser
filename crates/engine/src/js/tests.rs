@@ -2984,6 +2984,19 @@ fn destructuring_objects() {
 }
 
 #[test]
+fn regex_literals_validate_at_parse_time() {
+    // an invalid pattern is a SyntaxError even if the literal never runs
+    assert!(matches!(err("var r = /(/;"), JsError::Syntax { .. }));
+    assert!(matches!(err("var r = /[a/;"), JsError::Syntax { .. }));
+    assert!(matches!(
+        err("if (false) { var r = /(?<a>x/; }"),
+        JsError::Syntax { .. }
+    ));
+    // a valid pattern still parses and matches
+    assert!(boolean("var r = /a+b/; r.test('aab')"));
+}
+
+#[test]
 fn function_length_counts_leading_params() {
     assert_eq!(num("(function (a, b) {}).length"), 2.0);
     assert_eq!(num("(function (a, b = 1, c) {}).length"), 1.0);

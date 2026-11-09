@@ -4064,6 +4064,12 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
             }
             Tok::Regex(p, f) => {
                 self.next();
+                // a regex literal is validated at parse time: an invalid
+                // pattern is a SyntaxError even if the literal never runs
+                // (test262's parse-phase negative cases rely on this)
+                if let Err(e) = super::regex::compile(&p, &f) {
+                    return self.err(&format!("/{}/{}: {}", p, f, e.msg));
+                }
                 ExprKind::Regex {
                     pattern: p,
                     flags: f,
