@@ -1464,6 +1464,9 @@ pub struct JsEngine {
     pub(crate) global_obj: Rc<RefCell<Obj>>,
     /// shared prototype for every array (lazy-attached on first access)
     pub(crate) array_proto: Option<Rc<RefCell<Obj>>>,
+    /// native id of `Array.prototype.values`, so `get_iterator` can tell the
+    /// builtin `@@iterator` apart from a deleted or replaced one
+    pub(crate) array_values_native: usize,
     /// shared `Object.prototype`: every plain object inherits it lazily
     pub(crate) object_proto: Option<Rc<RefCell<Obj>>>,
     pub(crate) natives: Vec<NativeEntry>,
@@ -1647,6 +1650,7 @@ impl Drop for JsEngine {
         // prototypes can hold constructor methods whose closures capture the
         // global env; release the table entries as well as the roots
         self.array_proto = None;
+        self.array_values_native = 0;
         self.object_proto = None;
         self.promise_proto = None;
         self.url_proto = None;
@@ -1736,6 +1740,7 @@ impl JsEngine {
             page,
             global_obj,
             array_proto: None,
+            array_values_native: 0,
             object_proto: None,
             natives: Vec::new(),
             natives_by_name: HashMap::new(),

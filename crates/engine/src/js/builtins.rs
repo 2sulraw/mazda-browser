@@ -221,13 +221,22 @@ pub(crate) fn install(e: &mut JsEngine) {
         "copyWithin",
         "flat",
         "flatMap",
+        "values",
+        "keys",
+        "entries",
     ]
     .iter()
     .enumerate()
     {
         let id = e.register_native(name, n_array, i as u16);
         obj_set_own(own(&arr_proto), name, Val::Native(id));
+        if name == &"values" {
+            e.array_values_native = id;
+        }
     }
+    // `Array.prototype[Symbol.iterator]` is `values` itself
+    let arr_values = obj_get_own(own(&arr_proto), "values");
+    obj_set_own(own(&arr_proto), crate::js::SYMBOL_ITERATOR, arr_values);
     if let Val::Obj(o) = &arr_proto {
         e.array_proto = Some(o.clone());
     }
@@ -1902,6 +1911,9 @@ const A_FILL: u16 = 24;
 const A_COPY_WITHIN: u16 = 25;
 const A_FLAT: u16 = 26;
 const A_FLATMAP: u16 = 27;
+const A_VALUES: u16 = 28;
+const A_KEYS: u16 = 29;
+const A_ENTRIES: u16 = 30;
 const A_ISARRAY: u16 = 100;
 
 /// Own-property check that also understands array indices/length.
@@ -2544,6 +2556,14 @@ fn n_array(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                 flatten_into(&mapped, 1.0, &mut out);
             }
             Val::new_array(out)
+        }
+        A_VALUES | A_KEYS | A_ENTRIES => {
+            let kind = match idx {
+                A_KEYS => crate::js::IterKind::Keys,
+                A_ENTRIES => crate::js::IterKind::Entries,
+                _ => crate::js::IterKind::Values,
+            };
+            super::interp::make_iterator(Val::Obj(o.clone()), kind)
         }
         _ => Val::Undefined,
     })

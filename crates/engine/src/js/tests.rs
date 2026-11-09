@@ -3746,4 +3746,29 @@ fn array_flat_and_flat_map_respect_depth() {
     assert_eq!(num("[].flat().length"), 0.0);
 }
 
+#[test]
+fn array_iterator_methods() {
+    // `values`/`keys`/`entries` exist on Array.prototype and `[Symbol.iterator]`
+    // is the same function as `values`.
+    assert_eq!(string("typeof [][Symbol.iterator]"), "function");
+    assert_eq!(string("Array.prototype[Symbol.iterator] === Array.prototype.values"), "true");
+    assert_eq!(num("[7, 8].values().next().value"), 7.0);
+    assert_eq!(num("[7, 8].keys().next().value"), 0.0);
+    assert_eq!(num("[7, 8].entries().next().value[1]"), 7.0);
+    // for-of / spread / destructuring go through the same iterator
+    assert_eq!(num("var s = 0; for (const x of [1, 2, 3]) s += x; s"), 6.0);
+    assert_eq!(num("var [a, b] = [4, 5]; a + b"), 9.0);
+}
 
+#[test]
+fn deleting_array_iterator_makes_arrays_non_iterable() {
+    assert!(matches!(
+        err("delete Array.prototype[Symbol.iterator]; [...[1, 2]]"),
+        JsError::Throw(_)
+    ));
+    // a replaced iterator is honoured too
+    assert_eq!(
+        num("Array.prototype[Symbol.iterator] = function () { return { i: 0, next() { return this.i++ < 1 ? { value: 42, done: false } : { done: true } } } }; [...[1, 2]][0]"),
+        42.0
+    );
+}

@@ -1066,10 +1066,35 @@ pub(crate) fn get_iterator(e: &mut JsEngine, v: &Val) -> Result<Val, JsError> {
                 let items = e.live_values.map(|f| f(&spec)).unwrap_or_default();
                 return Ok(make_iterator(Val::new_array(items), IterKind::Values));
             }
+            // arrays iterate through the *live* `Array.prototype[Symbol.iterator]`:
+            // the fast path only applies while it is still the builtin
+            // `values`. Deleting it makes arrays non-iterable; replacing it
+            // with a user function must call that function.
+            if matches!(o.borrow().kind, ObjKind::Array(_)) {
+                let current = match &e.array_proto {
+                    Some(p) => get_member(e, &Val::Obj(p.clone()), crate::js::SYMBOL_ITERATOR)?,
+                    None => Val::Undefined,
+                };
+                if matches!(current, Val::Native(id) if id == e.array_values_native) {
+                    return Ok(make_iterator(v.clone(), IterKind::Values));
+                }
+                if is_callable(&current) {
+                    let it = e.call(current, v.clone(), Vec::new())?;
+                    if matches!(it, Val::Obj(_)) {
+                        return Ok(it);
+                    }
+                    return Err(JsError::throw(
+                        "TypeError: Result of the Symbol.iterator method is not an object",
+                    ));
+                }
+                return Err(JsError::throw(
+                    "TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))",
+                ));
+            }
             let builtin = {
                 let b = o.borrow();
                 match &b.kind {
-                    ObjKind::Array(_) | ObjKind::TypedArray(_) => Some(IterKind::Values),
+                    ObjKind::TypedArray(_) => Some(IterKind::Values),
                     // a generator is its own iterator: `[...gen]`,
                     // `for (const x of gen)`, destructuring a call result
                     ObjKind::Iterator(_) | ObjKind::Generator(_) => return Ok(v.clone()),

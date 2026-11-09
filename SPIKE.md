@@ -1748,3 +1748,19 @@ descriptor tests stop reporting `m descriptor should be configurable`.
 
 - test262 language subset: 11,470 -> **11,588** pass (65.6% of 17,678 run,
   6,154 skipped). Engine tests **919** green.
+
+### Array iterator methods
+
+`Array.prototype` had no `values`/`keys`/`entries` and no
+`[Symbol.iterator]`, so `[1][Symbol.iterator]` was `undefined` even though
+engine-internal iteration fast-pathed arrays. The three methods now exist
+(reusing `make_iterator` / `IterKind`), and `Symbol.iterator` is the same
+native as `values`. `get_iterator` no longer unconditionally fast-paths
+arrays: it reads the live `Array.prototype[Symbol.iterator]`, uses the fast
+path only while it is still the builtin native, calls a user replacement,
+and reports "not iterable" after a delete. 11,588 -> **11,702** (+114).
+
+### Measured
+
+- test262 language subset: 11,588 -> **11,702** pass (66.2% of 17,678 run,
+  6,154 skipped). Engine tests **921** green.
