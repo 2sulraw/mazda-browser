@@ -357,6 +357,20 @@ fn function_declaration_and_call() {
 }
 
 #[test]
+fn anonymous_function_name_inference() {
+    assert_eq!(string("var fn = function () {}; fn.name"), "fn");
+    assert_eq!(string("var g = function* () {}; g.name"), "g");
+    assert_eq!(string("var a = () => {}; a.name"), "a");
+    assert_eq!(string("const [x = function () {}] = []; x.name"), "x");
+    assert_eq!(string("const { y = () => {} } = {}; y.name"), "y");
+    assert_eq!(string("let z; z = function () {}; z.name"), "z");
+    assert_eq!(
+        string("function f(cb = function () {}) { return cb.name } f()"),
+        "cb"
+    );
+}
+
+#[test]
 fn closures() {
     // counter closure
     let src = "function makeCounter() { let n = 0; return function() { n = n + 1; return n } }

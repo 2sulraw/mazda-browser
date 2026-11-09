@@ -539,6 +539,31 @@ pub enum FnBody {
 
 pub type Program = Vec<Stmt>;
 
+/// NamedEvaluation for a binding initializer: `fn = function () {}`,
+/// `gen = function* () {}` and `arrow = () => {}` give the anonymous
+/// function the bound name, so `fn.name === 'fn'`. Applied at parse time,
+/// which covers the literal shapes real code uses; an initializer that is a
+/// parenthesized/computed expression keeps its empty name.
+fn name_anon_fn(name: &str, init: &mut Expr) {
+    let (def, is_arrow) = match &init.kind {
+        ExprKind::Func(f) => (f.clone(), false),
+        ExprKind::Arrow(f) => (f.clone(), true),
+        _ => return,
+    };
+    if !def.name.is_empty() {
+        return;
+    }
+    let renamed = Rc::new(FnDef {
+        name: Rc::from(name),
+        ..(*def).clone()
+    });
+    init.kind = if is_arrow {
+        ExprKind::Arrow(renamed)
+    } else {
+        ExprKind::Func(renamed)
+    };
+}
+
 /// What a `class` body accumulates. Lowered to statements once the whole
 /// body is parsed, in source order per list (instance members and static
 /// members keep their own relative order).
@@ -1370,7 +1395,12 @@ impl<'a> Parser<'a> {
         loop {
             let (name, pat) = self.pattern_or_ident()?;
             let init = if self.eat_op(Op::Assign) {
-                Some(self.assign_expr()?)
+                let mut e = self.assign_expr()?;
+                // `var fn = function () {}` takes the declarator name
+                if pat.is_none() {
+                    name_anon_fn(&name, &mut e);
+                }
+                Some(e)
             } else {
                 None
             };
@@ -1491,7 +1521,8 @@ impl<'a> Parser<'a> {
                         let key = key.clone().expect("shorthand key");
                         if *self.peek() == Tok::Op(Op::Assign) {
                             self.next();
-                            let d = self.assign_expr()?;
+                            let mut d = self.assign_expr()?;
+                            name_anon_fn(&key, &mut d);
                             PatPart::Bind(
                                 Box::new(Pat::Name(BindTgt::Name(key.clone()))),
                                 Some(d),
@@ -1522,11 +1553,16 @@ impl<'a> Parser<'a> {
             Tok::Punct(Punct::LBrack) | Tok::Punct(Punct::LBrace) => self.parse_pattern(decl_form)?,
             _ => self.parse_binding_leaf(decl_form)?,
         };
-        let default = if self.eat_op(Op::Assign) {
+        let mut default = if self.eat_op(Op::Assign) {
             Some(self.assign_expr()?)
         } else {
             None
         };
+        // `[fn = function () {}]`: the anonymous function takes the bound
+        // name (NamedEvaluation), so `fn.name === 'fn'`
+        if let (Some(d), Pat::Name(BindTgt::Name(n))) = (default.as_mut(), &sub) {
+            name_anon_fn(n, d);
+        }
         Ok(PatPart::Bind(Box::new(sub), default))
     }
 
@@ -1823,13 +1859,19 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     return self.err("expected parameter name");
                 }
             };
-            let default = if rest {
+            let mut default = if rest {
                 None // rest params take no default
             } else if self.eat_op(Op::Assign) {
                 Some(Box::new(self.assign_expr()?))
             } else {
                 None
             };
+            // `function f(fn = function () {})`: NamedEvaluation
+            if pat.is_none() {
+                if let Some(d) = default.as_mut() {
+                    name_anon_fn(&name, d);
+                }
+            }
             params.push(Param { name, pat, default, rest });
         }
         Ok(params)
@@ -2512,7 +2554,13 @@ fn for_rest(&mut self) -> Result<ForHead, JsError> {
                     span: self.span_from(start),
                 });
             }
-            let value = self.assign_expr()?;
+            let mut value = self.assign_expr()?;
+            // `fn = function () {}`: NamedEvaluation
+            if op == Op::Assign {
+                if let ExprKind::Ident(n) = &l.kind {
+                    name_anon_fn(n, &mut value);
+                }
+            }
             let binop = match op {
                 Op::Assign => None,
                 Op::AddAssign => Some(BinOp::Add),
