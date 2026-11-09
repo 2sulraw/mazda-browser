@@ -1990,53 +1990,139 @@ fn bigint_binary(op: BinOp, l: &Val, r: &Val) -> Option<Result<Val, JsError>> {
     })
 }
 
-fn binary_op(e: &JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> {
+#[derive(Clone, Copy, PartialEq)]
+enum PrimHint {
+    Default,
+    Number,
+    String,
+}
+
+fn is_primitive(v: &Val) -> bool {
+    !matches!(
+        v,
+        Val::Obj(_) | Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_)
+    )
+}
+
+/// JS `ToPrimitive` with observable coercions. `Symbol.toPrimitive` wins;
+/// otherwise `valueOf`/`toString` run in hint order. Boxed primitives unwrap
+/// directly (their primitive prototypes are not attached in this engine) and
+/// `Date` behaves as if it had the spec `@@toPrimitive` (string for
+/// `default`, so `date + date` concatenates).
+fn to_primitive(e: &mut JsEngine, v: &Val, hint: PrimHint) -> Result<Val, JsError> {
+    let mut hint = hint;
+    match v {
+        Val::Obj(o) => {
+            let b = o.borrow();
+            if let ObjKind::Boxed(p) = &b.kind {
+                return Ok(p.clone());
+            }
+            if hint == PrimHint::Default && matches!(b.kind, ObjKind::Date(_)) {
+                hint = PrimHint::String;
+            }
+        }
+        Val::Func(_) | Val::Native(_) => {}
+        _ => return Ok(v.clone()),
+    }
+    let sym = get_member(e, v, "Symbol(toPrimitive)")?;
+    if is_callable(&sym) {
+        let hint = match hint {
+            PrimHint::Default => "default",
+            PrimHint::Number => "number",
+            PrimHint::String => "string",
+        };
+        let r = e.call(sym, v.clone(), vec![Val::Str(Rc::from(hint))])?;
+        if is_primitive(&r) {
+            return Ok(r);
+        }
+        return Err(JsError::throw(
+            "TypeError: Cannot convert object to primitive value",
+        ));
+    }
+    let order: [&str; 2] = match hint {
+        PrimHint::String => ["toString", "valueOf"],
+        _ => ["valueOf", "toString"],
+    };
+    for name in order {
+        let f = get_member(e, v, name)?;
+        if is_callable(&f) {
+            let r = e.call(f, v.clone(), Vec::new())?;
+            if is_primitive(&r) {
+                return Ok(r);
+            }
+        }
+    }
+    Err(JsError::throw(
+        "TypeError: Cannot convert object to primitive value",
+    ))
+}
+
+fn binary_op(e: &mut JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsError> {
     use BinOp::*;
     if let Some(result) = bigint_binary(op, l, r) {
         return result;
     }
     Ok(match op {
         Add => {
-            // string concat if either side is (or stringifies to) a string;
-            // a boxed Number/Boolean coerces numerically instead
-            let strish = |v: &Val| match v {
-                Val::Str(_) | Val::Func(_) | Val::Native(_) | Val::Method(_) | Val::Acc(_) => true,
-                Val::Obj(o) => !matches!(
-                    o.borrow().kind,
-                    ObjKind::Boxed(Val::Num(_)) | ObjKind::Boxed(Val::Bool(_))
-                ),
-                _ => false,
-            };
-            if strish(l) || strish(r) {
-                Val::Str(Rc::from(format!("{}{}", l.to_string(), r.to_string())))
+            // ToPrimitive on both sides; a string operand (after coercion,
+            // including a Date or an object with a custom `toString`) wins
+            let lp = to_primitive(e, l, PrimHint::Default)?;
+            let rp = to_primitive(e, r, PrimHint::Default)?;
+            if let Some(result) = bigint_binary(Add, &lp, &rp) {
+                return result;
+            }
+            if matches!(lp, Val::Str(_) | Val::BigInt(_))
+                || matches!(rp, Val::Str(_))
+            {
+                Val::Str(Rc::from(format!("{}{}", lp.to_string(), rp.to_string())))
             } else {
-                Val::Num(l.to_number() + r.to_number())
+                Val::Num(lp.to_number() + rp.to_number())
             }
         }
-        Sub => Val::Num(l.to_number() - r.to_number()),
-        Mul => Val::Num(l.to_number() * r.to_number()),
-        Div => Val::Num(l.to_number() / r.to_number()),
-        Mod => Val::Num(l.to_number() % r.to_number()),
-        Pow => Val::Num(l.to_number().powf(r.to_number())),
-        Eq => Val::Bool(loose_eq(l, r)),
-        Ne => Val::Bool(!loose_eq(l, r)),
+        Sub | Mul | Div | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr | UShr => {
+            let lp = to_primitive(e, l, PrimHint::Number)?;
+            let rp = to_primitive(e, r, PrimHint::Number)?;
+            if let Some(result) = bigint_binary(op, &lp, &rp) {
+                return result;
+            }
+            let a = lp.to_number();
+            let b = rp.to_number();
+            match op {
+                Sub => Val::Num(a - b),
+                Mul => Val::Num(a * b),
+                Div => Val::Num(a / b),
+                Mod => Val::Num(a % b),
+                Pow => Val::Num(a.powf(b)),
+                BitAnd => Val::Num((to_int32(a) & to_int32(b)) as f64),
+                BitOr => Val::Num((to_int32(a) | to_int32(b)) as f64),
+                BitXor => Val::Num((to_int32(a) ^ to_int32(b)) as f64),
+                Shl => Val::Num((to_int32(a) << (to_uint32(b) & 31)) as f64),
+                Shr => Val::Num((to_int32(a) >> (to_uint32(b) & 31)) as f64),
+                UShr => Val::Num((to_uint32(a) >> (to_uint32(b) & 31)) as f64),
+                _ => unreachable!(),
+            }
+        }
+        Eq | Ne => {
+            // object-vs-object stays identity; otherwise ToPrimitive first
+            let eq = match (l, r) {
+                (Val::Obj(_), Val::Obj(_)) => strict_eq(l, r),
+                _ => {
+                    let lp = to_primitive(e, l, PrimHint::Default)?;
+                    let rp = to_primitive(e, r, PrimHint::Default)?;
+                    loose_eq(&lp, &rp)
+                }
+            };
+            Val::Bool(if op == Eq { eq } else { !eq })
+        }
         StrictEq => Val::Bool(strict_eq(l, r)),
         StrictNe => Val::Bool(!strict_eq(l, r)),
-        Lt | Le | Gt | Ge => Val::Bool(relational(op, l, r)),
-        BitAnd => Val::Num((to_int32(l.to_number()) & to_int32(r.to_number())) as f64),
-        BitOr => Val::Num((to_int32(l.to_number()) | to_int32(r.to_number())) as f64),
-        BitXor => Val::Num((to_int32(l.to_number()) ^ to_int32(r.to_number())) as f64),
-        Shl => Val::Num(
-            (to_int32(l.to_number()) << (to_uint32(r.to_number()) & 31)) as f64,
-        ),
-        Shr => Val::Num(
-            (to_int32(l.to_number()) >> (to_uint32(r.to_number()) & 31)) as f64,
-        ),
-        UShr => Val::Num(
-            (to_uint32(l.to_number()) >> (to_uint32(r.to_number()) & 31)) as f64,
-        ),
+        Lt | Le | Gt | Ge => {
+            let lp = to_primitive(e, l, PrimHint::Number)?;
+            let rp = to_primitive(e, r, PrimHint::Number)?;
+            Val::Bool(relational(op, &lp, &rp))
+        }
         In => {
-            let key = l.to_string();
+            let key = to_primitive(e, l, PrimHint::String)?.to_string();
             Val::Bool(super::has_member(e, &r, &key)?)
         }
         InstanceOf => match r {

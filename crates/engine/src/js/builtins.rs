@@ -237,6 +237,9 @@ pub(crate) fn install(e: &mut JsEngine) {
     // `Array.prototype[Symbol.iterator]` is `values` itself
     let arr_values = obj_get_own(own(&arr_proto), "values");
     obj_set_own(own(&arr_proto), crate::js::SYMBOL_ITERATOR, arr_values);
+    // `Array.prototype.toString` is `join`: `[1, 2] + ''` -> "1,2"
+    let arr_join = obj_get_own(own(&arr_proto), "join");
+    obj_set_own(own(&arr_proto), "toString", arr_join);
     if let Val::Obj(o) = &arr_proto {
         e.array_proto = Some(o.clone());
     }

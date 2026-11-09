@@ -1427,6 +1427,37 @@ fn primitive_and_function_prototypes_exist() {
 }
 
 #[test]
+fn to_primitive_uses_observable_methods() {
+    // valueOf first (number/default hint)
+    assert_eq!(num("({ valueOf: function () { return 1 } }) + 1"), 2.0);
+    assert_eq!(num("1 + ({ valueOf: function () { return 41 } })"), 42.0);
+    // a non-primitive valueOf falls through to toString
+    assert_eq!(
+        string("({ valueOf: function () { return {} }, toString: function () { return 'x' } }) + ''"),
+        "x"
+    );
+    // Symbol.toPrimitive wins and receives the hint
+    assert_eq!(
+        num("var o = {}; o[Symbol.toPrimitive] = function (h) { return h === 'default' ? 40 : 0 }; o + 2"),
+        42.0
+    );
+    assert_eq!(
+        num("var o = {}; o[Symbol.toPrimitive] = function (h) { return h === 'number' ? 10 : 0 }; o * 2"),
+        20.0
+    );
+    // both ordinary methods returning objects is a TypeError
+    assert!(matches!(
+        err("({ valueOf: function () { return {} }, toString: function () { return {} } }) + 1"),
+        JsError::Throw(_)
+    ));
+    // arrays stringify through join; objects compare by identity
+    assert_eq!(string("[1, 2] + ''"), "1,2");
+    assert!(boolean("var d = new Date(0); d + d === d.toString() + d.toString()"));
+    assert!(boolean("({ valueOf: function () { return 5 } }) == 5"));
+    assert!(boolean("({ valueOf: function () { return 5 } }) < 6"));
+}
+
+#[test]
 fn unicode_whitespace_and_line_terminators() {
     // NBSP, BOM and the U+2028/U+2029 terminators are not identifiers
     assert_eq!(num("1\u{a0}+ 2"), 3.0);
@@ -2033,7 +2064,7 @@ fn real_world_snippets() {
     // object identity
     assert!(boolean("let a = {}; let b = a; a === b"));
     assert!(!boolean("let a = {}; let b = {}; a === b"));
-    assert!(boolean("let a = {}; let b = {}; a == b")); // both stringify
+    assert!(!boolean("let a = {}; let b = {}; a == b")); // identity, not stringified
 }
 
 // ---------------------------------------------------------------------------

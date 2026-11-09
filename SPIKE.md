@@ -2010,3 +2010,28 @@ is unchanged.
   6,154 skipped).
 - `language/white-space`: 45/67 -> **64/67** pass.
 - engine tests **933** green (new unicode-whitespace test).
+## Observable ToPrimitive in binary operators (P7, 2026-11-09)
+
+Arithmetic and comparison used `Val::to_string`/`to_number`, which never ran
+user code: `({ valueOf: () => 1 }) + 1` produced `"[object Object]1"` and
+`{ valueOf() { throw x } } + 1` did not throw. `binary_op` now performs
+`ToPrimitive` with the spec hint before coercing: `Symbol.toPrimitive` wins
+(with the hint string), otherwise `valueOf`/`toString` run in hint order and
+must return a primitive or raise a TypeError. `+` uses the default hint
+(string concat when either result is a string), arithmetic/bitwise/shift use
+the number hint, relational uses the number hint, and `==` against an object
+coerces it (object-vs-object stays identity). Boxed primitives unwrap
+directly, `Date` uses the string hint for `default`, and
+`Array.prototype.toString` now aliases `join` so `[1, 2] + ''` stays `"1,2"`.
+
+### Measured
+
+- test262 language subset: 13,528 -> **13,607** pass (77.0% of 17,678 run,
+  6,154 skipped).
+- `language/expressions/addition`: 34/48 -> **44/48**; `equals`: 22/47 ->
+  **43/47**; `subtraction`: 26/38 -> **35/38**; `less-than`: 33/45 ->
+  **41/45**; `bitwise-and`: 22/30 -> **25/30**.
+- engine tests **934** green (new ToPrimitive test; the old `{} == {}` test
+  now expects identity).
+- Remaining gap: `String(obj)` / template literals still use the non-observable
+  `Val::to_string` fast path.
