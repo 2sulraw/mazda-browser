@@ -3126,6 +3126,41 @@ fn nested_pattern_elements_with_a_default() {
 }
 
 #[test]
+fn compound_assignment_keeps_its_with_reference() {
+    // the reference is captured before GetValue: a getter that deletes its
+    // own property must not send the write to an outer binding
+    assert_eq!(
+        num("(function(){ var x = 0; var scope = { get x() { delete this.x; return 2; } }; \
+             with (scope) { x ^= 3; } return scope.x * 10 + x; })()"),
+        10.0
+    );
+    assert_eq!(
+        num("(function(){ var x = 0; var o = { x: 5 }; \
+             with (o) { x += 1; } return o.x * 10 + x; })()"),
+        60.0
+    );
+    // a name the with object does not hold still writes the outer binding
+    assert_eq!(
+        num("(function(){ var x = 1; var o = {}; \
+             with (o) { x += 1; } return x; })()"),
+        2.0
+    );
+    // the right-hand side is evaluated after the target is read
+    assert_eq!(
+        string("(function(){ var log = ''; var o = { get x() { log += 'g'; return 1; }, \
+             set x(v) { log += 's'; } }; \
+             with (o) { x += (log += 'r', 1); } return log; })()"),
+        "grs"
+    );
+    // logical assignment shares the resolution
+    assert_eq!(
+        num("(function(){ var x = 0; var scope = { get x() { delete this.x; return 0; } }; \
+             with (scope) { x ||= 9; } return scope.x * 10 + x; })()"),
+        90.0
+    );
+}
+
+#[test]
 fn computed_keys_in_assignment_patterns() {
     // `{[expr]: target}` in an assignment/loop destructuring pattern
     assert_eq!(

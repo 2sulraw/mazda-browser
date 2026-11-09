@@ -2452,3 +2452,25 @@ becomes a bound part carrying that default.
 - `statements/for-of` 135 -> **124**, `expressions/assignment` 91 -> **80**;
   the 16 `invalid for-of target` failures are gone. No directory regressed.
 - engine tests **957** green (two new pattern tests).
+
+## Compound assignment keeps its reference (P7, 2026-11-10)
+
+`lhs op= rhs` must evaluate the reference, `GetValue` it, then evaluate the
+right-hand side, then `PutValue` through that same reference. The interpreter
+did the opposite: it evaluated the right-hand side first, and it re-resolved
+an identifier on the write. Re-resolution broke `with`: the A5 tests use a
+getter that deletes its own property, so at write time the object no longer
+has the name and the write escaped to the outer `var` instead of creating the
+property on the `with` object. Compound and logical assignment now resolve an
+identifier's `with` object once, before the read, and write through it (an
+ordinary binding or implicit global still goes through `env_set`). The
+right-hand side now runs after the target read, as the spec orders it.
+
+### Measured
+
+- test262 language subset: 14,889 -> **14,944** pass (84.5% of 17,678 run,
+  6,154 skipped).
+- `expressions/compound-assignment` 135 -> **80** (the 32 `with`-scope cases
+  and 12 DummyError evaluation-order cases among them). No directory
+  regressed.
+- engine tests **958** green (new reference-capture test).

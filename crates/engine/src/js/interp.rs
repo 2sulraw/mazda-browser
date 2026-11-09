@@ -1533,17 +1533,37 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
             })
         }
         ExprKind::Assign { target, op, value } => {
-            let mut v = eval_expr(e, env, value)?;
+            // `lhs op= rhs`: evaluate the reference, GetValue, then the RHS,
+            // then PutValue through that same reference. A getter may delete
+            // the property out of its `with` object, but the reference still
+            // points at that object, so the write must not re-resolve.
             if let Some(bop) = op {
+                let with_ref = match &target.kind {
+                    ExprKind::Ident(n) => ident_with_ref(env, n),
+                    _ => None,
+                };
                 let cur = eval_target_value(e, env, target)?;
-                v = binary_op(e, *bop, &cur, &v)?;
+                let rhs = eval_expr(e, env, value)?;
+                let v = binary_op(e, *bop, &cur, &rhs)?;
+                match (with_ref, &target.kind) {
+                    (Some(w), ExprKind::Ident(n)) => {
+                        set_member(e, &Val::Obj(w), n, v.clone())?
+                    }
+                    _ => assign_target(e, env, target, v.clone())?,
+                }
+                return Ok(v);
             }
+            let v = eval_expr(e, env, value)?;
             assign_target(e, env, target, v.clone())?;
             Ok(v)
         }
         // `a ??= b`, `a ||= b`, `a &&= b`: read, decide, and only then
         // evaluate (and write) the right-hand side
         ExprKind::LogicalAssign { target, op, value } => {
+            let with_ref = match &target.kind {
+                ExprKind::Ident(n) => ident_with_ref(env, n),
+                _ => None,
+            };
             let cur = eval_target_value(e, env, target)?;
             let write = match op {
                 LogOp::And => cur.to_bool(),
@@ -1554,7 +1574,10 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
                 return Ok(cur);
             }
             let v = eval_expr(e, env, value)?;
-            assign_target(e, env, target, v.clone())?;
+            match (with_ref, &target.kind) {
+                (Some(w), ExprKind::Ident(n)) => set_member(e, &Val::Obj(w), n, v.clone())?,
+                _ => assign_target(e, env, target, v.clone())?,
+            }
             Ok(v)
         }
         // class expression: lower in a private scope so a named class
@@ -1969,8 +1992,26 @@ fn eval_args(e: &mut JsEngine, env: &Rc<Env>, args: &[CallArg]) -> Result<Vec<Va
 }
 
 /// current value of an assignment target (ident or member)
-fn eval_target_value(e: &mut JsEngine, env: &Rc<Env>, target: &Expr) -> Result<Val, JsError> {
-    match &target.kind {
+/// For a compound/logical assignment on an identifier: the `with` object the
+/// reference resolved to, captured before GetValue. `None` means the name is
+/// an ordinary binding (or unresolved, i.e. an implicit global). A getter that
+/// deletes its own property must not redirect the write to an outer binding.
+fn ident_with_ref(env: &Rc<Env>, name: &str) -> Option<Rc<RefCell<Obj>>> {
+    let mut cur = env.clone();
+    loop {
+        if let Some(w) = &cur.with {
+            if obj_has(w, name) {
+                return Some(w.clone());
+            }
+        }
+        if cur.has_own(name) {
+            return None;
+        }
+        cur = cur.parent.clone()?;
+    }
+}
+
+fn eval_target_value(e: &mut JsEngine, env: &Rc<Env>, target: &Expr) -> Result<Val, JsError> {    match &target.kind {
         ExprKind::Ident(name) => e.env_get_checked(env, name),
         ExprKind::Member { base, key } => {
             let b = eval_expr(e, env, base)?;
