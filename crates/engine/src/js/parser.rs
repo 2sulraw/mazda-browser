@@ -377,6 +377,11 @@ pub enum StmtKind {
         disc: Box<Expr>,
         cases: Vec<SwitchCase>,
     },
+    /// `with (obj) stmt` (sloppy mode only; the engine has no strict mode)
+    With {
+        obj: Box<Expr>,
+        body: Box<Stmt>,
+    },
     Try {
         block: Vec<Stmt>,
         catch: Option<Box<CatchClause>>,
@@ -1473,6 +1478,17 @@ impl<'a> Parser<'a> {
                 StmtKind::Switch {
                     disc: Box::new(disc),
                     cases,
+                }
+            }
+            Tok::Kw(Kw::With) => {
+                self.next();
+                self.expect_punct(Punct::LParen)?;
+                let obj = self.expr()?;
+                self.expect_punct(Punct::RParen)?;
+                let body = Box::new(self.statement()?);
+                StmtKind::With {
+                    obj: Box::new(obj),
+                    body,
                 }
             }
             Tok::Kw(Kw::Try) => {
@@ -4567,6 +4583,7 @@ fn stmt_uses(s: &Stmt, k: SusKind) -> bool {
         Return(o) => o.as_ref().map_or(false, |e| expr_uses(e, k)),
         Break(_) | Continue(_) => false,
         Label { body, .. } => stmt_uses(body, k),
+        With { obj, body } => expr_uses(obj, k) || stmt_uses(body, k),
         FuncDecl(_) => false, // nested function bodies own their yield/await
         PatAssign { pat, value } => pat_uses(pat, k) || expr_uses(value, k),
         DefineAcc { owner, getter, setter, .. } => {
@@ -4737,6 +4754,12 @@ fn check_y_clean(s: &Stmt) -> Result<(), String> {
         }
         Break(_) | Continue(_) | FuncDecl(_) | DefineAcc { .. } | DefineMethod { .. } => Ok(()),
         Label { body, .. } => check_y_clean(body),
+        With { obj, body } => {
+            if expr_uses(obj, SusKind::Yield) {
+                return Err("yield cannot appear in a `with` head".into());
+            }
+            check_y_clean(body)
+        }
         PatAssign { pat, value } => {
             if pat_uses(pat, SusKind::Yield) || expr_uses(value, SusKind::Yield) {
                 return Err("yield cannot appear in destructuring assignment".into());
@@ -5633,6 +5656,7 @@ fn scan_stmt_arguments(s: &Stmt) -> bool {
         Return(o) => o.as_ref().map_or(false, |x| scan_expr_arguments(x)),
         Break(_) | Continue(_) => false,
         Label { body, .. } => scan_stmt_arguments(body),
+        With { obj, body } => scan_expr_arguments(obj) || scan_stmt_arguments(body),
         // nested function bodies have their own `arguments`; don't descend
         FuncDecl(_) => false,
         PatAssign { pat, value } => {

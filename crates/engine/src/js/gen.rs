@@ -945,6 +945,7 @@ fn stmt_has_yield(s: &parser::Stmt) -> bool {
             parser::StmtKind::FuncDecl(_) | parser::StmtKind::Break(_)
             | parser::StmtKind::Continue(_) => false,
             parser::StmtKind::Label { body, .. } => w(body),
+            parser::StmtKind::With { obj, body } => expr_has_yield(obj) || w(body),
             // per spec these cannot contain a legal yield; consistent
             parser::StmtKind::PatAssign { .. }
             | parser::StmtKind::DefineAcc { .. }

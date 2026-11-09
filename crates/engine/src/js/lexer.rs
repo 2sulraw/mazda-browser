@@ -106,6 +106,7 @@ pub enum Kw {
     Async,
     Await,
     Yield,
+    With,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -252,6 +253,7 @@ fn kw_of(s: &str) -> Option<Kw> {
         "case" => Kw::Case,
         "default" => Kw::Default,
         "instanceof" => Kw::Instanceof,
+        "with" => Kw::With,
         // contextual keywords promoted to reserved (matches the strict-keyword
         // convention of the rest of this lexer): `async`, `await`, `yield`
         "async" => Kw::Async,

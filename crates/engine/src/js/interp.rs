@@ -137,6 +137,7 @@ pub(crate) fn hoist(e: &mut JsEngine, env: &Rc<Env>, stmts: &[Stmt]) {
                         walk(e, env, &c.body);
                     }
                 }
+                StmtKind::With { body, .. } => walk(e, env, std::slice::from_ref(body)),
                 StmtKind::Try {
                     block,
                     catch,
@@ -324,6 +325,19 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
         StmtKind::Block(stmts) => {
             let benv = Env::child(env);
             run_block(e, &benv, stmts)
+        }
+        StmtKind::With { obj, body } => {
+            let o = eval_expr(e, env, obj)?;
+            let o = match o {
+                Val::Obj(o) => o,
+                _ => {
+                    return Err(JsError::throw(
+                        "TypeError: `with` requires an object",
+                    ))
+                }
+            };
+            let wenv = Env::with_obj(env, o);
+            eval_stmt(e, &wenv, body)
         }
         StmtKind::List(stmts) => run_block(e, env, stmts),
         // A module loader consumes these before evaluation; reaching one

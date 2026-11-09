@@ -1043,6 +1043,9 @@ impl JsError {
 pub struct Env {
     parent: Option<Rc<Env>>,
     bindings: RefCell<Vec<Binding>>,
+    /// `with (obj) { ... }`: identifier lookups consult this object before
+    /// the enclosing scopes (an object environment record)
+    with: Option<Rc<RefCell<Obj>>>,
     /// `this` of the nearest function frame. Block scopes leave it `None`
     /// and resolution walks to the frame; arrows store their lexical `this`
     /// so the binding exists exactly where the language says it does.
@@ -1296,6 +1299,7 @@ impl Env {
         Rc::new(Env {
             parent: None,
             bindings: RefCell::new(Vec::new()),
+            with: None,
             this,
             new_target: None,
             page,
@@ -1307,6 +1311,21 @@ impl Env {
         Rc::new(Env {
             parent: Some(parent.clone()),
             bindings: RefCell::new(Vec::new()),
+            with: None,
+            this: None,
+            new_target: None,
+            page: parent.page,
+            registered: Cell::new(false),
+        })
+    }
+
+    /// Scope of a `with` statement body: identifier lookups consult `obj`
+    /// before walking to the parent.
+    pub(crate) fn with_obj(parent: &Rc<Env>, obj: Rc<RefCell<Obj>>) -> Rc<Env> {
+        Rc::new(Env {
+            parent: Some(parent.clone()),
+            bindings: RefCell::new(Vec::new()),
+            with: Some(obj),
             this: None,
             new_target: None,
             page: parent.page,
@@ -1320,6 +1339,7 @@ impl Env {
         Rc::new(Env {
             parent: Some(parent.clone()),
             bindings: RefCell::new(Vec::new()),
+            with: None,
             this: Some(this),
             new_target,
             page: parent.page,
@@ -2462,6 +2482,11 @@ impl JsEngine {
         }
         let mut cur: &Env = env;
         loop {
+            if let Some(w) = &cur.with {
+                if let Some(v) = obj_lookup_chain(w, name) {
+                    return v;
+                }
+            }
             if let Some(v) = cur.bindings.borrow().iter().find(|b| b.name.as_ref() == name) {
                 return v.val.clone();
             }
@@ -2484,15 +2509,21 @@ impl JsEngine {
     /// Identifier read for expression positions: an unresolvable reference is
     /// a ReferenceError. `typeof ident` and `get_global` keep using `env_get`
     /// (an undeclared name is legal there).
-    pub(crate) fn env_get_checked(&self, env: &Rc<Env>, name: &str) -> Result<Val, JsError> {
+    pub(crate) fn env_get_checked(&mut self, env: &Rc<Env>, name: &str) -> Result<Val, JsError> {
         if name == "this" {
             return Ok(Self::frame_slot(env, "this"));
         }
         if name == "#new.target" {
             return Ok(Self::frame_slot(env, "#new.target"));
         }
-        let mut cur: &Env = env;
+        let mut cur: &Rc<Env> = env;
         loop {
+            // a `with` object's property wins over every outer binding
+            if let Some(w) = &cur.with {
+                if obj_has(w, name) {
+                    return get_member(self, &Val::Obj(w.clone()), name);
+                }
+            }
             if let Some(v) = cur.bindings.borrow().iter().find(|b| b.name.as_ref() == name) {
                 return Ok(v.val.clone());
             }
@@ -2544,8 +2575,15 @@ impl JsEngine {
     /// Assignment: walks the chain; const bindings throw; unknown names are
     /// (sloppily) created as globals — real-world scripts rely on that.
     pub(crate) fn env_set(&mut self, env: &Rc<Env>, name: &str, v: Val) -> Result<(), JsError> {
-        let mut cur: &Env = env;
+        let mut cur: &Rc<Env> = env;
         loop {
+            // `with (obj) { name = v }` assigns the property when the object
+            // has it (HasProperty), otherwise the assignment falls through
+            if let Some(w) = &cur.with {
+                if obj_has(w, name) {
+                    return set_member(self, &Val::Obj(w.clone()), name, v);
+                }
+            }
             if cur.set_own(name, v.clone())? {
                 return Ok(());
             }
@@ -2991,9 +3029,24 @@ fn deliver_combo(
 // Property access
 // ---------------------------------------------------------------------------
 
+/// Data-property read walking the prototype chain, without invoking accessors.
+/// Used by the lenient `env_get` for `with` objects; `env_get_checked` uses
+/// `get_member` so getters and proxy-ish behaviour still work.
+fn obj_lookup_chain(o: &Rc<RefCell<Obj>>, key: &str) -> Option<Val> {
+    let mut cur = Some(o.clone());
+    for _ in 0..PROTO_WALK_CAP {
+        let c = cur?;
+        let b = c.borrow();
+        if let Some((_, v)) = b.props.iter().find(|(k, _)| k.as_ref() == key) {
+            return Some(v.clone());
+        }
+        cur = b.proto.clone();
+    }
+    None
+}
+
 /// Own-property read (no prototype walk, no methods).
-pub fn obj_get_own(o: &Rc<RefCell<Obj>>, key: &str) -> Val {
-    let b = o.borrow();
+pub fn obj_get_own(o: &Rc<RefCell<Obj>>, key: &str) -> Val {    let b = o.borrow();
     if let ObjKind::ModuleNs(xs) = &b.kind {
         return xs.borrow().get(key).cloned().unwrap_or(Val::Undefined);
     }

@@ -1729,6 +1729,23 @@ fn private_names_are_lexically_scoped_and_unique() {
 }
 
 #[test]
+fn with_statement_scopes_identifier_lookup() {
+    // a property of the with object shadows outer bindings
+    assert_eq!(num("var x = 1; var o = { x: 2 }; var r; with (o) { r = x } r"), 2.0);
+    // assignment hits the object property when it exists, otherwise falls out
+    assert_eq!(num("var o = { x: 1 }; with (o) { x = 5 } o.x"), 5.0);
+    assert_eq!(num("var x = 1; var o = {}; with (o) { x = 3 } x"), 3.0);
+    // `var` in the body still hoists to the function/global scope
+    assert_eq!(num("with ({}) { var y = 4 } y"), 4.0);
+    // `typeof` consults the with object, and closures capture it
+    assert_eq!(string("var o = { x: 'v' }; var r; with (o) { r = typeof x } r"), "string");
+    assert_eq!(
+        num("var o = { x: 7 }; var f; with (o) { f = function () { return x } } f()"),
+        7.0
+    );
+}
+
+#[test]
 fn block_scope_lexical_and_var_redeclaration() {
     for src in [
         "{ let f; var f }",

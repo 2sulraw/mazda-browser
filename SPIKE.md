@@ -1850,3 +1850,19 @@ var-scoped at the top of a function body/program and lexical inside a block.
 
 - test262 language subset: 12,971 -> **13,128** pass (74.3% of 17,678 run,
   6,154 skipped). Engine tests **927** green.
+
+### `with` statement
+
+`with` was lexed as an identifier and rejected as a reserved word, so every
+sloppy-mode `with` test failed at parse time. It is now a keyword parsed into
+a `With` statement. Evaluation builds an object environment record
+(`Env::with_obj`): identifier reads consult the object (through its prototype
+chain) before the enclosing scopes, `typeof` does the same, and assignment
+writes the property when the object has it, otherwise falls through to the
+outer binding. `var` inside the body still hoists. 13,128 -> **13,238**
+(+110).
+
+### Measured
+
+- test262 language subset: 13,128 -> **13,238** pass (74.9% of 17,678 run,
+  6,154 skipped). Engine tests **928** green.
