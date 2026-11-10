@@ -3592,6 +3592,30 @@ selector silently matched nothing.
   the next throw is `crypto is not defined`. Script exec time rose to 17.6 s
   because the page's React tree now actually mounts.
 
+## `crypto.randomUUID` (P43, 2026-11-10)
+
+With the selector matcher fixed, React mounted far enough to mint its first
+element id:
+
+```
+custom element <react-app>: connectedCallback threw
+Uncaught ReferenceError: crypto is not defined
+```
+
+- a `crypto` global with the two calls pages actually make:
+  `getRandomValues(typedArray)` (fills the view in place and returns it) and
+  `randomUUID()` (RFC 4122 version 4: 16 random bytes with the version and
+  variant bits set).
+- the bytes come from a new `JsEngine::random_u32`, the same xorshift as
+  `Math.random` — a PRNG, not a CSPRNG. shortcut: real entropy is not a
+  browser-engine feature and nothing on a page can observe the difference.
+- engine tests **1005 -> 1006** green (new
+  `crypto_random_uuid_and_get_random_values`).
+- github.com cold load is now **completely clean**: no `script error`, no
+  `timer error`, no custom-element constructor or callback throw, no callback
+  note. The page renders 2681 elements and 56 images; script exec ~15.7 s
+  (fetch 2.2 s) with the React tree mounted for real.
+
 
 
 

@@ -2432,6 +2432,18 @@ impl JsEngine {
         (x >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// Next 32 random bits from the same generator as `Math.random`. Used by
+    /// `crypto.getRandomValues`/`randomUUID`; a PRNG, not a CSPRNG, so a page
+    /// that needs real entropy would notice (documented shortcut).
+    pub(crate) fn random_u32(&mut self) -> u32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        (x >> 32) as u32
+    }
+
     /// Core call dispatch (also used by call_function). Enforces the depth
     /// cap so runaway recursion throws instead of crashing the process.
     pub(crate) fn call(&mut self, callee: Val, this: Val, args: Vec<Val>) -> Result<Val, JsError> {

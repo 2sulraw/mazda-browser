@@ -97,6 +97,18 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&perf), "timeOrigin", Val::Num(perf_time_origin()));
     e.set_global("performance", perf);
 
+    // -- Web Crypto (the two calls pages make at load) ---------------------
+    // `crypto.randomUUID()` and `crypto.getRandomValues()`. GitHub's React
+    // root mints ids with the first one. shortcut: the bytes come from the
+    // same PRNG as `Math.random`, not a CSPRNG — nothing on a page can tell
+    // the difference, and real entropy is not a browser-engine feature.
+    let crypto = Val::new_object();
+    let c_gfv = e.register_native("crypto.getRandomValues", n_crypto, 0);
+    let c_uuid = e.register_native("crypto.randomUUID", n_crypto, 1);
+    obj_set_own(own(&crypto), "getRandomValues", Val::Native(c_gfv));
+    obj_set_own(own(&crypto), "randomUUID", Val::Native(c_uuid));
+    e.set_global("crypto", crypto);
+
     // -- JSON --------------------------------------------------------------
     let json = Val::new_object();
     let p = e.register_native("JSON.parse", n_json, 0);
@@ -1005,6 +1017,63 @@ fn n_perf(_e: &mut JsEngine, idx: u16, _this: &Val, _args: &[Val]) -> Result<Val
         PF_MEASURE | PF_MARK => Val::Undefined,
         _ => Val::new_array(Vec::new()),
     })
+}
+
+// -- Web Crypto -------------------------------------------------------------
+
+/// `crypto.getRandomValues(typedArray)` / `crypto.randomUUID()`.
+fn n_crypto(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == 0 {
+        // Fill a typed array in place and return it. Copy the buffer handle
+        // out first: writing needs a `borrow_mut` on the same RefCell.
+        let Some(Val::Obj(o)) = args.first() else {
+            return Ok(Val::Undefined);
+        };
+        let (len, bytes_each, offset, buf) = {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::TypedArray(ta) => (ta.len, ta.kind.size(), ta.offset, ta.buf.clone()),
+                _ => return Ok(Val::Undefined),
+            }
+        };
+        let mut bytes = Vec::with_capacity(len * bytes_each);
+        while bytes.len() < len * bytes_each {
+            bytes.extend_from_slice(&e.random_u32().to_le_bytes());
+        }
+        let cell = {
+            let r = buf.borrow();
+            match &r.kind {
+                ObjKind::ArrayBuffer(c) => c.clone(),
+                _ => return Ok(Val::Undefined),
+            }
+        };
+        let mut all = cell.borrow_mut();
+        for (i, &b) in bytes.iter().take(len * bytes_each).enumerate() {
+            if offset + i < all.len() {
+                all[offset + i] = b;
+            }
+        }
+        return Ok(args.first().cloned().unwrap_or(Val::Undefined));
+    }
+    // RFC 4122 version 4: 16 random bytes, then the version and variant bits
+    let mut b = [0u8; 16];
+    for chunk in b.chunks_mut(4) {
+        chunk.copy_from_slice(&e.random_u32().to_le_bytes());
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex = |s: &[u8]| s.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    Ok(Val::Str(Rc::from(
+        format!(
+            "{}-{}-{}-{}-{}",
+            hex(&b[0..4]),
+            hex(&b[4..6]),
+            hex(&b[6..8]),
+            hex(&b[8..10]),
+            hex(&b[10..16])
+        )
+        .as_str(),
+    )))
 }
 
 // -- JSON -------------------------------------------------------------------

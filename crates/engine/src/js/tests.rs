@@ -1316,6 +1316,27 @@ fn typed_array_length_ctor_zero_fills_without_a_value_vector() {
 }
 
 #[test]
+fn crypto_random_uuid_and_get_random_values() {
+    // GitHub's React root mints its element ids with `crypto.randomUUID()`;
+    // the missing global was a ReferenceError out of connectedCallback.
+    assert!(boolean("typeof crypto.randomUUID() == 'string'"));
+    assert!(boolean(
+        "/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID())"
+    ));
+    assert!(boolean("crypto.randomUUID() != crypto.randomUUID()"));
+    // getRandomValues fills the view in place and returns it
+    assert!(boolean("var b = new Uint8Array(16); crypto.getRandomValues(b) === b"));
+    assert_eq!(
+        string("var b = new Uint8Array(16); crypto.getRandomValues(b); b.length"),
+        "16"
+    );
+    assert!(boolean(
+        "var b = new Uint8Array(16); crypto.getRandomValues(b); var nz = false, ok = true; \
+         for (var i = 0; i < b.length; i++) { if (b[i] !== 0) nz = true; if (b[i] < 0 || b[i] > 255) ok = false; } nz && ok"
+    ));
+}
+
+#[test]
 fn new_target_and_private_brand_checks() {
     assert!(boolean(
         "function F() { this.ok = new.target === F } new F().ok"
