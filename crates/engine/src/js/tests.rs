@@ -4875,3 +4875,22 @@ fn a_destructured_parameter_binds_in_the_call_frame() {
         5.0
     );
 }
+
+#[test]
+fn a_symbol_key_works_with_the_in_operator() {
+    // @bufbuild/protobuf brands its reflection wrappers with
+    // `Symbol.for("reflect unsafe local") in value`; the key was lost, so its
+    // list `add()` stored the wrapper instead of the wrapped message and
+    // GitHub's file descriptor held a Type where a DescriptorProto belonged.
+    assert!(boolean("var s = Symbol.for('q'); var o = {}; o[s] = 1; s in o"));
+    assert!(boolean(
+        "var s = Symbol.for('q'); var o = {}; o[s] = 1; Object.prototype.hasOwnProperty.call(o, s)"
+    ));
+    // the key is the same one a computed member writes and reads
+    assert_eq!(
+        string("var s = Symbol.for('q'); var o = {}; o[s] = 'v'; o[s]"),
+        "v"
+    );
+    // a non-symbol object key still coerces through ToPrimitive
+    assert!(boolean("var o = {}; o.a = 1; ({ toString: function () { return 'a'; } }) in o"));
+}

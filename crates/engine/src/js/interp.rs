@@ -2301,6 +2301,18 @@ fn to_primitive(e: &mut JsEngine, v: &Val, hint: PrimHint) -> Result<Val, JsErro
     match v {
         Val::Obj(o) => {
             let b = o.borrow();
+            // A symbol is a primitive in the spec; it stands in as a plain
+            // object with a hidden `__symbol`. ToPrimitive on a primitive is
+            // the identity, so this object must not run valueOf/toString.
+            // `s in o` takes this path for its key and has to land on the same
+            // `Symbol(desc)` key that `o[s] = 1` writes: @bufbuild/protobuf
+            // brands its reflection wrappers with `Symbol.for("reflect unsafe
+            // local") in value`, and a lost key made its list `add()` store the
+            // wrapper instead of the message, so GitHub's file descriptor
+            // carried a Type where a DescriptorProto belonged.
+            if b.props.iter().any(|(k, _)| &**k == "__symbol") {
+                return Ok(v.clone());
+            }
             if let ObjKind::Boxed(p) = &b.kind {
                 return Ok(p.clone());
             }

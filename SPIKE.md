@@ -3122,6 +3122,34 @@ hands the document the same object.
   A timer still fails in `pb-*.js`: `Cannot read property 'toUpperCase' of
   undefined`.
 
+## A symbol key survives `in` (P25, 2026-11-10)
+
+With `document.location` in place the landing bundle ran further and died with
+`TypeError: undefined is not iterable` inside `@bufbuild/protobuf`:
+
+```js
+add(value) {
+  if (!(Symbol.for("reflect unsafe local") in value)) …
+  this.list.push(value);
+}
+```
+
+`add` brands the unwrapped message with a symbol key and pushes either the
+wrapper or the message depending on the test. The symbol stands in as a plain
+object carrying a hidden `__symbol`, and `ToPrimitive` treated it as an
+ordinary object: it found no `valueOf`/`toString` that returned a primitive, so
+the `in` operator's key became the wrong string (`Symbol(desc)` never reached
+`has_member`). The brand check read `false`, the wrapper was stored, and GitHub's
+`FileDescriptorProto.messageType` held a `Type` where a `DescriptorProto`
+belonged -- the later `for..of` over it then failed with "not iterable".
+
+- `to_primitive` returns the symbol object unchanged, as spec ToPrimitive does
+  for a primitive. `s in o` and `o[s] = 1` now land on the same key.
+- engine tests **988 -> 989** green (new
+  `a_symbol_key_works_with_the_in_operator`).
+- Next fatal error: `Uncaught TypeError: Cannot convert object to primitive
+  value` (the null-equality rule below).
+
 
 
 
