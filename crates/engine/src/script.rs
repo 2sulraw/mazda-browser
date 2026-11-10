@@ -302,6 +302,10 @@ fn build_element(node: u32) -> Val {
         .unwrap_or(false);
     if let Some(p) = p {
         o.set("tagName", str_val(&p.tag));
+        // `nodeName` mirrors `tagName` for an element. jQuery's Sizzle indexes
+        // by `e.nodeName.toUpperCase()`; without it the wrapper answered
+        // `undefined` and the selector engine threw inside a timer.
+        o.set("nodeName", str_val(&p.tag));
         // `form.elements`: live collection of the form's listed controls.
         // A getter (not a method), like the real property.
         if p.tag.eq_ignore_ascii_case("form") {
@@ -4194,6 +4198,23 @@ mod tests {
 
     fn get_global_str(ps: &mut PageScripts, name: &str) -> String {
         js::obj_get_own(&ps.engine.global_obj, name).to_string()
+    }
+
+    #[test]
+    fn elements_have_a_node_name() {
+        // Sizzle's TAG index runs `e.nodeName.toUpperCase()`; a missing
+        // nodeName made it throw inside a timer on github.com.
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d"></div><script>
+                window.t = [
+                    document.body.nodeName,
+                    document.getElementById("d").nodeName,
+                    document.createElement("span").nodeName,
+                ].join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "t"), "BODY,DIV,SPAN");
     }
 
     #[test]

@@ -3306,6 +3306,27 @@ the `{` was "not a hex digit".
   error is the recurring timer failure in `pb-*.js`
   (`Cannot read property 'toUpperCase' of undefined`, 35:26875).
 
+## `nodeName` on element wrappers (P34, 2026-11-10)
+
+The last repeated failure on github.com was a timer in `pb-*.js`:
+
+```js
+n.prototype.indexes.push({ name: "TAG", selector: e => e.match(c) && e.match(c)[0].toUpperCase(),
+  element: e => [e.nodeName.toUpperCase()] })
+```
+
+That is Sizzle's tag index. Element wrappers exposed `tagName` but no
+`nodeName`, so `e.nodeName` was `undefined` and `.toUpperCase()` threw every
+time the selector engine indexed the page.
+
+- `nodeName` mirrors `tagName` on an element wrapper (both are the parsed,
+  upper-case tag name).
+- engine tests **997 -> 998** green (new `elements_have_a_node_name`).
+- github.com cold load now prints **no `script error` and no `timer error`
+  lines at all**. The remaining console noise is a custom-element constructor
+  throw for `<relative-time>` (`attachShadow` is missing) and two
+  `addEventListener: callback is not a function` notes.
+
 
 
 
