@@ -3103,5 +3103,25 @@ had let it reach the cookie write.
   `marketing-essentials`: `Cannot read property 'search' of undefined`,
   `landing-pages`: `undefined is not iterable`.
 
+## `document.location` is the window's Location (P24, 2026-11-10)
+
+The `marketing-essentials` bundle starts with
+
+```js
+constructor() { … this.queryString = document.location.search; … }
+```
+
+and died on `Cannot read property 'search' of undefined`: `location` existed
+as a window global, but `document` carried no `location` property. The spec
+aliases `Document.location` to the window's Location object, so the engine now
+hands the document the same object.
+
+- engine tests **987 → 988** green (new
+  `document_location_is_the_window_location`).
+- Next load error, now only in `landing-pages`: `undefined is not iterable`.
+  A timer still fails in `pb-*.js`: `Cannot read property 'toUpperCase' of
+  undefined`.
+
+
 
 

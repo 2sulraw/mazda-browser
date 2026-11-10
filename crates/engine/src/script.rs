@@ -3469,7 +3469,11 @@ impl PageScripts {
         loc.set("assign", Val::Native(ids.loc_assign));
         loc.set("replace", Val::Native(ids.loc_assign)); // shortcut: same as assign
         loc.set("reload", Val::Native(ids.loc_reload));
-        engine.set_global("location", loc);
+        engine.set_global("location", loc.clone());
+        // `document.location` is the same Location object (the spec aliases
+        // it). GitHub's marketing bootstrap reads `document.location.search`
+        // and died on `document.location` being undefined.
+        doc.set("location", loc);
         engine.set_global("fetch", Val::Native(ids.fetch));
 
         // body/documentElement/head wrappers snapshot DOM props; needs one
@@ -4777,6 +4781,22 @@ mod tests {
         );
         let _ = ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "t"), "string");
+    }
+
+    #[test]
+    fn document_location_is_the_window_location() {
+        // GitHub's marketing bootstrap reads `document.location.search`
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.same = document.location === location;
+                window.search = typeof document.location.search;
+                window.href = document.location.href;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "same"), "true");
+        assert_eq!(get_global_str(&mut ps, "search"), "string");
+        assert_eq!(get_global_str(&mut ps, "href"), "https://example.com/");
     }
 
     #[test]
