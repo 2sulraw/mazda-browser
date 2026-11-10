@@ -3367,6 +3367,12 @@ impl PageScripts {
         );
         // no incremental loader: by the time scripts run, parsing is finished
         doc.set("readyState", str_val("complete"));
+        // `document.domain`: the host without its port. GitHub's cookie
+        // helper reads it and throws when it is null.
+        let domain = js::url::parts(base)
+            .map(|p| p.hostname)
+            .unwrap_or_default();
+        doc.set("domain", str_val(&domain));
         // null outside a `<script>`; set/cleared around each script turn
         doc.set("currentScript", Val::Null);
 
@@ -4771,6 +4777,22 @@ mod tests {
         );
         let _ = ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "t"), "string");
+    }
+
+    #[test]
+    fn document_domain_is_the_page_host() {
+        // GitHub's cookie helper reads `document.domain` and throws
+        // "Unable to get document domain" when it is null, killing the
+        // bundle at load.
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.t = document.domain;
+                window.h = document.domain === location.hostname;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "t"), "example.com");
+        assert_eq!(get_global_str(&mut ps, "h"), "true");
     }
 
     #[test]

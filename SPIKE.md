@@ -3081,4 +3081,27 @@ table builder tried to look up a color space called `channels`.
   `defined_properties_are_non_enumerable_by_default`).
 - Next fatal error: `Uncaught Error: Unable to get document domain`.
 
+## `document.domain` is the page host (P23, 2026-11-10)
+
+GitHub's cookie helper starts with
+
+```js
+let o = document.domain;
+if (null == o) throw Error("Unable to get document domain");
+```
+
+`document` had no `domain` at all, so reading it produced `undefined`, which
+is `== null` — the throw took down the whole bundle, after every earlier fix
+had let it reach the cookie write.
+
+- `document.domain` = the URL's hostname (no port), from the same parser as
+  `location`. Setting it (origin relaxation) is not implemented; nothing in
+  the wild has needed it.
+- engine tests **986 → 987** green (new `document_domain_is_the_page_host`).
+- After this the `core-*.js` module runs to completion. Remaining load
+  errors move to other bundles:
+  `marketing-essentials`: `Cannot read property 'search' of undefined`,
+  `landing-pages`: `undefined is not iterable`.
+
+
 
