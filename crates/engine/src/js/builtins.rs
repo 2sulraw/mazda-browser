@@ -5,7 +5,7 @@
 //! pointer in the table. All console output goes to stderr via `eprintln!`
 //! to match the engine's logging style.
 
-use super::interp::{fmt_date_iso, slice_bounds};
+use super::interp::{date_parts, fmt_date_iso, slice_bounds};
 use super::*;
 
 /// `new` vs plain call distinction for constructor natives: during a
@@ -337,6 +337,29 @@ pub(crate) fn install(e: &mut JsEngine) {
     // dispatch on native values (see get_member/call_method).
     let dc = e.register_native("Date", n_date, 0);
     e.set_global("Date", Val::Native(dc));
+
+    // -- Intl ---------------------------------------------------------------
+    // shortcut: en-US formatting only and no locale data - the engine has no
+    // timezone database and its `Date` is UTC throughout, so `timeZoneName`
+    // answers "UTC" and month/day names are the English ones. Both
+    // constructors keep their options under a hidden `__intl` prop on the
+    // instance; `format` reads them back when it is called.
+    let dtf_proto = Val::new_object();
+    let dtf_fmt = e.register_native("Intl.DateTimeFormat.prototype.format", n_intl, 0);
+    obj_set_own(own(&dtf_proto), "format", Val::Native(dtf_fmt));
+    let dtf_ctor = e.register_native("Intl.DateTimeFormat", n_intl, 1);
+    e.set_native_prop(dtf_ctor, "prototype", dtf_proto.clone());
+    let nf_proto = Val::new_object();
+    let nf_fmt = e.register_native("Intl.NumberFormat.prototype.format", n_intl, 2);
+    obj_set_own(own(&nf_proto), "format", Val::Native(nf_fmt));
+    let nf_ctor = e.register_native("Intl.NumberFormat", n_intl, 3);
+    e.set_native_prop(nf_ctor, "prototype", nf_proto.clone());
+    let intl = Val::new_object();
+    obj_set_own(own(&intl), "DateTimeFormat", Val::Native(dtf_ctor));
+    obj_set_own(own(&intl), "NumberFormat", Val::Native(nf_ctor));
+    e.set_global("Intl", intl);
+    e.intl_dtf_proto = Some(own(&dtf_proto).clone());
+    e.intl_nf_proto = Some(own(&nf_proto).clone());
 
     // -- conversions + numeric globals --------------------------------------
     let str_id = e.register_native("String", n_convert, 0);
@@ -2982,6 +3005,321 @@ fn n_date(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, J
         // of the spec's human-readable date string
         Ok(Val::Str(Rc::from(Val::Num(now_ms).to_string().as_str())))
     }
+}
+
+// -- Intl -------------------------------------------------------------------
+
+/// Hidden own prop on every `Intl.DateTimeFormat` / `Intl.NumberFormat`
+/// instance; the value is a plain object holding the options that were
+/// passed to the constructor.
+const INTL_STATE: &str = "__intl";
+
+fn n_intl(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    // idx 0/1 = DateTimeFormat format/ctor, 2/3 = NumberFormat format/ctor
+    if idx % 2 == 1 {
+        let inst = proto_instance(if idx == 1 {
+            e.intl_dtf_proto.clone()
+        } else {
+            e.intl_nf_proto.clone()
+        });
+        let state = Val::new_object();
+        let opts = args.get(1);
+        let names: &[(&str, &str)] = if idx == 1 {
+            &[
+                ("year", "year"),
+                ("month", "month"),
+                ("day", "day"),
+                ("weekday", "weekday"),
+                ("hour", "hour"),
+                ("minute", "minute"),
+                ("second", "second"),
+                ("tz", "timeZoneName"),
+            ]
+        } else {
+            &[
+                ("notation", "notation"),
+                ("mfd", "maximumFractionDigits"),
+                ("mnd", "minimumFractionDigits"),
+                ("msd", "maximumSignificantDigits"),
+            ]
+        };
+        for (key, name) in names {
+            if let Some(v) = intl_option(e, opts, name)? {
+                obj_set_own(own(&state), key, v);
+            }
+        }
+        obj_set_own(own(&inst), INTL_STATE, state);
+        return Ok(inst);
+    }
+    let state = intl_state(this)?;
+    if idx == 0 {
+        let ms = match args.first() {
+            Some(Val::Obj(o)) => match &o.borrow().kind {
+                ObjKind::Date(ms) => *ms,
+                _ => args[0].to_number(),
+            },
+            Some(v) => v.to_number(),
+            None => f64::NAN,
+        };
+        Ok(Val::Str(Rc::from(fmt_date_intl(e, &state, ms)?.as_str())))
+    } else {
+        let n = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(Val::Str(Rc::from(fmt_num_intl(e, &state, n)?.as_str())))
+    }
+}
+
+/// Read one option off the constructor's options object; `undefined`, `null`
+/// and an absent object all mean "not given".
+fn intl_option(e: &mut JsEngine, opts: Option<&Val>, name: &str) -> Result<Option<Val>, JsError> {
+    let opts = match opts {
+        Some(v) if !matches!(v, Val::Undefined | Val::Null) => v,
+        _ => return Ok(None),
+    };
+    let v = get_member(e, opts, name)?;
+    Ok(if matches!(v, Val::Undefined) {
+        None
+    } else {
+        Some(v)
+    })
+}
+
+fn intl_state(this: &Val) -> Result<Val, JsError> {
+    if let Val::Obj(o) = this {
+        let found = o
+            .borrow()
+            .props
+            .iter()
+            .find(|(k, _)| k.as_ref() == INTL_STATE)
+            .map(|(_, v)| v.clone());
+        if let Some(v) = found {
+            return Ok(v);
+        }
+    }
+    Err(JsError::throw("TypeError: Intl method called on an incompatible receiver"))
+}
+
+fn intl_get(e: &mut JsEngine, state: &Val, key: &str) -> Result<Option<Val>, JsError> {
+    let v = get_member(e, state, key)?;
+    Ok(if matches!(v, Val::Undefined) {
+        None
+    } else {
+        Some(v)
+    })
+}
+
+const MONTHS_SHORT: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const MONTHS_LONG: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const WEEKDAYS_SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAYS_LONG: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// `Intl.DateTimeFormat.prototype.format` (shortcut: en-US names, UTC only).
+fn fmt_date_intl(e: &mut JsEngine, state: &Val, ms: f64) -> Result<String, JsError> {
+    let (y, mo, d, hh, mi, ss, _) =
+        date_parts(ms).ok_or_else(|| JsError::throw("RangeError: Invalid time value"))?;
+    let opt = |e: &mut JsEngine, key: &str| intl_get(e, state, key);
+    let year = opt(e, "year")?;
+    let month = opt(e, "month")?;
+    let day = opt(e, "day")?;
+    let weekday = opt(e, "weekday")?;
+    let hour = opt(e, "hour")?;
+    let minute = opt(e, "minute")?;
+    let second = opt(e, "second")?;
+    let tz = opt(e, "tz")?;
+
+    let mut date = String::new();
+    if let Some(wd) = &weekday {
+        let days = (ms.floor() as i64).div_euclid(86_400_000);
+        let i = (days + 4).rem_euclid(7) as usize;
+        let names = if wd.to_string() == "long" {
+            &WEEKDAYS_LONG
+        } else {
+            &WEEKDAYS_SHORT
+        };
+        date.push_str(names[i]);
+        date.push_str(", ");
+    }
+    let month_s = month.as_ref().map(|v| v.to_string());
+    let has_date = month_s.is_some() || year.is_some() || day.is_some() || weekday.is_some();
+    if !has_date && hour.is_none() && minute.is_none() && second.is_none() {
+        // no options at all: en-US default is a numeric date
+        return Ok(format!("{}/{}/{}", mo, d, y));
+    }
+    if has_date {
+        let numeric_month = matches!(month_s.as_deref(), Some("numeric") | Some("2-digit"));
+        if numeric_month {
+            date.push_str(&format!("{}/{}", mo, d));
+            if let Some(_) = year {
+                date.push_str(&format!("/{y}"));
+            }
+        } else if let Some(m) = &month_s {
+            let name = if m == "long" {
+                MONTHS_LONG[(mo - 1) as usize]
+            } else if m == "narrow" {
+                &MONTHS_SHORT[(mo - 1) as usize][..1]
+            } else {
+                MONTHS_SHORT[(mo - 1) as usize]
+            };
+            date.push_str(name);
+            if day.is_some() {
+                date.push_str(&format!(" {d}"));
+            }
+            if year.is_some() {
+                date.push_str(&format!(", {y}"));
+            }
+        } else if day.is_some() {
+            date.push_str(&d.to_string());
+            if year.is_some() {
+                date.push_str(&format!(", {y}"));
+            }
+        } else if let Some(_) = year {
+            date.push_str(&y.to_string());
+        }
+    }
+
+    let mut time = String::new();
+    if hour.is_some() || minute.is_some() || second.is_some() {
+        let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
+        time.push_str(&format!("{h12}:{mi:02}"));
+        if second.is_some() {
+            time.push_str(&format!(":{ss:02}"));
+        }
+        time.push_str(if hh < 12 { " AM" } else { " PM" });
+        if tz.is_some() {
+            time.push_str(" UTC");
+        }
+    }
+    Ok(match (date.is_empty(), time.is_empty()) {
+        (false, false) => format!("{date}, {time}"),
+        (false, true) => date,
+        (true, false) => time,
+        (true, true) => String::new(),
+    })
+}
+
+/// `Intl.NumberFormat.prototype.format` (shortcut: en-US grouping only).
+fn fmt_num_intl(e: &mut JsEngine, state: &Val, n: f64) -> Result<String, JsError> {
+    if n.is_nan() {
+        return Ok("NaN".into());
+    }
+    if n.is_infinite() {
+        return Ok(if n < 0.0 { "-∞".into() } else { "∞".into() });
+    }
+    let notation = intl_get(e, state, "notation")?.map(|v| v.to_string());
+    let num_opt = |e: &mut JsEngine, key: &str| -> Result<Option<f64>, JsError> {
+        Ok(intl_get(e, state, key)?.and_then(|v| {
+            let x = v.to_number();
+            if x.is_finite() {
+                Some(x)
+            } else {
+                None
+            }
+        }))
+    };
+    let mfd = num_opt(e, "mfd")?.map(|x| x.clamp(0.0, 20.0) as usize);
+    if notation.as_deref() == Some("compact") {
+        let msd = num_opt(e, "msd")?.map(|x| x.clamp(1.0, 21.0) as u32);
+        return Ok(fmt_compact(n, mfd.unwrap_or(1), msd));
+    }
+    Ok(fmt_decimal(n, mfd.unwrap_or(3)))
+}
+
+/// Fixed-point-enough decimal with comma grouping, trailing fraction zeros
+/// trimmed (the default `minimumFractionDigits` is 0).
+fn fmt_decimal(n: f64, mfd: usize) -> String {
+    let neg = n < 0.0;
+    let s = format!("{:.*}", mfd, n.abs());
+    let (int, frac) = match s.split_once('.') {
+        Some((a, b)) => (a.to_string(), b.to_string()),
+        None => (s, String::new()),
+    };
+    let mut out = group_int(&int);
+    let frac = frac.trim_end_matches('0');
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    if neg && out != "0" {
+        out.insert(0, '-');
+    }
+    out
+}
+
+fn fmt_compact(n: f64, mfd: usize, msd: Option<u32>) -> String {
+    let neg = n < 0.0;
+    let abs = n.abs();
+    if abs < 1000.0 {
+        return fmt_decimal(n, mfd);
+    }
+    let mut v = abs;
+    let mut suffix = "";
+    for (scale, unit) in [
+        (1e3, "K"),
+        (1e6, "M"),
+        (1e9, "B"),
+        (1e12, "T"),
+    ] {
+        if abs >= scale {
+            v = abs / scale;
+            suffix = unit;
+        }
+    }
+    if let Some(sig) = msd {
+        v = round_sig(v, sig);
+    }
+    let mut out = format!("{:.*}", mfd, v);
+    if out.contains('.') {
+        let trimmed = out.trim_end_matches('0').trim_end_matches('.');
+        out = trimmed.to_string();
+    }
+    if neg {
+        out.insert(0, '-');
+    }
+    out.push_str(suffix);
+    out
+}
+
+fn round_sig(x: f64, sig: u32) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let mag = x.abs().log10().floor();
+    let factor = 10f64.powi(sig as i32 - 1 - mag as i32);
+    (x * factor).round() / factor
+}
+
+/// Insert thousands separators into an unsigned integer string.
+fn group_int(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 // -- conversions ------------------------------------------------------------

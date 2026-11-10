@@ -1,4 +1,4 @@
-﻿//! JavaScript interpreter core — a from-scratch tree-walking evaluator for a
+//! JavaScript interpreter core — a from-scratch tree-walking evaluator for a
 //! useful ES5+ subset. This is the foundation wave: pure logic, no DOM, no
 //! event loop; the embedder (later waves) drives script execution and drains
 //! the timer queue itself.
@@ -1609,6 +1609,10 @@ pub struct JsEngine {
     pub(crate) weakset_proto: Option<Rc<RefCell<Obj>>>,
     pub(crate) text_encoder_proto: Option<Rc<RefCell<Obj>>>,
     pub(crate) text_decoder_proto: Option<Rc<RefCell<Obj>>>,
+    /// `Intl.DateTimeFormat` / `Intl.NumberFormat` prototypes; their
+    /// instances keep the options under a hidden `__intl` prop
+    pub(crate) intl_dtf_proto: Option<Rc<RefCell<Obj>>>,
+    pub(crate) intl_nf_proto: Option<Rc<RefCell<Obj>>>,
     /// reused native ids for the Uint8Array/Buffer stand-ins (avoids
     /// registering a new native per created instance)
     pub(crate) uint8_to_b64: usize,
@@ -1765,6 +1769,8 @@ impl Drop for JsEngine {
         self.weakset_proto = None;
         self.text_encoder_proto = None;
         self.text_decoder_proto = None;
+        self.intl_dtf_proto = None;
+        self.intl_nf_proto = None;
         self.arraybuffer_proto = None;
         self.typed_proto = None;
         self.data_view_proto = None;
@@ -1867,6 +1873,8 @@ impl JsEngine {
             weakset_proto: None,
             text_encoder_proto: None,
             text_decoder_proto: None,
+            intl_dtf_proto: None,
+            intl_nf_proto: None,
             uint8_to_b64: 0,
             buffer_to_string: 0,
             arraybuffer_proto: None,

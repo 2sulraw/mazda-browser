@@ -1763,6 +1763,52 @@ fn date_parse_reads_iso_forms() {
 }
 
 #[test]
+fn intl_date_time_and_number_format() {
+    // GitHub's code-view builds `new Intl.DateTimeFormat(void 0, {...})` at
+    // module scope for blame dates and `Intl.NumberFormat("en-US",
+    // {notation:"compact"})` for dependent counts; `Intl` was not defined at
+    // all, so the whole module never loaded.
+    assert_eq!(
+        string("new Intl.DateTimeFormat(void 0, {year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'numeric',second:void 0,timeZoneName:'short'}).format(new Date(0))"),
+        "Jan 1, 1970, 12:00 AM UTC"
+    );
+    assert_eq!(
+        string("new Intl.DateTimeFormat(void 0, {year:'numeric',month:'short',day:'numeric'}).format(new Date(0))"),
+        "Jan 1, 1970"
+    );
+    assert_eq!(
+        string("new Intl.DateTimeFormat(void 0, {month:'short',day:'numeric'}).format(new Date(0))"),
+        "Jan 1"
+    );
+    // no options at all is the en-US numeric date
+    assert_eq!(
+        string("new Intl.DateTimeFormat().format(new Date(0))"),
+        "1/1/1970"
+    );
+    // PM side of the clock
+    assert_eq!(
+        string("new Intl.DateTimeFormat(void 0, {hour:'numeric',minute:'numeric'}).format(new Date(82800000))"),
+        "11:00 PM"
+    );
+    // NumberFormat: grouping, then the compact form GitHub asks for
+    assert_eq!(
+        string("new Intl.NumberFormat('en-US').format(1234.5)"),
+        "1,234.5"
+    );
+    assert_eq!(
+        string("new Intl.NumberFormat('en-US').format(1000000)"),
+        "1,000,000"
+    );
+    let compact = "var f = Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:1,maximumSignificantDigits:2}); f.format";
+    assert_eq!(string(&format!("{compact}(1234)")), "1.2K");
+    assert_eq!(string(&format!("{compact}(1500000)")), "1.5M");
+    assert_eq!(string(&format!("{compact}(999)")), "999");
+    assert_eq!(string(&format!("{compact}(12345)")), "12K");
+    assert!(boolean("new Intl.DateTimeFormat() instanceof Intl.DateTimeFormat"));
+    assert!(boolean("new Intl.NumberFormat() instanceof Intl.NumberFormat"));
+}
+
+#[test]
 fn timers_queue_only() {
     let mut e = JsEngine::new();
     e.exec("let calls = 0; setTimeout(function(x) { calls += x }, 100, 5); setTimeout(function() {}, 0)")

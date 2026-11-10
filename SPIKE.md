@@ -3834,6 +3834,35 @@ done, and even a case body with no yield in it was skipped.
   descriptor walk gets through and the module chain stops on `Intl is not
   defined` (next entry).
 
+## `Intl` (P51, 2026-11-10)
+
+With the descriptor walk fixed, the code-view module failed at module scope:
+
+```
+[js] script error in code-view-*.js: Uncaught ReferenceError: Intl is not defined
+```
+
+It builds three `Intl.DateTimeFormat` instances at module scope (blame dates:
+`{year:"numeric",month:"short",day:"numeric",hour:"numeric",minute:"numeric",
+timeZoneName:"short"}`, `{year,month,day}`, `{month,day}`) and one
+`Intl.NumberFormat("en-US",{notation:"compact",maximumFractionDigits:1,
+maximumSignificantDigits:2})` for dependent counts.
+
+- `Intl.DateTimeFormat` / `Intl.NumberFormat` are ordinary constructors whose
+  instances are plain objects pointing at their prototype; the options live
+  under a hidden `__intl` own prop, and `format` reads them back.
+- shortcut: en-US only, no locale data and no timezone database. Month and
+  weekday names are the English ones, `timeZoneName` answers "UTC", and a
+  date-time is UTC. Compact notation rounds to `maximumSignificantDigits` and
+  appends K/M/B/T.
+- `date_parts` now shares the civil-date math with `toISOString`.
+- engine tests **1013 -> 1014** green (new
+  `intl_date_time_and_number_format`: the three GitHub date shapes, the default
+  numeric date, the PM clock, grouping, and compact 1.2K / 1.5M / 999 / 12K).
+- `github.com/rust-lang/rust`: code-view gets past `Intl`; script exec
+  32133 -> 25132 ms, worker 101038 -> 61545 ms. The next failure is the
+  selector observer's `rootNode.contains` (next entry).
+
 
 
 

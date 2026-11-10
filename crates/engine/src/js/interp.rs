@@ -3515,8 +3515,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// ms since epoch -> ISO-8601 UTC string (used by Date + JSON.stringify)
-pub(crate) fn fmt_date_iso(ms: f64) -> Option<String> {
+/// ms since epoch -> UTC civil parts (year, month 1-12, day, hour, minute,
+/// second, millisecond). `None` for a non-finite value. Shared by
+/// `toISOString` and the `Intl.DateTimeFormat` stand-in.
+pub(crate) fn date_parts(ms: f64) -> Option<(i64, u32, u32, u32, u32, u32, u32)> {
     if !ms.is_finite() {
         return None;
     }
@@ -3524,8 +3526,20 @@ pub(crate) fn fmt_date_iso(ms: f64) -> Option<String> {
     let days = total.div_euclid(86_400_000);
     let rem = total.rem_euclid(86_400_000);
     let (y, mo, d) = civil_from_days(days);
-    let (hh, mm, ss) = (rem / 3_600_000, (rem / 60_000) % 60, (rem / 1000) % 60);
-    let millis = rem % 1000;
+    Some((
+        y,
+        mo,
+        d,
+        (rem / 3_600_000) as u32,
+        ((rem / 60_000) % 60) as u32,
+        ((rem / 1000) % 60) as u32,
+        (rem % 1000) as u32,
+    ))
+}
+
+/// ms since epoch -> ISO-8601 UTC string (used by Date + JSON.stringify)
+pub(crate) fn fmt_date_iso(ms: f64) -> Option<String> {
+    let (y, mo, d, hh, mm, ss, millis) = date_parts(ms)?;
     Some(format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         y, mo, d, hh, mm, ss, millis
