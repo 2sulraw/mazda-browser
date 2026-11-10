@@ -4008,6 +4008,40 @@ what the engine does. A warm-cache run of the same page executes the same
 modules in ~3.2 s of script time (core 0.6-2.1 s, code-view 1.0-1.1 s). That is
 why the entries below quote error movement rather than total page time.
 
+## Date getters and `toLocale*` strings (P57, 2026-11-11)
+
+The repo module on the issues page threw at `58-*.js` 2:1286:
+
+```js
+value: () => {
+  let e = new Date;
+  return `${e.getFullYear()}-${`0${e.getMonth()+1}`.slice(-2)}-${`0${e.getDate()}`.slice(-2)}`
+},
+displayName: new Date().toLocaleDateString("en-us", {year:"numeric",month:"long",day:"numeric"})
+```
+
+A `Date` object answered only `getTime`/`valueOf`/`toISOString`.
+
+- The eight getters (`getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`,
+  `getMinutes`, `getSeconds`, `getMilliseconds`) and their `getUTC*` aliases are
+  new `Meth` variants dispatched off the Date object, all reading `date_parts`
+  (which already backs `toISOString` and `Intl`). An invalid date answers NaN
+  from every one of them, as the spec says.
+- shortcut: there is no timezone database, so local time IS UTC - the same
+  shortcut `Intl.DateTimeFormat` already takes - which is why the `getUTC*`
+  aliases answer the same numbers.
+- `toLocaleDateString` / `toLocaleTimeString` / `toLocaleString` reuse the
+  `Intl.DateTimeFormat` formatter. Per `ToDateTimeOptions` the en-US defaults
+  (numeric date; clock time with seconds; both) are filled in only when the
+  caller asked for **none** of the components, so `{hour,minute}` prints no
+  seconds while the bare call does.
+- engine tests **1017 -> 1018** green (new `date_getters_and_locale_strings`:
+  all eight getters, the UTC aliases, two NaN cases, the three default shapes,
+  and GitHub's own options).
+- `github.com/rust-lang/rust/issues`: the repo module's Date error is gone; the
+  only script error left is the filter-token regex's
+  `\p{Extended_Pictographic}` (next entry).
+
 
 
 

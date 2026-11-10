@@ -139,6 +139,22 @@ pub enum Meth {
     DateToISO,
     DateNow,
     DateParse,
+    /// `getFullYear`/`getUTCFullYear` and the rest of the local-time getters.
+    /// shortcut: no timezone database, so local time IS UTC (same as
+    /// `date_parts`), which is why the UTC aliases share these.
+    DateGetYear,
+    DateGetMonth,
+    DateGetDate,
+    /// `getDay`/`getUTCDay` - the weekday index
+    DateGetWeekday,
+    DateGetHours,
+    DateGetMinutes,
+    DateGetSeconds,
+    DateGetMillis,
+    /// `toLocaleDateString` / `toLocaleTimeString` / `toLocaleString`
+    DateLocaleDate,
+    DateLocaleTime,
+    DateLocaleBoth,
     // promise methods
     PromiseThen,
     PromiseCatch,
@@ -3797,6 +3813,19 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                     let m = match key {
                         "getTime" | "valueOf" => Some(DateGetTime),
                         "toISOString" => Some(DateToISO),
+                        // the local-time getters; UTC aliases answer the same
+                        // numbers because this engine has no timezone database
+                        "getFullYear" | "getUTCFullYear" => Some(DateGetYear),
+                        "getMonth" | "getUTCMonth" => Some(DateGetMonth),
+                        "getDate" | "getUTCDate" => Some(DateGetDate),
+                        "getDay" | "getUTCDay" => Some(DateGetWeekday),
+                        "getHours" | "getUTCHours" => Some(DateGetHours),
+                        "getMinutes" | "getUTCMinutes" => Some(DateGetMinutes),
+                        "getSeconds" | "getUTCSeconds" => Some(DateGetSeconds),
+                        "getMilliseconds" | "getUTCMilliseconds" => Some(DateGetMillis),
+                        "toLocaleDateString" => Some(DateLocaleDate),
+                        "toLocaleTimeString" => Some(DateLocaleTime),
+                        "toLocaleString" => Some(DateLocaleBoth),
                         _ => None,
                     };
                     if let Some(m) = m {

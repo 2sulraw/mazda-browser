@@ -1781,6 +1781,53 @@ fn date_parse_reads_iso_forms() {
 }
 
 #[test]
+fn date_getters_and_locale_strings() {
+    // The issues page builds a filter's value as
+    // `${e.getFullYear()}-${e.getMonth()+1}-${e.getDate()}` and formats its
+    // label with `new Date().toLocaleDateString("en-us", {...})`; only
+    // getTime/toISOString existed, so the whole repo module threw.
+    let d = "var d = new Date('2021-06-01T03:04:05.678Z'); ";
+    assert_eq!(num(&format!("{d}d.getFullYear()")), 2021.0);
+    assert_eq!(num(&format!("{d}d.getMonth()")), 5.0);
+    assert_eq!(num(&format!("{d}d.getDate()")), 1.0);
+    // 2021-06-01 was a Tuesday (0 = Sunday)
+    assert_eq!(num(&format!("{d}d.getDay()")), 2.0);
+    assert_eq!(num(&format!("{d}d.getHours()")), 3.0);
+    assert_eq!(num(&format!("{d}d.getMinutes()")), 4.0);
+    assert_eq!(num(&format!("{d}d.getSeconds()")), 5.0);
+    assert_eq!(num(&format!("{d}d.getMilliseconds()")), 678.0);
+    // local time is UTC here, so the UTC aliases answer the same numbers
+    assert!(boolean(&format!(
+        "{d}d.getUTCFullYear() === d.getFullYear() && d.getUTCDay() === d.getDay()"
+    )));
+    // an invalid date answers NaN from every getter
+    assert!(boolean("isNaN(new Date('nope').getFullYear())"));
+    assert!(boolean("isNaN(new Date(NaN).getDate())"));
+    // the en-US defaults: short numeric date, clock time, then both
+    assert_eq!(
+        string("new Date('2021-06-01T03:04:05Z').toLocaleDateString()"),
+        "6/1/2021"
+    );
+    assert_eq!(
+        string("new Date('2021-06-01T03:04:05Z').toLocaleTimeString()"),
+        "3:04:05 AM"
+    );
+    assert_eq!(
+        string("new Date('2021-06-01T03:04:05Z').toLocaleString()"),
+        "6/1/2021, 3:04:05 AM"
+    );
+    // the options GitHub passes override the defaults
+    assert_eq!(
+        string("new Date('2021-06-01T03:04:05Z').toLocaleDateString('en-us', {year:'numeric',month:'long',day:'numeric'})"),
+        "June 1, 2021"
+    );
+    assert_eq!(
+        string("new Date('2021-06-01T03:04:05Z').toLocaleTimeString('en-us', {hour:'numeric',minute:'numeric',timeZoneName:'short'})"),
+        "3:04 AM UTC"
+    );
+}
+
+#[test]
 fn intl_date_time_and_number_format() {
     // GitHub's code-view builds `new Intl.DateTimeFormat(void 0, {...})` at
     // module scope for blame dates and `Intl.NumberFormat("en-US",

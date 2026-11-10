@@ -3076,6 +3076,37 @@ pub(crate) fn call_method(
             }
             _ => Err(JsError::throw("TypeError: toISOString on non-Date")),
         },
+        DateGetYear | DateGetMonth | DateGetDate | DateGetWeekday | DateGetHours
+        | DateGetMinutes | DateGetSeconds | DateGetMillis => {
+            let ms = date_ms(this)?;
+            // an invalid date answers NaN from every getter, like the spec
+            let Some((y, mo, d, hh, mi, ss, millis)) = date_parts(ms) else {
+                return Ok(Val::Num(f64::NAN));
+            };
+            Ok(Val::Num(match m {
+                DateGetYear => y as f64,
+                DateGetMonth => (mo - 1) as f64,
+                DateGetDate => d as f64,
+                DateGetWeekday => {
+                    let days = (ms.floor() as i64).div_euclid(86_400_000);
+                    ((days + 4).rem_euclid(7)) as f64
+                }
+                DateGetHours => hh as f64,
+                DateGetMinutes => mi as f64,
+                DateGetSeconds => ss as f64,
+                _ => millis as f64,
+            }))
+        }
+        DateLocaleDate | DateLocaleTime | DateLocaleBoth => {
+            let ms = date_ms(this)?;
+            let kind = match m {
+                DateLocaleDate => super::builtins::LOCALE_DATE,
+                DateLocaleTime => super::builtins::LOCALE_TIME,
+                _ => super::builtins::LOCALE_BOTH,
+            };
+            let s = super::builtins::date_locale_string(e, ms, kind, args.get(1))?;
+            Ok(Val::Str(Rc::from(s.as_str())))
+        }
 
         // -- promise methods ----------------------------------------------
         PromiseThen | PromiseCatch | PromiseFinally => {
@@ -3535,6 +3566,18 @@ pub(crate) fn date_parts(ms: f64) -> Option<(i64, u32, u32, u32, u32, u32, u32)>
         ((rem / 1000) % 60) as u32,
         (rem % 1000) as u32,
     ))
+}
+
+/// The epoch-ms behind a `Date` receiver; a non-Date throws like the spec's
+/// `thisTimeValue` check does.
+fn date_ms(this: &Val) -> Result<f64, JsError> {
+    if let Val::Obj(o) = this {
+        let b = o.borrow();
+        if let ObjKind::Date(ms) = &b.kind {
+            return Ok(*ms);
+        }
+    }
+    Err(JsError::throw("TypeError: Date method called on non-Date"))
 }
 
 /// ms since epoch -> ISO-8601 UTC string (used by Date + JSON.stringify)

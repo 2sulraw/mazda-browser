@@ -3174,6 +3174,69 @@ const WEEKDAYS_LONG: [&str; 7] = [
     "Saturday",
 ];
 
+/// `Date.prototype.toLocaleDateString` / `toLocaleTimeString` /
+/// `toLocaleString`: the same en-US shapes as `Intl.DateTimeFormat`, with the
+/// spec's default components filled in (date only, time only, or both). The
+/// caller's options override any default component.
+pub(crate) const LOCALE_DATE: u8 = 0;
+pub(crate) const LOCALE_TIME: u8 = 1;
+pub(crate) const LOCALE_BOTH: u8 = 2;
+
+pub(crate) fn date_locale_string(
+    e: &mut JsEngine,
+    ms: f64,
+    kind: u8,
+    opts: Option<&Val>,
+) -> Result<String, JsError> {
+    // (state key, option name)
+    let mut keys: Vec<(&str, &str)> = Vec::new();
+    if kind != LOCALE_TIME {
+        keys.push(("year", "year"));
+        keys.push(("month", "month"));
+        keys.push(("day", "day"));
+        keys.push(("weekday", "weekday"));
+    }
+    if kind != LOCALE_DATE {
+        keys.push(("hour", "hour"));
+        keys.push(("minute", "minute"));
+        keys.push(("second", "second"));
+        keys.push(("tz", "timeZoneName"));
+    }
+    let state = Val::new_object();
+    let mut any = false;
+    for (key, name) in keys {
+        if let Some(v) = intl_option(e, opts, name)? {
+            any = true;
+            obj_set_own(own(&state), key, v);
+        }
+    }
+    // shortcut: the spec fills in the default components only when the caller
+    // asked for NONE of them (ToDateTimeOptions), so `{hour,minute}` prints no
+    // seconds while the bare call does
+    if !any {
+        let dflt: &[(&str, &str)] = match kind {
+            LOCALE_DATE => &[("year", "numeric"), ("month", "numeric"), ("day", "numeric")],
+            LOCALE_TIME => &[
+                ("hour", "numeric"),
+                ("minute", "numeric"),
+                ("second", "numeric"),
+            ],
+            _ => &[
+                ("year", "numeric"),
+                ("month", "numeric"),
+                ("day", "numeric"),
+                ("hour", "numeric"),
+                ("minute", "numeric"),
+                ("second", "numeric"),
+            ],
+        };
+        for (key, v) in dflt {
+            obj_set_own(own(&state), key, Val::Str(Rc::from(*v)));
+        }
+    }
+    fmt_date_intl(e, &state, ms)
+}
+
 /// `Intl.DateTimeFormat.prototype.format` (shortcut: en-US names, UTC only).
 fn fmt_date_intl(e: &mut JsEngine, state: &Val, ms: f64) -> Result<String, JsError> {
     let (y, mo, d, hh, mi, ss, _) =
