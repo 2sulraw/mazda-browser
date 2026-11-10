@@ -2550,6 +2550,60 @@ impl PageScripts {
         turn
     }
 
+    /// Warm the page's whole module graph before any body runs. The loader
+    /// discovers a chunk's imports only after executing it, so a bundle with N
+    /// chunks paid N sequential round trips (github.com: ~20 chunks at ~300 ms
+    /// each). Parsing each body's static `import`/`export ... from` lists lets
+    /// the engine issue every request on the preload lanes; execution then
+    /// reads all bodies from the HTTP disk cache. Bounded by count and waves.
+    fn preload_module_graph(&self, scripts: &[ScriptSrc]) {
+        const MODULE_PRELOAD_MAX: usize = 96;
+        const MODULE_PRELOAD_DEPTH: usize = 4;
+        let map = self
+            .engine
+            .module_loader
+            .as_ref()
+            .and_then(|l| l.import_map());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: Vec<String> = Vec::new();
+        for s in scripts.iter().filter(|s| s.is_module) {
+            let Some(u) = &s.src else { continue };
+            if let Some(abs) = crate::resolve(&self.base, u) {
+                if seen.insert(abs.clone()) {
+                    queue.push(abs);
+                }
+            }
+        }
+        let mut waves = 0usize;
+        let mut fetched = 0usize;
+        while !queue.is_empty() && waves < MODULE_PRELOAD_DEPTH && fetched < MODULE_PRELOAD_MAX {
+            waves += 1;
+            let batch = std::mem::take(&mut queue);
+            fetched += batch.len();
+            crate::preload_labeled(&batch, "module preload");
+            for u in &batch {
+                let Ok((bytes, _)) = crate::fetch(u) else {
+                    continue;
+                };
+                let src = String::from_utf8_lossy(&bytes);
+                for spec in js::module::static_deps(&src) {
+                    let Some(abs) = js::module::resolve_with_map(map, u, &spec) else {
+                        continue;
+                    };
+                    if !abs.starts_with("http") {
+                        continue;
+                    }
+                    if seen.insert(abs.clone()) {
+                        queue.push(abs);
+                    }
+                }
+            }
+        }
+        if fetched > 0 {
+            eprintln!("[js] module preload: {fetched} modules in {waves} wave(s)");
+        }
+    }
+
     fn run_scripts_inner(&mut self, dom: &mut Dom) -> Turn {
         let scripts = collect_scripts(dom);
         // `<script type="importmap">` has to be installed before the first
@@ -2571,6 +2625,9 @@ impl PageScripts {
         // a dual build (module entry + `nomodule` fallback) must run only the
         // module half; with no module script at all the legacy half still runs
         let has_modules = scripts.iter().any(|s| s.is_module);
+        if has_modules {
+            self.preload_module_graph(&scripts);
+        }
         let mut dirty = false;
         let mut nav = None;
         let mut form_nav: Option<runtime::FormNav> = None;

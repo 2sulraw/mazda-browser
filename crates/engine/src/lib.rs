@@ -24,7 +24,9 @@ pub mod app;
 // Modules (cookie, runtime, script, js::module) call these through `crate::`
 // because they lived next to them in the single-file shell. Keep the paths
 // working until the engine split moves them to their real home.
-pub(crate) use app::{build_submission, cache_dir, fetch, fetch_nanos_take, resolve, SubmitMethod};
+pub(crate) use app::{
+    build_submission, cache_dir, fetch, fetch_nanos_take, preload_labeled, resolve, SubmitMethod,
+};
 
 pub use app::{run_headless, run_shell};
 

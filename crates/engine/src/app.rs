@@ -5873,7 +5873,7 @@ fn layout_page(
     // the round trips first (same reason as the markup preload)
     let mut img_urls = Vec::new();
     pending_image_urls(&root_box, url, &mut img_urls);
-    preload_accept(&img_urls, Some(IMAGE_ACCEPT));
+    preload_accept(&img_urls, Some(IMAGE_ACCEPT), "preload (images)");
     let (n_img, skipped) = probe_images(&mut root_box, url);
     stage!("image probe");
     if n_img > 0 || skipped > 0 {
@@ -7261,14 +7261,21 @@ const PRELOAD_THREADS: usize = 6;
 /// and swallowed: a failed preload just means the later sequential fetch
 /// retries and reports the failure in its own phase.
 pub(crate) fn preload(urls: &[String]) {
-    preload_accept(urls, None);
+    preload_accept(urls, None, "preload");
+}
+
+/// Same pool, different `[time]` label: the module-graph preloader runs while
+/// the script phase is already in progress, so its round trips must be
+/// visible apart from the initial subresource preload.
+pub(crate) fn preload_labeled(urls: &[String], label: &str) {
+    preload_accept(urls, None, label);
 }
 
 /// [`preload`] with a content-negotiation `Accept` header. The cache is keyed
 /// by URL only, so the preload must ask for the same representation the
 /// sequential phase would: images lead with WebP, and a preload that asked for
 /// HTML would poison that entry with the original JPEG.
-fn preload_accept(urls: &[String], accept: Option<&str>) {
+fn preload_accept(urls: &[String], accept: Option<&str>, label: &str) {
     let mut seen = std::collections::HashSet::new();
     let todo: Vec<&str> = urls
         .iter()
@@ -7293,7 +7300,8 @@ fn preload_accept(urls: &[String], accept: Option<&str>) {
     });
     if std::env::var_os("MAZDA_TIME").is_some() {
         eprintln!(
-            "[time] preload: {:.0} ms ({} requests, {} lanes)",
+            "[time] {}: {:.0} ms ({} requests, {} lanes)",
+            label,
             t0.elapsed().as_secs_f64() * 1000.0,
             todo.len(),
             PRELOAD_THREADS.min(todo.len())

@@ -121,8 +121,12 @@ impl ModuleLoader {
 
     /// `resolve_specifier`, falling back to the import map for a bare name.
     fn resolve(&self, base: &str, spec: &str) -> Option<String> {
-        resolve_specifier(base, spec)
-            .or_else(|| self.import_map.as_ref().and_then(|m| m.resolve(spec)))
+        resolve_with_map(self.import_map.as_ref(), base, spec)
+    }
+
+    /// The page's import map, for the preloader.
+    pub(crate) fn import_map(&self) -> Option<&ImportMap> {
+        self.import_map.as_ref()
     }
 
     /// Fetch `url` and run it as a module. Errors are strings: the script
@@ -374,6 +378,36 @@ fn resolve_specifier(base: &str, spec: &str) -> Option<String> {
         .join(spec)
         .ok()
         .map(|u| u.to_string())
+}
+
+/// `resolve_specifier` plus the page's import map for a bare name. Shared by
+/// the loader and the module-graph preloader so the two cannot disagree.
+pub(crate) fn resolve_with_map(
+    map: Option<&ImportMap>,
+    base: &str,
+    spec: &str,
+) -> Option<String> {
+    resolve_specifier(base, spec).or_else(|| map.and_then(|m| m.resolve(spec)))
+}
+
+/// Static import specifiers of a module body: `import ... from "x"` plus
+/// `export ... from "x"`. Used only to warm the HTTP cache before execution;
+/// a parse error yields no specifiers (the real load reports it).
+pub(crate) fn static_deps(src: &str) -> Vec<String> {
+    let Ok(program) = parser::parse(src, 0) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for st in &program {
+        match &st.kind {
+            parser::StmtKind::Import { source, .. } => out.push(source.to_string()),
+            parser::StmtKind::Export {
+                source: Some(s), ..
+            } => out.push(s.to_string()),
+            _ => {}
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +829,54 @@ mod tests {
             Some("https://mazda.test/assets/chunk.js")
         );
         assert_eq!(l.resolve(base, "lodash"), None);
+    }
+
+    #[test]
+    fn static_deps_lists_import_and_export_from_sources() {
+        let src = r#"
+            import def from "./a.js";
+            import { x as y } from "react";
+            import * as ns from "../b.js";
+            import "./side-effect.js";
+            export { z } from "./c.js";
+            export * from "./d.js";
+            export const own = 1;
+            const later = () => import("./lazy.js");
+        "#;
+        // the preloader warms the static graph only: dynamic imports stay lazy
+        assert_eq!(
+            static_deps(src),
+            vec![
+                "./a.js".to_string(),
+                "react".to_string(),
+                "../b.js".to_string(),
+                "./side-effect.js".to_string(),
+                "./c.js".to_string(),
+                "./d.js".to_string(),
+            ]
+        );
+        // a body that does not parse has no trustworthy edges
+        assert!(static_deps("import {").is_empty());
+    }
+
+    #[test]
+    fn resolve_with_map_serves_the_preloader_the_same_urls() {
+        let map = ImportMap::parse(
+            r#"{"imports":{"react":"https://cdn.test/react.js"}}"#,
+            "https://mazda.test/page/",
+        )
+        .expect("map");
+        let base = "https://mazda.test/assets/core.js";
+        assert_eq!(
+            resolve_with_map(Some(&map), base, "react").as_deref(),
+            Some("https://cdn.test/react.js")
+        );
+        assert_eq!(
+            resolve_with_map(Some(&map), base, "./chunk.js").as_deref(),
+            Some("https://mazda.test/assets/chunk.js")
+        );
+        // no map: a bare name has no URL, and the preloader must not invent one
+        assert_eq!(resolve_with_map(None, base, "react"), None);
     }
 
     #[test]

@@ -2818,3 +2818,37 @@ behaviour stayed dead.
 - `[time] scripts` exec: 617 -> 723 ms (the `wgy` bundle now parses and runs).
 - engine tests **967** green (new `regex_unicode_property_escapes`; the
   unsupported-syntax test now uses `\p{So}`).
+
+## Preload the module graph (P15, 2026-11-10)
+
+On a cold load github.com fetched its chunks one at a time: the loader only
+learns a chunk's imports *after* executing it, so ~28 modules paid a
+sequential round trip each (~270-530 ms apiece at ~80 ms RTT) after the
+initial 6-lane subresource preload had already finished. `[time] scripts`
+showed the cost plainly: 12,231 ms, of which 10,867 ms was fetch.
+
+- Before any module body runs, `preload_module_graph` walks the static graph:
+  parse each module's `import ... from` / `export ... from` specifiers
+  (`js::module::static_deps`), resolve them with the page's import map
+  (`resolve_with_map` — the same function the loader uses, so the two cannot
+  disagree), and fetch each wave on the same 6 lanes.
+- Bounded by 96 modules and 4 waves; dynamic `import()` edges stay lazy, so
+  nothing speculative is requested that execution would not have asked for.
+- `preload_labeled` reports its own `[time] module preload:` line, because it
+  runs inside the script phase and would otherwise hide in `exec`.
+
+### Measured (two cold runs, cache cleared, `MAZDA_TIME=1`)
+
+| phase | before | after |
+| --- | --- | --- |
+| `[time] scripts` total | 12,231 ms | 5,843 / 4,847 ms |
+| of which fetch | 10,867 ms | 314 / 281 ms |
+| module preload | - | 34 modules, 3 waves, 3,650 / 3,004 ms |
+| `[nav] worker finished` | 24,955 ms | 17,995 / 18,326 ms |
+
+The 3.0-3.7 s of preload wall time is now the floor: 3 MB of chunks over 6
+HTTP/1.1 connections. That is where the remaining latency lives (HTTP/2 would
+collapse it, but `ureq` 2.12 is 1.1-only).
+
+- engine tests **969** green (new `static_deps_lists_import_and_export_from_sources`,
+  `resolve_with_map_serves_the_preloader_the_same_urls`).
