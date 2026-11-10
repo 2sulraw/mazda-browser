@@ -3616,6 +3616,31 @@ Uncaught ReferenceError: crypto is not defined
   note. The page renders 2681 elements and 56 images; script exec ~15.7 s
   (fetch 2.2 s) with the React tree mounted for real.
 
+## `\p{Bidi_Control}` (P44, 2026-11-10)
+
+The landing page was clean, so the next measurement moved one click in, to a
+repository page (`https://github.com/rust-lang/rust`). There the *code view*
+bundle is fetched, and `dp-*.js` failed to compile:
+
+```
+[js] script error in code-view-*.js: dp-*.js:
+SyntaxError: /[\p{Bidi_Control}\u0590-\u08ff…]/u:
+unsupported unicode property escape \p{Bidi_Control} (line 2, col 15379)
+```
+
+GitHub classifies bidirectional-formatting controls in a displayed source file
+with exactly that character class; an unknown property name is a *compile*
+error, so the whole code-view module (and therefore every file blob) was dead.
+
+- `PropKind::BidiControl`, accepted as `\p{Bidi_Control}` and the short
+  `\p{Bidi_C}`.
+- the ranges are exact rather than approximate (UAX #9): `U+061C`, `U+200E`,
+  `U+200F`, `U+202A..=U+202E`, `U+2066..=U+2069`. Notably `U+200B` zero-width
+  space is *not* a bidi control, and the test pins that.
+- engine tests **1006 -> 1007** green (new `regex_bidi_control_property_escape`).
+- `github.com/rust-lang/rust`: the code-view module now compiles and fails one
+  step later, on a *lookbehind* in `dp-*.js` (next entry).
+
 
 
 

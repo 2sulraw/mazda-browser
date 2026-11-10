@@ -117,6 +117,8 @@ pub(crate) enum PropKind {
     Emoji,
     /// `\p{EMod}` - the emoji modifier (skin-tone) code points
     EmojiModifier,
+    /// `\p{Bidi_Control}` - the bidirectional-formatting controls
+    BidiControl,
 }
 /// capture snapshot: caps\[i\] = Some((start_char, end_char));
 /// caps\[0\]/caps\[1\] are the whole match. Copy-on-write via Rc.
@@ -725,6 +727,9 @@ fn prop_kind(name: &str) -> Option<PropKind> {
         "RI" | "Regional_Indicator" => PropKind::RegionalIndicator,
         "Emoji" => PropKind::Emoji,
         "EMod" | "Emoji_Modifier" => PropKind::EmojiModifier,
+        // GitHub's code-view bundle classifies bidi controls to render source
+        // files; without the property the whole bundle was a SyntaxError.
+        "Bidi_C" | "Bidi_Control" => PropKind::BidiControl,
         _ => return None,
     })
 }
@@ -739,6 +744,12 @@ fn prop_matches(kind: PropKind, ch: char) -> bool {
         PropKind::Ascii => ch.is_ascii(),
         PropKind::RegionalIndicator => ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch),
         PropKind::EmojiModifier => ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch),
+        // exact: ALM, LRM, RLM, the embedding/override controls and the
+        // isolate controls (UAX #9)
+        PropKind::BidiControl => matches!(
+            ch as u32,
+            0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+        ),
         // honest shortcut: the Unicode `Emoji` property is approximated by
         // the symbol/pictograph blocks (and the keycap bases). The splitter
         // only groups a cluster; it never indexes into the matched text.

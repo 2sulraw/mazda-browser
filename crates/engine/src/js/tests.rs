@@ -5088,6 +5088,21 @@ fn regex_emoji_property_escapes() {
 }
 
 #[test]
+fn regex_bidi_control_property_escape() {
+    // GitHub's code-view bundle classifies bidi controls with
+    // /[\p{Bidi_Control}…]/u to render source files; the unknown property
+    // name made the whole bundle a SyntaxError.
+    assert!(boolean(r"/^\p{Bidi_Control}$/u.test(String.fromCharCode(0x200F))"));
+    assert!(boolean(r"/^\p{Bidi_Control}$/u.test(String.fromCharCode(0x2066))"));
+    assert!(boolean(r"/^\p{Bidi_C}$/u.test('\u061C')"));
+    assert!(!boolean(r"/\p{Bidi_Control}/u.test('A')"));
+    // zero-width space is not a bidi control
+    assert!(!boolean(
+        r"/\p{Bidi_Control}/u.test(String.fromCharCode(0x200B))"
+    ));
+}
+
+#[test]
 fn regex_unicode_escape_at_class_range_bound() {
     // The splitter's tag-sequence class is `[\u{E0020}-\u{E007E}]`: the
     // range's upper bound used the fixed `\uXXXX` form only, so a `{...}`
