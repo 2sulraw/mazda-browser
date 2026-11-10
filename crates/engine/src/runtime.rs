@@ -834,7 +834,10 @@ impl DomHost {
 
     /// DOM `nodeType`: 1 element, 3 text, 8 comment. None on a bad id.
     pub fn node_type(&self, node: u32) -> Option<u8> {
-        match &self.dom_ref().nodes.get(node as usize)?.kind {
+        let dom = self.dom_ref();
+        match &dom.nodes.get(node as usize)?.kind {
+            // a documented fragment is a Node, not an Element (nodeType 11)
+            NodeKind::Element(..) if dom.tag(node) == "#fragment" => Some(11),
             NodeKind::Element(..) => Some(1),
             NodeKind::Text(_) => Some(3),
             NodeKind::Comment(_) => Some(8),
@@ -1121,6 +1124,84 @@ impl DomHost {
         });
         self.dirty = true;
         Some(id)
+    }
+
+    /// `document.createDocumentFragment()` / `<template>.content`: an orphan
+    /// node tagged `#fragment` (no tag selector ever matches it). Inserting it
+    /// splices its children into the parent, so the wrapper is transparent
+    /// where the spec says it is.
+    pub fn create_fragment(&mut self) -> Option<u32> {
+        self.create_element("#fragment")
+    }
+
+    /// `Node.cloneNode(deep)`: a copy of the node, and of the whole subtree
+    /// when `deep`. The copy is an orphan (parent = document root, not listed
+    /// among its children), like the spec's cloned node before insertion.
+    /// Attributes come along; live state (listener registrations, wrapper
+    /// identity) does not, which is also the spec.
+    pub fn clone_node(&mut self, node: u32, deep: bool) -> Option<u32> {
+        let dom = unsafe { &mut *self.dom };
+        if dom.nodes.is_empty() {
+            return None;
+        }
+        let (kind, children) = {
+            let n = dom.nodes.get(node as usize)?;
+            let kind = match &n.kind {
+                NodeKind::Element(t, attrs) => NodeKind::Element(*t, attrs.clone()),
+                NodeKind::Text(s) => NodeKind::Text(s.clone()),
+                NodeKind::Comment(s) => NodeKind::Comment(s.clone()),
+            };
+            (kind, if deep { n.children.clone() } else { Vec::new() })
+        };
+        let id = dom.nodes.len() as u32;
+        dom.nodes.push(html::Node {
+            parent: 0,
+            children: Vec::new(),
+            kind,
+        });
+        if deep {
+            // recursive walk over the source children; each copy is appended
+            // to the last created node
+            let mut stack: Vec<(u32, u32)> = Vec::new();
+            for c in children.into_iter().rev() {
+                stack.push((id, c));
+            }
+            while let Some((parent, src)) = stack.pop() {
+                let (kind, kids) = {
+                    let n = match dom.nodes.get(src as usize) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let kind = match &n.kind {
+                        NodeKind::Element(t, attrs) => NodeKind::Element(*t, attrs.clone()),
+                        NodeKind::Text(s) => NodeKind::Text(s.clone()),
+                        NodeKind::Comment(s) => NodeKind::Comment(s.clone()),
+                    };
+                    (kind, n.children.clone())
+                };
+                let copy = dom.nodes.len() as u32;
+                dom.nodes.push(html::Node {
+                    parent,
+                    children: Vec::new(),
+                    kind,
+                });
+                dom.nodes[parent as usize].children.push(copy);
+                for c in kids.into_iter().rev() {
+                    stack.push((copy, c));
+                }
+            }
+        }
+        self.dirty = true;
+        Some(id)
+    }
+
+    /// Is this the `#fragment` node? Fragments are transparent on insertion.
+    pub fn is_fragment(&self, node: u32) -> bool {
+        let dom = self.dom_ref();
+        match dom.nodes.get(node as usize).map(|n| &n.kind) {
+            Some(NodeKind::Element(..)) => dom.tag(node) == "#fragment",
+            _ => false,
+        }
     }
 
     /// `createTextNode(text)` / `createComment(text)`: append an orphan

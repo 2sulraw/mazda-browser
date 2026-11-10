@@ -402,6 +402,18 @@ fn eval_stmt_inner(e: &mut JsEngine, env: &Rc<Env>, s: &Stmt) -> Result<Flow, Js
                         bind_pat(e, env, p, v, BindKind::Decl(*kind))?;
                     }
                     None => {
+                        // `var x;` without an initializer does nothing at
+                        // runtime: the binding already exists (hoisting made
+                        // it), and re-setting it to undefined would wipe a
+                        // value assigned earlier in the same scope. Minified
+                        // TypeScript enums depend on that:
+                        //   var eM, …, eW, …;
+                        //   (eM = eW || (eW = {}))[eM.initial = 0] = "initial", …
+                        // GitHub's Turbo bundle hit it: the `var eW;` that
+                        // follows the enum setup reset the stage table.
+                        if matches!(kind, VarKind::Var) && d.init.is_none() {
+                            continue;
+                        }
                         let v = match &d.init {
                             Some(x) => eval_expr(e, env, x)?,
                             None => Val::Undefined,

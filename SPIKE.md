@@ -2954,3 +2954,34 @@ Three small steps, each measured by the next fatal error in the same file
 - engine tests **977 → 980** green (new
   `resize_observer_constructs_and_observes_without_firing`,
   `create_element_ns_makes_svg_elements`, `not_a_function_names_the_call_site`).
+
+## A `var` without an initializer is a no-op (P19, 2026-11-10)
+
+With `<template>.content` in place the bundle got further and died on
+`Cannot read property 'initial' of undefined` while reading a stage table
+(`class et { constructor() { this.stage = eW.initial } }`). `eW` is a minified
+TypeScript enum:
+
+```js
+var eM, …, eW, …;                                  // hoisted to the end of the module
+(eM = eW || (eW = {}))[eM.initial = 0] = "initial", …;
+```
+
+`eW` *was* assigned; then the hoisted `var … eW …;` ran and set it back to
+`undefined`. The engine executed every `VarDecl` declarator as an assignment,
+so a declaration without an initializer assigned `undefined`.
+
+Per spec a `VariableDeclaration` with no initializer does nothing at runtime:
+the binding is created during instantiation (`var`) or evaluation (`let`), and
+the statement itself has no effect. That is not a rare shape — minifiers hoist
+every `var` to one list, and `function f(x) { var x; }` must keep the
+parameter.
+
+- `var` + no initializer: skip. `let x;` still initializes to `undefined`
+  (`const x;` stays the documented shortcut).
+- engine tests **981 → 982** green (new
+  `var_without_initializer_does_not_reset_the_binding`).
+- Next fatal error in `core-*.js`:
+  `Cannot read property 'requestErrored' of null` — the page calls
+  `Object.getPrototypeOf(document.createElement("turbo-frame").delegate)`, i.e.
+  it expects `customElements.define` to have upgraded the element.

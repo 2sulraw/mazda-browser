@@ -134,6 +134,12 @@ thread_local! {
     static IO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Same, for `ResizeObserver`.
     static RO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `template node → its content fragment`. The spec keeps a template's
+    /// children in a fragment; here the parser stores them as ordinary
+    /// children, so the first `content` access moves them into a `#fragment`
+    /// node and the pair is cached for the rest of the page.
+    static TEMPLATE_CONTENT: RefCell<std::collections::HashMap<u32, u32>> =
+        RefCell::new(std::collections::HashMap::new());
 }
 
 /// Install the script-local context for the duration of a turn.
@@ -261,6 +267,12 @@ fn wrap_element(node: u32) -> Val {
     // the interface chain depends on the tag (`<button>` is an
     // HTMLButtonElement), so resolve it before the snapshot is consumed
     let proto = dom_tag_proto(p.as_ref().map(|p| p.tag.as_str()).unwrap_or(""));
+    // a fragment (template content / createDocumentFragment) is a Node, not
+    // an Element, so its `nodeType` is 11
+    let is_fragment = p
+        .as_ref()
+        .map(|p| p.tag.eq_ignore_ascii_case("#fragment"))
+        .unwrap_or(false);
     if let Some(p) = p {
         o.set("tagName", str_val(&p.tag));
         // `form.elements`: live collection of the form's listed controls.
@@ -283,6 +295,17 @@ fn wrap_element(node: u32) -> Val {
             o.set("checked", js::Val::Bool(p.checked));
         }
         o.set("textContent", str_val(&p.text));
+        // `<template>.content`: a getter, because the fragment is created on
+        // first access (moving the template's children into it)
+        if p.tag.eq_ignore_ascii_case("template") {
+            o.set(
+                "content",
+                js::Val::Acc(Rc::new(js::AccEntry {
+                    getter: Some(js::Val::Native(n.el_template_content)),
+                    setter: None,
+                })),
+            );
+        }
     }
     // Reflected attribute props go on LAST: `id`/`className`/`href` are in
     // the table, so these accessors replace the snapshot writes above (live
@@ -310,7 +333,10 @@ fn wrap_element(node: u32) -> Val {
     );
     // node-level navigation: comments and text are real arena nodes, so
     // React's streaming bootstrap can walk/rewrite its boundary markers
-    o.set("nodeType", js::Val::Num(1.0));
+    o.set(
+        "nodeType",
+        js::Val::Num(if is_fragment { 11.0 } else { 1.0 }),
+    );
     o.set("parentNode", lazy_native_attr(n.node_parent));
     o.set("previousSibling", lazy_native_attr(n.node_prev));
     o.set("nextSibling", lazy_native_attr(n.node_next));
@@ -320,6 +346,7 @@ fn wrap_element(node: u32) -> Val {
     o.set("dataset", lazy_native_attr(n.node_dataset));
     o.set("removeChild", js::Val::Native(n.node_remove_child));
     o.set("insertBefore", js::Val::Native(n.node_insert_before));
+    o.set("cloneNode", js::Val::Native(n.node_clone));
     // layout reads: scripts run before layout in this pipeline, so these are
     // 0 — documented shortcut (no synchronous layout to measure against).
     o.set("offsetWidth", js::Val::Num(0.0));
@@ -443,6 +470,53 @@ fn this_node(this: &Val) -> Result<u32, JsError> {
     }
 }
 
+/// `template.content`: the fragment holding a template's children.
+///
+/// The parser stores a `<template>`'s children as ordinary children (it has no
+/// inert-document machinery). The first `content` access moves them into a
+/// `#fragment` node and remembers the pair for the page, so the template
+/// itself stops being a parent — which is what the spec says and what
+/// `content.cloneNode(true)` needs to copy.
+fn template_content_node(tpl: u32) -> Option<u32> {
+    if let Some(f) = TEMPLATE_CONTENT.with(|m| m.borrow().get(&tpl).copied()) {
+        return Some(f);
+    }
+    let frag = runtime::host_mut(|h| h.create_fragment())?;
+    runtime::host_mut(|h| {
+        for c in h.child_nodes(tpl) {
+            h.remove_node(c);
+            h.append_child(frag, c);
+        }
+    });
+    TEMPLATE_CONTENT.with(|m| {
+        m.borrow_mut().insert(tpl, frag);
+    });
+    Some(frag)
+}
+
+fn n_template_content(_e: &mut JsEngine, _idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    let node = this_node(this)?;
+    Ok(match template_content_node(node) {
+        Some(f) => wrap_any(f),
+        None => Val::Null,
+    })
+}
+
+/// A fragment argument inserts its own children, never itself (the spec's
+/// "replace a fragment with its children").
+fn splice_node(n: u32) -> Vec<u32> {
+    if !runtime::host(|h| h.is_fragment(n)) {
+        return vec![n];
+    }
+    let kids = runtime::host(|h| h.child_nodes(n));
+    runtime::host_mut(|h| {
+        for &c in &kids {
+            h.remove_node(c);
+        }
+    });
+    kids
+}
+
 /// Argument list of `prepend`/`append`/… → arena ids. Elements resolve through
 /// `__node`; strings and other primitives become text nodes (the spec's
 /// `Node`-or-`DOMString` conversion). Values that are neither are skipped: one
@@ -471,6 +545,9 @@ fn arg_nodes(args: &[Val]) -> Vec<u32> {
 /// The insertion methods, one pass over the arena per call. `prepend`/`before`
 /// keep argument order by inserting everything before the same anchor.
 fn insert_children(node: u32, idx: u16, nodes: &[u32]) {
+    // a fragment contributes its children, in order
+    let nodes: Vec<u32> = nodes.iter().flat_map(|&n| splice_node(n)).collect();
+    let nodes = nodes.as_slice();
     runtime::host_mut(|h| match idx {
         E_PREPEND => {
             let anchor = h.first_child(node);
@@ -550,6 +627,7 @@ struct Nids {
     doc_query_all: usize,
     doc_create: usize,
     doc_create_ns: usize,
+    doc_create_fragment: usize,
     doc_cookie_get: usize,
     doc_cookie_set: usize,
     doc_get_by_tag: usize,
@@ -596,6 +674,7 @@ struct Nids {
     node_insert_before: usize,
     node_child_nodes: usize,
     node_children: usize,
+    node_clone: usize,
     node_dataset: usize,
     /// `form.elements` (a live controls collection)
     el_form_elements: usize,
@@ -644,6 +723,8 @@ struct Nids {
     /// `DOM_INTERFACES`, then `TAG_INTERFACES`, then `SVGSVGElement`)
     dom_ctor: [usize; DOM_INTERFACE_COUNT],
     el_closest: usize,
+    /// `HTMLTemplateElement.content` (getter)
+    el_template_content: usize,
     /// variadic insertion group (`prepend`/`append`/`before`/`after`/
     /// `replaceWith`/`replaceChildren`)
     el_prepend: usize,
@@ -819,6 +900,8 @@ const D_CREATE_COMMENT: u16 = 11;
 /// `createElementNS(ns, qualifiedName)` — the namespace decides the element
 /// family (SVG vs HTML), so it is not a synonym for `createElement`.
 const D_CREATE_ELEMENT_NS: u16 = 12;
+/// `createDocumentFragment()`
+const D_CREATE_FRAGMENT: u16 = 13;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -919,6 +1002,8 @@ const N_DATASET: u16 = 9;
 /// snapshots built from the arena's child list
 const N_CHILD_NODES: u16 = 10;
 const N_CHILDREN: u16 = 11;
+/// `Node.cloneNode(deep)`
+const N_CLONE_NODE: u16 = 12;
 /// live-collection group idxs (one native for `item`/`namedItem`)
 const C_ITEM: u16 = 0;
 const C_NAMED: u16 = 1;
@@ -1014,6 +1099,10 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             };
             create_element(tag.rsplit(':').next().unwrap_or(&tag))
         }
+        D_CREATE_FRAGMENT => match runtime::host_mut(|h| h.create_fragment()) {
+            Some(id) => Ok(wrap_any(id)),
+            None => Ok(Val::Null),
+        },
         D_GET_ELEMENTS_BY_TAG => Ok(wrap_coll(LIVE_TAG, 0, &sel.unwrap_or_default())),
         D_GET_ELEMENTS_BY_CLASS => Ok(wrap_coll(LIVE_CLASS, 0, &sel.unwrap_or_default())),
         D_FORMS => Ok(wrap_coll(LIVE_FORMS, 0, "")),
@@ -1103,8 +1192,14 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
         E_APPEND_CHILD => {
             let child = this_node(&a0)?;
             // dirty flag bookkeeping lives inside the host write (as
-            // before: an out-of-range no-op never dirties the page)
-            runtime::host_mut(|h| h.append_child(node, child));
+            // before: an out-of-range no-op never dirties the page). A
+            // fragment appends its children, not itself.
+            let kids = splice_node(child);
+            runtime::host_mut(|h| {
+                for c in kids {
+                    h.append_child(node, c);
+                }
+            });
             Ok(a0)
         }
         E_SET_ATTRIBUTE => {
@@ -1345,6 +1440,7 @@ fn wrap_char_data(node: u32) -> Val {
     // character data never has children; a fresh empty array keeps
     // `node.childNodes.length` truthful without a host round-trip
     o.set("childNodes", Val::new_array(Vec::new()));
+    o.set("cloneNode", Val::Native(n.node_clone));
     set_proto(
         &o,
         dom_proto(if ty == 8 { DOM_COMMENT } else { DOM_TEXT }),
@@ -1398,6 +1494,15 @@ fn n_node(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                 .collect();
             Val::new_array(elems)
         }
+        N_CLONE_NODE => {
+            // the clone is an orphan; HTML clones keep attributes but not
+            // listeners, values or wrapper identity (same as the spec)
+            let deep = args.first().map(|v| v.to_bool()).unwrap_or(false);
+            match runtime::host_mut(|h| h.clone_node(node, deep)) {
+                Some(c) => wrap_any(c),
+                None => Val::Null,
+            }
+        }
         N_REMOVE_CHILD => {
             let child = this_node(&args.first().cloned().unwrap_or(Val::Undefined))?;
             if runtime::host(|h| h.is_child_of(node, child)) {
@@ -1411,7 +1516,12 @@ fn n_node(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
                 Some(v) if !matches!(v, Val::Undefined | Val::Null) => Some(this_node(v)?),
                 _ => None,
             };
-            runtime::host_mut(|h| h.insert_before(node, new, before));
+            let kids = splice_node(new);
+            runtime::host_mut(|h| {
+                for c in kids {
+                    h.insert_before(node, c, before);
+                }
+            });
             args.first().cloned().unwrap_or(Val::Null)
         }
         // shortcut: a snapshot object cached on the wrapper, so writes made
@@ -1976,6 +2086,8 @@ fn dom_tag_proto(tag: &str) -> Option<Rc<RefCell<js::Obj>>> {
         let d = b.as_ref()?;
         let i = match d.by_tag.get(tag.as_str()) {
             Some(i) => *i,
+            // a fragment is a Node (nodeType 11), not an Element
+            None if tag == "#fragment" => DOM_DOCUMENT_FRAGMENT,
             // the arena has no namespace column, so an SVG element is known
             // by its tag name alone: `createElementNS(NS, "path")` and a
             // parsed `<path>` both land here
@@ -2955,6 +3067,7 @@ impl PageScripts {
         CUSTOM_ELEMENTS.with(|c| c.borrow_mut().clear());
         IO_NOTE.with(|n| n.set(false));
         RO_NOTE.with(|n| n.set(false));
+        TEMPLATE_CONTENT.with(|m| m.borrow_mut().clear());
         runtime::set_mutation_tracking(false);
         let mut engine = JsEngine::new();
         // one native per reflected-prop accessor (getter + setter share it)
@@ -2978,6 +3091,7 @@ impl PageScripts {
             doc_query_all: engine.register_native("document.querySelectorAll", doc_native, D_QUERY_ALL),
             doc_create: engine.register_native("document.createElement", doc_native, D_CREATE_ELEMENT),
             doc_create_ns: engine.register_native("document.createElementNS", doc_native, D_CREATE_ELEMENT_NS),
+            doc_create_fragment: engine.register_native("document.createDocumentFragment", doc_native, D_CREATE_FRAGMENT),
             doc_cookie_get: engine.register_native("document.getCookie", doc_native, D_COOKIE_GET),
             doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
             doc_get_by_tag: engine.register_native("document.getElementsByTagName", doc_native, D_GET_ELEMENTS_BY_TAG),
@@ -3021,6 +3135,7 @@ impl PageScripts {
             node_first: engine.register_native("Node.firstChild", n_node, N_FIRST_CHILD),
             node_child_nodes: engine.register_native("Node.childNodes", n_node, N_CHILD_NODES),
             node_children: engine.register_native("Element.children", n_node, N_CHILDREN),
+            node_clone: engine.register_native("Node.cloneNode", n_node, N_CLONE_NODE),
             node_remove_child: engine.register_native("Node.removeChild", n_node, N_REMOVE_CHILD),
             node_insert_before: engine.register_native("Node.insertBefore", n_node, N_INSERT_BEFORE),
             node_dataset: engine.register_native("HTMLElement.dataset", n_node, N_DATASET),
@@ -3064,6 +3179,7 @@ impl PageScripts {
             fetch_text: engine.register_native("response.text", fetch_text_native, 0),
             dom_ctor,
             el_closest: engine.register_native("Element.closest", el_native, E_CLOSEST),
+            el_template_content: engine.register_native("HTMLTemplateElement.content", n_template_content, 0),
             el_prepend: engine.register_native("Element.prepend", el_native, E_PREPEND),
             el_append_many: engine.register_native("Element.append", el_native, E_APPEND),
             el_before: engine.register_native("Element.before", el_native, E_BEFORE),
@@ -3119,6 +3235,7 @@ impl PageScripts {
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
         doc.set("createElement", Val::Native(ids.doc_create));
         doc.set("createElementNS", Val::Native(ids.doc_create_ns));
+        doc.set("createDocumentFragment", Val::Native(ids.doc_create_fragment));
         doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
         doc.set("getElementsByClassName", Val::Native(ids.doc_get_by_class));
         doc.set("getElementsByName", Val::Native(ids.doc_get_by_name));
@@ -4099,6 +4216,45 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "fired"), "0");
         assert_eq!(get_global_str(&mut ps, "isInstance"), "true");
         assert_eq!(get_global_str(&mut ps, "badCb"), "true");
+    }
+
+    #[test]
+    fn template_content_clones_and_splices() {
+        // the shape github.com's task-list code uses: clone `content`, find
+        // the handle in the copy, prepend the copy into a row
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="host"></div>
+            <template id="t"><span class="handle">h</span><svg><path d="M0 0"></path></svg></template>
+            <script>
+                var t = document.getElementById("t");
+                var c = t.content;
+                window.type = c.nodeType;
+                window.moved = t.children.length === 0 && c.childNodes.length === 2;
+                var copy = c.cloneNode(true);
+                window.copyType = copy.nodeType;
+                window.handle = copy.querySelector(".handle").textContent;
+                window.deep = copy.querySelector("svg") !== null;
+                var shallow = c.cloneNode(false);
+                window.shallowKids = shallow.childNodes.length;
+                document.getElementById("host").appendChild(copy);
+                var host = document.getElementById("host");
+                window.spliced = host.children.length;
+                window.splicedTags = Array.prototype.map
+                    .call(host.children, function (e) { return e.tagName; })
+                    .join(",");
+                window.empty = document.createDocumentFragment().nodeType;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "type"), "11");
+        assert_eq!(get_global_str(&mut ps, "moved"), "true");
+        assert_eq!(get_global_str(&mut ps, "copyType"), "11");
+        assert_eq!(get_global_str(&mut ps, "handle"), "h");
+        assert_eq!(get_global_str(&mut ps, "deep"), "true");
+        assert_eq!(get_global_str(&mut ps, "shallowKids"), "0");
+        assert_eq!(get_global_str(&mut ps, "spliced"), "2");
+        assert_eq!(get_global_str(&mut ps, "splicedTags"), "SPAN,SVG");
+        assert_eq!(get_global_str(&mut ps, "empty"), "11");
     }
 
     #[test]

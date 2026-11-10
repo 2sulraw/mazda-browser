@@ -4810,3 +4810,19 @@ fn deleting_array_iterator_makes_arrays_non_iterable() {
         42.0
     );
 }
+#[test]
+fn var_without_initializer_does_not_reset_the_binding() {
+    // minified TypeScript enums are set up as
+    //   (eM = eW || (eW = {}))[eM.initial = 0] = "initial", …; var … eW …;
+    // the trailing `var eW;` must be a no-op, not a reset (GitHub's Turbo
+    // bundle reads its stage table back later and got `undefined`)
+    assert_eq!(
+        run("var eW;\n(eM = eW || (eW = {}))[eM.initial = 0] = 'initial';\nvar eW;\neW.initial + ':' + eW[0]")
+            .to_string(),
+        "0:initial"
+    );
+    // the same rule keeps a parameter's value: `var x;` is not an assignment
+    assert_eq!(num("function f(x) { var x; return x; } f(5)"), 5.0);
+    // a leading `var` still declares the name (undefined until assigned)
+    assert_eq!(run("var y; y").to_string(), "undefined");
+}

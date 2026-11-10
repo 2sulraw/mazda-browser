@@ -2134,10 +2134,61 @@ fn need_array(e: &mut JsEngine, this: &Val) -> Result<Rc<RefCell<Obj>>, JsError>
                 let items = e.live_values.map(|f| f(&spec)).unwrap_or_default();
                 return Ok(new_obj(ObjKind::Array(items), Vec::new(), None));
             }
-            Err(JsError::throw("TypeError: array method on non-array"))
+            // any other array-like, `length` and indices read through the
+            // prototype chain: `Slice`/`Map` are generic in the spec, and
+            // `Object.create(someArray).slice(0)` is how selector libraries
+            // extend a matcher list
+            if let Val::Num(n) = chain_get(o, "length") {
+                if n >= 0.0 && n.fract() == 0.0 {
+                    let n = n as usize;
+                    let items: Vec<Val> = (0..n)
+                        .map(|i| chain_get(o, &i.to_string()))
+                        .collect();
+                    return Ok(new_obj(ObjKind::Array(items), Vec::new(), None));
+                }
+            }
+            // name the receiver: a wrapper or something else entirely -
+            // "non-array" alone does not say which
+            let what = match obj_get_own(o, "tagName") {
+                Val::Str(s) => format!("<{}> wrapper", s),
+                _ => "plain object".to_string(),
+            };
+            Err(JsError::throw(&format!(
+                "TypeError: array method on non-array (this is a {what}){}",
+                e.call_site_note()
+            )))
         }
-        _ => Err(JsError::throw("TypeError: array method on non-array")),
+        _ => Err(JsError::throw(&format!(
+            "TypeError: array method on non-array{}",
+            e.call_site_note()
+        ))),
     }
+}
+
+/// `Get` through the prototype chain for data props, an array's indexed items
+/// and its `length` — enough for the generic array methods to accept
+/// array-likes (`Object.create(array)`, DOM collections, `arguments`).
+fn chain_get(o: &Rc<RefCell<Obj>>, key: &str) -> Val {
+    let mut cur = Some(o.clone());
+    for _ in 0..PROTO_WALK_CAP {
+        let Some(c) = cur else { break };
+        let b = c.borrow();
+        if let ObjKind::Array(items) = &b.kind {
+            if key == "length" {
+                return Val::Num(items.len() as f64);
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                if let Some(v) = items.get(i) {
+                    return v.clone();
+                }
+            }
+        }
+        if let Some((_, v)) = b.props.iter().find(|(k, _)| k.as_ref() == key) {
+            return v.clone();
+        }
+        cur = b.proto.clone();
+    }
+    Val::Undefined
 }
 
 /// `Array(n)`, `new Array(...)`, `Array.of(...)`, `Array.from(items, mapFn?)`.
