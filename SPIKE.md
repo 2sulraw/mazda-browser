@@ -3974,6 +3974,40 @@ function Z(e){return Object.getOwnPropertySymbols(e)}
   own hydration work rather than a stop, so the next measurements are latency,
   not missing builtins.
 
+## `\p{Connector_Punctuation}` (P56, 2026-11-11)
+
+The next page tried was the issue list
+(`https://github.com/rust-lang/rust/issues`), whose `structured-issues-*.js`
+was a SyntaxError before a single statement ran:
+
+```
+SyntaxError: /[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]/gu:
+unsupported unicode property escape \p{Connector_Punctuation} (line 2, col 7389)
+```
+
+That class is GitHub's "word character" test for filter tokens.
+
+- `\p{Pc}` / `\p{Connector_Punctuation}` is one of the few categories the engine
+  can answer exactly: Pc is a closed list of ten code points (U+005F, U+203F,
+  U+2040, U+2054, U+FE33, U+FE34, U+FE4D..U+FE4F, U+FF3F). The `char`
+  predicates have no connector test, so the list is spelled out.
+- engine tests **1016 -> 1017** green (new
+  `regex_connector_punctuation_property_escape`: underscore, an undertie, the
+  fullwidth low line, the two negatives, and the bundle's own class).
+- `github.com/rust-lang/rust/issues`: structured-issues parses and runs; the
+  only script error left is the repo module's `new Date().getFullYear()`/`getDate`
+  call (next entry). Worker 17485 -> 32930 ms on the day's link (74 KB/s to
+  githubassets - see the note at the end of this entry), so the timing is not
+  the signal; the error moving is.
+
+### A note on the remaining wall-clock time
+
+`curl` against `githubassets.com` from this host measures 74 KB/s and ~1 s to
+first byte, so the page's ~3.5 MB of CSS/JS costs ~25 s of *network* no matter
+what the engine does. A warm-cache run of the same page executes the same
+modules in ~3.2 s of script time (core 0.6-2.1 s, code-view 1.0-1.1 s). That is
+why the entries below quote error movement rather than total page time.
+
 
 
 

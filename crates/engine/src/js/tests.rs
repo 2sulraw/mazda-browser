@@ -5292,6 +5292,25 @@ fn regex_emoji_property_escapes() {
 }
 
 #[test]
+fn regex_connector_punctuation_property_escape() {
+    // The issues page's "word character" class is
+    // `[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]/gu`;
+    // the unknown name made the whole structured-issues module a SyntaxError.
+    assert!(boolean(r"/^\p{Connector_Punctuation}$/u.test('_')"));
+    assert!(boolean(r"/^\p{Connector_Punctuation}$/u.test(String.fromCharCode(0x203F))"));
+    assert!(boolean(r"/^\p{Pc}$/u.test(String.fromCharCode(0xFF3F))"));
+    assert!(!boolean(r"/\p{Connector_Punctuation}/u.test('-')"));
+    assert!(!boolean(r"/\p{Pc}/u.test('a')"));
+    // the class the bundle builds compiles and excludes a space
+    assert!(boolean(
+        r"/[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]/u.test(' ')"
+    ));
+    assert!(!boolean(
+        r"/[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]/u.test('a_1')"
+    ));
+}
+
+#[test]
 fn regex_bidi_control_property_escape() {
     // GitHub's code-view bundle classifies bidi controls with
     // /[\p{Bidi_Control}…]/u to render source files; the unknown property

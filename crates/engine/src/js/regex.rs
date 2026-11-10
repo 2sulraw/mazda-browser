@@ -122,6 +122,9 @@ pub(crate) enum PropKind {
     EmojiModifier,
     /// `\p{Bidi_Control}` - the bidirectional-formatting controls
     BidiControl,
+    /// `\p{Pc}` / `\p{Connector_Punctuation}` - the ten connector
+    /// punctuation code points (underscore and its presentation forms).
+    ConnectorPunctuation,
     /// `\p{M}` / `\p{Mn}` / `\p{Mc}` / `\p{Me}` — combining marks.
     /// shortcut: the engine has no Unicode tables, so the three mark
     /// subcategories are not distinguished; all of them answer from the same
@@ -767,6 +770,10 @@ fn prop_kind(name: &str) -> Option<PropKind> {
         // `\p{Mn}`, `\p{Mc}`, `\p{Me}` and their union
         "M" | "Mark" | "Mn" | "Nonspacing_Mark" | "Mc" | "Spacing_Mark" | "Me"
         | "Enclosing_Mark" => PropKind::Mark,
+        // the issues page's "word character" class is
+        // `[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]`,
+        // and the whole structured-issues module was a SyntaxError without it
+        "Pc" | "Connector_Punctuation" => PropKind::ConnectorPunctuation,
         _ => return None,
     })
 }
@@ -804,6 +811,12 @@ fn prop_matches(kind: PropKind, ch: char) -> bool {
         PropKind::BidiControl => matches!(
             ch as u32,
             0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+        ),
+        // exact: the Unicode general category Pc is a closed list, and the
+        // engine's `char` predicates have no connector test
+        PropKind::ConnectorPunctuation => matches!(
+            ch as u32,
+            0x005F | 0x203F | 0x2040 | 0x2054 | 0xFE33 | 0xFE34 | 0xFE4D..=0xFE4F | 0xFF3F
         ),
         // honest shortcut: the Unicode `Emoji` property is approximated by
         // the symbol/pictograph blocks (and the keycap bases). The splitter
