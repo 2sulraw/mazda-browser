@@ -3432,6 +3432,34 @@ is in a document.
   (next entry). Script exec time rose from 5.0 s to 6.3 s because the
   callbacks are now doing real work.
 
+## `ownerDocument` (P38, 2026-11-10)
+
+The first `connectedCallback` to run threw immediately:
+
+```
+custom element <tool-tip>: connectedCallback threw
+Uncaught TypeError: Cannot read property 'getElementById' of undefined
+(at 136:402 of pb-*.js)
+```
+
+That column is the `<tool-tip>` `control` getter:
+
+```js
+get control() { return this.ownerDocument.getElementById(this.htmlFor); }
+```
+
+`ownerDocument` existed nowhere on the wrapper, so the lookup itself threw
+before `getElementById` was even reached.
+
+- `DomHost::node_owner_document` isn't needed: every node in this arena belongs
+  to the one document, which is the global `document` object. The getter
+  (`E_OWNER_DOCUMENT`) returns `globalThis.document`, so
+  `el.ownerDocument === document` is true.
+- exposed on element wrappers and on character data (text/comment) wrappers.
+- engine tests **1001 -> 1002** green (new `nodes_have_an_owner_document`).
+- github.com cold load: the `<tool-tip>` callback completes; the next throw is
+  `<relative-time>`'s `Date.parse` (next entry).
+
 
 
 

@@ -388,6 +388,9 @@ fn build_element(node: u32) -> Val {
     o.set("childNodes", lazy_native_attr(n.node_child_nodes));
     o.set("children", lazy_native_attr(n.node_children));
     o.set("dataset", lazy_native_attr(n.node_dataset));
+    // `this.ownerDocument.getElementById(...)` — GitHub's `<tool-tip>` reads
+    // the `for` target that way from `connectedCallback`
+    o.set("ownerDocument", lazy_native_attr(n.node_owner_document));
     o.set("removeChild", js::Val::Native(n.node_remove_child));
     o.set("insertBefore", js::Val::Native(n.node_insert_before));
     o.set("cloneNode", js::Val::Native(n.node_clone));
@@ -750,6 +753,8 @@ struct Nids {
     node_children: usize,
     node_clone: usize,
     node_dataset: usize,
+    /// `Node.ownerDocument` (the same object as the global `document`)
+    node_owner_document: usize,
     /// `form.elements` (a live controls collection)
     el_form_elements: usize,
     /// shared `item`/`namedItem` native for live collections
@@ -1111,6 +1116,8 @@ const E_REPLACE_CHILDREN: u16 = 59;
 const E_ATTACH_SHADOW: u16 = 60;
 /// `Element.shadowRoot` (getter) — the `attachShadow` root, or null
 const E_SHADOW_ROOT: u16 = 61;
+/// `Node.ownerDocument` (getter) — the page's document object
+const E_OWNER_DOCUMENT: u16 = 62;
 /// `window.removeEventListener(type, cb)` (document shares the bucket)
 const W_REMOVE_LISTENER: u16 = 53;
 /// `customElements` group idxs
@@ -1384,6 +1391,11 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
             .with(|m| m.borrow().get(&node).cloned())
             .map(|(frag, _)| shadow_root_wrap(node, frag))
             .unwrap_or(Val::Null)),
+        // the page's document object is the global; every node belongs to it
+        E_OWNER_DOCUMENT => Ok(match e.global_object() {
+            Val::Obj(g) => js::obj_get_own(&g, "document"),
+            _ => Val::Null,
+        }),
         E_PREPEND | E_APPEND | E_BEFORE | E_AFTER | E_REPLACE_WITH | E_REPLACE_CHILDREN => {
             let nodes = arg_nodes(args);
             insert_children(e, node, idx, &nodes);
@@ -1540,6 +1552,7 @@ fn wrap_char_data(node: u32) -> Val {
     }));
     o.set("data", data.clone());
     o.set("textContent", data);
+    o.set("ownerDocument", lazy_native_attr(n.node_owner_document));
     o.set(
         "parentNode",
         Val::Acc(Rc::new(js::AccEntry {
@@ -3407,6 +3420,7 @@ impl PageScripts {
             node_remove_child: engine.register_native("Node.removeChild", n_node, N_REMOVE_CHILD),
             node_insert_before: engine.register_native("Node.insertBefore", n_node, N_INSERT_BEFORE),
             node_dataset: engine.register_native("HTMLElement.dataset", n_node, N_DATASET),
+            node_owner_document: engine.register_native("Node.ownerDocument", el_native, E_OWNER_DOCUMENT),
             cls_add: engine.register_native("Element.classList.add", el_native, E_CLASS_ADD),
             cls_remove: engine.register_native("Element.classList.remove", el_native, E_CLASS_REMOVE),
             cls_toggle: engine.register_native("Element.classList.toggle", el_native, E_CLASS_TOGGLE),
@@ -4380,6 +4394,25 @@ mod tests {
         );
         let _ = ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "t"), "BODY,DIV,SPAN");
+    }
+
+    #[test]
+    fn nodes_have_an_owner_document() {
+        // GitHub's `<tool-tip>` resolves its `for` target with
+        // `this.ownerDocument.getElementById(...)` from connectedCallback;
+        // `ownerDocument` was undefined, so the whole callback threw.
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d"></div><script>
+                var el = document.getElementById("d");
+                window.same = el.ownerDocument === document;
+                window.found = el.ownerDocument.getElementById("d").id;
+                window.txt = document.createTextNode("x").ownerDocument === document;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "same"), "true");
+        assert_eq!(get_global_str(&mut ps, "found"), "d");
+        assert_eq!(get_global_str(&mut ps, "txt"), "true");
     }
 
     #[test]
