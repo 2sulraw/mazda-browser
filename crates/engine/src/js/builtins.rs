@@ -416,6 +416,10 @@ pub(crate) fn install(e: &mut JsEngine) {
     let pf = e.register_native("parseFloat", n_num_globals, 1);
     let ie = e.register_native("isNaN", n_num_globals, 2);
     let ifn = e.register_native("isFinite", n_num_globals, 3);
+    // `Number.isNaN` is the strict form (no coercion): `Number.isNaN("NaN")`
+    // is false. GitHub's relative-time uses it to test a `Date.parse` result.
+    let n_num_is_nan = e.register_native("Number.isNaN", n_num_globals, 4);
+    e.set_native_prop(num_id, "isNaN", Val::Native(n_num_is_nan));
     e.set_global("parseInt", Val::Native(pi));
     e.set_global("parseFloat", Val::Native(pf));
     e.set_global("isNaN", Val::Native(ie));
@@ -3046,6 +3050,7 @@ fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
 
 fn n_num_globals(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     Ok(match idx {
+        4 => Val::Bool(matches!(args.first(), Some(Val::Num(n)) if n.is_nan())),
         0 => {
             let s = args.first().map_or("".to_string(), |v| v.to_string());
             let s = s.trim();

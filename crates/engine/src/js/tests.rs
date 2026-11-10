@@ -1429,6 +1429,12 @@ fn primitive_and_function_prototypes_exist() {
     assert!(boolean("Number.MAX_SAFE_INTEGER === 9007199254740991"));
     assert!(boolean("Number.MIN_SAFE_INTEGER === -9007199254740991"));
     assert!(boolean("Number.EPSILON > 0 && Number.EPSILON < 1e-15"));
+    // Number.isNaN is the strict form: no coercion, so a numeric string is not
+    assert!(boolean("Number.isNaN(NaN)"));
+    assert!(boolean("Number.isNaN(0 / 0)"));
+    assert!(boolean("!Number.isNaN('NaN')"));
+    assert!(boolean("!Number.isNaN(0)"));
+    assert!(boolean("!Number.isNaN()"));
     assert_eq!(
         string("Function.prototype.call.call(function (a) { return a; }, null, 4)"),
         "4"

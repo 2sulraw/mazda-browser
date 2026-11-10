@@ -3493,6 +3493,29 @@ evaluate, so a nested call can be reported under the wrong column.)
 - github.com cold load: `Date.parse` returns, and the same getter now fails on
   the *next* call in that line — `Number.isNaN` is missing (next entry).
 
+## `Number.isNaN` (P40, 2026-11-10)
+
+`<relative-time>`'s `date` getter has two calls on one line, and the second one
+was missing too:
+
+```js
+get date(){ let e = Date.parse(this.datetime); return Number.isNaN(e) ? null : new Date(e); }
+```
+
+`Number` only carried its value constants, so `Number.isNaN` was undefined and
+the getter threw again.
+
+- `Number.isNaN` is the spec's strict form: true only for a Number that is NaN,
+  so `Number.isNaN("NaN")` and `Number.isNaN()` are false (the global `isNaN`
+  still coerces).
+- reached through a new `n_num_globals` index, installed as an own property of
+  the `Number` native.
+- engine tests stay at **1003** (the new assertions extend the existing
+  `primitive_and_function_prototypes_exist` test rather than adding one).
+- github.com cold load: `<relative-time>` connects and renders; the next throw
+  is `<react-app>`'s `connectedCallback` calling `toggleAttribute` (next
+  entry).
+
 
 
 
