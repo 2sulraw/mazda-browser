@@ -2615,6 +2615,7 @@ fn match_obj(
     input: &[char],
     m: &regex::MatchVal,
     with_index: bool,
+    names: &[(String, usize)],
 ) -> Result<Val, JsError> {
     let n_groups = m.caps.len() / 2 - 1;
     let mut items: Vec<Val> = Vec::with_capacity(n_groups + 1);
@@ -2632,6 +2633,23 @@ fn match_obj(
         // `input` as the original string
         let s: String = input.iter().collect();
         obj_set_own(&ab, "input", Val::from(s));
+        // `groups`: one property per `(?<name>...)`, absent when the pattern
+        // has no named group (the spec says `undefined` then)
+        let groups = if names.is_empty() {
+            Val::Undefined
+        } else {
+            let g = Val::new_object();
+            let go = obj_of(&g);
+            for (name, gi) in names {
+                let v = match m.caps.get(2 * gi + 1).copied().flatten() {
+                    Some((s, en)) => Val::from(input[s..en].iter().collect::<String>()),
+                    None => Val::Undefined,
+                };
+                obj_set_own(&go, name, v);
+            }
+            g
+        };
+        obj_set_own(&ab, "groups", groups);
     }
     let _ = e;
     Ok(arr)
@@ -2781,7 +2799,7 @@ pub(crate) fn call_method(
                 Ok(if out.is_empty() { Val::Null } else { Val::new_array(out) })
             } else {
                 match re.find(&chars, 0) {
-                    Some(mm) => Ok(match_obj(e, &chars, &mm, true)?),
+                    Some(mm) => Ok(match_obj(e, &chars, &mm, true, &re.names)?),
                     None => Ok(Val::Null),
                 }
             }
@@ -2798,7 +2816,7 @@ pub(crate) fn call_method(
             while pos <= chars.len() {
                 match scan_first(&re, &chars, pos) {
                     Some(rr) => {
-                        out.push(match_obj(e, &chars, &rr, true)?);
+                        out.push(match_obj(e, &chars, &rr, true, &re.names)?);
                         pos = if rr.end > rr.start { rr.end } else { rr.end + 1 };
                     }
                     None => break,
@@ -3036,7 +3054,7 @@ pub(crate) fn call_method(
                     if m == RegexTest {
                         Ok(Val::Bool(true))
                     } else {
-                        Ok(match_obj(e, &chars, &mm, true)?)
+                        Ok(match_obj(e, &chars, &mm, true, &re.names)?)
                     }
                 }
                 None => {

@@ -2203,6 +2203,27 @@ fn regex_replace_function_replacer() {
 }
 
 #[test]
+fn regex_named_capture_groups() {
+    // the pattern from GitHub's react-core bundle
+    assert!(boolean(r"/Minified React error #(?<invariant>\d+)/.test('Minified React error #418')"));
+    // the group is numbered like a plain capture and shows up in `groups`
+    assert_eq!(
+        string(r"(() => { const m = /(?<y>\d{4})-(?<mo>\d{2})/.exec('2026-10'); return m.groups.y + '/' + m.groups.mo; })()"),
+        "2026/10"
+    );
+    // `\k<name>` is the same backreference as `\1`
+    assert!(boolean(r"/(?<w>ab)\k<w>/.test('abab') && !/(?<w>ab)\k<w>/.test('abac')"));
+    // a named group keeps its number for positional access too
+    assert_eq!(string(r"/(?<a>x)(y)/.exec('xy')[2]"), "y");
+    // no named group: `groups` is undefined, not an empty object
+    assert!(boolean(r"/x/.exec('x').groups === undefined"));
+    // duplicate names and unknown names are syntax errors, and a `new
+    // RegExp` error is catchable (bundles probe with try/catch)
+    assert!(boolean(r"(() => { try { new RegExp('(?<a>x)(?<a>y)') } catch (e) { return e instanceof SyntaxError } return false })()"));
+    assert!(boolean(r"(() => { try { new RegExp('\\k<nope>') } catch (e) { return e instanceof SyntaxError } return false })()"));
+}
+
+#[test]
 fn regex_flags() {
     assert!(boolean("/HELLO/i.test('hello')"));
     assert!(!boolean("/HELLO/.test('hello')"));
@@ -2306,7 +2327,7 @@ fn performance_now_is_a_monotonic_clock() {
 fn regex_unsupported_syntax_is_clean_error() {
     assert!(matches!(err("'x'.replace(/(?<=a)b/, '')"), JsError::Syntax { .. }));
     assert!(matches!(err("/\\p{L}/u"), JsError::Syntax { .. }));
-    assert!(matches!(err("/(?<name>a)/"), JsError::Syntax { .. }));
+    assert!(matches!(err("/(?<1bad>a)/"), JsError::Syntax { .. }));
     assert!(matches!(err("/[unclosed/"), JsError::Syntax { .. }));
     assert!(matches!(err("/a+/q"), JsError::Syntax { .. })); // bad flag
 }

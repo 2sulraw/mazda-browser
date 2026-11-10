@@ -2738,3 +2738,33 @@ description), so no `Val`/`Obj` representation changed.
 - engine tests **965** green (assertions added to
   `primitive_and_function_prototypes_exist`: registry identity, `keyFor`,
   stringification of a registered symbol).
+
+## Named capture groups (P12, 2026-11-10)
+
+`react-core` then died on its second regex: `/Minified React error
+#(?<invariant>\d+)/`. The parser rejected every `(?<` as "lookbehind / named
+groups are not supported", so the whole React core module failed to parse and
+the page's interactive bundle never ran.
+
+- `(?<name>...)` is a capture group with the next number, exactly like `(`;
+  the name table rides on the compiled `Regex`.
+- `\k<name>` compiles to the same `Backref` as `\1`.
+- A match result now carries `groups` (one property per name, `undefined` for a
+  group that did not participate, and `undefined` -- not `{}` -- when the
+  pattern has no names). `exec`, `match`, and `matchAll` all go through the
+  same `match_obj`.
+- Rejected honestly: duplicate names, empty/invalid names, and an unknown
+  `\k<name>`; `new RegExp` keeps those catchable (`try { new
+  RegExp("(?<a>x)(?<a>y)") } catch {}`).
+- Still gaps, documented: lookbehind (`(?<=`/`(?<!`) has its own error now, and
+  `$<name>` in a `replace` template is not substituted yet.
+
+### Measured
+
+- github.com: the `react-core` `SyntaxError` is gone. The page now reaches two
+  new gaps instead: "Cannot use `in` operator on function" (from
+  `wp-runtime-*.js`) and `\p{L}` unicode property escapes in `wgy-*.js`.
+- `[time] scripts` exec on this run: 744 ms (the 2.4 MB landing bundle now
+  parses and runs instead of aborting at its first regex).
+- engine tests **966** green (new `regex_named_capture_groups`; the unsupported
+  syntax test now uses an invalid name rather than a valid named group).

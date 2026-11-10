@@ -105,6 +105,8 @@ pub(crate) struct Regex {
     first_char: Option<char>,
     /// number of capture groups (excluding the whole match slot)
     pub n_groups: usize,
+    /// named capture groups: `(name, group number)`, for `match.groups`
+    pub names: Vec<(String, usize)>,
 }
 
 impl Regex {
@@ -155,6 +157,8 @@ struct PatParser {
     c: Vec<char>,
     i: usize,
     group: usize,
+    /// `(?<name>...)` name -> group number, in pattern order
+    names: Vec<(String, usize)>,
     multiline: bool,
     dot_all: bool,
 }
@@ -328,9 +332,26 @@ impl PatParser {
                             Ok(Node::Look(true, Box::new(inner)))
                         }
                         Some('<') => {
-                            // honest gap: lookbehind (and named groups,
-                            // which share its syntax) are not supported
-                            rerr("lookbehind / named groups are not supported")
+                            // `(?<=` / `(?<!` are lookbehind (still a gap);
+                            // `(?<name>` is a named capture group, numbered
+                            // exactly like a plain `(`
+                            self.i += 1;
+                            if matches!(self.peek(), Some('=') | Some('!')) {
+                                return rerr("lookbehind is not supported");
+                            }
+                            let name = self.group_name()?;
+                            if self.names.iter().any(|(n, _)| n == &name) {
+                                return rerr(&format!("duplicate capture group name `{name}`"));
+                            }
+                            let g = self.group + 1;
+                            if g > MAX_GROUPS {
+                                return rerr("too many capture groups");
+                            }
+                            self.group = g;
+                            self.names.push((name, g));
+                            let inner = self.alt()?;
+                            self.expect_rparen()?;
+                            Ok(Node::Group(g, Box::new(inner)))
                         }
                         _ => rerr("unsupported group (?...)"),
                     }
@@ -379,6 +400,34 @@ impl PatParser {
         } else {
             rerr("unbalanced group")
         }
+    }
+
+    /// `name>` after `(?<` or `\k<`: an identifier-like name (letters, `_`,
+    /// `$`, non-ASCII alphanumerics; digits only after the first char).
+    fn group_name(&mut self) -> Result<String, RegexError> {
+        let mut name = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return rerr("unterminated capture group name");
+            };
+            if c == '>' {
+                self.i += 1;
+                break;
+            }
+            let first = name.is_empty();
+            let ok = c == '_'
+                || c == '$'
+                || if first { c.is_alphabetic() } else { c.is_alphanumeric() };
+            if !ok {
+                return rerr("invalid capture group name");
+            }
+            name.push(c);
+            self.i += 1;
+        }
+        if name.is_empty() {
+            return rerr("empty capture group name");
+        }
+        Ok(name)
     }
 
     fn escape(&mut self) -> Result<Node, RegexError> {
@@ -453,6 +502,26 @@ impl PatParser {
                     return rerr("backref to a group that does not exist yet");
                 }
                 A::Backref(n as usize)
+            }
+            'k' => {
+                // `\k<name>`: named backreference. Forward references (a name
+                // defined later in the pattern) are valid JS but stay a gap
+                // here, like the numeric backref rule above.
+                if self.peek() == Some('<') {
+                    self.i += 1;
+                    let name = self.group_name()?;
+                    let g = self
+                        .names
+                        .iter()
+                        .find(|(n, _)| n == &name)
+                        .map(|(_, g)| *g)
+                        .ok_or_else(|| RegexError {
+                            msg: format!("backref to an unknown group name `{name}`"),
+                        })?;
+                    A::Backref(g)
+                } else {
+                    A::Char('k') // Annex B identity escape
+                }
             }
             c if c.is_ascii_alphanumeric() => {
                 return rerr(&format!("unsupported escape `\\{}` in pattern", c));
@@ -830,6 +899,7 @@ pub(crate) fn compile(src: &str, flags: &str) -> Result<Regex, RegexError> {
         c: src.chars().collect(),
         i: 0,
         group: 0,
+        names: Vec::new(),
         multiline,
         dot_all,
     };
@@ -846,6 +916,7 @@ pub(crate) fn compile(src: &str, flags: &str) -> Result<Regex, RegexError> {
         prog,
         first_char,
         n_groups: p.group,
+        names: p.names,
     })
 }
 
