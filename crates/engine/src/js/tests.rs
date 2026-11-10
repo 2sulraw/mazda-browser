@@ -5164,6 +5164,46 @@ fn regex_mark_property_escapes() {
 }
 
 #[test]
+fn regex_script_property_escapes() {
+    // GitHub's code-view confusable/homograph check names scripts directly:
+    // /\p{Script=Greek}/u, /\p{Script=Han}/u, … Every one was an
+    // unsupported property escape, so the module never compiled.
+    for (script, ch) in [
+        ("Greek", '\u{3B1}'),      // α
+        ("Hebrew", '\u{5D0}'),     // א
+        ("Arabic", '\u{627}'),     // ا
+        ("Syriac", '\u{710}'),     // ܐ
+        ("Thaana", '\u{780}'),     // ހ
+        ("Mandaic", '\u{840}'),    // ࡀ
+        ("Hiragana", '\u{3072}'),  // ひ
+        ("Katakana", '\u{30AB}'),  // カ
+        ("Han", '\u{6F22}'),       // 漢
+    ] {
+        assert!(
+            boolean(&format!(
+                "/^\\p{{Script={script}}}$/u.test(String.fromCharCode(0x{:X}))",
+                ch as u32
+            )),
+            "\\p{{Script={script}}} should match U+{:04X}",
+            ch as u32
+        );
+    }
+    // latin text belongs to none of them
+    assert!(!boolean(r"/\p{Script=Greek}/u.test('a')"));
+    assert!(!boolean(r"/\p{Script=Han}/u.test('a')"));
+    // short property and value forms, plus the negated form
+    assert!(boolean(
+        r"/\p{sc=Greek}/u.test(String.fromCharCode(0x3B1))"
+    ));
+    assert!(boolean(
+        r"/\p{scx=Han}/u.test(String.fromCharCode(0x6F22))"
+    ));
+    assert!(boolean(r"/\P{Script=Greek}/u.test('a')"));
+    // an unlisted script is still an honest compile error
+    err("/\\p{Script=Ogham}/u");
+}
+
+#[test]
 fn regex_unicode_escape_at_class_range_bound() {
     // The splitter's tag-sequence class is `[\u{E0020}-\u{E007E}]`: the
     // range's upper bound used the fixed `\uXXXX` form only, so a `{...}`

@@ -127,6 +127,18 @@ pub(crate) enum PropKind {
     /// subcategories are not distinguished; all of them answer from the same
     /// combining-mark block list (`MARK_RANGES`).
     Mark,
+    /// `\p{Script=…}` — the scripts GitHub's confusable check asks for.
+    /// shortcut: script membership is the script's Unicode BLOCK (see
+    /// `script_matches`), not the per-character Script property.
+    Greek,
+    Hebrew,
+    Arabic,
+    Syriac,
+    Thaana,
+    Mandaic,
+    Hiragana,
+    Katakana,
+    Han,
 }
 /// capture snapshot: caps\[i\] = Some((start_char, end_char));
 /// caps\[0\]/caps\[1\] are the whole match. Copy-on-write via Rc.
@@ -725,6 +737,15 @@ fn match_char_escape() -> RegexError {
 
 /// The property names accepted by `\p{...}` (long and short forms).
 fn prop_kind(name: &str) -> Option<PropKind> {
+    // `\p{Script=Greek}` / `\p{sc=Greek}` (and the Script_Extensions alias,
+    // which this engine answers with the same block test). A property name
+    // with `=` is never a binary property.
+    if let Some((prop, value)) = name.split_once('=') {
+        return match prop {
+            "Script" | "sc" | "Script_Extensions" | "scx" => script_kind(value),
+            _ => None,
+        };
+    }
     Some(match name {
         "L" | "Letter" => PropKind::Letter,
         "Lu" | "Uppercase_Letter" => PropKind::Upper,
@@ -746,6 +767,24 @@ fn prop_kind(name: &str) -> Option<PropKind> {
         // `\p{Mn}`, `\p{Mc}`, `\p{Me}` and their union
         "M" | "Mark" | "Mn" | "Nonspacing_Mark" | "Mc" | "Spacing_Mark" | "Me"
         | "Enclosing_Mark" => PropKind::Mark,
+        _ => return None,
+    })
+}
+
+/// Script values accepted by `\p{Script=…}`: the ISO 15924 short tag and the
+/// long name. The set is exactly what GitHub's code-view confusable check
+/// asks for; an unlisted script is an honest compile error.
+fn script_kind(v: &str) -> Option<PropKind> {
+    Some(match v {
+        "Greek" | "Grek" => PropKind::Greek,
+        "Hebrew" | "Hebr" => PropKind::Hebrew,
+        "Arabic" | "Arab" => PropKind::Arabic,
+        "Syriac" | "Syrc" => PropKind::Syriac,
+        "Thaana" | "Thaa" => PropKind::Thaana,
+        "Mandaic" | "Mand" => PropKind::Mandaic,
+        "Hiragana" | "Hira" => PropKind::Hiragana,
+        "Katakana" | "Kana" => PropKind::Katakana,
+        "Han" | "Hani" => PropKind::Han,
         _ => return None,
     })
 }
@@ -773,7 +812,47 @@ fn prop_matches(kind: PropKind, ch: char) -> bool {
         // shortcut: `Mn`/`Mc`/`Me` share one combining-mark block list, so a
         // spacing mark answers true for `\p{Mn}` too (see `PropKind::Mark`)
         PropKind::Mark => MARK_RANGES.iter().any(|&(a, b)| (a..=b).contains(&ch)),
+        // script shortcuts: block membership, not the per-character property
+        PropKind::Greek => in_ranges(ch, &[('\u{0370}', '\u{03FF}'), ('\u{1F00}', '\u{1FFF}')]),
+        PropKind::Hebrew => in_ranges(ch, &[('\u{0590}', '\u{05FF}'), ('\u{FB1D}', '\u{FB4F}')]),
+        PropKind::Arabic => in_ranges(
+            ch,
+            &[
+                ('\u{0600}', '\u{06FF}'),
+                ('\u{0750}', '\u{077F}'),
+                ('\u{08A0}', '\u{08FF}'),
+                ('\u{FB50}', '\u{FDFF}'),
+                ('\u{FE70}', '\u{FEFF}'),
+                ('\u{1EE00}', '\u{1EEFF}'),
+            ],
+        ),
+        PropKind::Syriac => in_ranges(ch, &[('\u{0700}', '\u{074F}'), ('\u{0860}', '\u{086F}')]),
+        PropKind::Thaana => in_ranges(ch, &[('\u{0780}', '\u{07BF}')]),
+        PropKind::Mandaic => in_ranges(ch, &[('\u{0840}', '\u{085F}')]),
+        PropKind::Hiragana => in_ranges(ch, &[('\u{3040}', '\u{309F}')]),
+        PropKind::Katakana => in_ranges(
+            ch,
+            &[
+                ('\u{30A0}', '\u{30FF}'),
+                ('\u{31F0}', '\u{31FF}'),
+                ('\u{FF66}', '\u{FF9D}'),
+            ],
+        ),
+        PropKind::Han => in_ranges(
+            ch,
+            &[
+                ('\u{3400}', '\u{4DBF}'),
+                ('\u{4E00}', '\u{9FFF}'),
+                ('\u{F900}', '\u{FAFF}'),
+                ('\u{20000}', '\u{2EBEF}'),
+                ('\u{30000}', '\u{3134F}'),
+            ],
+        ),
     }
+}
+
+fn in_ranges(ch: char, ranges: &[(char, char)]) -> bool {
+    ranges.iter().any(|&(a, b)| (a..=b).contains(&ch))
 }
 
 /// The combining-mark blocks (`Mn` ∪ `Mc` ∪ `Me`), by script. Deliberately

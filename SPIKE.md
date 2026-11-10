@@ -3704,6 +3704,35 @@ declares all four forms: `\p{Mn}`, `\p{Mc}`, `\p{Me}` and the union
 - `github.com/rust-lang/rust`: the mark checks compile; the module chain now
   stops on `\p{Script=Greek}` (next entry).
 
+## `\p{Script=…}` (P47, 2026-11-10)
+
+With the marks known, the same confusable check named scripts directly:
+
+```
+[js] script error in code-view-*.js: dp-*.js:
+SyntaxError: /\p{Script=Greek}/u: unsupported unicode property escape \p{Script=Greek}
+```
+
+The module groups Greek, Hebrew, Arabic, Syriac, Thaana, Mandaic, Hiragana,
+Katakana and Han characters, and GitHub's own source files carry all nine.
+
+- `prop_kind` splits on `=` first: `Script` / `sc` / `Script_Extensions` /
+  `scx` go to `script_kind`, which accepts the long name and the ISO 15924 tag
+  for those nine scripts. A property name with `=` is never a binary property,
+  so the existing table is untouched.
+- shortcut: script membership is the script's Unicode **block** (plus the
+  presentation-form and supplementary blocks that script actually uses), not
+  the per-character Script property. Block granularity over-accepts a few
+  shared-block neighbours; every code point of the nine scripts is covered.
+- exactly nine scripts, not the full Unicode list: an unlisted value is still
+  an honest compile error, and the test pins that with `\p{Script=Ogham}`.
+- engine tests **1009 -> 1010** green (new `regex_script_property_escapes`:
+  one character per script, the Latin negative, the `sc=` / `scx=` short forms
+  and the `\P{…}` negation).
+- `github.com/rust-lang/rust`: the code-view module compiles and the protobuf
+  descriptor builder inside `4u-*.js` runs for real for the first time
+  (next entry).
+
 
 
 
