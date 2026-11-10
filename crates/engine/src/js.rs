@@ -4172,6 +4172,17 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
 /// every other primitive throws the operator's TypeError.
 pub(crate) fn has_member(e: &JsEngine, v: &Val, key: &str) -> Result<bool, JsError> {
     Ok(match v {
+        // a callable object (`Object`, `Array` are plain objects with a
+        // hidden `__call`) is a function for `in` too: it owns `name`/
+        // `length` and inherits Function.prototype
+        Val::Obj(o) if o.borrow().props.iter().any(|(k, _)| &**k == "__call") => {
+            key == "name"
+                || key == "length"
+                || e.chain_has(o, key)
+                || e.function_proto
+                    .as_ref()
+                    .is_some_and(|fp| e.chain_has(fp, key))
+        }
         Val::Obj(o) => e.chain_has(o, key),
         // functions are objects: `"name" in f`, `"prototype" in f`
         Val::Func(c) => {
@@ -4193,10 +4204,29 @@ pub(crate) fn has_member(e: &JsEngine, v: &Val, key: &str) -> Result<bool, JsErr
                     }
                 }
             }
+            // every function inherits Function.prototype (`"call" in f`)
             found
+                || e.function_proto
+                    .as_ref()
+                    .is_some_and(|fp| e.chain_has(fp, key))
         }
         // `"0" in "abc"` -> true (index/length/method names)
         Val::Str(s) => key == "length" || key.parse::<usize>().ok().and_then(|i| s.chars().nth(i)).is_some(),
+        // built-in functions are objects too: every function has `name` and
+        // `length`, a constructor's statics live on the native side table,
+        // and the rest inherits from Function.prototype
+        Val::Native(id) => {
+            key == "name"
+                || key == "length"
+                || e.native_prop(*id, key).is_some()
+                || (Some(*id) == e.import_native && key == "meta")
+                || e.function_proto
+                    .as_ref()
+                    .is_some_and(|fp| e.chain_has(fp, key))
+        }
+        // built-in methods are callable: they answer the Function.prototype
+        // surface (`"call" in [].push`), nothing more
+        Val::Method(_) => matches!(key, "name" | "length" | "call" | "apply" | "bind" | "toString"),
         _ => {
             return Err(JsError::throw(&format!(
                 "TypeError: Cannot use `in` operator on {}",

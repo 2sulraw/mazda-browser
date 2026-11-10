@@ -1097,6 +1097,19 @@ fn in_operator_accepts_function_objects() {
     assert!(boolean("'name' in function f() {}"));
     assert!(boolean("'prototype' in function f() {}"));
     assert!(!boolean("'nope' in function f() {}"));
+    // built-ins are function objects too: the WordPress runtime does
+    // `… in someNative` capability probes
+    assert!(boolean("'call' in Object"));
+    assert!(boolean("'apply' in Array"));
+    assert!(boolean("'name' in JSON.parse"));
+    assert!(boolean("'apply' in JSON.parse"));
+    assert!(boolean("'call' in function f() {}"));
+    // a method value answers the Function.prototype surface, not Object's
+    assert!(boolean("'apply' in JSON.parse.call"));
+    assert!(!boolean("'toUpperCase' in JSON.parse.call"));
+    assert!(!boolean("'nope' in JSON.parse"));
+    // ... and still throw on a primitive
+    assert!(matches!(err("'x' in 1"), JsError::Throw(_)));
 }
 
 #[test]

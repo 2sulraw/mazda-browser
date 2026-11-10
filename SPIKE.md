@@ -2768,3 +2768,27 @@ the page's interactive bundle never ran.
   parses and runs instead of aborting at its first regex).
 - engine tests **966** green (new `regex_named_capture_groups`; the unsupported
   syntax test now uses an invalid name rather than a valid named group).
+
+## `in` on built-in functions (P13, 2026-11-10)
+
+The next error from GitHub was from `wp-runtime-*.js`:
+`Uncaught TypeError: Cannot use \`in\` operator on function`. The engine only
+treated script closures as objects for `in`; every built-in
+(`Val::Native`, `Val::Method`) and every callable plain object (`Object`,
+`Array`) fell through to the operator's TypeError.
+
+- `Val::Native`: owns `name`/`length`, keeps its statics on the native side
+  table, and inherits the rest from `Function.prototype`.
+- `Val::Method`: answers the Function.prototype surface only.
+- A plain object with the hidden `__call` hook is a function for `in`: it owns
+  `name`/`length` and inherits `Function.prototype`.
+- Script closures now also see `Function.prototype` (`"call" in f`), not just
+  their own `prototype` object.
+
+### Measured
+
+- github.com: the `wp-runtime` `in` TypeError is gone; the next failure from
+  that bundle is a separate gap ("undefined is not a function"), and
+  `wgy-*.js` still stops at unicode property escapes.
+- engine tests **966** green (`in_operator_accepts_function_objects` extended
+  with native/method/callable-object cases and the primitive TypeError).
