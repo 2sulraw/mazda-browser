@@ -125,10 +125,24 @@ thread_local! {
 thread_local! {
     static OBSERVERS: RefCell<Vec<Val>> = const { RefCell::new(Vec::new()) };
     /// `customElements` definitions for the current page: `(tag, ctor)`.
-    /// Elements are *not* upgraded (see `n_custom_elements`), so this only
-    /// answers `get`/`whenDefined` — but its presence is what pages probe,
-    /// and a missing global is a ReferenceError that kills the module.
+    /// A definition upgrades the elements that already exist and every one
+    /// created afterwards (see `upgrade_custom_element`).
     static CUSTOM_ELEMENTS: RefCell<Vec<(String, Val)>> = const { RefCell::new(Vec::new()) };
+    /// Upgraded custom elements, keyed by arena node: the wrapper object the
+    /// page's constructor ran against. Real elements have identity (the same
+    /// object every time), so an upgraded element hands out this wrapper
+    /// instead of a fresh one; ordinary elements still get a wrapper per
+    /// access (the documented identity gap).
+    static CE_INSTANCES: RefCell<std::collections::HashMap<u32, Val>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// One note per page when an upgrade constructor throws (a broken
+    /// definition must not spam the log once per element).
+    static CE_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Elements whose constructor is running right now, innermost last. An
+    /// element's interface constructor (`HTMLElement`, via the ES5 adapter's
+    /// `Reflect.construct`) hands back the element under construction, exactly
+    /// like the spec's construction stack.
+    static CE_CONSTRUCTING: RefCell<Vec<Val>> = const { RefCell::new(Vec::new()) };
     /// Has this page already been told that IntersectionObserver never
     /// fires? Pages build several, and one note per page is enough.
     static IO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -260,6 +274,19 @@ const REFLECTED: &[(&str, &str)] = &[
 /// — the exact prop set both engines expose), then attach the method
 /// natives. Methods are `Val::Native` entries that read `__node` off `this`.
 fn wrap_element(node: u32) -> Val {
+    // an upgraded custom element is one object for the page: the page's
+    // constructor put its state on that object, and a fresh wrapper would
+    // lose it (and `el === document.getElementById(el.id)` would be false)
+    if let Some(w) = CE_INSTANCES.with(|m| m.borrow().get(&node).cloned()) {
+        return w;
+    }
+    build_element(node)
+}
+
+/// Build a fresh wrapper for `node` (the Element surface plus its interface
+/// chain). Callers that may be looking at a custom element go through
+/// [`wrap_element`], which returns the upgraded instance instead.
+fn build_element(node: u32) -> Val {
     let o = js::Val::new_object();
     o.set("__node", js::Val::Num(node as f64));
     let n = nids();
@@ -1055,7 +1082,7 @@ fn next_raf_id() -> f64 {
     })
 }
 
-fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn doc_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let sel = args.first().and_then(|v| v.as_string());
     match idx {
         D_GET_ELEMENT_BY_ID => {
@@ -1086,7 +1113,7 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
         }
         D_CREATE_ELEMENT => {
             let Some(tag) = sel else { return Ok(Val::Null) };
-            create_element(&tag)
+            create_element(e, &tag)
         }
         // `createElementNS(ns, "svg")`: only the local name reaches the arena
         // (tags are interned by name, no namespace column), so an SVG element
@@ -1097,7 +1124,7 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
             let Some(tag) = args.get(1).and_then(|v| v.as_string()) else {
                 return Ok(Val::Null);
             };
-            create_element(tag.rsplit(':').next().unwrap_or(&tag))
+            create_element(e, tag.rsplit(':').next().unwrap_or(&tag))
         }
         D_CREATE_FRAGMENT => match runtime::host_mut(|h| h.create_fragment()) {
             Some(id) => Ok(wrap_any(id)),
@@ -1135,11 +1162,16 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
 /// on demand, so any tag is legal) and wraps the orphan node. The arena push
 /// is split from wrapper construction so an unwrapped orphan node can never
 /// leak into script-visible state.
-fn create_element(tag: &str) -> Result<Val, JsError> {
+fn create_element(e: &mut JsEngine, tag: &str) -> Result<Val, JsError> {
     let tag = tag.to_ascii_lowercase();
     let made = runtime::host_mut(|h| h.create_element(&tag));
     match made {
-        Some(id) => Ok(wrap_element(id)),
+        Some(id) => {
+            // `document.createElement("my-box")` is already upgraded when the
+            // page defined `my-box`
+            upgrade_custom_element(e, id);
+            Ok(wrap_element(id))
+        }
         None => {
             eprintln!("[js] createElement: empty tag name");
             Ok(Val::Null)
@@ -1451,7 +1483,7 @@ fn wrap_char_data(node: u32) -> Val {
 /// Node-level natives: `Node.data` / `nodeType` / `parentNode` /
 /// `previousSibling` / `nextSibling` / `firstChild` / `removeChild` /
 /// `insertBefore`, plus `dataset` on element wrappers.
-fn n_node(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_node(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let node = this_node(this)?;
     Ok(match idx {
         N_DATA_GET => runtime::host(|h| h.node_data(node))
@@ -1499,7 +1531,12 @@ fn n_node(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
             // listeners, values or wrapper identity (same as the spec)
             let deep = args.first().map(|v| v.to_bool()).unwrap_or(false);
             match runtime::host_mut(|h| h.clone_node(node, deep)) {
-                Some(c) => wrap_any(c),
+                Some(c) => {
+                    // a cloned custom element is a new element: its
+                    // constructor runs again (spec: "upgrade" the copy)
+                    upgrade_custom_element(e, c);
+                    wrap_any(c)
+                }
                 None => Val::Null,
             }
         }
@@ -2002,7 +2039,25 @@ const SVG_TAGS: [&str; 26] = [
 /// `new Element()` / `new Node()`: the spec marks these interfaces as illegal
 /// constructors, and every real node comes from the parser or
 /// `document.createElement`, so throwing is the honest answer.
-fn n_dom_ctor(_e: &mut JsEngine, _idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+fn n_dom_ctor(_e: &mut JsEngine, _idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    // `class MyBox extends HTMLElement { constructor() { super(); … } }`
+    // calls this native with the element that is already being upgraded as
+    // `this`; the interface has no constructor body, so the element itself is
+    // the only honest return value. Any other call (`new HTMLElement()`) has
+    // no element behind it and stays illegal.
+    if let Val::Obj(o) = this {
+        if matches!(js::obj_get_own(o, "__node"), Val::Num(_)) {
+            return Ok(this.clone());
+        }
+    }
+    // The ES5 custom-elements adapter rewrites `window.HTMLElement` into
+    // `function () { return Reflect.construct(BuiltIn, [], this.constructor) }`,
+    // so a transpiled element's `super()` lands here with a fresh `this`.
+    // Spec: the interface constructor returns the element on the definition's
+    // construction stack, i.e. the element being upgraded.
+    if let Some(w) = CE_CONSTRUCTING.with(|s| s.borrow().last().cloned()) {
+        return Ok(w);
+    }
     Err(JsError::throw("TypeError: Illegal constructor"))
 }
 
@@ -2117,11 +2172,9 @@ fn set_proto(v: &Val, proto: Option<Rc<RefCell<js::Obj>>>) {
 /// `window.customElements.get("file-attachment") || (… define(…) …)` at load;
 /// without the global that line is a ReferenceError and the bundle dies.
 ///
-/// shortcut: elements are **not** upgraded. This engine's element wrappers are
-/// plain objects built per access (no identity, no class instances), so a
-/// defined class never runs against an existing `<file-attachment>`; the
-/// definition is recorded so `get`/`whenDefined` answer truthfully and the
-/// page's own `document.createElement` path keeps working.
+/// `define` upgrades the elements that already have the tag (a page's parsed
+/// `<turbo-frame>`s) and [`upgrade_custom_element`] covers the ones created
+/// later. `upgrade(root)` is still a no-op: nothing in the wild calls it.
 fn install_custom_elements(e: &mut JsEngine, ids: Nids) {
     let ce = Val::new_object();
     ce.set("define", Val::Native(ids.ce_define));
@@ -2140,7 +2193,50 @@ fn ce_lookup(name: &str) -> Option<Val> {
     })
 }
 
-fn n_custom_elements(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+/// Upgrade `node` to its registered custom element.
+///
+/// A real custom element is an already-constructed `HTMLElement` whose
+/// prototype chain carries the page's class, and its constructor runs exactly
+/// once — when the definition arrives or when the element is created. The
+/// wrapper becomes that instance (`CE_INSTANCES`), so the page's methods,
+/// getters and instance fields all live on the object it gets back.
+fn upgrade_custom_element(e: &mut JsEngine, node: u32) {
+    if CE_INSTANCES.with(|m| m.borrow().contains_key(&node)) {
+        return;
+    }
+    let Some(tag) = runtime::host_opt(|h| h.tag_name(node)).flatten() else {
+        return;
+    };
+    let Some(ctor) = ce_lookup(&tag) else { return };
+    let w = build_element(node);
+    // the definition's prototype replaces the tag interface; it still chains
+    // to HTMLElement.prototype (the class was `extends HTMLElement`)
+    if let Ok(Val::Obj(proto)) = js::get_member(e, &ctor, "prototype") {
+        if let Val::Obj(o) = &w {
+            o.borrow_mut().proto = Some(proto);
+        }
+    }
+    // remember the instance before the constructor runs: a constructor that
+    // reads the element back (or creates another of the same tag) must see
+    // this same object
+    CE_INSTANCES.with(|m| {
+        m.borrow_mut().insert(node, w.clone());
+    });
+    // the constructor's `super()` reaches the interface native, which hands
+    // back this element (the spec's construction stack)
+    CE_CONSTRUCTING.with(|s| s.borrow_mut().push(w.clone()));
+    let r = e.call(ctor, w, Vec::new());
+    CE_CONSTRUCTING.with(|s| s.borrow_mut().pop());
+    if let Err(err) = r {
+        // spec: a throwing constructor leaves the element as it is; it must
+        // not take the page down
+        if !CE_FAILED.with(|f| f.replace(true)) {
+            eprintln!("[js] custom element <{tag}>: constructor threw ({err})");
+        }
+    }
+}
+
+fn n_custom_elements(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let name = args.first().map(|v| v.to_string()).unwrap_or_default();
     match idx {
         CE_DEFINE => {
@@ -2160,9 +2256,11 @@ fn n_custom_elements(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> 
             let known = ce_lookup(&name).is_some();
             if !known {
                 CUSTOM_ELEMENTS.with(|c| c.borrow_mut().push((name.clone(), ctor)));
-                eprintln!(
-                    "[js] customElements.define({name:?}): defined, elements are not upgraded (shortcut)"
-                );
+                // a definition upgrades the elements that already exist
+                let existing = runtime::host(|h| h.by_tag(&name));
+                for n in existing {
+                    upgrade_custom_element(e, n);
+                }
             }
             Ok(Val::Undefined)
         }
@@ -2171,9 +2269,9 @@ fn n_custom_elements(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> 
             // spec keeps the promise pending until `define`; here the page
             // defines synchronously at load, so resolving either way is the
             // same observable order for the `await` in the wild
-            let p = _e.new_promise();
+            let p = e.new_promise();
             let v = ce_lookup(&name).unwrap_or(Val::Undefined);
-            js::settle_promise(_e, &p, Ok(v));
+            js::settle_promise(e, &p, Ok(v));
             Ok(Val::Obj(p))
         }
         _ => Ok(Val::Undefined),
@@ -3065,6 +3163,9 @@ impl PageScripts {
         // a fresh page starts with no observers and no mutation logging
         OBSERVERS.with(|o| o.borrow_mut().clear());
         CUSTOM_ELEMENTS.with(|c| c.borrow_mut().clear());
+        CE_INSTANCES.with(|m| m.borrow_mut().clear());
+        CE_FAILED.with(|f| f.set(false));
+        CE_CONSTRUCTING.with(|s| s.borrow_mut().clear());
         IO_NOTE.with(|n| n.set(false));
         RO_NOTE.with(|n| n.set(false));
         TEMPLATE_CONTENT.with(|m| m.borrow_mut().clear());
@@ -4361,6 +4462,99 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "upgraded"), "true");
         assert_eq!(get_global_str(&mut ps, "afterUpgrade"), "true");
         assert_eq!(get_global_str(&mut ps, "sub"), "true");
+    }
+
+    #[test]
+    fn es5_custom_element_adapter_can_construct_on_the_element_under_upgrade() {
+        // GitHub ships the custom-elements ES5 adapter, which replaces the
+        // global with `function () { return Reflect.construct(BuiltIn, [],
+        // this.constructor) }`. Spec: that call returns the element on the
+        // definition's construction stack, i.e. the element being upgraded.
+        let (mut dom, mut ps) = page(
+            r##"<html><body><my-box id="existing"></my-box><script>
+                var BuiltInHTMLElement = HTMLElement;
+                window.HTMLElement = function () {
+                    return Reflect.construct(BuiltInHTMLElement, [], this.constructor);
+                };
+                window.HTMLElement.prototype = BuiltInHTMLElement.prototype;
+                class MyBox extends HTMLElement {
+                    constructor() {
+                        super();
+                        this.kind = "box";
+                        this.id2 = this.getAttribute("id");
+                    }
+                    tag() { return this.tagName; }
+                }
+                customElements.define("my-box", MyBox);
+                var el = document.getElementById("existing");
+                window.kind = el.kind;
+                window.id2 = el.id2;
+                window.tag = el.tag();
+                window.instance = el instanceof MyBox;
+                // without an element under construction the interface is
+                // still illegal to construct
+                var illegal = false;
+                try { new HTMLElement(); } catch (e) { illegal = e instanceof TypeError; }
+                window.illegal = illegal;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "kind"), "box");
+        assert_eq!(get_global_str(&mut ps, "id2"), "existing");
+        assert_eq!(get_global_str(&mut ps, "tag"), "MY-BOX");
+        assert_eq!(get_global_str(&mut ps, "instance"), "true");
+        assert_eq!(get_global_str(&mut ps, "illegal"), "true");
+    }
+
+    #[test]
+    fn custom_elements_upgrade_existing_created_and_cloned() {
+        // a definition upgrades the parsed element; createElement and
+        // cloneNode upgrade the new ones. `super()` must return the element.
+        let (mut dom, mut ps) = page(
+            r##"<html><body><my-box id="existing"></my-box><div id="plain"></div><script>
+                window.made = 0;
+                class MyBox extends HTMLElement {
+                    constructor() {
+                        super();
+                        window.made++;
+                        this.kind = "box";
+                    }
+                    get label() { return "box:" + this.getAttribute("id"); }
+                    tag() { return this.tagName; }
+                }
+                customElements.define("my-box", MyBox);
+                var existing = document.getElementById("existing");
+                window.existingInstance = existing instanceof MyBox;
+                window.existingKind = existing.kind;
+                window.existingLabel = existing.label;
+                window.existingTag = existing.tag();
+                window.madeAfterDefine = window.made;
+                var created = document.createElement("my-box");
+                window.createdKind = created.kind;
+                window.createdIsInstance = created instanceof MyBox;
+                var copy = existing.cloneNode(true);
+                window.copyKind = copy.kind;
+                window.copyCount = window.made;
+                window.identity = document.getElementById("existing") === document.getElementById("existing");
+                window.plainClass = document.getElementById("plain") instanceof MyBox;
+                var illegal = false;
+                try { new HTMLElement(); } catch (e) { illegal = e instanceof TypeError; }
+                window.illegal = illegal;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "existingInstance"), "true");
+        assert_eq!(get_global_str(&mut ps, "existingKind"), "box");
+        assert_eq!(get_global_str(&mut ps, "existingLabel"), "box:existing");
+        assert_eq!(get_global_str(&mut ps, "existingTag"), "MY-BOX");
+        assert_eq!(get_global_str(&mut ps, "madeAfterDefine"), "1");
+        assert_eq!(get_global_str(&mut ps, "createdKind"), "box");
+        assert_eq!(get_global_str(&mut ps, "createdIsInstance"), "true");
+        assert_eq!(get_global_str(&mut ps, "copyKind"), "box");
+        assert_eq!(get_global_str(&mut ps, "copyCount"), "3");
+        assert_eq!(get_global_str(&mut ps, "identity"), "true");
+        assert_eq!(get_global_str(&mut ps, "plainClass"), "false");
+        assert_eq!(get_global_str(&mut ps, "illegal"), "true");
     }
 
     #[test]

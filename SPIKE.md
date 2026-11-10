@@ -3011,7 +3011,42 @@ Spec: a parameter is bound in the function's own environment. Now
 the last value, like sloppy duplicate parameters). Plain parameters already
 did this; destructured ones did not.
 
-- engine tests **982 → 983** green (new
+- engine tests **983 → 984** green (new
   `a_destructured_parameter_binds_in_the_call_frame`).
 - Next fatal error in `core-*.js`:
   `Cannot read property 'distance' of undefined`.
+
+## Custom elements are upgraded, and their interface constructor yields the element under construction (P21, 2026-11-10)
+
+`document.createElement("turbo-frame").delegate` was `undefined` because
+`customElements.define` only recorded the definition. Turbo's frame element is
+`class c extends HTMLElement { constructor() { super(); …; this.delegate = new
+c.delegateConstructor(this) } }`, so without an upgrade there is no delegate.
+
+Upgrading needs three pieces:
+
+1. **The instance is the wrapper.** `CE_INSTANCES: node → wrapper` caches the
+   object the page's constructor ran against; `wrap_element` hands it back
+   (ordinary elements still get a fresh wrapper per access). `define` upgrades
+   parsed elements, `createElement` and `cloneNode` upgrade new ones.
+2. **`super()` works.** The interface native gets the element as `this` (so
+   the wrapper's prototype can be the page's class) and returns it; `new
+   HTMLElement()` is still `TypeError: Illegal constructor`.
+3. **The ES5 adapter works.** GitHub ships
+   `custom-elements-es5-adapter.js`: it replaces the global with
+   `function () { return Reflect.construct(BuiltInHTMLElement, [],
+   this.constructor) }`. Spec: the interface constructor returns the element
+   on the definition's construction stack — the element being upgraded. The
+   engine keeps that stack in `CE_CONSTRUCTING`; with it empty, construction
+   is still illegal.
+
+Before both fixes the cold run died at
+`Cannot read property 'requestErrored' of object` (Turbo's frame element
+missing `delegate`).
+
+- engine tests **984 → 985** green (through P20; new
+  `custom_elements_upgrade_existing_created_and_cloned`,
+  `es5_custom_element_adapter_can_construct_on_the_element_under_upgrade`).
+- Next fatal error: `Cannot read property 'distance' of undefined`
+  (see P20 for the destructured-parameter rule it exposed).
+

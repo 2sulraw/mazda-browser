@@ -620,6 +620,19 @@ impl DomHost {
         crate::script::matches_simple(self.dom_ref(), node, sel)
     }
 
+    /// Tag name of an element node (`None` for character data / out of range),
+    /// used to decide whether a node is a defined custom element.
+    pub fn tag_name(&self, node: u32) -> Option<String> {
+        let dom = self.dom_ref();
+        if node as usize >= dom.nodes.len() {
+            return None;
+        }
+        match dom.nodes[node as usize].kind {
+            NodeKind::Element(..) => Some(dom.tag(node).to_string()),
+            _ => None,
+        }
+    }
+
     /// `getElementsByTagName`: every element with this tag in document order
     /// (`"*"` = all elements).
     pub fn by_tag(&self, name: &str) -> Vec<u32> {
