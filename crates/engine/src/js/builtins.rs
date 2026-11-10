@@ -457,6 +457,19 @@ pub(crate) fn install(e: &mut JsEngine) {
     // is false. GitHub's relative-time uses it to test a `Date.parse` result.
     let n_num_is_nan = e.register_native("Number.isNaN", n_num_globals, 4);
     e.set_native_prop(num_id, "isNaN", Val::Native(n_num_is_nan));
+    // The rest of the strict Number statics. GitHub's predicate library in
+    // `dp-*.js` calls `Number.isFinite` and `Number.isInteger` on every value
+    // it inspects, and both were missing, so the code-view module threw
+    // "undefined is not a function" while loading.
+    let n_num_is_int = e.register_native("Number.isInteger", n_num_globals, 5);
+    e.set_native_prop(num_id, "isInteger", Val::Native(n_num_is_int));
+    let n_num_is_finite = e.register_native("Number.isFinite", n_num_globals, 6);
+    e.set_native_prop(num_id, "isFinite", Val::Native(n_num_is_finite));
+    let n_num_is_safe = e.register_native("Number.isSafeInteger", n_num_globals, 7);
+    e.set_native_prop(num_id, "isSafeInteger", Val::Native(n_num_is_safe));
+    // the spec makes these the *same* function objects as the globals
+    e.set_native_prop(num_id, "parseInt", Val::Native(pi));
+    e.set_native_prop(num_id, "parseFloat", Val::Native(pf));
     e.set_global("parseInt", Val::Native(pi));
     e.set_global("parseFloat", Val::Native(pf));
     e.set_global("isNaN", Val::Native(ie));
@@ -3487,6 +3500,10 @@ fn n_convert(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
 fn n_num_globals(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     Ok(match idx {
         4 => Val::Bool(matches!(args.first(), Some(Val::Num(n)) if n.is_nan())),
+        5 => Val::Bool(matches!(args.first(), Some(Val::Num(n)) if n.is_finite() && n.fract() == 0.0)),
+        6 => Val::Bool(matches!(args.first(), Some(Val::Num(n)) if n.is_finite())),
+        7 => Val::Bool(matches!(args.first(), Some(Val::Num(n))
+            if n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0)),
         0 => {
             let s = args.first().map_or("".to_string(), |v| v.to_string());
             let s = s.trim();

@@ -3919,6 +3919,33 @@ i = RegExp(String.raw`\b(?:${words.split(" ").join("|")}):\S*`, "gi")
   worker 37207 -> 2532 ms. The next failure is in `dp-*.js` at 2:997 (next
   entry).
 
+## Strict `Number` statics (P54, 2026-11-11)
+
+With `String.raw` in place the code-view module loaded far enough to reach
+GitHub's predicate library, which threw at `dp-*.js` 2:997:
+
+```js
+function s(e){return Number.isFinite(e)}
+```
+
+That column is the `Number.isFinite(e)` call itself. The library also calls
+`Number.isInteger`; only `Number.isNaN` existed on the constructor.
+
+- `Number.isInteger`, `Number.isFinite` and `Number.isSafeInteger` joined the
+  existing `n_num_globals` native (idx 5/6/7). All three are strict: a non-number
+  argument answers false, so `Number.isFinite("3")` is false and
+  `Number.isInteger(NaN)`/`(Infinity)` are false. An integer is a finite number
+  with no fractional part; a safe integer is also within ±2^53-1.
+- `Number.parseInt`/`Number.parseFloat` are the *same* function objects as the
+  globals, which is what the spec says and what `===` checks in the wild expect.
+- engine tests stay **1015** green (ten assertions added to
+  `primitive_and_function_prototypes_exist`: strictness for all three, the
+  fractional and 2^53 boundaries, and the identity of the parse aliases).
+- `github.com/rust-lang/rust`: the error moves past 2:997 to `dp-*.js` 2:2524
+  (`Object.getOwnPropertySymbols`, next entry). Exec time rises
+  1594 -> 25596 ms and the worker 2532 -> 64005 ms, because the module chain now
+  gets much further before it stops.
+
 
 
 

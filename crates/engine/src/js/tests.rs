@@ -1462,6 +1462,18 @@ fn primitive_and_function_prototypes_exist() {
     assert!(boolean("!Number.isNaN('NaN')"));
     assert!(boolean("!Number.isNaN(0)"));
     assert!(boolean("!Number.isNaN()"));
+    // the strict Number statics: no coercion, and integers are finite numbers
+    // with no fractional part
+    assert!(boolean("Number.isInteger(3) && !Number.isInteger(3.5)"));
+    assert!(boolean("!Number.isInteger('3') && !Number.isInteger(NaN) && !Number.isInteger(Infinity)"));
+    assert!(boolean("Number.isFinite(3) && !Number.isFinite('3')"));
+    assert!(boolean("!Number.isFinite(NaN) && !Number.isFinite(Infinity) && !Number.isFinite()"));
+    assert!(boolean("Number.isSafeInteger(9007199254740991)"));
+    assert!(boolean("!Number.isSafeInteger(9007199254740992)"));
+    assert!(boolean("!Number.isSafeInteger(0.5) && !Number.isSafeInteger('0')"));
+    // Number.parseInt/parseFloat are the same function objects as the globals
+    assert!(boolean("Number.parseInt === parseInt && Number.parseFloat === parseFloat"));
+    assert_eq!(num("Number.parseInt('ff', 16)"), 255.0);
     assert_eq!(
         string("Function.prototype.call.call(function (a) { return a; }, null, 4)"),
         "4"
