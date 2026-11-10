@@ -1441,6 +1441,12 @@ fn primitive_and_function_prototypes_exist() {
     assert_eq!(string("String.fromCharCode(0x000A)"), "\n");
     assert_eq!(string("String.fromCharCode(0xD83D, 0xDE00)"), "\u{1f600}");
     assert_eq!(string("String.fromCharCode()"), "");
+    // String.raw: the array form and the tagged-template form. GitHub builds
+    // its search filter regex with a tagged template, so the tag must exist.
+    assert_eq!(string("String.raw({raw: ['a', 'b', 'c']}, 1, 2)"), "a1b2c");
+    assert_eq!(string("String.raw({raw: ['x']})"), "x");
+    assert_eq!(string("String.raw`x${1}y`"), "x1y");
+    assert_eq!(string("String.raw({raw: ['a', 'b']}, 'X')"), "aXb");
     // Number's own value properties
     assert!(boolean("Number.POSITIVE_INFINITY === Infinity"));
     assert!(boolean("Number.NEGATIVE_INFINITY === -Infinity"));

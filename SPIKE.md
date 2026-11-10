@@ -3887,6 +3887,38 @@ observer never attached to a single selector.
   25132 -> 9813 ms, worker 61545 -> 37207 ms. The next failure is `String.raw`
   in `e95-*.js` (next entry).
 
+## `String.raw` (P53, 2026-11-10)
+
+The code-view module then threw from `e95-*.js`:
+
+```
+[js] script error in code-view-*.js: Uncaught TypeError: undefined is not a
+function (at 2:13967 of e95-*.js)
+```
+
+The reported column lands inside a template literal because the callee is the
+tag:
+
+```js
+i = RegExp(String.raw`\b(?:${words.split(" ").join("|")}):\S*`, "gi")
+```
+
+`String.raw` was the only static missing from `String`.
+
+- `String.raw(strings, ...subs)` uses `strings.raw` when present, else
+  `strings`, and interleaves the substitutions. The tagged-template form works
+  because `tagged_args` already gives the strings array a `raw` array.
+- shortcut: that `raw` array still holds the *cooked* text (the parser keeps no
+  original escape spelling), so ``String.raw`\n` `` differs from a real engine
+  for escapes. Enough for GitHub's filter regex, which is built from plain
+  words; noted rather than hidden.
+- engine tests stay **1015** green (four `String.raw` assertions added to
+  `primitive_and_function_prototypes_exist`: the array form, a single segment,
+  a tagged template, and an explicit substitution).
+- `github.com/rust-lang/rust`: code-view loads; script exec 9813 -> 1594 ms,
+  worker 37207 -> 2532 ms. The next failure is in `dp-*.js` at 2:997 (next
+  entry).
+
 
 
 

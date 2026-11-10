@@ -400,6 +400,8 @@ pub(crate) fn install(e: &mut JsEngine) {
     // borrowed callables, so both patterns work.
     let from_char_code = e.register_native("String.fromCharCode", n_str_static, 0);
     e.set_native_prop(str_id, "fromCharCode", Val::Native(from_char_code));
+    let str_raw = e.register_native("String.raw", n_str_static, 1);
+    e.set_native_prop(str_id, "raw", Val::Native(str_raw));
     let str_proto = Val::new_object();
     for (i, (name, _m)) in STR_METHODS.iter().enumerate() {
         let id = e.register_native(&format!("String.prototype.{name}"), n_str_proto, i as u16);
@@ -3410,7 +3412,34 @@ fn n_fn_ctor(e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<V
 /// `String` static helpers. `fromCharCode` builds the string from UTF-16 code
 /// units (surrogates are pairs; lone surrogates become U+FFFD because the
 /// engine's `Val::Str` is UTF-8).
-fn n_str_static(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+fn n_str_static(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == 1 {
+        // `String.raw(strings, ...subs)`: the template's raw text with each
+        // substitution placed between the segments. GitHub's search filter
+        // builds its regex as ``RegExp(String.raw`\b(?:${words})\S*`, "gi")``.
+        let strings = args.first().cloned().unwrap_or(Val::Undefined);
+        let mut raw = get_member(e, &strings, "raw")?;
+        if matches!(raw, Val::Undefined) {
+            raw = strings;
+        }
+        let len = get_member(e, &raw, "length")?.to_number();
+        let len = if len.is_finite() && len > 0.0 {
+            len as usize
+        } else {
+            0
+        };
+        let mut out = String::new();
+        for i in 0..len {
+            if i > 0 {
+                if let Some(v) = args.get(i) {
+                    out.push_str(&v.to_string());
+                }
+            }
+            let seg = get_member(e, &raw, &i.to_string())?;
+            out.push_str(&seg.to_string());
+        }
+        return Ok(Val::Str(Rc::from(out.as_str())));
+    }
     let units: Vec<u16> = args
         .iter()
         .map(|v| {
