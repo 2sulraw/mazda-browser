@@ -4985,3 +4985,17 @@ fn promise_with_resolvers_returns_the_three_parts() {
         "function,function,function"
     );
 }
+
+#[test]
+fn math_trigonometry_exists() {
+    // The landing chunk's easing curve calls Math.asin, Math.sin/cos/tan and
+    // Math.atan2; only the arithmetic half of Math existed.
+    assert_eq!(num("Math.sin(0)"), 0.0);
+    assert!((num("Math.cos(0)") - 1.0).abs() < 1e-12);
+    assert!(num("Math.tan(0)").abs() < 1e-12);
+    assert!((num("Math.asin(1)") - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    assert!(num("Math.acos(1)").abs() < 1e-12);
+    assert_eq!(num("Math.atan(0)"), 0.0);
+    // atan2 takes (y, x)
+    assert!((num("Math.atan2(1, 1)") - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+}

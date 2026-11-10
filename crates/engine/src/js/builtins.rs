@@ -54,6 +54,13 @@ pub(crate) fn install(e: &mut JsEngine) {
         "trunc",
         "random",
         "sign",
+        "sin",
+        "cos",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "atan2",
     ]
     .iter()
     .enumerate()
@@ -904,6 +911,13 @@ const M_SQRT: u16 = 7;
 const M_TRUNC: u16 = 8;
 const M_RANDOM: u16 = 9;
 const M_SIGN: u16 = 10;
+const M_SIN: u16 = 11;
+const M_COS: u16 = 12;
+const M_TAN: u16 = 13;
+const M_ASIN: u16 = 14;
+const M_ACOS: u16 = 15;
+const M_ATAN: u16 = 16;
+const M_ATAN2: u16 = 17;
 
 fn n_math(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     Ok(match idx {
@@ -930,6 +944,18 @@ fn n_math(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, 
         M_TRUNC => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).trunc()),
         M_RANDOM => Val::Num(e.random_f64()),
         M_SIGN => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).signum()),
+        M_SIN => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).sin()),
+        M_COS => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).cos()),
+        M_TAN => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).tan()),
+        M_ASIN => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).asin()),
+        M_ACOS => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).acos()),
+        M_ATAN => Val::Num(args.first().map_or(f64::NAN, |v| v.to_number()).atan()),
+        // Math.atan2(y, x): the y argument is the receiver of Rust's atan2
+        M_ATAN2 => Val::Num(
+            args.first()
+                .map_or(f64::NAN, |v| v.to_number())
+                .atan2(args.get(1).map_or(f64::NAN, |v| v.to_number())),
+        ),
         _ => Val::Undefined,
     })
 }

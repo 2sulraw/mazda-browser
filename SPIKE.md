@@ -3234,6 +3234,23 @@ it reuses the same slot natives the `new Promise(executor)` path installs.
 - Next fatal error: `undefined is not a function` at `Math.asin` in the same
   chunk (below).
 
+## Math trigonometry (P30, 2026-11-10)
+
+The landing chunk's easing curve is
+
+```js
+a = s / F * (Math.asin(1 / n) || 0)
+```
+
+and `Math` here only had floor/ceil/round/abs/max/min/pow/sqrt/trunc/random/
+sign. That chunk alone calls `sin` (8x), `cos` (9x), `tan` (2x), `asin` and
+`atan2`, so all of that family was missing.
+
+- `Math.sin/cos/tan/asin/acos/atan` take one value; `Math.atan2(y, x)` uses
+  the first argument as Rust's receiver (`y.atan2(x)`), which is the JS order.
+- engine tests **993 -> 994** green (new `math_trigonometry_exists`).
+- Next fatal error: `e.substr is not a function` (below).
+
 
 
 
