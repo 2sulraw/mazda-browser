@@ -3794,9 +3794,45 @@ anything else became `""`.
   (a `FDBG`/`GM`/`QF`/`AF` probe plus a refreshed timestamp so the cache did
   not re-download over it). The patched file was deleted afterwards, so no
   debug copy ever shipped.
-- `github.com/rust-lang/rust`: the descriptor strings resolve, the builder
-  gets past `type_name`, and the module chain stops on `Intl is not defined`
+- `github.com/rust-lang/rust`: the descriptor strings decode, so the builder
+  names the type it wants (`type_name .github.common.v1.SafeHtml`); the lookup
+  still missed, because the file walker that should register it was broken
   (next entry).
+
+## `yield` inside a `switch` (P50, 2026-11-10)
+
+Empty strings were not the only reason for `type_name .github.common.v1.SafeHtml
+not found`. The registry's file walker is a generator whose cases yield:
+
+```js
+function* e(t){switch(t.kind){
+  case "file": for(let n of t.messages) yield n, yield* e(n); yield*t.enums, …
+  case "message": …}}
+```
+
+and its switch body never ran. A direct probe confirmed it: `function*
+g(){ switch (1) { case 1: yield 7 } }` returned a generator that was already
+done, and even a case body with no yield in it was skipped.
+
+- `step_stmt`'s switch arm pushed only the `SwitchBody` marker frame (the
+  `break` target) and never the batch of stitched case bodies. The marker's
+  own step reported "finished" immediately, so the body was dropped. Every
+  `yield` inside a switch had silently done nothing since the walker was
+  written; nothing had measured it before.
+- the arm now pushes the marker *and* the batch above it, exactly like a loop
+  body. Fall-through runs the batch to its end and the marker then reports
+  finished; `break` unwinds to the marker and pops it (`unwind_flow` already
+  treated it as a break target, so that side was already right).
+- a bare `{ … }` block statement holding a yield hit the walker's "yield in
+  this statement position" error; it now gets a batch of its own with the
+  block's own scope.
+- engine tests **1012 -> 1013** green (new `generator_yield_inside_switch`,
+  seven assertions: one case, fall-through, `break` plus a non-matching case,
+  the resume value of `let x = yield`, `default:` as the entry case, a bare
+  block, and a statement after the switch).
+- `github.com/rust-lang/rust`: the dependency file's messages register, so the
+  descriptor walk gets through and the module chain stops on `Intl is not
+  defined` (next entry).
 
 
 

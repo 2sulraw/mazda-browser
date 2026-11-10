@@ -2764,6 +2764,54 @@ fn generator_yield_inside_if_and_loop() {
 }
 
 #[test]
+fn generator_yield_inside_switch() {
+    // GitHub's protobuf registry walker is a generator whose `switch (kind)`
+    // cases yield every message and recurse with `yield*`; the switch body
+    // never ran, so a dependency file's types were never registered and the
+    // later `type_name ... not found` check fired. A direct probe confirmed
+    // it: `function* g(){ switch (1) { case 1: yield 7 } }` finished at once,
+    // and even a non-yielding case body was skipped.
+    assert_eq!(
+        string("function* g(){ switch (1) { case 1: yield 7 } } [...g()].join(',')"),
+        "7"
+    );
+    // fall-through from the matching case to the end runs every later body
+    assert_eq!(
+        string("function* g(){ switch (2) { case 1: yield 7; case 2: yield 8; case 3: yield 9 } } [...g()].join(',')"),
+        "8,9"
+    );
+    // a non-matching case body never runs, and `break` ends the switch
+    assert_eq!(
+        string(
+            "function* g(){ let a = []; switch (1) { case 1: a.push('x'); yield 1; break; case 2: yield 9 } yield a.join(''); } [...g()].join('|')"
+        ),
+        "1|x"
+    );
+    // the resume value of `let x = yield v` lands on the next .next(arg)
+    assert_eq!(
+        string(
+            "function* g(){ switch (1) { case 1: let x = yield 7; return x } } const it = g(); it.next(); it.next(9).value"
+        ),
+        "9"
+    );
+    // `default:` is the entry case when nothing matches
+    assert_eq!(
+        string("function* g(){ switch (9) { default: yield 5 } yield 6 } [...g()].join(',')"),
+        "5,6"
+    );
+    // a bare block statement suspends in place too
+    assert_eq!(
+        string("function* g(){ { yield 1; yield 2 } yield 3 } [...g()].join(',')"),
+        "1,2,3"
+    );
+    // statements after the switch still run once its body falls through
+    assert_eq!(
+        string("function* g(){ yield 1; switch (1) { case 1: yield 2 } yield 3 } [...g()].join(',')"),
+        "1,2,3"
+    );
+}
+
+#[test]
 fn escaped_accessor_and_async_modifiers_are_not_keywords() {
     for src in [
         "({ \\u0067\\u0065\\u0074 m() {} })",

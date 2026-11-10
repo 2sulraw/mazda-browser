@@ -104,7 +104,9 @@ enum GFrame {
         env: Rc<Env>,
     },
     /// stitched case bodies from the first matching case on; `break` here
-    /// exits the switch (see the Break flow handling in `drive`)
+    /// exits the switch (see the Break flow handling in `drive`). The batch
+    /// itself sits *above* this frame, exactly like a loop body, so this frame
+    /// is only stepped again once that batch fell through to the end.
     SwitchBody {
         batch: Rc<Vec<parser::Stmt>>,
         env: Rc<Env>,
@@ -909,8 +911,8 @@ fn step_frame(e: &mut JsEngine, vm: &mut GenVm, frame: GFrame) -> Result<StepR, 
             },
         },
         GFrame::SwitchBody { .. } => {
-            // reached only after a `continue` flowed past it (a break pops
-            // the frame inside drive); post-continue the switch is finished
+            // the stitched case bodies fell through to the end of the switch
+            // (a `break` pops this frame inside `drive` instead)
             Ok(StepR::Finished)
         }
         GFrame::Delegate {
@@ -1309,8 +1311,16 @@ fn step_stmt(
                 stitched.extend(c.body.iter().cloned());
             }
             let senv = Env::child(env);
+            // the batch runs above the marker frame, so a `break` unwinds to
+            // the marker (see `unwind_flow`) while plain fall-through steps
+            // the marker again after the last stitched statement
             vm.frames.push(GFrame::SwitchBody {
-                batch: Rc::new(stitched),
+                batch: Rc::new(stitched.clone()),
+                env: senv.clone(),
+            });
+            vm.frames.push(GFrame::Batch {
+                stmts: Rc::new(stitched),
+                i: 0,
                 env: senv,
             });
             Ok(SStep::Pushed)
@@ -1331,6 +1341,18 @@ fn step_stmt(
                 stmts: Rc::new(block.clone()),
                 i: 0,
                 env: env.clone(),
+            });
+            Ok(SStep::Pushed)
+        }
+        // a bare `{ ... }` block is one statement holding several; give its
+        // body a batch of its own (with the block's own scope) so a yield
+        // inside it suspends where it stands
+        parser::StmtKind::Block(b) | parser::StmtKind::List(b) => {
+            let benv = Env::child(env);
+            vm.frames.push(GFrame::Batch {
+                stmts: Rc::new(b.clone()),
+                i: 0,
+                env: benv,
             });
             Ok(SStep::Pushed)
         }
