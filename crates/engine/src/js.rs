@@ -2348,6 +2348,18 @@ impl JsEngine {
     /// chain, so fresh built-ins never look prototype-less (core-js read
     /// `u.next` off a `null` iterator prototype and threw).
     pub(crate) fn proto_of(&self, o: &Rc<RefCell<Obj>>) -> Option<Rc<RefCell<Obj>>> {
+        // Proxy: the prototype comes from the target, so `instanceof` and
+        // inherited method reads behave as if the proxy were the target.
+        if let Some((target, _)) = proxy_parts(o) {
+            return match target {
+                Val::Obj(t) => self.proto_of(&t),
+                Val::Func(c) => match c.proto() {
+                    Some(Val::Obj(t)) => self.proto_of(&t),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
         let b = o.borrow();
         // an explicitly null [[Prototype]] must not fall through to the lazy
         // default below
@@ -3363,6 +3375,32 @@ pub fn obj_has(o: &Rc<RefCell<Obj>>, key: &str) -> bool {
     false
 }
 
+/// Proxy stand-in plumbing: a proxy is a plain object carrying a hidden
+/// `__proxy` slot `{ target, handler }`. Only the `get`/`set` traps run; every
+/// other operation forwards to the target (see the `Proxy` shortcut in
+/// `builtins.rs`).
+pub(crate) fn proxy_parts(o: &Rc<RefCell<Obj>>) -> Option<(Val, Val)> {
+    let b = o.borrow();
+    let slot = b
+        .props
+        .iter()
+        .find(|(k, _)| &**k == "__proxy")
+        .map(|(_, v)| v.clone())?;
+    let Val::Obj(s) = slot else { return None };
+    let sb = s.borrow();
+    let target = sb
+        .props
+        .iter()
+        .find(|(k, _)| &**k == "target")
+        .map(|(_, v)| v.clone())?;
+    let handler = sb
+        .props
+        .iter()
+        .find(|(k, _)| &**k == "handler")
+        .map(|(_, v)| v.clone())?;
+    Some((target, handler))
+}
+
 /// Full member read including the prototype chain and built-in methods.
 pub(crate) fn get_member(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsError> {
     get_member_impl(e, base, key)
@@ -3593,6 +3631,19 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                         }
                     }
                 }
+            }
+            // Proxy: the handler's `get` trap wins, otherwise the read
+            // forwards to the target.
+            if let Some((target, handler)) = proxy_parts(o) {
+                let trap = get_member(e, &handler, "get")?;
+                if is_callable(&trap) {
+                    return e.call(
+                        trap,
+                        handler.clone(),
+                        vec![target, Val::Str(Rc::from(key)), Val::Obj(o.clone())],
+                    );
+                }
+                return get_member(e, &target, key);
             }
             // boxed String: `length` and index reads behave like the
             // primitive; everything else (methods) falls through to the
@@ -4037,6 +4088,20 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
                     }
                 }
             }
+            // Proxy: the handler's `set` trap wins, otherwise the write
+            // forwards to the target.
+            if let Some((target, handler)) = proxy_parts(o) {
+                let trap = get_member(e, &handler, "set")?;
+                if is_callable(&trap) {
+                    e.call(
+                        trap,
+                        handler.clone(),
+                        vec![target, Val::Str(Rc::from(key)), v, Val::Obj(o.clone())],
+                    )?;
+                    return Ok(());
+                }
+                return set_member(e, &target, key, v);
+            }
             // CSSStyleDeclaration stand-in: every write is a declaration
             // update on the element's `style` attribute (empty value removes
             // the declaration; `cssText` replaces the whole text).
@@ -4168,6 +4233,12 @@ pub(crate) fn set_member(e: &mut JsEngine, base: &Val, key: &str, v: Val) -> Res
 }
 
 pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
+    // Proxy: `delete` forwards to the target (the trap is not run)
+    if let Val::Obj(o) = base {
+        if let Some((target, _)) = proxy_parts(o) {
+            return delete_member(&target, key);
+        }
+    }
     match base {
         Val::Obj(o) => {
             let mut b = o.borrow_mut();
@@ -4202,6 +4273,12 @@ pub(crate) fn delete_member(base: &Val, key: &str) -> bool {
 /// `prototype`) plus the prototype chain; strings count indices and `length`;
 /// every other primitive throws the operator's TypeError.
 pub(crate) fn has_member(e: &JsEngine, v: &Val, key: &str) -> Result<bool, JsError> {
+    // Proxy: `in` forwards to the target (the `has` trap is not run)
+    if let Val::Obj(o) = v {
+        if let Some((target, _)) = proxy_parts(o) {
+            return has_member(e, &target, key);
+        }
+    }
     Ok(match v {
         // a callable object (`Object`, `Array` are plain objects with a
         // hidden `__call`) is a function for `in` too: it owns `name`/

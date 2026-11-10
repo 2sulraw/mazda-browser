@@ -4918,3 +4918,36 @@ fn null_equality_does_not_coerce_the_other_side() {
     assert!(boolean("1 == '1'"));
     assert!(boolean("0 == false"));
 }
+
+#[test]
+fn proxy_get_trap_overrides_and_forwards_to_the_target() {
+    // Turbo wraps its router in `new Proxy(router, { get: … "navigate" … })`;
+    // `Proxy` was missing and the landing bundle died with
+    // "ReferenceError: Proxy is not defined".
+    assert_eq!(
+        string("var t = { a: 1 }; var p = new Proxy(t, { get: function (o, k) { return k === 'navigate' ? 'soft' : o[k]; } }); p.navigate + ':' + p.a"),
+        "soft:1"
+    );
+    // a method read through the proxy keeps the proxy as `this`
+    assert_eq!(
+        string("var t = { a: 7, m: function () { return this.a; } }; var p = new Proxy(t, { get: function (o, k) { return o[k]; } }); String(p.m())"),
+        "7"
+    );
+    // writes forward without a set trap
+    assert_eq!(
+        num("var t = { a: 1 }; var p = new Proxy(t, {}); p.a = 4; t.a"),
+        4.0
+    );
+    // `in`, delete and the prototype walk forward to the target
+    assert!(boolean("var t = { a: 1 }; var p = new Proxy(t, {}); 'a' in p"));
+    assert!(boolean(
+        "var t = { a: 1 }; var p = new Proxy(t, {}); delete p.a; !('a' in t)"
+    ));
+    assert!(boolean(
+        "function C() {} var p = new Proxy(new C(), {}); p instanceof C"
+    ));
+    // a set trap runs instead of forwarding
+    assert!(boolean("var got = 0; var p = new Proxy({}, { set: function (o, k, v) { got = v; return true; } }); p.x = 5; got === 5"));
+    // a non-object target is rejected
+    assert!(boolean("var threw = false; try { new Proxy(1, {}) } catch (e) { threw = e instanceof TypeError } threw"));
+}

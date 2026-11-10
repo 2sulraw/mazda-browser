@@ -164,6 +164,15 @@ pub(crate) fn install(e: &mut JsEngine) {
     }
     e.set_global("Reflect", reflect);
 
+    // -- Proxy -------------------------------------------------------------
+    // shortcut: a proxy is a plain object carrying a hidden `__proxy`
+    // { target, handler } slot. The `get` and `set` traps run; every other
+    // operation (in, delete, prototype walk, instanceof) forwards to the
+    // target, and own-key enumeration sees the proxy itself (empty), not the
+    // target. Turbo's router wraps its API with a one-trap get proxy.
+    let pc = e.register_native("Proxy", n_proxy_ctor, 0);
+    e.set_global("Proxy", Val::Native(pc));
+
     // Object.prototype + Array.prototype chain
     let obj_proto = Val::new_object();
     let ts = e.register_native("toString", n_objproto, 0);
@@ -1797,6 +1806,32 @@ fn arg_list(v: Option<&Val>) -> Result<Vec<Val>, JsError> {
             "TypeError: Reflect argument list is not an array",
         )),
     }
+}
+
+/// `new Proxy(target, handler)` - see the Proxy shortcut in the installer.
+fn n_proxy_ctor(
+    _e: &mut JsEngine,
+    _idx: u16,
+    _this: &Val,
+    args: &[Val],
+) -> Result<Val, JsError> {
+    let target = args.first().cloned().unwrap_or(Val::Undefined);
+    if !matches!(target, Val::Obj(_) | Val::Func(_) | Val::Native(_)) {
+        return Err(JsError::throw("TypeError: Proxy target must be an object"));
+    }
+    let handler = args.get(1).cloned().unwrap_or(Val::Undefined);
+    if !matches!(handler, Val::Obj(_)) {
+        return Err(JsError::throw("TypeError: Proxy handler must be an object"));
+    }
+    let slot = Val::new_object();
+    slot.set("target", target);
+    slot.set("handler", handler);
+    let p = Val::new_object();
+    p.set("__proxy", slot);
+    if let Val::Obj(o) = &p {
+        obj_hide(o, &Rc::from("__proxy"));
+    }
+    Ok(p)
 }
 
 fn n_reflect(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {

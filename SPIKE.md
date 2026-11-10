@@ -3173,6 +3173,30 @@ to each other; the other operand is never coerced.
   `null_equality_does_not_coerce_the_other_side`).
 - Next fatal error: `ReferenceError: Proxy is not defined` (below).
 
+## `Proxy` with get/set traps (P27, 2026-11-10)
+
+The landing bundle then died with `ReferenceError: Proxy is not defined`.
+Turbo wraps its router API so one name reads differently:
+
+```js
+return new Proxy(e, { get: (e, r, n) => "navigate" === r ? t : Reflect.get(e, r, n) })
+```
+
+- shortcut: a proxy is a plain object carrying a hidden `__proxy`
+  `{ target, handler }` slot. The `get` and `set` traps run when the handler
+  has them; everything else forwards to the target: reads and writes without a
+  trap, `in`, `delete`, the prototype walk (so `instanceof` and inherited
+  methods work). Own-key enumeration sees the proxy itself (no proxy keys), not
+  the target. `has`/`deleteProperty`/`getPrototypeOf`/`ownKeys` traps do not
+  run.
+- `new Proxy` rejects a non-object target or handler with a TypeError, and
+  `__proxy` is hidden from enumeration.
+- engine tests **990 -> 991** green (new
+  `proxy_get_trap_overrides_and_forwards_to_the_target`).
+- Next fatal error: `Uncaught TypeError: undefined is not a function` in
+  `landing-pages-623b97b89e4b9885.js` (thrown inside
+  `wp-runtime-c06c3de1d3ace990.js`).
+
 
 
 
