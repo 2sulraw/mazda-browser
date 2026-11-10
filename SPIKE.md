@@ -3362,6 +3362,42 @@ prototype is what the polyfill reads. `t(root)` then does
   only remaining console lines are two
   `addEventListener: callback is not a function` notes (next entry).
 
+## `EventListener` objects (P36, 2026-11-10)
+
+The last two console notes on github.com were, after adding the call site to
+the message:
+
+```
+window.addEventListener: callback is not a function
+  (test object (at 35:18887 of pb-*.js))
+window.addEventListener: callback is not a function
+  (test object (at 1:21838 of react-dom-client-*.js))
+```
+
+Both are the same feature detection, in Lit and in React:
+
+```js
+var probe = {};
+Object.defineProperty(probe, "passive", { get: function () { supported = true } });
+window.addEventListener("test", probe, probe);
+window.removeEventListener("test", probe, probe);
+```
+
+The DOM's `EventListener` may be an object with a `handleEvent` method, so a
+browser accepts this silently. The engine only accepted functions, logged the
+note, and skipped the registration.
+
+- `addEventListener` (element and window) accepts an object listener as well as
+  a function; primitives still get the diagnostic.
+- dispatch looks `handleEvent` up at invoke time and calls it with the event,
+  which is the spec's callback-interface rule.
+- engine tests **999 -> 1000** green (new
+  `add_event_listener_accepts_a_handle_event_object`).
+- github.com cold load now prints **no `script error`, no `timer error`, no
+  custom-element constructor throw and no callback note**. What remains is the
+  documented observer/relative-time noise only (IntersectionObserver and
+  ResizeObserver never fire).
+
 
 
 

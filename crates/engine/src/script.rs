@@ -1297,8 +1297,17 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
         E_ADD_EVENT_LISTENER => {
             let Some(kind) = a0.as_string() else { return Ok(Val::Undefined) };
             let cb = args.get(1).cloned().unwrap_or(Val::Undefined);
-            if !matches!(cb, Val::Func(_) | Val::Native(_)) {
-                eprintln!("[js] addEventListener: callback is not a function");
+            // A listener may also be an object with a `handleEvent` method
+            // (the DOM's EventListener interface). React and Lit both probe
+            // passive-event support by registering such an object.
+            if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Obj(_)) {
+                eprintln!(
+                    "[js] addEventListener: callback is not a function ({} on <{}> {}{})",
+                    kind,
+                    runtime::host(|h| h.tag_name(node)).unwrap_or_default(),
+                    cb.type_of(),
+                    e.call_site_note()
+                );
                 return Ok(Val::Undefined);
             }
             ctx_add_listener(node, kind.to_string(), cb);
@@ -1686,8 +1695,14 @@ fn win_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<V
                 return Ok(Val::Undefined);
             };
             let cb = args.get(1).cloned().unwrap_or(Val::Undefined);
-            if !matches!(cb, Val::Func(_) | Val::Native(_)) {
-                eprintln!("[js] addEventListener: callback is not a function");
+            // same EventListener-object rule as `Element.addEventListener`
+            if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Obj(_)) {
+                eprintln!(
+                    "[js] window.addEventListener: callback is not a function ({} {}{})",
+                    kind,
+                    cb.type_of(),
+                    e.call_site_note()
+                );
                 return Ok(Val::Undefined);
             }
             ctx_add_listener(WIN_NODE, kind.to_string(), cb);
@@ -1891,8 +1906,16 @@ fn dispatch_event(e: &mut JsEngine, target: u32, target_val: Val, evt: &Val) -> 
             if event_flag(evt, "__sip") {
                 break;
             }
-            if let Err(err) = e.call_function(&cb, current.clone(), &[evt.clone()]) {
-                eprintln!("[js] listener error ({kind} on node {n}): {err}");
+            // An object listener is invoked through `handleEvent`, looked up
+            // at dispatch time (the spec's EventListener callback interface).
+            let handler = match &cb {
+                Val::Obj(o) => js::obj_get_own(o, "handleEvent"),
+                _ => cb.clone(),
+            };
+            if matches!(handler, Val::Func(_) | Val::Native(_)) {
+                if let Err(err) = e.call_function(&handler, current.clone(), &[evt.clone()]) {
+                    eprintln!("[js] listener error ({kind} on node {n}): {err}");
+                }
             }
             if let Err(m) = e.drain_microtasks() {
                 eprintln!("[js] microtask error: {m}");
@@ -4778,6 +4801,42 @@ mod tests {
         // listener), none after its removal, then +100 from the other handler
         assert_eq!(get_global_str(&mut ps, "calls"), "101");
         assert_eq!(get_global_str(&mut ps, "windowCalls"), "0");
+    }
+
+    #[test]
+    fn add_event_listener_accepts_a_handle_event_object() {
+        // An EventListener may be an object with a `handleEvent` method. React
+        // and Lit both register `{get capture(){…}}` on window to probe
+        // passive-event support at load, so treating a non-function as an
+        // error logged two notes on every github.com page and skipped the
+        // registration.
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="d"></div><script>
+                window.hits = 0;
+                var listener = {
+                    handleEvent: function (ev) {
+                        window.hits += 1;
+                        window.kind = ev.type;
+                    }
+                };
+                var el = document.getElementById("d");
+                el.addEventListener("ping", listener);
+                el.dispatchEvent(new Event("ping"));
+                // the feature-detection registration, verbatim
+                var probe = { get capture() { return false } };
+                try {
+                    window.addEventListener("test", probe, probe);
+                    window.removeEventListener("test", probe, probe);
+                    window.probe = "ok";
+                } catch (e) {
+                    window.probe = "threw";
+                }
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "hits"), "1");
+        assert_eq!(get_global_str(&mut ps, "kind"), "ping");
+        assert_eq!(get_global_str(&mut ps, "probe"), "ok");
     }
 
     #[test]
