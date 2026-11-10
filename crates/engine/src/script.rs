@@ -392,6 +392,7 @@ fn build_element(node: u32) -> Val {
     // the `for` target that way from `connectedCallback`
     o.set("ownerDocument", lazy_native_attr(n.node_owner_document));
     o.set("removeChild", js::Val::Native(n.node_remove_child));
+    o.set("contains", js::Val::Native(n.node_contains));
     o.set("insertBefore", js::Val::Native(n.node_insert_before));
     o.set("cloneNode", js::Val::Native(n.node_clone));
     // layout reads: scripts run before layout in this pipeline, so these are
@@ -528,6 +529,19 @@ fn this_node(this: &Val) -> Result<u32, JsError> {
         },
         _ => Err(JsError::throw("TypeError: not an element")),
     }
+}
+
+/// The arena id behind a wrapper value, or `None` when the value is not one
+/// of our DOM wrappers (`Node.contains(3)` is false, not a throw).
+fn node_id_of(v: &Val) -> Option<u32> {
+    if let Val::Obj(o) = v {
+        if let Val::Num(n) = js::obj_get_own(o, "__node") {
+            if n >= 0.0 && n.fract() == 0.0 {
+                return Some(n as u32);
+            }
+        }
+    }
+    None
 }
 
 /// `template.content`: the fragment holding a template's children.
@@ -714,6 +728,8 @@ struct Nids {
     doc_get_by_name: usize,
     doc_create_text: usize,
     doc_create_comment: usize,
+    /// `Document.contains(other)` (the document is arena node 0)
+    doc_contains: usize,
     /// one native per `REFLECTED` entry (accessor pair halves)
     reflect: [usize; REFLECTED.len()],
     el_get_element: usize,
@@ -755,6 +771,8 @@ struct Nids {
     node_child_nodes: usize,
     node_children: usize,
     node_clone: usize,
+    /// `Node.contains(other)`
+    node_contains: usize,
     node_dataset: usize,
     /// `Node.ownerDocument` (the same object as the global `document`)
     node_owner_document: usize,
@@ -983,6 +1001,9 @@ const D_CREATE_COMMENT: u16 = 11;
 const D_CREATE_ELEMENT_NS: u16 = 12;
 /// `createDocumentFragment()`
 const D_CREATE_FRAGMENT: u16 = 13;
+/// `document.contains(other)` - `Document` is a `Node`, and GitHub's
+/// selector observer asks its root node before attaching anything
+const D_CONTAINS: u16 = 14;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -1085,6 +1106,9 @@ const N_CHILD_NODES: u16 = 10;
 const N_CHILDREN: u16 = 11;
 /// `Node.cloneNode(deep)`
 const N_CLONE_NODE: u16 = 12;
+/// `Node.contains(other)` - the ancestor walk GitHub's selector observer
+/// needs before it attaches a mutation observer to a root
+const N_CONTAINS: u16 = 13;
 /// live-collection group idxs (one native for `item`/`namedItem`)
 const C_ITEM: u16 = 0;
 const C_NAMED: u16 = 1;
@@ -1192,6 +1216,14 @@ fn doc_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<V
             Some(id) => Ok(wrap_any(id)),
             None => Ok(Val::Null),
         },
+        D_CONTAINS => {
+            // the document's arena id is 0; a non-node argument is not
+            // contained (the spec's own answer for a non-Node)
+            let other = args.first().and_then(node_id_of);
+            Ok(Val::Bool(
+                other.is_some_and(|n| runtime::host(|h| h.node_contains(0, n))),
+            ))
+        }
         D_GET_ELEMENTS_BY_TAG => Ok(wrap_coll(LIVE_TAG, 0, &sel.unwrap_or_default())),
         D_GET_ELEMENTS_BY_CLASS => Ok(wrap_coll(LIVE_CLASS, 0, &sel.unwrap_or_default())),
         D_FORMS => Ok(wrap_coll(LIVE_FORMS, 0, "")),
@@ -1661,6 +1693,10 @@ fn n_node(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, J
                 }
                 None => Val::Null,
             }
+        }
+        N_CONTAINS => {
+            let other = args.first().and_then(node_id_of);
+            Val::Bool(other.is_some_and(|n| runtime::host(|h| h.node_contains(node, n))))
         }
         N_REMOVE_CHILD => {
             let child = this_node(&args.first().cloned().unwrap_or(Val::Undefined))?;
@@ -3394,6 +3430,7 @@ impl PageScripts {
             doc_create: engine.register_native("document.createElement", doc_native, D_CREATE_ELEMENT),
             doc_create_ns: engine.register_native("document.createElementNS", doc_native, D_CREATE_ELEMENT_NS),
             doc_create_fragment: engine.register_native("document.createDocumentFragment", doc_native, D_CREATE_FRAGMENT),
+            doc_contains: engine.register_native("document.contains", doc_native, D_CONTAINS),
             doc_cookie_get: engine.register_native("document.getCookie", doc_native, D_COOKIE_GET),
             doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
             doc_get_by_tag: engine.register_native("document.getElementsByTagName", doc_native, D_GET_ELEMENTS_BY_TAG),
@@ -3439,6 +3476,7 @@ impl PageScripts {
             node_child_nodes: engine.register_native("Node.childNodes", n_node, N_CHILD_NODES),
             node_children: engine.register_native("Element.children", n_node, N_CHILDREN),
             node_clone: engine.register_native("Node.cloneNode", n_node, N_CLONE_NODE),
+            node_contains: engine.register_native("Node.contains", n_node, N_CONTAINS),
             node_remove_child: engine.register_native("Node.removeChild", n_node, N_REMOVE_CHILD),
             node_insert_before: engine.register_native("Node.insertBefore", n_node, N_INSERT_BEFORE),
             node_dataset: engine.register_native("HTMLElement.dataset", n_node, N_DATASET),
@@ -3542,6 +3580,7 @@ impl PageScripts {
         doc.set("createElement", Val::Native(ids.doc_create));
         doc.set("createElementNS", Val::Native(ids.doc_create_ns));
         doc.set("createDocumentFragment", Val::Native(ids.doc_create_fragment));
+        doc.set("contains", Val::Native(ids.doc_contains));
         doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
         doc.set("getElementsByClassName", Val::Native(ids.doc_get_by_class));
         doc.set("getElementsByName", Val::Native(ids.doc_get_by_name));
@@ -5973,6 +6012,44 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "before"), "4");
         assert_eq!(get_global_str(&mut ps, "after"), "5");
         assert_eq!(get_global_str(&mut ps, "elemsAfter"), "2");
+    }
+
+    /// `Node.contains(other)` is the ancestor walk GitHub's selector
+    /// observer asks for before it attaches to its root node; it was missing,
+    /// so every observed selector silently failed with "undefined is not a
+    /// function". The document root (arena node 0) and any element both
+    /// answer, and a node contains itself.
+    #[test]
+    fn node_contains_walks_the_arena() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="a"><span id="b"><i id="c"></i></span></div><p id="d"></p><script>
+                var a = document.getElementById("a");
+                var b = document.getElementById("b");
+                var c = document.getElementById("c");
+                var d = document.getElementById("d");
+                window.self = a.contains(a);
+                window.shallow = a.contains(b);
+                window.deep = a.contains(c);
+                window.sibling = a.contains(d);
+                window.up = c.contains(a);
+                window.doc = document.contains(c);
+                window.docSelf = document.contains(document.body);
+                window.junk = a.contains(3);
+                window.orphan = a.contains(document.createElement("div"));
+                window.orphanDoc = document.contains(document.createElement("div"));
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "self"), "true");
+        assert_eq!(get_global_str(&mut ps, "shallow"), "true");
+        assert_eq!(get_global_str(&mut ps, "deep"), "true");
+        assert_eq!(get_global_str(&mut ps, "sibling"), "false");
+        assert_eq!(get_global_str(&mut ps, "up"), "false");
+        assert_eq!(get_global_str(&mut ps, "doc"), "true");
+        assert_eq!(get_global_str(&mut ps, "docSelf"), "true");
+        assert_eq!(get_global_str(&mut ps, "junk"), "false");
+        assert_eq!(get_global_str(&mut ps, "orphan"), "false");
+        assert_eq!(get_global_str(&mut ps, "orphanDoc"), "false");
     }
 
     /// rAF coalescing: two callbacks queued in one epoch fire in ONE pass

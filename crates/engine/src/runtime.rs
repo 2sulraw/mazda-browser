@@ -1036,6 +1036,36 @@ impl DomHost {
             .is_some_and(|p| p.children.contains(&child))
     }
 
+    /// `Node.contains(other)`: walk `other`'s ancestor chain looking for
+    /// `root`. A node contains itself, and the document root contains every
+    /// connected node. Bounded like `closest`, so a malformed arena cannot
+    /// spin.
+    pub fn node_contains(&self, root: u32, other: u32) -> bool {
+        let dom = self.dom_ref();
+        let mut cur = other;
+        for _ in 0..1024 {
+            if cur == root {
+                return true;
+            }
+            let Some(n) = dom.nodes.get(cur as usize) else {
+                return false;
+            };
+            if n.parent == cur {
+                return false;
+            }
+            // an orphan points at the document root but is not listed among
+            // its children (same membership check as `is_connected`)
+            let Some(parent) = dom.nodes.get(n.parent as usize) else {
+                return false;
+            };
+            if !parent.children.contains(&cur) {
+                return false;
+            }
+            cur = n.parent;
+        }
+        false
+    }
+
     /// `node.data-*` attribute names, for the `dataset` accessor.
     pub fn data_attrs(&self, node: u32) -> Vec<(String, String)> {
         let dom = self.dom_ref();

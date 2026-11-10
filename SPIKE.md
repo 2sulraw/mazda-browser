@@ -3863,6 +3863,30 @@ maximumSignificantDigits:2})` for dependent counts.
   32133 -> 25132 ms, worker 101038 -> 61545 ms. The next failure is the
   selector observer's `rootNode.contains` (next entry).
 
+## `Node.contains` (P52, 2026-11-10)
+
+The next error was in `core-*.js`:
+
+```
+[js] mutation observer error: Uncaught TypeError: undefined is not a function
+  (at 136:117612 of core-*.js)
+```
+
+`core`'s selector observer checks `e.rootNode.contains(i)` before it attaches
+to a node; `contains` was on no wrapper, so `undefined` was called and the
+observer never attached to a single selector.
+
+- `DomHost::node_contains(root, other)` walks `other`'s ancestor chain and
+  checks each parent link's child list, so an orphan that merely points at the
+  document root is not "contained". Bounded like `closest`.
+- `Node.contains` is installed on every element wrapper; `document.contains`
+  uses arena node 0. A non-node argument answers false instead of throwing.
+- engine tests **1014 -> 1015** green (new `node_contains_walks_the_arena`:
+  self, child, grandchild, sibling, upward, document, orphan, non-node).
+- `github.com/rust-lang/rust`: no mutation-observer error; script exec
+  25132 -> 9813 ms, worker 61545 -> 37207 ms. The next failure is `String.raw`
+  in `e95-*.js` (next entry).
+
 
 
 
