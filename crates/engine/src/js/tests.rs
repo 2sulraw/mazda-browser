@@ -4965,3 +4965,23 @@ fn string_concat_appends_each_argument() {
     // borrowed through the prototype, like the polyfills do
     assert_eq!(string("String.prototype.concat.call('p', 'q')"), "pq");
 }
+
+#[test]
+fn promise_with_resolvers_returns_the_three_parts() {
+    // `let R = Promise.withResolvers()` is how a batching helper at the top
+    // of GitHub's landing bundle starts: it exposes the deferred promise and
+    // settles it later.
+    assert_eq!(
+        mnum("let R = Promise.withResolvers(); let m = 0; R.promise.then(v => m = v); R.resolve(6); m"),
+        6.0
+    );
+    assert_eq!(
+        mstring("let R = Promise.withResolvers(); let m = ''; R.promise.catch(e => m = 'caught:' + e); R.reject('x'); m"),
+        "caught:x"
+    );
+    // the parts are functions, and the promise is a real thenable
+    assert_eq!(
+        string("let R = Promise.withResolvers(); typeof R.resolve + ',' + typeof R.reject + ',' + typeof R.promise.then"),
+        "function,function,function"
+    );
+}

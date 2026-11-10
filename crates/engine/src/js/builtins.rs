@@ -447,6 +447,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     let pany = e.register_native("Promise.any", n_promise, PS_ANY);
     let pray = e.register_native("Promise.race", n_promise, PS_RACE);
     let pass = e.register_native("Promise.allSettled", n_promise, PS_ALL_SETTLED);
+    let pwr = e.register_native("Promise.withResolvers", n_promise, PS_WITH_RESOLVERS);
     e.set_global("Promise", Val::Native(pc));
     obj_set_own(own(&promise), "resolve", Val::Native(prs));
     obj_set_own(own(&promise), "reject", Val::Native(prj));
@@ -454,6 +455,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&promise), "any", Val::Native(pany));
     obj_set_own(own(&promise), "race", Val::Native(pray));
     obj_set_own(own(&promise), "allSettled", Val::Native(pass));
+    obj_set_own(own(&promise), "withResolvers", Val::Native(pwr));
     e.promise_statics = Some(obj_of(&promise));
     // `Promise.prototype` must exist: feature probes borrow its `then`
     // (`var Vy = Promise.prototype.then`) and re-apply it to real promises.
@@ -3228,6 +3230,7 @@ const PS_ALL: u16 = 3;
 const PS_ANY: u16 = 4;
 const PS_RACE: u16 = 5;
 const PS_ALL_SETTLED: u16 = 6;
+const PS_WITH_RESOLVERS: u16 = 7;
 
 /// register a reaction on an element promise (pending -> queue; settled ->
 /// enqueue immediately); `ret` stays None for combinator elements because
@@ -3273,6 +3276,7 @@ fn n_promise(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Va
             );
             Ok(Val::Obj(p))
         }
+        PS_WITH_RESOLVERS => Ok(promise_with_resolvers(e)),
         PS_ALL | PS_ANY | PS_RACE | PS_ALL_SETTLED => {
             let items = interp::for_of_items(
                 e,

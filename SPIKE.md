@@ -3217,6 +3217,23 @@ function".
 - engine tests **991 -> 992** green (new `string_concat_appends_each_argument`).
 - Next fatal error: `Promise.withResolvers is not a function` (below).
 
+## `Promise.withResolvers` (P29, 2026-11-10)
+
+The landing chunk's batching helper starts with
+
+```js
+let R = Promise.withResolvers()
+```
+
+and the engine's `Promise` had only the five combinators. `withResolvers()`
+returns the deferred `{ promise, resolve, reject }`; there is no executor, so
+it reuses the same slot natives the `new Promise(executor)` path installs.
+
+- engine tests **992 -> 993** green (new
+  `promise_with_resolvers_returns_the_three_parts`).
+- Next fatal error: `undefined is not a function` at `Math.asin` in the same
+  chunk (below).
+
 
 
 

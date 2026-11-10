@@ -2976,6 +2976,21 @@ pub(crate) fn new_promise_with_executor(e: &mut JsEngine, executor: Val) -> Resu
     Ok(Val::Obj(p))
 }
 
+/// `Promise.withResolvers()`: a fresh promise plus its resolve/reject pair,
+/// with no executor to run. Same slot mechanism as the `new Promise` form.
+pub(crate) fn promise_with_resolvers(e: &mut JsEngine) -> Val {
+    let p = e.new_promise();
+    let slot = e.promise_slots.len() as u16;
+    e.promise_slots.push(Some(p.clone()));
+    let rid = e.register_native("Promise.resolve#slot", n_p_resolve, slot);
+    let jid = e.register_native("Promise.reject#slot", n_p_reject, slot);
+    let out = Val::new_object();
+    out.set("promise", Val::Obj(p));
+    out.set("resolve", Val::Native(rid));
+    out.set("reject", Val::Native(jid));
+    out
+}
+
 fn resolve_slot(e: &mut JsEngine, idx: u16, v: Val) {
     if let Some(p) = e.promise_slots.get(idx as usize).cloned().flatten() {
         resolve_promise(e, &p, v);
