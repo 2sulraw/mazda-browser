@@ -3150,6 +3150,29 @@ belonged -- the later `for..of` over it then failed with "not iterable".
 - Next fatal error: `Uncaught TypeError: Cannot convert object to primitive
   value` (the null-equality rule below).
 
+## `null == object` never coerces the object (P26, 2026-11-10)
+
+Past the symbol fix, the landing bundle threw
+`TypeError: Cannot convert object to primitive value` from React's
+`__COMPILER_RUNTIME`:
+
+```js
+var r = getCachedValue(), m = cache.get(r);
+null == r || store(r, m);
+```
+
+`r` is a null-prototype object with no `valueOf`/`toString`. Loose equality
+ran ToPrimitive on both operands before comparing, so the comparison threw
+instead of answering `false`. Per spec `null`/`undefined` compare equal only
+to each other; the other operand is never coerced.
+
+- `binary_op`'s `==`/`!=` now short-circuits when either side is `null` or
+  `undefined`: true only for the null/undefined pairs, false otherwise, with
+  no ToPrimitive call.
+- engine tests **989 -> 990** green (new
+  `null_equality_does_not_coerce_the_other_side`).
+- Next fatal error: `ReferenceError: Proxy is not defined` (below).
+
 
 
 

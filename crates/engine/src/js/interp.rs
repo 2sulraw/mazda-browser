@@ -2405,6 +2405,20 @@ fn binary_op(e: &mut JsEngine, op: BinOp, l: &Val, r: &Val) -> Result<Val, JsErr
             // object-vs-object stays identity; otherwise ToPrimitive first
             let eq = match (l, r) {
                 (Val::Obj(_), Val::Obj(_)) => strict_eq(l, r),
+                // `null`/`undefined` only equal each other, and never
+                // coerce the other operand. React's memo-cache helper
+                // guards with `null == r` where `r` is a null-prototype
+                // object: ToPrimitive on it had no valueOf/toString and
+                // threw "Cannot convert object to primitive value".
+                _ if matches!(l, Val::Null | Val::Undefined)
+                    || matches!(r, Val::Null | Val::Undefined) =>
+                {
+                    matches!(
+                        (l, r),
+                        (Val::Null, Val::Null | Val::Undefined)
+                            | (Val::Undefined, Val::Null | Val::Undefined)
+                    )
+                }
                 _ => {
                     let lp = to_primitive(e, l, PrimHint::Default)?;
                     let rp = to_primitive(e, r, PrimHint::Default)?;

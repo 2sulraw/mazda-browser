@@ -4894,3 +4894,27 @@ fn a_symbol_key_works_with_the_in_operator() {
     // a non-symbol object key still coerces through ToPrimitive
     assert!(boolean("var o = {}; o.a = 1; ({ toString: function () { return 'a'; } }) in o"));
 }
+
+#[test]
+fn null_equality_does_not_coerce_the_other_side() {
+    // React's `__COMPILER_RUNTIME` is a null-prototype object, and its
+    // memo-cache helper guards with `null == r`. A loose comparison must not
+    // run ToPrimitive on the object (it has no valueOf/toString and threw
+    // "Cannot convert object to primitive value").
+    assert!(boolean("null == undefined"));
+    assert!(boolean("undefined == null"));
+    assert!(boolean("null == null"));
+    // everything else is false without touching the object
+    assert!(boolean("!(null == Object.create(null))"));
+    assert!(boolean("!(Object.create(null) == null)"));
+    assert!(boolean("!(null == 0)"));
+    assert!(boolean("!(null == '')"));
+    assert!(boolean("null != Object.create(null)"));
+    // an object with side-effecting coercions is never asked
+    assert!(boolean(
+        "var asked = false; var o = { valueOf: function () { asked = true; return 1; } }; null == o; !asked"
+    ));
+    // ordinary loose equality still coerces
+    assert!(boolean("1 == '1'"));
+    assert!(boolean("0 == false"));
+}
