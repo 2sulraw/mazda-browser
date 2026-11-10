@@ -2929,6 +2929,7 @@ const STR_METHODS: &[(&str, Meth)] = &[
     ("trimRight", Meth::StrTrimEnd),
     ("slice", Meth::StrSlice),
     ("concat", Meth::StrConcat),
+    ("substr", Meth::StrSubstr),
     ("substring", Meth::StrSlice),
     ("indexOf", Meth::StrIndexOf),
     ("lastIndexOf", Meth::StrLastIndexOf),

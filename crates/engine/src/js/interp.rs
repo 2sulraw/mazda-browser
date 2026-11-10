@@ -2749,6 +2749,40 @@ pub(crate) fn call_method(
             }
             Ok(Val::Str(Rc::from(out.as_str())))
         }
+        StrSubstr => {
+            // Annex B `substr(start, length)`: the second argument is a
+            // length, not an end index (`slice` is the end-index form).
+            let s = need_str(this)?;
+            let chars: Vec<char> = s.chars().collect();
+            let n = chars.len() as i64;
+            let start = {
+                let v = args.first().map_or(0.0, |a| a.to_number());
+                let v = if v.is_nan() { 0 } else { v.trunc() as i64 };
+                if v < 0 {
+                    n.saturating_add(v).max(0)
+                } else {
+                    v.min(n)
+                }
+            };
+            let len = match args.get(1) {
+                None | Some(Val::Undefined) => n,
+                Some(v) => {
+                    let v = v.to_number();
+                    if v.is_nan() || v <= 0.0 {
+                        0
+                    } else {
+                        v.trunc() as i64
+                    }
+                }
+            };
+            let end = start.saturating_add(len).min(n);
+            Ok(Val::Str(Rc::from(
+                chars[start as usize..end as usize]
+                    .iter()
+                    .collect::<String>()
+                    .as_str(),
+            )))
+        }
         StrIndexOf => {
             let s = need_str(this)?;
             let needle = arg_str(args, 0);

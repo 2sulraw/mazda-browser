@@ -4999,3 +4999,17 @@ fn math_trigonometry_exists() {
     // atan2 takes (y, x)
     assert!((num("Math.atan2(1, 1)") - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
 }
+
+#[test]
+fn string_substr_takes_a_length() {
+    // `"css".charAt(0).toUpperCase() + e.substr(1) + "Plugin"` names a DOM
+    // plugin at GitHub's chunk top; `substr` was missing.
+    assert_eq!(string("'abcdef'.substr(2)"), "cdef");
+    assert_eq!(string("'abcdef'.substr(2, 3)"), "cde");
+    assert_eq!(string("'abcdef'.substr(-2)"), "ef");
+    assert_eq!(string("'abcdef'.substr(-2, 1)"), "e");
+    assert_eq!(string("'abcdef'.substr(99)"), "");
+    assert_eq!(string("'abcdef'.substr(1, 0)"), "");
+    // borrowed through the prototype
+    assert_eq!(string("String.prototype.substr.call('xyz', 1)"), "yz");
+}

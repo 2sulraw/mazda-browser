@@ -113,6 +113,7 @@ pub enum Meth {
     StrTrimEnd,
     StrSlice,
     StrConcat,
+    StrSubstr,
     StrIndexOf,
     StrLastIndexOf,
     StrIncludes,
@@ -3454,6 +3455,7 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                 "trimEnd" | "trimRight" => Some(StrTrimEnd),
                 "slice" => Some(StrSlice),
                 "concat" => Some(StrConcat),
+                "substr" => Some(StrSubstr),
                 "substring" => Some(StrSlice), // shortcut: maps to slice (clamping differs)
                 "indexOf" => Some(StrIndexOf),
                 "lastIndexOf" => Some(StrLastIndexOf),

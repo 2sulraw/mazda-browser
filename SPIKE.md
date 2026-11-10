@@ -3251,6 +3251,24 @@ sign. That chunk alone calls `sin` (8x), `cos` (9x), `tan` (2x), `asin` and
 - engine tests **993 -> 994** green (new `math_trigonometry_exists`).
 - Next fatal error: `e.substr is not a function` (below).
 
+## `String.prototype.substr` (P31, 2026-11-10)
+
+The same chunk names a DOM plugin with
+
+```js
+e = ("css" === e ? "CSS" : e.charAt(0).toUpperCase() + e.substr(1)) + "Plugin"
+```
+
+`substr` is Annex B, but browsers have it and bundles use it. The engine's
+string table had `slice` and `substring` but not `substr`.
+
+- `substr(start, length)` is the length form: a negative start counts from
+  the end, the second argument is a count, and an absent count runs to the end
+  (`slice` is the end-index form).
+- engine tests **994 -> 995** green (new `string_substr_takes_a_length`).
+- Next fatal error: the grapheme splitter's regex is rejected with
+  `unsupported unicode property escape \p{RI}` (below).
+
 
 
 
