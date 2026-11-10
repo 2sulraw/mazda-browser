@@ -3327,6 +3327,41 @@ time the selector engine indexed the page.
   throw for `<relative-time>` (`attachShadow` is missing) and two
   `addEventListener: callback is not a function` notes.
 
+## `attachShadow` / `shadowRoot` (P35, 2026-11-10)
+
+With Sizzle silent, the only error on github.com was every custom element
+constructor:
+
+```
+custom element <relative-time>: constructor threw
+Uncaught TypeError: Cannot read property 'call' of undefined (in define <- D)
+at 136:133524 of pb-f417da738ec82369.js
+```
+
+That line is the command polyfill (the one that turns `[oncommand]` into
+`CommandEvent`):
+
+```js
+e = globalThis.HTMLElement || function(){},
+i = e.prototype.attachShadow,
+e.prototype.attachShadow = function (init) { let n = i.call(this, init); return t(n), n }
+```
+
+`i` was `undefined`: the engine had no `attachShadow` anywhere, and the
+prototype is what the polyfill reads. `t(root)` then does
+`root.addEventListener("click", …)`, `root.querySelectorAll("[oncommand]")`.
+
+- `Element.prototype.attachShadow(init)` now answers a real `#fragment` arena
+  node (nodeType 11) cached per host in `SHADOW_ROOTS`, so `shadowRoot` recalls
+  the same root. The returned wrapper also carries `host` and `mode`.
+- the root is a fragment, so the ordinary insertion and query methods work on
+  it; `attachShadow` is on `Element.prototype` (inherited by
+  `HTMLElement.prototype`), exactly where the polyfill looks.
+- engine tests **998 -> 999** green (new `attach_shadow_returns_a_fragment_root`).
+- github.com cold load: the `<relative-time>` constructor error is gone. The
+  only remaining console lines are two
+  `addEventListener: callback is not a function` notes (next entry).
+
 
 
 

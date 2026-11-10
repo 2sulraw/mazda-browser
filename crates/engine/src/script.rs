@@ -154,6 +154,12 @@ thread_local! {
     /// node and the pair is cached for the rest of the page.
     static TEMPLATE_CONTENT: RefCell<std::collections::HashMap<u32, u32>> =
         RefCell::new(std::collections::HashMap::new());
+    /// `attachShadow` results: host element → `(root fragment, mode)`. The
+    /// root is a real `#fragment` arena node, so a library can build into it
+    /// with the ordinary insertion methods; the pair is cached because the
+    /// wrappers are rebuilt per access.
+    static SHADOW_ROOTS: RefCell<std::collections::HashMap<u32, (u32, String)>> =
+        RefCell::new(std::collections::HashMap::new());
 }
 
 /// Install the script-local context for the duration of a turn.
@@ -419,6 +425,18 @@ fn build_element(node: u32) -> Val {
     o.set("pause", js::Val::Native(n.el_media_noop));
     o.set("load", js::Val::Native(n.el_media_noop));
     o.set("closest", js::Val::Native(n.el_closest));
+    // `attachShadow` returns a real `#fragment` root and `shadowRoot` recalls
+    // it. GitHub's command polyfill wraps both and then observes and queries
+    // the returned root, so a missing `attachShadow` broke every custom
+    // element constructor on the page.
+    o.set("attachShadow", js::Val::Native(n.el_attach_shadow));
+    o.set(
+        "shadowRoot",
+        js::Val::Acc(Rc::new(js::AccEntry {
+            getter: Some(js::Val::Native(n.el_shadow_root)),
+            setter: None,
+        })),
+    );
     // the prototype chain is only for `instanceof Element` (every method
     // stays an own prop, one behaviour for wrappers created before and after
     // the protos are installed)
@@ -523,6 +541,22 @@ fn template_content_node(tpl: u32) -> Option<u32> {
         m.borrow_mut().insert(tpl, frag);
     });
     Some(frag)
+}
+
+/// The `attachShadow` root wrapper: the `#fragment` surface plus the two
+/// `ShadowRoot` props pages read (`host` and `mode`). Wrappers are rebuilt per
+/// access, so both are set here rather than stored on the node.
+fn shadow_root_wrap(host: u32, frag: u32) -> Val {
+    let root = wrap_any(frag);
+    root.set("host", wrap_element(host));
+    let mode = SHADOW_ROOTS.with(|m| {
+        m.borrow()
+            .get(&host)
+            .map(|(_, mode)| mode.clone())
+            .unwrap_or_else(|| "open".to_string())
+    });
+    root.set("mode", str_val(&mode));
+    root
 }
 
 fn n_template_content(_e: &mut JsEngine, _idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
@@ -756,6 +790,9 @@ struct Nids {
     el_closest: usize,
     /// `HTMLTemplateElement.content` (getter)
     el_template_content: usize,
+    /// `Element.attachShadow` and the `shadowRoot` getter
+    el_attach_shadow: usize,
+    el_shadow_root: usize,
     /// variadic insertion group (`prepend`/`append`/`before`/`after`/
     /// `replaceWith`/`replaceChildren`)
     el_prepend: usize,
@@ -1061,6 +1098,10 @@ const E_BEFORE: u16 = 56;
 const E_AFTER: u16 = 57;
 const E_REPLACE_WITH: u16 = 58;
 const E_REPLACE_CHILDREN: u16 = 59;
+/// `Element.attachShadow({mode})` — a real `#fragment` root, cached per host
+const E_ATTACH_SHADOW: u16 = 60;
+/// `Element.shadowRoot` (getter) — the `attachShadow` root, or null
+const E_SHADOW_ROOT: u16 = 61;
 /// `window.removeEventListener(type, cb)` (document shares the bucket)
 const W_REMOVE_LISTENER: u16 = 53;
 /// `customElements` group idxs
@@ -1296,6 +1337,34 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
                 Val::Null
             }))
         }
+        E_ATTACH_SHADOW => {
+            if let Some((frag, _)) = SHADOW_ROOTS.with(|m| m.borrow().get(&node).cloned()) {
+                return Ok(shadow_root_wrap(node, frag));
+            }
+            // `{ mode: "open" }` is what pages pass; anything else still
+            // attaches (the mode only ever round-trips through `shadowRoot`).
+            let mode = args
+                .first()
+                .and_then(|v| match v {
+                    Val::Obj(o) => match js::obj_get_own(o, "mode") {
+                        Val::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| "open".to_string());
+            let Some(frag) = runtime::host_mut(|h| h.create_fragment()) else {
+                return Ok(Val::Null);
+            };
+            SHADOW_ROOTS.with(|m| {
+                m.borrow_mut().insert(node, (frag, mode));
+            });
+            Ok(shadow_root_wrap(node, frag))
+        }
+        E_SHADOW_ROOT => Ok(SHADOW_ROOTS
+            .with(|m| m.borrow().get(&node).cloned())
+            .map(|(frag, _)| shadow_root_wrap(node, frag))
+            .unwrap_or(Val::Null)),
         E_PREPEND | E_APPEND | E_BEFORE | E_AFTER | E_REPLACE_WITH | E_REPLACE_CHILDREN => {
             let nodes = arg_nodes(args);
             insert_children(node, idx, &nodes);
@@ -2099,6 +2168,9 @@ fn install_dom_types(e: &mut JsEngine, ids: &Nids) {
     chain[DOM_ELEMENT].set("closest", Val::Native(ids.el_closest));
     chain[DOM_ELEMENT].set("hasAttribute", Val::Native(ids.el_has_attr));
     chain[DOM_ELEMENT].set("removeEventListener", Val::Native(ids.el_remove_listener));
+    // the command polyfill reads `HTMLElement.prototype.attachShadow` and
+    // wraps it; it is inherited from `Element.prototype` like `matches` is
+    chain[DOM_ELEMENT].set("attachShadow", Val::Native(ids.el_attach_shadow));
 
     // one interface per tag family, all hanging off HTMLElement
     let mut by_tag: std::collections::HashMap<&'static str, usize> = Default::default();
@@ -3173,6 +3245,7 @@ impl PageScripts {
         IO_NOTE.with(|n| n.set(false));
         RO_NOTE.with(|n| n.set(false));
         TEMPLATE_CONTENT.with(|m| m.borrow_mut().clear());
+        SHADOW_ROOTS.with(|m| m.borrow_mut().clear());
         runtime::set_mutation_tracking(false);
         let mut engine = JsEngine::new();
         // one native per reflected-prop accessor (getter + setter share it)
@@ -3285,6 +3358,8 @@ impl PageScripts {
             dom_ctor,
             el_closest: engine.register_native("Element.closest", el_native, E_CLOSEST),
             el_template_content: engine.register_native("HTMLTemplateElement.content", n_template_content, 0),
+            el_attach_shadow: engine.register_native("Element.attachShadow", el_native, E_ATTACH_SHADOW),
+            el_shadow_root: engine.register_native("Element.shadowRoot", el_native, E_SHADOW_ROOT),
             el_prepend: engine.register_native("Element.prepend", el_native, E_PREPEND),
             el_append_many: engine.register_native("Element.append", el_native, E_APPEND),
             el_before: engine.register_native("Element.before", el_native, E_BEFORE),
@@ -4215,6 +4290,41 @@ mod tests {
         );
         let _ = ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "t"), "BODY,DIV,SPAN");
+    }
+
+    #[test]
+    fn attach_shadow_returns_a_fragment_root() {
+        // GitHub's command polyfill wraps `HTMLElement.prototype.attachShadow`
+        // and then observes, queries and listener-binds the root it returns.
+        // With no `attachShadow` on the prototype, `orig.call(this, init)`
+        // threw inside every custom element constructor.
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="host"></div><script>
+                var orig = HTMLElement.prototype.attachShadow;
+                HTMLElement.prototype.attachShadow = function (init) {
+                    var root = orig.call(this, init);
+                    root.addEventListener("click", function () {});
+                    root.querySelectorAll("[oncommand]");
+                    return root;
+                };
+                var host = document.getElementById("host");
+                var root = host.attachShadow({ mode: "open" });
+                var span = document.createElement("span");
+                span.setAttribute("oncommand", "x");
+                root.appendChild(span);
+                var again = host.shadowRoot;
+                window.t = [
+                    root.nodeType,
+                    root.mode,
+                    root.host.id,
+                    again.nodeType,
+                    again.querySelectorAll("span").length,
+                    typeof orig,
+                ].join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "t"), "11,open,host,11,1,function");
     }
 
     #[test]
