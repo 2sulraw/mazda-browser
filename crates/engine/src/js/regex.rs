@@ -111,6 +111,12 @@ pub(crate) enum PropKind {
     Space,
     /// `\p{ASCII}`
     Ascii,
+    /// `\p{RI}` - regional indicator symbols (flag halves)
+    RegionalIndicator,
+    /// `\p{Emoji}` - honest shortcut: the symbol and pictograph blocks
+    Emoji,
+    /// `\p{EMod}` - the emoji modifier (skin-tone) code points
+    EmojiModifier,
 }
 /// capture snapshot: caps\[i\] = Some((start_char, end_char));
 /// caps\[0\]/caps\[1\] are the whole match. Copy-on-write via Rc.
@@ -726,6 +732,12 @@ fn prop_kind(name: &str) -> Option<PropKind> {
         "Nd" | "Decimal_Number" => PropKind::Digit,
         "Z" | "Separator" | "Zs" | "Space_Separator" => PropKind::Space,
         "ASCII" => PropKind::Ascii,
+        // GitHub's grapheme splitter (a `…|./gu` alternation) needs the emoji
+        // properties to compile: without them the whole landing module was a
+        // SyntaxError.
+        "RI" | "Regional_Indicator" => PropKind::RegionalIndicator,
+        "Emoji" => PropKind::Emoji,
+        "EMod" | "Emoji_Modifier" => PropKind::EmojiModifier,
         _ => return None,
     })
 }
@@ -738,7 +750,45 @@ fn prop_matches(kind: PropKind, ch: char) -> bool {
         PropKind::Number | PropKind::Digit => ch.is_numeric(),
         PropKind::Space => ch.is_whitespace(),
         PropKind::Ascii => ch.is_ascii(),
+        PropKind::RegionalIndicator => ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch),
+        PropKind::EmojiModifier => ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch),
+        // honest shortcut: the Unicode `Emoji` property is approximated by
+        // the symbol/pictograph blocks (and the keycap bases). The splitter
+        // only groups a cluster; it never indexes into the matched text.
+        PropKind::Emoji => is_emoji(ch),
     }
+}
+
+fn is_emoji(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x23
+            | 0x2A
+            | 0x30..=0x39
+            | 0xA9
+            | 0xAE
+            | 0x203C
+            | 0x2049
+            | 0x2122
+            | 0x2139
+            | 0x2194..=0x21AA
+            | 0x231A..=0x23FF
+            | 0x24C2
+            | 0x25AA..=0x25AB
+            | 0x25B6
+            | 0x25C0
+            | 0x25FB..=0x27BF
+            | 0x2934..=0x2935
+            | 0x2B05..=0x2B07
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x3030
+            | 0x303D
+            | 0x3297
+            | 0x3299
+            | 0x1F000..=0x1FAFF
+    )
 }
 
 fn dig_set(neg: bool) -> ClassSet {

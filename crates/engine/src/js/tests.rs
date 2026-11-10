@@ -5013,3 +5013,30 @@ fn string_substr_takes_a_length() {
     // borrowed through the prototype
     assert_eq!(string("String.prototype.substr.call('xyz', 1)"), "yz");
 }
+
+#[test]
+fn regex_emoji_property_escapes() {
+    // GitHub's grapheme splitter is
+    // `/\p{RI}\p{RI}|\p{Emoji}(\p{EMod}|…)?(…)*|./gu`; RI, Emoji and EMod
+    // were unknown names, so the whole landing module was a SyntaxError.
+    let ri = |a: u32, b: u32| format!("String.fromCharCode(0x{a:X}, 0x{b:X})");
+    assert!(boolean(&format!(
+        "var e = {}; /^\\p{{Emoji}}$/u.test(e)",
+        ri(0xD83D, 0xDE00)
+    )));
+    assert!(boolean(&format!(
+        "var a = {}, b = {}; /^\\p{{RI}}\\p{{RI}}$/u.test(a + b)",
+        ri(0xD83C, 0xDDE6),
+        ri(0xD83C, 0xDDE7)
+    )));
+    assert!(boolean(&format!(
+        "var e = {}; /^\\p{{EMod}}$/u.test(e)",
+        ri(0xD83C, 0xDFFB)
+    )));
+    assert!(!boolean(r"/\p{Emoji}/u.test('abc')"));
+    assert!(!boolean(r"/\p{RI}/u.test('A')"));
+    // the splitter's own alternation compiles
+    assert!(boolean(
+        "(() => { try { new RegExp('\\\\p{RI}|\\\\p{Emoji}|\\\\p{EMod}|.', 'gu'); return true } catch (e) { return false } })()"
+    ));
+}

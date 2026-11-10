@@ -3269,6 +3269,27 @@ string table had `slice` and `substring` but not `substr`.
 - Next fatal error: the grapheme splitter's regex is rejected with
   `unsupported unicode property escape \p{RI}` (below).
 
+## Emoji Unicode properties in regex (P32, 2026-11-10)
+
+With `substr` in place the landing module got as far as its grapheme splitter:
+
+```js
+/\p{RI}\p{RI}|\p{Emoji}(\p{EMod}|\u{FE0F}\u{20E3}?|[\u{E0020}-\u{E007E}]+\u{E007F})?(…)*|./gu
+```
+
+`\p{...}` knew only the letter/number/space/ASCII names, so this was a
+`SyntaxError` for the whole module.
+
+- `\p{RI}` / `\p{Regional_Indicator}` = U+1F1E6..U+1F1FF,
+  `\p{EMod}` / `\p{Emoji_Modifier}` = U+1F3FB..U+1F3FF.
+- `\p{Emoji}` is an honest shortcut: the symbol/pictograph blocks (BMP
+  symbols 0x2194..0x27BF plus 0x1F000..0x1FAFF and the keycap bases), not the
+  full Unicode property. The splitter only groups a cluster and never indexes
+  into the matched text, so a slightly wider set changes no page behaviour.
+- engine tests **995 -> 996** green (new `regex_emoji_property_escapes`).
+- Next fatal error: `bad hexadecimal escape in pattern` for the same regex:
+  its tag-sequence class is `[\u{E0020}-\u{E007E}]` (below).
+
 
 
 
