@@ -4951,3 +4951,17 @@ fn proxy_get_trap_overrides_and_forwards_to_the_target() {
     // a non-object target is rejected
     assert!(boolean("var threw = false; try { new Proxy(1, {}) } catch (e) { threw = e instanceof TypeError } threw"));
 }
+
+#[test]
+fn string_concat_appends_each_argument() {
+    // Minified bundles build a literal out of escapes with `"".concat(...)`;
+    // GitHub's landing chunk started its char-class table that way and died
+    // with "undefined is not a function".
+    assert_eq!(string("'a'.concat('b', 'c')"), "abc");
+    assert_eq!(string("'a'.concat()"), "a");
+    // each argument goes through ToString
+    assert_eq!(string("''.concat(1, null, undefined)"), "1nullundefined");
+    assert_eq!(string("'x'.concat(['y', 'z'])"), "xy,z");
+    // borrowed through the prototype, like the polyfills do
+    assert_eq!(string("String.prototype.concat.call('p', 'q')"), "pq");
+}

@@ -3197,6 +3197,26 @@ return new Proxy(e, { get: (e, r, n) => "navigate" === r ? t : Reflect.get(e, r,
   `landing-pages-623b97b89e4b9885.js` (thrown inside
   `wp-runtime-c06c3de1d3ace990.js`).
 
+## `String.prototype.concat` (P28, 2026-11-10)
+
+The next call failure pointed into an `8d-*.js` chunk at 2:17069, and the
+callee there is `""`:
+
+```js
+var o = "0-9\uFF10...", i = "".concat("-\u2010-\u2015...").concat("\uFF0F/")...
+```
+
+That is how the minified bundle writes a long literal: a chain of
+`"".concat(part)`. The engine had no `concat` on its string method table, so
+the receiver's method was `undefined` and the call threw "undefined is not a
+function".
+
+- `String.prototype.concat(...args)` appends the ToString of every argument to
+  the receiver; installed on the prototype table and in the primitive dispatch
+  so both `"a".concat(...)` and `String.prototype.concat.call(...)` work.
+- engine tests **991 -> 992** green (new `string_concat_appends_each_argument`).
+- Next fatal error: `Promise.withResolvers is not a function` (below).
+
 
 
 

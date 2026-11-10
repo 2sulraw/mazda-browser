@@ -2740,6 +2740,15 @@ pub(crate) fn call_method(
             let (a, b) = slice_bounds(arg_num(args, 0), args.get(1), n);
             Ok(Val::Str(Rc::from(chars[a..b].iter().collect::<String>().as_str())))
         }
+        StrConcat => {
+            // `"".concat(a, b)` - ToString each argument, receiver first.
+            let s = need_str(this)?;
+            let mut out = s.to_string();
+            for a in args {
+                out.push_str(a.to_string().as_str());
+            }
+            Ok(Val::Str(Rc::from(out.as_str())))
+        }
         StrIndexOf => {
             let s = need_str(this)?;
             let needle = arg_str(args, 0);
