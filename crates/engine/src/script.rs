@@ -129,6 +129,9 @@ thread_local! {
     /// answers `get`/`whenDefined` — but its presence is what pages probe,
     /// and a missing global is a ReferenceError that kills the module.
     static CUSTOM_ELEMENTS: RefCell<Vec<(String, Val)>> = const { RefCell::new(Vec::new()) };
+    /// Has this page already been told that IntersectionObserver never
+    /// fires? Pages build several, and one note per page is enough.
+    static IO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Install the script-local context for the duration of a turn.
@@ -650,7 +653,14 @@ struct Nids {
     ce_define: usize,
     ce_get: usize,
     ce_when_defined: usize,
-    ce_noop: usize,}
+    ce_noop: usize,
+    /// `IntersectionObserver`
+    io_ctor: usize,
+    io_observe: usize,
+    io_unobserve: usize,
+    io_disconnect: usize,
+    io_take: usize,
+}
 
 thread_local! {
     static NIDS: std::cell::Cell<Option<Nids>> = const { std::cell::Cell::new(None) };
@@ -864,6 +874,12 @@ const MO_CTOR: u16 = 0;
 const MO_OBSERVE: u16 = 1;
 const MO_DISCONNECT: u16 = 2;
 const MO_TAKE: u16 = 3;
+/// IntersectionObserver group idxs
+const IO_CTOR: u16 = 0;
+const IO_OBSERVE: u16 = 1;
+const IO_UNOBSERVE: u16 = 2;
+const IO_DISCONNECT: u16 = 3;
+const IO_TAKE: u16 = 4;
 /// storage group idxs
 const S_GET: u16 = 40;
 const S_SET: u16 = 41;
@@ -2322,7 +2338,94 @@ fn install_mutation_observer(e: &mut JsEngine, ids: Nids) {
     e.set_global("MutationObserver", Val::Native(ids.mo_ctor));
 }
 
-/// `requestAnimationFrame(cb)` — the callback joins this turn's queue with
+/// `new IntersectionObserver(callback, {root, rootMargin, threshold})`.
+///
+/// shortcut: callbacks are never delivered. Delivery needs a viewport and a
+/// scroll position, which the renderer does not expose to a page turn; the
+/// honest stand-in for "not in view" is an observer that never fires. Pages
+/// that lazy-load on intersection simply never load more (github.com's
+/// analytics and infinite lists), and no code path depends on a callback
+/// having run.
+fn n_io(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == IO_CTOR {
+        if !is_ctor_call(e, this) {
+            return Err(JsError::throw(
+                "TypeError: IntersectionObserver is not a constructor",
+            ));
+        }
+        let cb = args.first().cloned().unwrap_or(Val::Undefined);
+        if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
+            return Err(JsError::throw(
+                "TypeError: IntersectionObserver callback is not a function",
+            ));
+        }
+        let obs = proto_instance(
+            e.native_prop(nids().io_ctor, "prototype")
+                .unwrap_or(Val::Undefined),
+        );
+        let opts = args.get(1);
+        obs.set("__cb", cb);
+        obs.set(
+            "root",
+            match event_option(opts, "root") {
+                Val::Undefined => Val::Null,
+                v => v,
+            },
+        );
+        let margin = match event_option(opts, "rootMargin") {
+            Val::Str(s) => s.to_string(),
+            _ => "0px 0px 0px 0px".to_string(),
+        };
+        obs.set("rootMargin", str_val(&margin));
+        // `threshold` takes a number or an array of them; the spec always
+        // reports it as a list of increasing fractions
+        let thresholds = match event_option(opts, "threshold") {
+            Val::Num(n) => vec![n],
+            Val::Obj(o) => o
+                .borrow()
+                .props
+                .iter()
+                .filter_map(|(k, v)| match (k.parse::<usize>(), v) {
+                    (Ok(_), Val::Num(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![0.0],
+        };
+        obs.set(
+            "thresholds",
+            Val::new_array(thresholds.into_iter().map(Val::Num).collect()),
+        );
+        if !IO_NOTE.with(|n| n.replace(true)) {
+            eprintln!(
+                "[js] IntersectionObserver: observe() records nothing and never fires (no viewport; shortcut)"
+            );
+        }
+        return Ok(obs);
+    }
+    // every method needs a live observer object
+    if !matches!(this, Val::Obj(o) if !matches!(js::obj_get_own(o, "__cb"), Val::Undefined)) {
+        return Err(JsError::throw(
+            "TypeError: IntersectionObserver method called on a non-observer",
+        ));
+    }
+    match idx {
+        IO_TAKE => Ok(Val::new_array(Vec::new())),
+        _ => Ok(Val::Undefined),
+    }
+}
+
+fn install_intersection_observer(e: &mut JsEngine, ids: Nids) {
+    let proto = Val::new_object();
+    proto.set("observe", Val::Native(ids.io_observe));
+    proto.set("unobserve", Val::Native(ids.io_unobserve));
+    proto.set("disconnect", Val::Native(ids.io_disconnect));
+    proto.set("takeRecords", Val::Native(ids.io_take));
+    e.set_native_prop(ids.io_ctor, "prototype", proto);
+    e.set_global("IntersectionObserver", Val::Native(ids.io_ctor));
+}
+
+/// `requestAnimationFrame(cb)` - the callback joins this turn's queue with
 /// a one-epoch deadline; the worker's scheduler fires every queued callback
 /// in a single coalesced pass and re-lays out once if any of them mutated
 /// the DOM (not per callback, not vsync-locked — module docs).
@@ -2734,6 +2837,7 @@ impl PageScripts {
         // a fresh page starts with no observers and no mutation logging
         OBSERVERS.with(|o| o.borrow_mut().clear());
         CUSTOM_ELEMENTS.with(|c| c.borrow_mut().clear());
+        IO_NOTE.with(|n| n.set(false));
         runtime::set_mutation_tracking(false);
         let mut engine = JsEngine::new();
         // one native per reflected-prop accessor (getter + setter share it)
@@ -2852,12 +2956,18 @@ impl PageScripts {
             ce_get: engine.register_native("customElements.get", n_custom_elements, CE_GET),
             ce_when_defined: engine.register_native("customElements.whenDefined", n_custom_elements, CE_WHEN_DEFINED),
             ce_noop: engine.register_native("customElements.upgrade", n_custom_elements, CE_NOOP),
+            io_ctor: engine.register_native("IntersectionObserver", n_io, IO_CTOR),
+            io_observe: engine.register_native("IntersectionObserver.prototype.observe", n_io, IO_OBSERVE),
+            io_unobserve: engine.register_native("IntersectionObserver.prototype.unobserve", n_io, IO_UNOBSERVE),
+            io_disconnect: engine.register_native("IntersectionObserver.prototype.disconnect", n_io, IO_DISCONNECT),
+            io_take: engine.register_native("IntersectionObserver.prototype.takeRecords", n_io, IO_TAKE),
         };
         NIDS.with(|c| c.set(Some(ids)));
         install_event_types(&mut engine, ids);
         install_dom_types(&mut engine, &ids);
         install_custom_elements(&mut engine, ids);
         install_mutation_observer(&mut engine, ids);
+        install_intersection_observer(&mut engine, ids);
         // CSSOM bridge: the style object's member reads/writes go through
         // the shared host (js.rs itself stays DOM-free)
         engine.style_get = Some(style_get_hook);
@@ -3831,6 +3941,40 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "text"), "firstablast");
         assert_eq!(get_global_str(&mut ps, "order2"), "x,z,a,b");
         assert_eq!(get_global_str(&mut ps, "order3"), "0:only");
+    }
+
+    #[test]
+    fn intersection_observer_constructs_and_observes_without_firing() {
+        // the shape github.com uses: construct with options, observe elements,
+        // unobserve from the callback (which never runs here)
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d"></div><script>
+                var fired = 0;
+                var io = new IntersectionObserver(function (entries) {
+                    fired++;
+                }, { rootMargin: "0% 0% -30% 0%", threshold: 0 });
+                window.margin = io.rootMargin;
+                window.thresholds = io.thresholds.length + ":" + io.thresholds[0];
+                window.root = io.root === null;
+                io.observe(document.getElementById("d"));
+                io.unobserve(document.getElementById("d"));
+                window.records = io.takeRecords().length;
+                io.disconnect();
+                window.fired = fired;
+                window.isInstance = io instanceof IntersectionObserver;
+                var bad = false;
+                try { new IntersectionObserver(); } catch (e) { bad = e instanceof TypeError; }
+                window.badCb = bad;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "margin"), "0% 0% -30% 0%");
+        assert_eq!(get_global_str(&mut ps, "thresholds"), "1:0");
+        assert_eq!(get_global_str(&mut ps, "root"), "true");
+        assert_eq!(get_global_str(&mut ps, "records"), "0");
+        assert_eq!(get_global_str(&mut ps, "fired"), "0");
+        assert_eq!(get_global_str(&mut ps, "isInstance"), "true");
+        assert_eq!(get_global_str(&mut ps, "badCb"), "true");
     }
 
     #[test]

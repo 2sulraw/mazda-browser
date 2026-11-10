@@ -2893,3 +2893,29 @@ What this batch adds, and the shape it had to take:
 - Page render on github.com is unchanged (header only): the bootstrap still
   dies, now on `IntersectionObserver`. The value of this batch is that each
   run gets further into real site code before it stops.
+
+## `IntersectionObserver` that never fires (P17, 2026-11-10)
+
+Next fatal error in the same bootstrap: `ReferenceError: IntersectionObserver
+is not defined`. Github's analytics chunk builds one at load
+(`new IntersectionObserver(cb, {rootMargin: "0% 0% -30% 0%", threshold: 0})`)
+and calls `observe()` on every nav link.
+
+- The interface exists with the honest shape: constructor validating a
+  function callback, `root`/`rootMargin`/`thresholds` read back from the
+  options, `observe`/`unobserve`/`disconnect`, and `takeRecords()` answering an
+  empty list.
+- Delivery is the one thing missing, and it is a documented shortcut: an
+  intersection needs a viewport and a scroll position, which a page turn does
+  not see. "Not intersecting" is exactly an observer that never calls back, so
+  lazy-loading pages stop at the first screen instead of lying about what is
+  visible. Logged once per page.
+
+### Measured (one cold run, `MAZDA_TIME=1`)
+
+| phase | before | after |
+| --- | --- | --- |
+| first fatal error in `core-*.js` | `IntersectionObserver is not defined` | `ResizeObserver is not defined` |
+
+- engine tests **976 → 977** green (new
+  `intersection_observer_constructs_and_observes_without_firing`).
