@@ -3516,6 +3516,38 @@ the getter threw again.
   is `<react-app>`'s `connectedCallback` calling `toggleAttribute` (next
   entry).
 
+## `Element.toggleAttribute` (P41, 2026-11-10)
+
+`<react-app>` (GitHub's Catalyst controller) then became the first throw:
+
+```
+custom element <react-app>: connectedCallback threw
+Uncaught TypeError: undefined is not a function (at 136:145728 of pb-*.js)
+```
+
+The column is the loop head of:
+
+```js
+connectedCallback(e, t) {
+  for (let t of (e.toggleAttribute("data-catalyst", true),
+                 customElements.upgrade(e),
+                 e.querySelectorAll("template[data-shadowroot]")))
+    …
+```
+
+`customElements.upgrade` was already a callable no-op and `querySelectorAll`
+existed, so the undefined call was `toggleAttribute` itself.
+
+- `Element.toggleAttribute(name, force)` implements the spec's three cases:
+  present with no force or `false` → remove and return false; absent with no
+  force or `true` → add with an empty value and return true.
+- exposed on element wrappers and on `Element.prototype` (like `hasAttribute`).
+- engine tests **1003 -> 1004** green (new
+  `toggle_attribute_flips_presence_and_returns_the_result`).
+- github.com cold load: the Catalyst callback now proceeds and fails on
+  `No embedded data provided for react element`, a *page* error whose cause is
+  the selector matcher (next entry).
+
 
 
 

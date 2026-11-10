@@ -420,6 +420,7 @@ fn build_element(node: u32) -> Val {
     o.set("removeEventListener", js::Val::Native(n.el_remove_listener));
     o.set("matches", js::Val::Native(n.el_matches));
     o.set("hasAttribute", js::Val::Native(n.el_has_attr));
+    o.set("toggleAttribute", js::Val::Native(n.el_toggle_attr));
     o.set("dispatchEvent", js::Val::Native(n.el_dispatch));
     o.set("setTextContent", js::Val::Native(n.el_set_text));
     o.set("setInnerHTML", js::Val::Native(n.el_set_inner));
@@ -728,6 +729,8 @@ struct Nids {
     el_remove_listener: usize,
     el_matches: usize,
     el_has_attr: usize,
+    /// `Element.toggleAttribute(name, force)`
+    el_toggle_attr: usize,
     /// one shared `dispatchEvent` native for elements, document and window
     el_dispatch: usize,
     el_set_text: usize,
@@ -1118,6 +1121,8 @@ const E_ATTACH_SHADOW: u16 = 60;
 const E_SHADOW_ROOT: u16 = 61;
 /// `Node.ownerDocument` (getter) — the page's document object
 const E_OWNER_DOCUMENT: u16 = 62;
+/// `Element.toggleAttribute(name, force)` — returns the resulting presence
+const E_TOGGLE_ATTRIBUTE: u16 = 63;
 /// `window.removeEventListener(type, cb)` (document shares the bucket)
 const W_REMOVE_LISTENER: u16 = 53;
 /// `customElements` group idxs
@@ -1348,6 +1353,22 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
         E_HAS_ATTRIBUTE => Ok(Val::Bool(runtime::host(|h| {
             h.attr(node, &a0.to_string()).is_some()
         }))),
+        E_TOGGLE_ATTRIBUTE => {
+            // spec: present + (force absent or false) -> remove; absent +
+            // (force absent or true) -> add with an empty value
+            let name = a0.to_string();
+            let present = runtime::host(|h| h.attr(node, &name).is_some());
+            let want = match args.get(1) {
+                Some(v) if !matches!(v, Val::Undefined) => v.to_bool(),
+                _ => !present,
+            };
+            if want && !present {
+                set_attr(node, &name, "");
+            } else if !want && present {
+                remove_attr(node, &name);
+            }
+            Ok(Val::Bool(want))
+        }
         E_CLOSEST => {
             let Some(sel) = a0.as_string() else { return Ok(Val::Null) };
             Ok(runtime::host(|h| {
@@ -2214,6 +2235,7 @@ fn install_dom_types(e: &mut JsEngine, ids: &Nids) {
     chain[DOM_ELEMENT].set("matches", Val::Native(ids.el_matches));
     chain[DOM_ELEMENT].set("closest", Val::Native(ids.el_closest));
     chain[DOM_ELEMENT].set("hasAttribute", Val::Native(ids.el_has_attr));
+    chain[DOM_ELEMENT].set("toggleAttribute", Val::Native(ids.el_toggle_attr));
     chain[DOM_ELEMENT].set("removeEventListener", Val::Native(ids.el_remove_listener));
     // the command polyfill reads `HTMLElement.prototype.attachShadow` and
     // wraps it; it is inherited from `Element.prototype` like `matches` is
@@ -3395,6 +3417,7 @@ impl PageScripts {
             el_remove_listener: engine.register_native("Element.removeEventListener", el_native, E_REMOVE_EVENT_LISTENER),
             el_matches: engine.register_native("Element.matches", el_native, E_MATCHES),
             el_has_attr: engine.register_native("Element.hasAttribute", el_native, E_HAS_ATTRIBUTE),
+            el_toggle_attr: engine.register_native("Element.toggleAttribute", el_native, E_TOGGLE_ATTRIBUTE),
             el_dispatch: engine.register_native("EventTarget.dispatchEvent", ev_native, V_DISPATCH),
             el_set_text: engine.register_native("Element.setTextContent", el_native, E_SET_TEXT_CONTENT),
             el_set_inner: engine.register_native("Element.setInnerHTML", el_native, E_SET_INNER_HTML),
@@ -4902,6 +4925,33 @@ mod tests {
         assert_eq!(
             get_global_str(&mut ps, "t"),
             "true,true,true,false,false,true,false,true,false"
+        );
+    }
+
+    #[test]
+    fn toggle_attribute_flips_presence_and_returns_the_result() {
+        // GitHub's Catalyst controller starts its connectedCallback with
+        // `e.toggleAttribute("data-catalyst", true)`; without the method the
+        // whole callback was "undefined is not a function".
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d" hidden></div><script>
+                var el = document.getElementById("d");
+                var t = [];
+                t.push(el.toggleAttribute("hidden"));      // was present -> removed
+                t.push(el.hasAttribute("hidden"));
+                t.push(el.toggleAttribute("hidden"));      // absent -> added empty
+                t.push(el.getAttribute("hidden") === "");
+                t.push(el.toggleAttribute("hover", true));  // force add
+                t.push(el.toggleAttribute("hover", true));  // already there
+                t.push(el.toggleAttribute("hover", false)); // force remove
+                t.push(el.hasAttribute("hover"));
+                window.t = t.join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "t"),
+            "false,false,true,true,true,true,false,false"
         );
     }
 
