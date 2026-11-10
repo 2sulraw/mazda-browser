@@ -5215,3 +5215,37 @@ fn regex_unicode_escape_at_class_range_bound() {
         "var out = String.fromCharCode(0xDB40, 0xDC1F); /^[\\u{E0020}-\\u{E007E}]$/u.test(out)"
     ));
 }
+
+#[test]
+fn map_values_iterator_yields_values_not_pairs() {
+    // GitHub's protobuf descriptor builder walks a Map's `values()` and reads
+    // `.proto` off each entry. The values iterator returned the raw
+    // `[key, value]` slot (what `entries` yields), so every entry was an
+    // array and the builder threw "Cannot read property 'oneofDecl' of
+    // undefined".
+    assert_eq!(string("[...new Map([['a', 1]]).values()].join(',')"), "1");
+    assert_eq!(
+        string("var m = new Map([['a', 1], ['b', 2]]); [...m.values()].join(',')"),
+        "1,2"
+    );
+    assert_eq!(
+        string("var m = new Map([['a', 1]]); [...m.keys()].join(',')"),
+        "a"
+    );
+    assert_eq!(
+        string("var m = new Map([['a', 1], ['b', 2]]); [...m.entries()].map(p => p.join(':')).join(',')"),
+        "a:1,b:2"
+    );
+    // the default iterator is still `entries`
+    assert_eq!(
+        string("var m = new Map([['a', 1]]); [...m].map(p => p.join(':')).join(',')"),
+        "a:1"
+    );
+    assert_eq!(
+        num("var m = new Map([['a', 1], ['b', 2]]), n = 0; for (var v of m.values()) n += v; n"),
+        3.0
+    );
+    // a Set stores the value itself, so its values iterator is unaffected
+    assert_eq!(string("[...new Set([7, 8]).values()].join(',')"), "7,8");
+}
+

@@ -3733,6 +3733,31 @@ Katakana and Han characters, and GitHub's own source files carry all nine.
   descriptor builder inside `4u-*.js` runs for real for the first time
   (next entry).
 
+## Map `values()` yields values (P48, 2026-11-10)
+
+With the regex gaps closed, GitHub's protobuf descriptor builder in `4u-*.js`
+ran and threw inside its message walk:
+
+```
+[js] script error in code-view-*.js: Uncaught TypeError: Cannot read
+property 'oneofDecl' of undefined (in Q <- q <- et)
+```
+
+`et` builds one `oneof` per `DescriptorProto.oneofDecl` entry and got
+`undefined` entries because the thing it walked was an *array*: the builder
+collects descriptors with `for (let e of s.values())` over a `Map`, and the
+engine's values iterator handed back the raw `[key, value]` pair, which is what
+`entries()` yields.
+
+- `iter_step` unwraps the pair for `IterKind::Values` when the source carries
+  the hidden `__map` prop. Sets keep the value itself under `__set`, so they
+  fall through untouched, and `entries()` still gets the pair.
+- engine tests **1010 -> 1011** green (new
+  `map_values_iterator_yields_values_not_pairs`: values order, keys, entries,
+  the default iterator staying `entries`, a `for...of` sum, and the Set side).
+- `github.com/rust-lang/rust`: the descriptor walk proceeds; the next failure
+  is that every *string* in the decoded descriptor is empty (next entry).
+
 
 
 

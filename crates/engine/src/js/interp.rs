@@ -1121,6 +1121,18 @@ pub(crate) fn iter_step(it: &mut IterState) -> Option<Val> {
     let raw = iter_slot(&it.source, it.index)?;
     let idx = it.index;
     it.index += 1;
+    // A Map's raw slot is its `[key, value]` pair (that is what `entries`
+    // yields), so the *values* iterator takes the second half. Sets store the
+    // value itself, so they fall through untouched. GitHub's protobuf
+    // descriptor builder iterates a Map's values and indexes the result; with
+    // the pair it saw an array where it expected a message.
+    if matches!(it.kind, IterKind::Values) && has_hidden(&it.source, "__map") {
+        if let Val::Obj(p) = &raw {
+            if let ObjKind::Array(kv) = &p.borrow().kind {
+                return Some(kv.get(1).cloned().unwrap_or(Val::Undefined));
+            }
+        }
+    }
     Some(match it.kind {
         IterKind::Values => raw,
         IterKind::Keys => keys_value(&it.source, idx, raw),
