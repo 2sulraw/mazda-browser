@@ -5130,6 +5130,40 @@ fn regex_bidi_control_property_escape() {
 }
 
 #[test]
+fn regex_mark_property_escapes() {
+    // GitHub's code-view bundle tests source text for combining marks with
+    // `\p{Mn}`, `\p{Mc}`, `\p{Me}` and the union `[\p{Mn}\p{Mc}\p{Me}]`;
+    // every one of them was an unsupported property escape.
+    let cp = |n: u32| format!("String.fromCharCode(0x{n:X})");
+    // combining acute accent, devanagari vowel sign, enclosing circle
+    for (prop, code) in [
+        ("Mn", 0x0301u32),
+        ("Mn", 0x093Fu32),
+        ("Mc", 0x093Eu32),
+        ("Me", 0x20DDu32),
+        ("M", 0x0301u32),
+        ("Mark", 0x20DDu32),
+    ] {
+        assert!(
+            boolean(&format!(
+                "var c = {}; new RegExp('^\\\\p{{{}}}$', 'u').test(c)",
+                cp(code),
+                prop
+            )),
+            "\\p{{{prop}}} should match U+{code:04X}"
+        );
+    }
+    // the union form the bundle writes
+    assert!(boolean(&format!(
+        "var c = {}; /[\\p{{Mn}}\\p{{Mc}}\\p{{Me}}]/u.test(c)",
+        cp(0x093E)
+    )));
+    // plain letters and ASCII are not marks
+    assert!(!boolean(r"/\p{Mn}/u.test('A')"));
+    assert!(!boolean(r"/\p{M}/u.test('a')"));
+}
+
+#[test]
 fn regex_unicode_escape_at_class_range_bound() {
     // The splitter's tag-sequence class is `[\u{E0020}-\u{E007E}]`: the
     // range's upper bound used the fixed `\uXXXX` form only, so a `{...}`

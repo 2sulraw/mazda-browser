@@ -3676,6 +3676,34 @@ recognised `(?<=` / `(?<!` only to reject them.
   on `\p{Mn}` (next entry). Script exec rose from 8.8 s to 12.2 s because the
   code view is running.
 
+## Mark property escapes (P46, 2026-11-10)
+
+The next bundle in the same chain needed the mark categories:
+
+```
+[js] script error in code-view-*.js: dp-*.js:
+SyntaxError: /\p{Mn}/u: unsupported unicode property escape \p{Mn} (line 2, col 15473)
+```
+
+That module classifies source text for its homograph/confusable check and
+declares all four forms: `\p{Mn}`, `\p{Mc}`, `\p{Me}` and the union
+`[\p{Mn}\p{Mc}\p{Me}]`.
+
+- `PropKind::Mark`, accepted as `M` / `Mark` / `Mn` / `Nonspacing_Mark` / `Mc`
+  / `Spacing_Mark` / `Me` / `Enclosing_Mark`.
+- shortcut: the engine has no Unicode tables, so the three subcategories are
+  **not distinguished**. They all answer from `MARK_RANGES`, a block list of
+  the combining marks by script (combining diacritics, Cyrillic, Hebrew,
+  Arabic, the Indic scripts, Thai/Lao, Tibetan, Myanmar, Khmer, the
+  combining supplement, variation selectors, and the supplementary-plane
+  blocks). Block granularity over-accepts a few neighbours in the same block;
+  every real combining mark in those scripts is covered. Flagged here rather
+  than pretending to be exact.
+- engine tests **1008 -> 1009** green (new `regex_mark_property_escapes`,
+  including the union form and the "letters are not marks" side).
+- `github.com/rust-lang/rust`: the mark checks compile; the module chain now
+  stops on `\p{Script=Greek}` (next entry).
+
 
 
 

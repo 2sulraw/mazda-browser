@@ -122,6 +122,11 @@ pub(crate) enum PropKind {
     EmojiModifier,
     /// `\p{Bidi_Control}` - the bidirectional-formatting controls
     BidiControl,
+    /// `\p{M}` / `\p{Mn}` / `\p{Mc}` / `\p{Me}` — combining marks.
+    /// shortcut: the engine has no Unicode tables, so the three mark
+    /// subcategories are not distinguished; all of them answer from the same
+    /// combining-mark block list (`MARK_RANGES`).
+    Mark,
 }
 /// capture snapshot: caps\[i\] = Some((start_char, end_char));
 /// caps\[0\]/caps\[1\] are the whole match. Copy-on-write via Rc.
@@ -737,6 +742,10 @@ fn prop_kind(name: &str) -> Option<PropKind> {
         // GitHub's code-view bundle classifies bidi controls to render source
         // files; without the property the whole bundle was a SyntaxError.
         "Bidi_C" | "Bidi_Control" => PropKind::BidiControl,
+        // the same bundle tests source text for combining marks with
+        // `\p{Mn}`, `\p{Mc}`, `\p{Me}` and their union
+        "M" | "Mark" | "Mn" | "Nonspacing_Mark" | "Mc" | "Spacing_Mark" | "Me"
+        | "Enclosing_Mark" => PropKind::Mark,
         _ => return None,
     })
 }
@@ -761,8 +770,209 @@ fn prop_matches(kind: PropKind, ch: char) -> bool {
         // the symbol/pictograph blocks (and the keycap bases). The splitter
         // only groups a cluster; it never indexes into the matched text.
         PropKind::Emoji => is_emoji(ch),
+        // shortcut: `Mn`/`Mc`/`Me` share one combining-mark block list, so a
+        // spacing mark answers true for `\p{Mn}` too (see `PropKind::Mark`)
+        PropKind::Mark => MARK_RANGES.iter().any(|&(a, b)| (a..=b).contains(&ch)),
     }
 }
+
+/// The combining-mark blocks (`Mn` ∪ `Mc` ∪ `Me`), by script. Deliberately
+/// block-granular: it over-accepts a few non-mark code points that share a
+/// block with marks, but every real combining mark in the scripts below is in
+/// it.
+const MARK_RANGES: &[(char, char)] = &[
+    ('\u{0300}', '\u{036F}'), // combining diacritics
+    ('\u{0483}', '\u{0489}'), // Cyrillic
+    ('\u{0591}', '\u{05BD}'),
+    ('\u{05BF}', '\u{05BF}'),
+    ('\u{05C1}', '\u{05C2}'),
+    ('\u{05C4}', '\u{05C5}'),
+    ('\u{05C7}', '\u{05C7}'), // Hebrew
+    ('\u{0610}', '\u{061A}'),
+    ('\u{064B}', '\u{065F}'),
+    ('\u{0670}', '\u{0670}'),
+    ('\u{06D6}', '\u{06ED}'), // Arabic
+    ('\u{0711}', '\u{0711}'),
+    ('\u{0730}', '\u{074A}'), // Syriac
+    ('\u{07A6}', '\u{07B0}'),
+    ('\u{07EB}', '\u{07F3}'), // Thaana / NKo
+    ('\u{0816}', '\u{082D}'), // Samaritan
+    ('\u{0859}', '\u{085B}'), // Mandaic
+    ('\u{08D4}', '\u{0903}'), // Arabic extended / Devanagari
+    ('\u{093A}', '\u{094F}'),
+    ('\u{0951}', '\u{0957}'),
+    ('\u{0962}', '\u{0963}'), // Devanagari
+    ('\u{0981}', '\u{0983}'),
+    ('\u{09BC}', '\u{09BC}'),
+    ('\u{09BE}', '\u{09CD}'),
+    ('\u{09D7}', '\u{09D7}'),
+    ('\u{09E2}', '\u{09E3}'), // Bengali
+    ('\u{0A01}', '\u{0A03}'),
+    ('\u{0A3C}', '\u{0A42}'),
+    ('\u{0A47}', '\u{0A48}'),
+    ('\u{0A4B}', '\u{0A4D}'),
+    ('\u{0A51}', '\u{0A51}'),
+    ('\u{0A70}', '\u{0A71}'),
+    ('\u{0A75}', '\u{0A75}'), // Gurmukhi
+    ('\u{0A81}', '\u{0A83}'),
+    ('\u{0ABC}', '\u{0ABC}'),
+    ('\u{0ABE}', '\u{0AC5}'),
+    ('\u{0AC7}', '\u{0ACD}'),
+    ('\u{0AE2}', '\u{0AE3}'), // Gujarati
+    ('\u{0B01}', '\u{0B03}'),
+    ('\u{0B3C}', '\u{0B44}'),
+    ('\u{0B47}', '\u{0B48}'),
+    ('\u{0B4B}', '\u{0B4D}'),
+    ('\u{0B56}', '\u{0B57}'),
+    ('\u{0B62}', '\u{0B63}'), // Oriya
+    ('\u{0B82}', '\u{0B82}'),
+    ('\u{0BBE}', '\u{0BCD}'),
+    ('\u{0BD7}', '\u{0BD7}'), // Tamil
+    ('\u{0C00}', '\u{0C04}'),
+    ('\u{0C3E}', '\u{0C44}'),
+    ('\u{0C46}', '\u{0C48}'),
+    ('\u{0C4A}', '\u{0C4D}'),
+    ('\u{0C55}', '\u{0C56}'),
+    ('\u{0C62}', '\u{0C63}'), // Telugu
+    ('\u{0C81}', '\u{0C83}'),
+    ('\u{0CBC}', '\u{0CBC}'),
+    ('\u{0CBE}', '\u{0CCD}'),
+    ('\u{0CD5}', '\u{0CD6}'),
+    ('\u{0CE2}', '\u{0CE3}'), // Kannada
+    ('\u{0D01}', '\u{0D03}'),
+    ('\u{0D3B}', '\u{0D44}'),
+    ('\u{0D46}', '\u{0D4D}'),
+    ('\u{0D57}', '\u{0D57}'),
+    ('\u{0D62}', '\u{0D63}'), // Malayalam
+    ('\u{0DCA}', '\u{0DDF}'), // Sinhala
+    ('\u{0E31}', '\u{0E3A}'),
+    ('\u{0E47}', '\u{0E4E}'), // Thai
+    ('\u{0EB1}', '\u{0EBC}'),
+    ('\u{0EC8}', '\u{0ECD}'), // Lao
+    ('\u{0F18}', '\u{0F19}'),
+    ('\u{0F35}', '\u{0F35}'),
+    ('\u{0F37}', '\u{0F37}'),
+    ('\u{0F39}', '\u{0F39}'),
+    ('\u{0F3E}', '\u{0F3F}'),
+    ('\u{0F71}', '\u{0F84}'),
+    ('\u{0F86}', '\u{0F87}'),
+    ('\u{0F8D}', '\u{0FBC}'), // Tibetan
+    ('\u{102B}', '\u{103E}'),
+    ('\u{1056}', '\u{1059}'),
+    ('\u{105E}', '\u{1060}'),
+    ('\u{1062}', '\u{1064}'),
+    ('\u{1067}', '\u{106D}'),
+    ('\u{1071}', '\u{1074}'),
+    ('\u{1082}', '\u{108D}'),
+    ('\u{108F}', '\u{108F}'),
+    ('\u{109A}', '\u{109D}'), // Myanmar
+    ('\u{135D}', '\u{135F}'), // Ethiopic
+    ('\u{1712}', '\u{1714}'),
+    ('\u{1732}', '\u{1734}'),
+    ('\u{1752}', '\u{1753}'),
+    ('\u{1772}', '\u{1773}'), // Tagalog / Hanunoo / Buhid / Tagbanwa
+    ('\u{17B4}', '\u{17D3}'),
+    ('\u{17DD}', '\u{17DD}'), // Khmer
+    ('\u{180B}', '\u{180D}'), // Mongolian
+    ('\u{1920}', '\u{1922}'),
+    ('\u{1927}', '\u{1928}'),
+    ('\u{1932}', '\u{1932}'),
+    ('\u{1939}', '\u{193B}'), // Limbu
+    ('\u{1A17}', '\u{1A1B}'),
+    ('\u{1A55}', '\u{1A5E}'),
+    ('\u{1A60}', '\u{1A7C}'), // Tai Tham
+    ('\u{1AB0}', '\u{1ABE}'), // combining extended
+    ('\u{1B00}', '\u{1B04}'),
+    ('\u{1B34}', '\u{1B44}'),
+    ('\u{1B6B}', '\u{1B73}'), // Balinese
+    ('\u{1B80}', '\u{1B82}'),
+    ('\u{1BA1}', '\u{1BAD}'), // Sundanese
+    ('\u{1BE6}', '\u{1BF3}'), // Batak
+    ('\u{1C24}', '\u{1C37}'), // Lepcha
+    ('\u{1CD0}', '\u{1CF9}'), // Vedic
+    ('\u{1DC0}', '\u{1DFF}'), // combining supplement
+    ('\u{20D0}', '\u{20F0}'), // combining marks for symbols
+    ('\u{2CEF}', '\u{2CF1}'),
+    ('\u{2D7F}', '\u{2D7F}'),
+    ('\u{2DE0}', '\u{2DFF}'), // Cyrillic extended
+    ('\u{302A}', '\u{302F}'),
+    ('\u{3099}', '\u{309A}'), // CJK / kana
+    ('\u{A66F}', '\u{A672}'),
+    ('\u{A674}', '\u{A67D}'),
+    ('\u{A69E}', '\u{A69F}'), // Cyrillic
+    ('\u{A6F0}', '\u{A6F1}'),
+    ('\u{A802}', '\u{A802}'),
+    ('\u{A806}', '\u{A806}'),
+    ('\u{A80B}', '\u{A80B}'),
+    ('\u{A823}', '\u{A827}'), // Bamum / Syloti Nagri
+    ('\u{A880}', '\u{A881}'),
+    ('\u{A8B4}', '\u{A8C5}'), // Saurashtra
+    ('\u{A8E0}', '\u{A8F1}'), // Devanagari extended
+    ('\u{A926}', '\u{A92D}'),
+    ('\u{A947}', '\u{A953}'), // Kayah Li / Rejang
+    ('\u{A980}', '\u{A983}'),
+    ('\u{A9B3}', '\u{A9C0}'), // Javanese
+    ('\u{A9E5}', '\u{A9E5}'),
+    ('\u{AA29}', '\u{AA36}'),
+    ('\u{AA43}', '\u{AA43}'),
+    ('\u{AA4C}', '\u{AA4C}'),
+    ('\u{AA7B}', '\u{AA7D}'), // Cham / Meetei Mayek
+    ('\u{AAB0}', '\u{AABF}'),
+    ('\u{AAC1}', '\u{AAC1}'), // Tai Viet
+    ('\u{AAEB}', '\u{AAEF}'),
+    ('\u{AAF5}', '\u{AAF6}'),
+    ('\u{ABE3}', '\u{ABEA}'),
+    ('\u{ABEC}', '\u{ABED}'), // Meetei Mayek extended
+    ('\u{FB1E}', '\u{FB1E}'), // Hebrew presentation
+    ('\u{FE00}', '\u{FE0F}'), // variation selectors
+    ('\u{FE20}', '\u{FE2F}'), // combining half marks
+    ('\u{101FD}', '\u{101FD}'),
+    ('\u{102E0}', '\u{102E0}'),
+    ('\u{10376}', '\u{1037A}'),
+    ('\u{10A01}', '\u{10A0F}'),
+    ('\u{10A38}', '\u{10A3F}'),
+    ('\u{10AE5}', '\u{10AE6}'),
+    ('\u{11000}', '\u{11002}'),
+    ('\u{11038}', '\u{11046}'),
+    ('\u{1107F}', '\u{11082}'),
+    ('\u{110B0}', '\u{110BA}'), // Brahmi / Kaithi / Chakma / Sharada
+    ('\u{11100}', '\u{11102}'),
+    ('\u{11127}', '\u{11134}'),
+    ('\u{11173}', '\u{11173}'),
+    ('\u{11180}', '\u{11182}'),
+    ('\u{111B3}', '\u{111C0}'), // Khojki / Khudawadi
+    ('\u{1122C}', '\u{11237}'),
+    ('\u{112DF}', '\u{112EA}'), // Takri / Grantha
+    ('\u{11300}', '\u{11303}'),
+    ('\u{1133B}', '\u{1134D}'),
+    ('\u{11357}', '\u{11357}'),
+    ('\u{11362}', '\u{11374}'), // Newa / Tirhuta
+    ('\u{11435}', '\u{11446}'),
+    ('\u{114B0}', '\u{114C3}'), // Modi / Shiddham
+    ('\u{115AF}', '\u{115C0}'),
+    ('\u{11630}', '\u{11640}'), // Grantha / Newa
+    ('\u{116AB}', '\u{116B7}'),
+    ('\u{1171D}', '\u{1172B}'), // Takri / Ahom
+    ('\u{11C2F}', '\u{11C3F}'), // Bhaiksuki
+    ('\u{16AF0}', '\u{16AF4}'),
+    ('\u{16B30}', '\u{16B36}'),
+    ('\u{16F51}', '\u{16F92}'), // Miao / Kharoshthi
+    ('\u{1BC9D}', '\u{1BC9E}'), // Duployan
+    ('\u{1D165}', '\u{1D169}'),
+    ('\u{1D16D}', '\u{1D182}'),
+    ('\u{1D185}', '\u{1D18B}'),
+    ('\u{1D1AA}', '\u{1D1AD}'), // musical symbols
+    ('\u{1D242}', '\u{1D244}'),
+    ('\u{1DA00}', '\u{1DA36}'),
+    ('\u{1DA3B}', '\u{1DA6C}'),
+    ('\u{1DA75}', '\u{1DA75}'),
+    ('\u{1DA84}', '\u{1DA84}'),
+    ('\u{1DA9B}', '\u{1DAAF}'), // signwriting
+    ('\u{1E000}', '\u{1E02A}'),
+    ('\u{1E8D0}', '\u{1E8D6}'),
+    ('\u{1E944}', '\u{1E94A}'), // Glagolitic / Adlam
+    ('\u{E0100}', '\u{E01EF}'), // variation selectors supplement
+];
 
 fn is_emoji(ch: char) -> bool {
     matches!(
