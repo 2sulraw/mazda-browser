@@ -3398,6 +3398,40 @@ note, and skipped the registration.
   documented observer/relative-time noise only (IntersectionObserver and
   ResizeObserver never fire).
 
+## `connectedCallback` (P37, 2026-11-10)
+
+With every earlier error gone, github.com's first *dynamic* failure appeared:
+custom elements construct fine now, but nothing ever tells them they are in the
+document. Lit renders from `connectedCallback`, so `<tool-tip>` and
+`<relative-time>` were upgraded and then stayed empty:
+
+```
+custom element <tool-tip>: connectedCallback threw
+Uncaught TypeError: Cannot read property 'getElementById' of undefined
+```
+
+The first throw was the *inside* of a callback that had never run before: the
+engine upgraded the element, set `CE_INSTANCES`, and stopped there. The spec
+"upgrade" and "insert" steps both enqueue a `connectedCallback` once the node
+is in a document.
+
+- `DomHost::is_connected` walks parent links and checks membership, so an
+  orphan (parent 0 but not listed among the root's children) is not connected.
+- `upgrade_custom_element` now follows the constructor with
+  `connect_custom_element`, which fires `connectedCallback` only for a
+  connected element, deduped by `CE_CONNECTED`.
+- `insert_children`, `appendChild` and `insertBefore` call `connect_subtree`,
+  so a detached subtree only connects when it is actually inserted.
+- one note per page if a callback throws (`CE_LIFE_FAILED`).
+- `disconnectedCallback` is still not fired on removal, so re-insertion does
+  not run `connectedCallback` again (documented gap).
+- engine tests **1000 -> 1001** green (new
+  `custom_element_connected_callback_fires_once_connected`).
+- github.com cold load: the callback now runs and fails one line further in,
+  at `this.ownerDocument.getElementById(...)` — `ownerDocument` was undefined
+  (next entry). Script exec time rose from 5.0 s to 6.3 s because the
+  callbacks are now doing real work.
+
 
 
 

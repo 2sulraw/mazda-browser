@@ -900,6 +900,31 @@ impl DomHost {
         (p != node).then_some(p)
     }
 
+    /// Is `node` in the document tree? An orphan also has parent 0 (the
+    /// document root), but it is not listed among the root's children, so the
+    /// membership of every link is what decides. Used by `connectedCallback`.
+    pub fn is_connected(&self, node: u32) -> bool {
+        let dom = self.dom_ref();
+        let mut cur = node;
+        // the same bound as `closest`: a malformed arena must not spin
+        for _ in 0..1024 {
+            let Some(n) = dom.nodes.get(cur as usize) else {
+                return false;
+            };
+            if n.parent == cur {
+                return cur == 0;
+            }
+            let Some(p) = dom.nodes.get(n.parent as usize) else {
+                return false;
+            };
+            if !p.children.contains(&cur) {
+                return false;
+            }
+            cur = n.parent;
+        }
+        false
+    }
+
     /// Adjacent sibling node (text and comments included), or None.
     pub fn sibling_node(&self, node: u32, next: bool) -> Option<u32> {
         let dom = self.dom_ref();

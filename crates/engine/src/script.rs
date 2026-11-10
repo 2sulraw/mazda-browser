@@ -143,6 +143,13 @@ thread_local! {
     /// `Reflect.construct`) hands back the element under construction, exactly
     /// like the spec's construction stack.
     static CE_CONSTRUCTING: RefCell<Vec<Val>> = const { RefCell::new(Vec::new()) };
+    /// Custom elements whose `connectedCallback` has already run. The spec
+    /// fires it once per connection; re-insertion after removal is a gap
+    /// (there is no `disconnectedCallback` yet), so the set only dedupes.
+    static CE_CONNECTED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// One note per page when a `connectedCallback` throws.
+    static CE_LIFE_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Has this page already been told that IntersectionObserver never
     /// fires? Pages build several, and one note per page is enough.
     static IO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -609,7 +616,7 @@ fn arg_nodes(args: &[Val]) -> Vec<u32> {
 
 /// The insertion methods, one pass over the arena per call. `prepend`/`before`
 /// keep argument order by inserting everything before the same anchor.
-fn insert_children(node: u32, idx: u16, nodes: &[u32]) {
+fn insert_children(e: &mut JsEngine, node: u32, idx: u16, nodes: &[u32]) {
     // a fragment contributes its children, in order
     let nodes: Vec<u32> = nodes.iter().flat_map(|&n| splice_node(n)).collect();
     let nodes = nodes.as_slice();
@@ -663,6 +670,8 @@ fn insert_children(node: u32, idx: u16, nodes: &[u32]) {
         }
         _ => {}
     });
+    // custom elements in the inserted subtree are connected now
+    connect_subtree(e, nodes);
 }
 
 /// Reflected attribute property (one native per `REFLECTED` entry): a getter/// call arrives with no arguments, a setter with one. Both halves of the
@@ -1273,10 +1282,11 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
             // fragment appends its children, not itself.
             let kids = splice_node(child);
             runtime::host_mut(|h| {
-                for c in kids {
+                for &c in &kids {
                     h.append_child(node, c);
                 }
             });
+            connect_subtree(e, &kids);
             Ok(a0)
         }
         E_SET_ATTRIBUTE => {
@@ -1376,7 +1386,7 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
             .unwrap_or(Val::Null)),
         E_PREPEND | E_APPEND | E_BEFORE | E_AFTER | E_REPLACE_WITH | E_REPLACE_CHILDREN => {
             let nodes = arg_nodes(args);
-            insert_children(node, idx, &nodes);
+            insert_children(e, node, idx, &nodes);
             Ok(Val::Undefined)
         }
         E_SET_TEXT_CONTENT => {
@@ -1637,10 +1647,11 @@ fn n_node(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, J
             };
             let kids = splice_node(new);
             runtime::host_mut(|h| {
-                for c in kids {
+                for &c in &kids {
                     h.insert_before(node, c, before);
                 }
             });
+            connect_subtree(e, &kids);
             args.first().cloned().unwrap_or(Val::Null)
         }
         // shortcut: a snapshot object cached on the wrapper, so writes made
@@ -2332,6 +2343,60 @@ fn upgrade_custom_element(e: &mut JsEngine, node: u32) {
         if !CE_FAILED.with(|f| f.replace(true)) {
             eprintln!("[js] custom element <{tag}>: constructor threw ({err})");
         }
+    }
+    // an upgrade of an already-parsed element is also its first connection
+    connect_custom_element(e, node);
+}
+
+/// Call `connectedCallback` on an upgraded element once it is in the
+/// document. Lit's base class starts its first render there, so without this
+/// every Lit component on a page stays empty. The spec also fires it when a
+/// connected custom element is inserted; [`connect_subtree`] covers that.
+fn connect_custom_element(e: &mut JsEngine, node: u32) {
+    // cheap gates first: nothing to do for ordinary elements or ones already
+    // connected (the arena walk in `is_connected` is the expensive part)
+    if !CE_INSTANCES.with(|m| m.borrow().contains_key(&node)) {
+        return;
+    }
+    if CE_CONNECTED.with(|s| s.borrow().contains(&node)) {
+        return;
+    }
+    if !runtime::host(|h| h.is_connected(node)) {
+        return;
+    }
+    CE_CONNECTED.with(|s| {
+        s.borrow_mut().insert(node);
+    });
+    let Some(w) = CE_INSTANCES.with(|m| m.borrow().get(&node).cloned()) else {
+        return;
+    };
+    let Ok(handler) = js::get_member(e, &w, "connectedCallback") else {
+        return;
+    };
+    if !matches!(handler, Val::Func(_) | Val::Native(_)) {
+        return;
+    }
+    if let Err(err) = e.call(handler, w, Vec::new()) {
+        if !CE_LIFE_FAILED.with(|f| f.replace(true)) {
+            let tag = runtime::host(|h| h.tag_name(node)).unwrap_or_default();
+            eprintln!("[js] custom element <{tag}>: connectedCallback threw ({err})");
+        }
+    }
+}
+
+/// Fire `connectedCallback` for every custom element in a freshly inserted
+/// subtree: the upgrade (createElement, clone, define) happened before the
+/// insertion, so the elements are only now in the document.
+fn connect_subtree(e: &mut JsEngine, roots: &[u32]) {
+    if CE_INSTANCES.with(|m| m.borrow().is_empty()) {
+        return;
+    }
+    let mut stack: Vec<u32> = roots.to_vec();
+    while let Some(n) = stack.pop() {
+        if runtime::host(|h| h.node_type(n)) == Some(1) {
+            connect_custom_element(e, n);
+        }
+        stack.extend(runtime::host(|h| h.child_nodes(n)));
     }
 }
 
@@ -3265,6 +3330,8 @@ impl PageScripts {
         CE_INSTANCES.with(|m| m.borrow_mut().clear());
         CE_FAILED.with(|f| f.set(false));
         CE_CONSTRUCTING.with(|s| s.borrow_mut().clear());
+        CE_CONNECTED.with(|s| s.borrow_mut().clear());
+        CE_LIFE_FAILED.with(|f| f.set(false));
         IO_NOTE.with(|n| n.set(false));
         RO_NOTE.with(|n| n.set(false));
         TEMPLATE_CONTENT.with(|m| m.borrow_mut().clear());
@@ -4719,6 +4786,42 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "identity"), "true");
         assert_eq!(get_global_str(&mut ps, "plainClass"), "false");
         assert_eq!(get_global_str(&mut ps, "illegal"), "true");
+    }
+
+    #[test]
+    fn custom_element_connected_callback_fires_once_connected() {
+        // Lit's base class starts its first render in connectedCallback, so an
+        // upgraded element that never hears it stays empty. The spec fires it
+        // on upgrade (when already in the document) and on insertion.
+        let (mut dom, mut ps) = page(
+            r##"<html><body><my-el id="parsed"></my-el><script>
+                window.log = [];
+                class MyEl extends HTMLElement {
+                    connectedCallback() {
+                        window.log.push(this.id + ":" + this.tagName);
+                    }
+                }
+                customElements.define("my-el", MyEl);
+                // the parsed element was upgraded and connected by `define`
+                var orphan = document.createElement("my-el");
+                orphan.id = "orphan";
+                window.beforeAppend = window.log.length;
+                var box = document.createElement("div");
+                var nested = document.createElement("my-el");
+                nested.id = "nested";
+                box.appendChild(nested);          // box is detached
+                window.afterNested = window.log.length;
+                document.body.appendChild(box);   // now the subtree connects
+                window.logText = window.log.join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "beforeAppend"), "1");
+        assert_eq!(get_global_str(&mut ps, "afterNested"), "1");
+        assert_eq!(
+            get_global_str(&mut ps, "logText"),
+            "parsed:MY-EL,nested:MY-EL"
+        );
     }
 
     #[test]
