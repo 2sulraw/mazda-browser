@@ -3946,6 +3946,34 @@ That column is the `Number.isFinite(e)` call itself. The library also calls
   1594 -> 25596 ms and the worker 2532 -> 64005 ms, because the module chain now
   gets much further before it stops.
 
+## `Object.getOwnPropertySymbols` (P55, 2026-11-11)
+
+The predicate library defines one function per reflection helper, and the next
+one in the list had no native behind it:
+
+```js
+function Z(e){return Object.getOwnPropertySymbols(e)}
+```
+
+- The engine has no primitive symbol: a symbol is a plain object with a hidden
+  `__symbol` description, and a computed key written with one lands in the
+  property list as its `"Symbol(desc)"` string. This static reads those keys
+  back and rebuilds a symbol value per key, so `typeof` is `"symbol"`,
+  `String(s)` is `"Symbol(k)"` and `Array.prototype` reports its
+  `Symbol.iterator` prop.
+- shortcut: the rebuilt value is a fresh stand-in, not the original object, so
+  `Object.getOwnPropertySymbols(o)[0] === s` is false; only the key string
+  survives a write. A plain string key that happens to spell `Symbol(x)` cannot
+  be told apart from a real symbol key - the same bridge the `in` operator
+  already crosses.
+- engine tests **1015 -> 1016** green (new
+  `get_own_property_symbols_reads_symbol_keys_back`).
+- `github.com/rust-lang/rust`: **no script error at all** for the first time -
+  the module chain runs to the end of the page's bundles. Script exec
+  25596 -> 25192 ms, worker 64005 -> 62660 ms; the remaining time is the page's
+  own hydration work rather than a stop, so the next measurements are latency,
+  not missing builtins.
+
 
 
 

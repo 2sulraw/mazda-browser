@@ -5119,6 +5119,32 @@ fn a_symbol_key_works_with_the_in_operator() {
     assert!(boolean("var o = {}; o.a = 1; ({ toString: function () { return 'a'; } }) in o"));
 }
 
+/// `Object.getOwnPropertySymbols` reads the symbol-keyed props back. GitHub's
+/// predicate library defines it (`function Z(e){return
+/// Object.getOwnPropertySymbols(e)}`) and the code-view module threw
+/// "undefined is not a function" at that definition until it existed.
+#[test]
+fn get_own_property_symbols_reads_symbol_keys_back() {
+    assert_eq!(
+        num("var s = Symbol('k'); var o = {}; o[s] = 1; Object.getOwnPropertySymbols(o).length"),
+        1.0
+    );
+    assert_eq!(
+        string("var s = Symbol('k'); var o = {}; o[s] = 1; String(Object.getOwnPropertySymbols(o)[0])"),
+        "Symbol(k)"
+    );
+    assert_eq!(
+        string("var s = Symbol('k'); var o = {}; o[s] = 1; typeof Object.getOwnPropertySymbols(o)[0]"),
+        "symbol"
+    );
+    // string keys are not symbols, and a non-object answers an empty array
+    assert_eq!(num("Object.getOwnPropertySymbols({ a: 1 }).length"), 0.0);
+    assert_eq!(num("Object.getOwnPropertySymbols(3).length"), 0.0);
+    assert_eq!(num("Object.getOwnPropertySymbols().length"), 0.0);
+    // Array.prototype carries Symbol.iterator as an own symbol prop
+    assert_eq!(num("Object.getOwnPropertySymbols(Array.prototype).length"), 1.0);
+}
+
 #[test]
 fn null_equality_does_not_coerce_the_other_side() {
     // React's `__COMPILER_RUNTIME` is a null-prototype object, and its

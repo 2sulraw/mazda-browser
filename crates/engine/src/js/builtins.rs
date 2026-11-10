@@ -133,6 +133,8 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&object), "create", Val::Native(cr));
     let opn = e.register_native("Object.getOwnPropertyNames", n_object, O_PROP_NAMES);
     obj_set_own(own(&object), "getOwnPropertyNames", Val::Native(opn));
+    let ops = e.register_native("Object.getOwnPropertySymbols", n_object, O_SYMBOLS);
+    obj_set_own(own(&object), "getOwnPropertySymbols", Val::Native(ops));
     let fe = e.register_native("Object.fromEntries", n_object, O_FROM_ENTRIES);
     obj_set_own(own(&object), "fromEntries", Val::Native(fe));
     for (name, idx) in [
@@ -1504,6 +1506,7 @@ const O_GET_DESC: u16 = 16;
 const O_GET_DESCS: u16 = 17;
 const O_DEFINE_PROPS: u16 = 18;
 const O_CALL: u16 = 19;
+const O_SYMBOLS: u16 = 20;
 
 /// Apply one `Object.defineProperty` descriptor to `target`.
 fn define_prop(
@@ -1901,6 +1904,27 @@ fn n_object(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val
                 _ => Vec::new(),
             };
             Ok(Val::new_array(keys))
+        }
+        O_SYMBOLS => {
+            // shortcut: a symbol is an object stand-in and a computed key
+            // written with one lands in the property list as its
+            // `"Symbol(desc)"` string (see `new_symbol`), so that key is where
+            // the symbols are read back from. A plain string key that happens
+            // to spell one cannot be told apart from a real symbol key.
+            let o = args.first().cloned().unwrap_or(Val::Undefined);
+            let keys: Vec<Rc<str>> = match &o {
+                Val::Obj(b) => b.borrow().props.iter().map(|(k, _)| k.clone()).collect(),
+                Val::Func(f) => {
+                    f.props.borrow().iter().map(|(k, _)| k.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+            Ok(Val::new_array(
+                keys.iter()
+                    .filter_map(|k| symbol_key_desc(k))
+                    .map(|d| new_symbol(&d))
+                    .collect(),
+            ))
         }
         _ => Ok(Val::Undefined),
     }
@@ -4379,6 +4403,14 @@ fn new_symbol(desc: &str) -> Val {
     let o = Val::new_object();
     obj_set_own(own(&o), "__symbol", Val::Str(Rc::from(desc)));
     o
+}
+
+/// The description inside a `"Symbol(desc)"` property key, if the key spells
+/// one - the engine's stand-in for a symbol-keyed property.
+fn symbol_key_desc(k: &str) -> Option<String> {
+    k.strip_prefix("Symbol(")
+        .and_then(|r| r.strip_suffix(')'))
+        .map(|d| d.to_string())
 }
 
 thread_local! {
