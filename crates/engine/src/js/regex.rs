@@ -85,7 +85,32 @@ pub(crate) enum Inst {
 #[derive(Debug, Clone)]
 pub(crate) struct ClassSet {
     pub ranges: Vec<(char, char)>,
+    /// `\p{...}` members, each with its own `\P` negation. OR'd with the
+    /// ranges; the class-level `neg` inverts the whole set.
+    pub props: Vec<(PropKind, bool)>,
     pub neg: bool,
+}
+
+/// Unicode property escapes the engine can answer exactly from `std`'s char
+/// predicates (see `prop_matches`). Kept deliberately small: an unknown
+/// property is an honest compile error, not a silent never-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropKind {
+    /// `\p{L}` / `\p{Letter}` — alphabetic
+    Letter,
+    /// `\p{Lu}` — uppercase
+    Upper,
+    /// `\p{Ll}` — lowercase
+    Lower,
+    /// `\p{N}` / `\p{Number}` — numeric
+    Number,
+    /// `\p{Nd}` / `\p{Decimal_Number}` — decimal digits (approximated by
+    /// `is_numeric`, which also accepts `½`-style numbers)
+    Digit,
+    /// `\p{Z}` / `\p{Zs}` — whitespace
+    Space,
+    /// `\p{ASCII}`
+    Ascii,
 }
 /// capture snapshot: caps\[i\] = Some((start_char, end_char));
 /// caps\[0\]/caps\[1\] are the whole match. Copy-on-write via Rc.
@@ -436,7 +461,13 @@ impl PatParser {
             None => return rerr("trailing backslash in pattern"),
         };
         if matches!(ch, 'p' | 'P') {
-            return rerr("unicode property escapes (\\p) are not supported");
+            let negated = ch == 'P';
+            let kind = self.prop_kind()?;
+            return Ok(Node::A(A::Class(ClassSet {
+                ranges: Vec::new(),
+                props: vec![(kind, negated)],
+                neg: false,
+            })));
         }
         Ok(Node::A(match ch {
             'd' => A::Class(dig_set(false)),
@@ -551,6 +582,7 @@ impl PatParser {
             neg = true;
         }
         let mut ranges: Vec<(char, char)> = Vec::new();
+        let mut props: Vec<(PropKind, bool)> = Vec::new();
         let mut first = true;
         loop {
             let ch = match self.peek() {
@@ -606,7 +638,9 @@ impl PatParser {
                         }
                     }
                     Some('p') | Some('P') => {
-                        return rerr("unicode property escapes (\\p) are not supported")
+                        let negated = self.c[self.i - 1] == 'P';
+                        props.push((self.prop_kind()?, negated));
+                        continue;
                     }
                     Some(c) if c.is_ascii_alphanumeric() => {
                         return rerr(&format!("unsupported escape `\\{}` in class", c));
@@ -644,7 +678,35 @@ impl PatParser {
                 ranges.push((lo, lo));
             }
         }
-        Ok(Node::A(A::Class(ClassSet { ranges, neg })))
+        Ok(Node::A(A::Class(ClassSet {
+            ranges,
+            props,
+            neg,
+        })))
+    }
+
+    /// Parse the property name after `\p` / `\P`: `{Name}` or a single
+    /// letter. Unknown names are an honest compile error.
+    fn prop_kind(&mut self) -> Result<PropKind, RegexError> {
+        let name = if self.eat('{') {
+            let mut s = String::new();
+            loop {
+                match self.next() {
+                    Some('}') => break,
+                    Some(c) => s.push(c),
+                    None => return rerr("unterminated \\p{...} escape"),
+                }
+            }
+            s
+        } else {
+            match self.next() {
+                Some(c) => c.to_string(),
+                None => return rerr("trailing \\p escape"),
+            }
+        };
+        prop_kind(&name).ok_or_else(|| RegexError {
+            msg: format!("unsupported unicode property escape \\p{{{name}}}"),
+        })
     }
 }
 
@@ -654,13 +716,43 @@ fn match_char_escape() -> RegexError {
     }
 }
 
+/// The property names accepted by `\p{...}` (long and short forms).
+fn prop_kind(name: &str) -> Option<PropKind> {
+    Some(match name {
+        "L" | "Letter" => PropKind::Letter,
+        "Lu" | "Uppercase_Letter" => PropKind::Upper,
+        "Ll" | "Lowercase_Letter" => PropKind::Lower,
+        "N" | "Number" => PropKind::Number,
+        "Nd" | "Decimal_Number" => PropKind::Digit,
+        "Z" | "Separator" | "Zs" | "Space_Separator" => PropKind::Space,
+        "ASCII" => PropKind::Ascii,
+        _ => return None,
+    })
+}
+
+fn prop_matches(kind: PropKind, ch: char) -> bool {
+    match kind {
+        PropKind::Letter => ch.is_alphabetic(),
+        PropKind::Upper => ch.is_uppercase(),
+        PropKind::Lower => ch.is_lowercase(),
+        PropKind::Number | PropKind::Digit => ch.is_numeric(),
+        PropKind::Space => ch.is_whitespace(),
+        PropKind::Ascii => ch.is_ascii(),
+    }
+}
+
 fn dig_set(neg: bool) -> ClassSet {
-    ClassSet { ranges: vec![('0', '9')], neg }
+    ClassSet {
+        ranges: vec![('0', '9')],
+        props: Vec::new(),
+        neg,
+    }
 }
 
 fn word_set(neg: bool) -> ClassSet {
     ClassSet {
         ranges: vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
+        props: Vec::new(),
         neg,
     }
 }
@@ -673,6 +765,7 @@ fn space_set(neg: bool) -> ClassSet {
             ('\u{a0}', '\u{a0}'), // honest shortcut: NBSP only, not the full Unicode space list
             ('\u{feff}', '\u{feff}'),
         ],
+        props: Vec::new(),
         neg,
     }
 }
@@ -949,7 +1042,13 @@ fn ch_eq(a: char, b: char, ci: bool) -> bool {
 
 /// does `ch` satisfy this class? (`ci` handled here, ranges stay pre-folded)
 fn in_class(set: &ClassSet, ch: char, ci: bool) -> bool {
-    let hit = |c: char| set.ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi);
+    let hit = |c: char| {
+        set.ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi)
+            || set
+                .props
+                .iter()
+                .any(|&(kind, neg)| prop_matches(kind, c) != neg)
+    };
     let mut m = hit(ch);
     if !m && ci {
         for v in [ch.to_ascii_lowercase(), ch.to_ascii_uppercase(), ch_fold(ch)] {

@@ -2237,6 +2237,25 @@ fn regex_named_capture_groups() {
 }
 
 #[test]
+fn regex_unicode_property_escapes() {
+    assert!(boolean(r"/\p{L}+/u.test('abcé')"));
+    assert!(!boolean(r"/^\p{L}+$/u.test('ab1')"));
+    assert!(boolean(r"/\p{N}+/u.test('x42')"));
+    assert!(boolean(r"/\p{Lu}/u.test('A') && !/\p{Lu}/u.test('a')"));
+    assert!(boolean(r"/\p{Ll}/u.test('a') && !/\p{Ll}/u.test('A')"));
+    // negated property, and properties mixed with ranges in one class
+    // (the exact shape `wgy-*.js` builds)
+    assert!(!boolean(r"/[^\p{L}\p{N}\s_-]/u.test('café_1-2')"));
+    assert!(boolean(r"/[^\p{L}\p{N}\s_-]/u.test('café!')"));
+    assert!(!boolean(r"/\P{L}/u.test('a')"));
+    assert!(boolean(r"/\p{ASCII}/u.test('a') && !/\p{ASCII}/u.test('é')"));
+    // an unknown property is an honest, catchable SyntaxError
+    assert!(boolean(
+        r"(() => { try { new RegExp('\\p{So}', 'u') } catch (e) { return e instanceof SyntaxError } return false })()"
+    ));
+}
+
+#[test]
 fn regex_flags() {
     assert!(boolean("/HELLO/i.test('hello')"));
     assert!(!boolean("/HELLO/.test('hello')"));
@@ -2339,7 +2358,7 @@ fn performance_now_is_a_monotonic_clock() {
 #[test]
 fn regex_unsupported_syntax_is_clean_error() {
     assert!(matches!(err("'x'.replace(/(?<=a)b/, '')"), JsError::Syntax { .. }));
-    assert!(matches!(err("/\\p{L}/u"), JsError::Syntax { .. }));
+    assert!(matches!(err("/\\p{So}/u"), JsError::Syntax { .. }));
     assert!(matches!(err("/(?<1bad>a)/"), JsError::Syntax { .. }));
     assert!(matches!(err("/[unclosed/"), JsError::Syntax { .. }));
     assert!(matches!(err("/a+/q"), JsError::Syntax { .. })); // bad flag

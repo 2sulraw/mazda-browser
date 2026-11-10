@@ -2792,3 +2792,29 @@ treated script closures as objects for `in`; every built-in
   `wgy-*.js` still stops at unicode property escapes.
 - engine tests **966** green (`in_operator_accepts_function_objects` extended
   with native/method/callable-object cases and the primitive TypeError).
+
+## Unicode property escapes `\p{...}` (P14, 2026-11-10)
+
+`wgy-*.js` (a WordPress bundle loaded by `landing-pages-*.js`) begins its
+route matcher with `/[^\p{L}\p{N}\s_-]/gu`. The regex engine rejected every
+`\p` as unsupported, so that module never parsed and the page's landing
+behaviour stayed dead.
+
+- A property is a class member, so it lives on `ClassSet` as
+  `(PropKind, neg)`; it OR's with the ranges and the class-level `^`
+  inverts the whole set. `\p{...}`, `\P{...}` and the single-letter `\pL`
+  form all parse, and mix with ranges inside one class.
+- Answered exactly from `std` char predicates: `L`/`Lu`/`Ll` (alphabetic,
+  uppercase, lowercase), `N`/`Nd` (numeric; `Nd` is approximated by
+  `is_numeric`), `Z`/`Zs` (whitespace), `ASCII`. Whole-word aliases
+  (`Letter`, `Uppercase_Letter`, …) work too.
+- Anything else (`\p{So}`, script names, …) stays an honest, catchable
+  compile error rather than a silent never-match.
+
+### Measured
+
+- github.com: the `wgy-*.js` `SyntaxError` is gone; `landing-pages-*.js` now
+  progresses to the same `wp-runtime` failure the other bundles hit.
+- `[time] scripts` exec: 617 -> 723 ms (the `wgy` bundle now parses and runs).
+- engine tests **967** green (new `regex_unicode_property_escapes`; the
+  unsupported-syntax test now uses `\p{So}`).
