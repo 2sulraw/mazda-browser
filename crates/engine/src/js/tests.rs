@@ -4828,6 +4828,33 @@ fn var_without_initializer_does_not_reset_the_binding() {
 }
 
 #[test]
+fn defined_properties_are_non_enumerable_by_default() {
+    // color-convert hides `channels`/`labels` with
+    //   delete space.channels; Object.defineProperty(space, "channels", { value })
+    // and then walks `Object.keys(space)`; a visible property made the page
+    // treat "channels" as another color space and read `.distance` off
+    // undefined.
+    assert_eq!(
+        num("var o = {}; Object.defineProperty(o, 'x', { value: 1 }); Object.keys(o).length"),
+        0.0
+    );
+    assert_eq!(
+        num("var o = {}; Object.defineProperty(o, 'x', { value: 1, enumerable: true }); Object.keys(o).length"),
+        1.0
+    );
+    // the value is still readable, and for-in skips it
+    assert_eq!(
+        num("var o = {}; Object.defineProperty(o, 'x', { value: 7 }); o.x"),
+        7.0
+    );
+    assert_eq!(
+        run("var o = { a: 1 }; Object.defineProperty(o, 'x', { value: 2 }); var s = ''; for (var k in o) s += k; s")
+            .to_string(),
+        "a"
+    );
+}
+
+#[test]
 fn a_destructured_parameter_binds_in_the_call_frame() {
     // minified code names destructured parameters like its own imports:
     //   constructor({ size: e, min: t, ttl: n, onDelete: r })

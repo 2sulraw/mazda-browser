@@ -3050,3 +3050,35 @@ missing `delegate`).
 - Next fatal error: `Cannot read property 'distance' of undefined`
   (see P20 for the destructured-parameter rule it exposed).
 
+## A property descriptor defaults to non-enumerable (P22, 2026-11-10)
+
+Next fatal error was `Cannot read property 'distance' of undefined` in
+`pb-*.js`, inside color-convert's conversion-distance table:
+
+```js
+let t = (function () { let e = {}, t = Object.keys(n); … })();
+let e = i.pop(), r = Object.keys(n[e]);
+let n = r[s], o = t[n];
+-1 === o.distance && …
+```
+
+`o` was `undefined` for `n === "channels"` (and `"labels"`). color-convert
+hides those two keys on every color space:
+
+```js
+delete space.channels;
+Object.defineProperty(space, "channels", { value: channels });
+```
+
+Per spec every descriptor flag defaults to false, so that property must be
+non-enumerable. `define_prop` treated a missing `enumerable` as *true* (a
+permissive shortcut), so `Object.keys(space)` listed `"channels"` and the
+table builder tried to look up a color space called `channels`.
+
+- descriptor flags: `enumerable` absent → false. Only an explicit
+  `enumerable: true` shows the property to `for-in` / `Object.keys`.
+- engine tests **985 → 986** green (new
+  `defined_properties_are_non_enumerable_by_default`).
+- Next fatal error: `Uncaught Error: Unable to get document domain`.
+
+

@@ -1430,9 +1430,11 @@ fn define_prop(
             }
         }
     };
-    // `enumerable: false` makes the property invisible to `for-in`,
-    // `Object.keys` and object-rest; only an explicit `false` is honored
-    // (the common flags-less descriptor keeps the permissive default).
+    // `enumerable` defaults to false, as every property descriptor flag does:
+    // `Object.defineProperty(o, "x", { value: 1 })` adds a property that
+    // `for-in`, `Object.keys` and object-rest do not see. color-convert
+    // depends on it (`defineProperty(space, "channels", { value })` must not
+    // show up as a target color space).
     let hidden = match d {
         Some(Val::Obj(ob)) => ob
             .borrow()
@@ -1440,8 +1442,8 @@ fn define_prop(
             .iter()
             .find(|(k, _)| k.as_ref() == "enumerable")
             .map(|(_, v)| !v.to_bool())
-            .unwrap_or(false),
-        _ => false,
+            .unwrap_or(true),
+        _ => true,
     };
     match target {
         Val::Obj(o) => {
