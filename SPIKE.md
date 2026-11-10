@@ -3758,6 +3758,46 @@ engine's values iterator handed back the raw `[key, value]` pair, which is what
 - `github.com/rust-lang/rust`: the descriptor walk proceeds; the next failure
   is that every *string* in the decoded descriptor is empty (next entry).
 
+## TextDecoder reads typed-array views (P49, 2026-11-10)
+
+The descriptor walk then reported what looked like a page-side inconsistency:
+
+```
+[js] script error in code-view-*.js: Uncaught Error:
+invalid FieldDescriptorProto: type_name .github.common.v1.SafeHtml not found
+```
+
+It was ours. Instrumenting the bundle's own field builder showed field
+descriptors with `type: 11` and an **empty** `typeName`; a probe inside
+`4u-*.js` then showed that every length-delimited field (name, type name,
+json name) decoded as `""` while the varint fields (`number`, `label`, `type`)
+were correct. `@bufbuild/protobuf` decodes those strings with
+
+```js
+decodeUtf8: (t, a) => a ? fatal.decode(t) : new globalThis.TextDecoder().decode(t)
+```
+
+where `t` is always a `Uint8Array` or a view into one. The engine's
+`TextDecoder.prototype.decode` accepted only a *plain array* of byte values, so
+anything else became `""`.
+
+- the decode branch goes through `text_bytes`, which understands a view's byte
+  window (`offset .. offset + len * size`, so `subarray()` decodes just its
+  slice), a whole `ArrayBuffer`, and a plain array. A `Float32Array` /
+  `Int16Array` view therefore decodes its underlying bytes rather than one char
+  per element.
+- engine tests **1011 -> 1012** green (new
+  `text_decoder_reads_typed_array_views`: a `Uint8Array`, `subarray()` with and
+  without an end, an `ArrayBuffer`, multibyte UTF-8, a round trip through
+  `TextEncoder`, and a non-byte view).
+- diagnostic note: this hunt hand-patched the `4u-*.js` disk-cache entry twice
+  (a `FDBG`/`GM`/`QF`/`AF` probe plus a refreshed timestamp so the cache did
+  not re-download over it). The patched file was deleted afterwards, so no
+  debug copy ever shipped.
+- `github.com/rust-lang/rust`: the descriptor strings resolve, the builder
+  gets past `type_name`, and the module chain stops on `Intl is not defined`
+  (next entry).
+
 
 
 

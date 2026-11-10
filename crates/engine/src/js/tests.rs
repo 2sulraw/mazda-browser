@@ -1617,6 +1617,45 @@ fn text_encoder_decoder_round_trip() {
 }
 
 #[test]
+fn text_decoder_reads_typed_array_views() {
+    // The protobuf runtime hands the decoder a `Uint8Array` (or a view into
+    // one), never a plain array; before this the decoder answered "" and
+    // GitHub's descriptor builder saw empty type names.
+    assert_eq!(
+        string("new TextDecoder().decode(new Uint8Array([104, 105, 33]))"),
+        "hi!"
+    );
+    // a view decodes only its own byte window
+    assert_eq!(
+        string("var b = new Uint8Array([65, 66, 67]); new TextDecoder().decode(b.subarray(1))"),
+        "BC"
+    );
+    assert_eq!(
+        string("var b = new Uint8Array([65, 66, 67, 68]); new TextDecoder().decode(b.subarray(1, 3))"),
+        "BC"
+    );
+    // a whole ArrayBuffer is the other accepted source
+    assert_eq!(
+        string("new TextDecoder().decode(new Uint8Array([65]).buffer)"),
+        "A"
+    );
+    // multibyte UTF-8 still goes through the same path
+    assert_eq!(
+        string("new TextDecoder().decode(new Uint8Array([226, 130, 172]))"),
+        "\u{20ac}"
+    );
+    assert_eq!(
+        string("new TextDecoder().decode(new TextEncoder().encode('\u{6f22}'))"),
+        "\u{6f22}"
+    );
+    // a non-byte view's window is decoded as bytes, not as one char per element
+    assert_eq!(
+        string("new TextDecoder().decode(new Uint8Array(new Int16Array([65]).buffer, 0, 1))"),
+        "A"
+    );
+}
+
+#[test]
 fn weak_collections_store_by_identity() {
     assert_eq!(
         string("var k = {}; var m = new WeakMap(); m.set(k, 5); m.get(k)"),

@@ -4959,21 +4959,43 @@ fn n_text(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val,
             ))
         }
         _ => {
-            // decode(bytes) -> string; accepts an array of byte values
+            // decode(bytes) -> string. Real pages pass a *view*, not a plain
+            // array: @bufbuild/protobuf decodes every length-delimited field
+            // with `decode(new Uint8Array(...))`, so GitHub's descriptor
+            // builder read every string (field names, type names) as "".
             let v = args.first().cloned().unwrap_or(Val::Undefined);
-            let bytes: Vec<u8> = match &v {
-                Val::Obj(o) => match &o.borrow().kind {
-                    ObjKind::Array(items) => items
-                        .iter()
-                        .map(|x| x.to_number().clamp(0.0, 255.0) as u8)
-                        .collect(),
-                    _ => Vec::new(),
-                },
+            let bytes = match &v {
                 Val::Str(s) => return Ok(Val::Str(s.clone())),
+                Val::Obj(o) => text_bytes(&o.borrow()),
                 _ => Vec::new(),
             };
             Ok(Val::Str(Rc::from(String::from_utf8_lossy(&bytes).as_ref())))
         }
+    }
+}
+
+/// The bytes a `TextDecoder` sees for `v`: a view's byte window
+/// (`offset..offset + len * size`, so `subarray` decodes just its slice), a
+/// whole `ArrayBuffer`, or a plain array of byte values.
+fn text_bytes(o: &Obj) -> Vec<u8> {
+    match &o.kind {
+        ObjKind::Array(items) => items
+            .iter()
+            .map(|x| x.to_number().clamp(0.0, 255.0) as u8)
+            .collect(),
+        ObjKind::TypedArray(ta) => {
+            let at = ta.offset;
+            let end = at + ta.len * ta.kind.size();
+            match &ta.buf.borrow().kind {
+                ObjKind::ArrayBuffer(b) => {
+                    let b = b.borrow();
+                    b.get(at..end.min(b.len())).map(|s| s.to_vec()).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
+        }
+        ObjKind::ArrayBuffer(b) => b.borrow().clone(),
+        _ => Vec::new(),
     }
 }
 
