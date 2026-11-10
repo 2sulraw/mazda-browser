@@ -2919,3 +2919,38 @@ and calls `observe()` on every nav link.
 
 - engine tests **976 → 977** green (new
   `intersection_observer_constructs_and_observes_without_firing`).
+
+## Naming the failing site, `ResizeObserver`, and `createElementNS` (P18, 2026-11-10)
+
+Three small steps, each measured by the next fatal error in the same file
+(`pb-f417…js`, 3 MB of minified code):
+
+1. `ResizeObserver is not defined`. Same shape as `IntersectionObserver`
+   (constructor takes a function, `observe`/`unobserve`/`disconnect`); it also
+   never fires, because a box size would have to be read out of the layout tree
+   and a page turn does not hold one. Noted once per page.
+   Next error: `TypeError: undefined is not a function` — with no location.
+2. So a "not a function" error now names its callee offset:
+   `TypeError: undefined is not a function (at 223:26892 of https://…/pb-f417…js)`.
+   That is the one location this engine can honestly give (no AST is kept for a
+   stack trace); the interpreter already stamped the callee offset for its step
+   budget, so the cost is only on the error path. Property reads on
+   `undefined`/`null` get the statement offset the same way.
+3. That location said `document.createElementNS(...)`, which pages use for
+   every SVG icon and drag handle. `createElementNS(ns, name)` now creates an
+   element from the local name, and SVG tag names map to `SVGElement`
+   (a `<path>` is not an `HTMLElement`); the arena has no namespace column, so
+   the tag name is what decides the family. SVG *rendering* remains the
+   documented gap.
+
+### Measured (one cold run per step, `MAZDA_TIME=1`)
+
+| after | first fatal error |
+| --- | --- |
+| `ResizeObserver` | `TypeError: undefined is not a function` (no site) |
+| call-site location in errors | `Cannot read property 'appendChild' of undefined (at 223:27350 of pb-f417…)` |
+| `createElementNS` | `Cannot read property 'appendChild' of undefined` — now inside `f.content.appendChild(p)`, i.e. `<template>.content` |
+
+- engine tests **977 → 980** green (new
+  `resize_observer_constructs_and_observes_without_firing`,
+  `create_element_ns_makes_svg_elements`, `not_a_function_names_the_call_site`).

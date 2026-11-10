@@ -4325,6 +4325,20 @@ fn queue_microtask_rejects_non_callables() {
 }
 
 #[test]
+fn not_a_function_names_the_call_site() {
+    // a minified bundle's "undefined is not a function" names nothing; the
+    // callee offset is the only location the engine can report
+    let mut e = JsEngine::new();
+    let err = e
+        .exec("var o = {};\nvar x = o.missing();")
+        .err()
+        .expect("calling undefined must throw");
+    let msg = err.to_string();
+    assert!(msg.contains("is not a function"), "err: {msg}");
+    assert!(msg.contains("(at 2:"), "no call site in: {msg}");
+}
+
+#[test]
 fn data_view_reads_and_writes_with_endianness() {
     // default endianness is big-endian; the littleEndian flag is per call
     assert_eq!(

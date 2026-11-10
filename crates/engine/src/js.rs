@@ -1652,6 +1652,10 @@ pub struct JsEngine {
     /// error reports line/col through this (enriched in `exec`, which has
     /// the source; dispatch turns only carry the offset)
     pub(crate) cur_span: usize,
+    /// start offset of the callee expression of the call being made: the only
+    /// location a "not a function" error can name (see `call_site_note`).
+    /// Set by every `ExprKind::Call`, read on the error path.
+    pub(crate) call_span: usize,
     /// constructor value set by an enclosing `new` expression immediately
     /// before the call; `call_inner` takes it and binds `#new.target` in the
     /// callee's environment
@@ -1878,6 +1882,7 @@ impl JsEngine {
             steps: 0,
             step_budget: DEFAULT_STEP_BUDGET,
             cur_span: 0,
+            call_span: 0,
             pending_construct: None,
             pending_label: None,
             call_names: Vec::new(),
@@ -2459,6 +2464,29 @@ impl JsEngine {
         format!(" (in {})", names.join(" <- "))
     }
 
+    /// Where the call currently being made sits in its source:
+    /// `" (at 285:155 of https://…/chunk.js)"`. `"undefined is not a function"`
+    /// from a minified bundle names nothing on its own, and this engine keeps
+    /// no AST for a stack trace — the callee offset is the one reliable
+    /// pointer a page author (or we) can read. Error path only.
+    pub(crate) fn call_site_note(&self) -> String {
+        self.site_note(self.call_span)
+    }
+
+    /// `" (at line:col of url)"` for any offset in the current source.
+    pub(crate) fn site_note(&self, span: usize) -> String {
+        let src = match self.source_text(self.cur_src) {
+            Some(s) => s,
+            None => return String::new(),
+        };
+        let (l, c) = parser::line_col(&src, span);
+        let url = match self.module_url_for(self.cur_src) {
+            Some(u) => u.to_string(),
+            None => format!("src {}", self.cur_src),
+        };
+        format!(" (at {l}:{c} of {url})")
+    }
+
     /// A call frame from the pool when one is free, otherwise a fresh one.
     fn take_env(&mut self, parent: &Rc<Env>, this: Val, new_target: Option<Val>) -> Rc<Env> {
         while let Some(mut env) = self.env_pool.pop() {
@@ -2602,15 +2630,17 @@ impl JsEngine {
                     .map(|(_, v)| v.clone());
                 match hook {
                     Some(f) => self.call(f, this, args),
-                    None => Err(JsError::Throw(Val::Str(Rc::from(
-                        "TypeError: object is not a function".to_string(),
-                    )))),
+                    None => Err(JsError::Throw(Val::Str(Rc::from(format!(
+                        "TypeError: object is not a function{}",
+                        self.call_site_note()
+                    ))))),
                 }
             }
             other => {
                 Err(JsError::Throw(Val::Str(Rc::from(format!(
-                    "TypeError: {} is not a function",
-                    other.type_of()
+                    "TypeError: {} is not a function{}",
+                    other.type_of(),
+                    self.call_site_note()
                 )))))
             }
         }
@@ -3344,10 +3374,11 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
         // (get_member unwraps them); unreachable in practice
         Val::Acc(_) => Ok(Val::Undefined),
         Val::Undefined | Val::Null => Err(JsError::Throw(Val::Str(Rc::from(format!(
-            "TypeError: Cannot read property '{}' of {}{}",
+            "TypeError: Cannot read property '{}' of {}{}{}",
             key,
             base.type_of(),
-            e.stack_hint()
+            e.stack_hint(),
+            e.site_note(e.cur_span)
         ))))),
         Val::Str(s) => {
             if key == "length" {

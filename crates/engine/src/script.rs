@@ -132,6 +132,8 @@ thread_local! {
     /// Has this page already been told that IntersectionObserver never
     /// fires? Pages build several, and one note per page is enough.
     static IO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Same, for `ResizeObserver`.
+    static RO_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Install the script-local context for the duration of a turn.
@@ -547,6 +549,7 @@ struct Nids {
     doc_query: usize,
     doc_query_all: usize,
     doc_create: usize,
+    doc_create_ns: usize,
     doc_cookie_get: usize,
     doc_cookie_set: usize,
     doc_get_by_tag: usize,
@@ -660,6 +663,11 @@ struct Nids {
     io_unobserve: usize,
     io_disconnect: usize,
     io_take: usize,
+    /// `ResizeObserver`
+    ro_ctor: usize,
+    ro_observe: usize,
+    ro_unobserve: usize,
+    ro_disconnect: usize,
 }
 
 thread_local! {
@@ -808,6 +816,9 @@ const D_GET_ELEMENTS_BY_NAME: u16 = 9;
 /// character-data constructors
 const D_CREATE_TEXT: u16 = 10;
 const D_CREATE_COMMENT: u16 = 11;
+/// `createElementNS(ns, qualifiedName)` — the namespace decides the element
+/// family (SVG vs HTML), so it is not a synonym for `createElement`.
+const D_CREATE_ELEMENT_NS: u16 = 12;
 /// element group idxs
 const E_GET_ELEMENT_BY_ID: u16 = 10;
 const E_QUERY: u16 = 11;
@@ -880,6 +891,11 @@ const IO_OBSERVE: u16 = 1;
 const IO_UNOBSERVE: u16 = 2;
 const IO_DISCONNECT: u16 = 3;
 const IO_TAKE: u16 = 4;
+/// ResizeObserver group idxs
+const RO_CTOR: u16 = 0;
+const RO_OBSERVE: u16 = 1;
+const RO_UNOBSERVE: u16 = 2;
+const RO_DISCONNECT: u16 = 3;
 /// storage group idxs
 const S_GET: u16 = 40;
 const S_SET: u16 = 41;
@@ -986,6 +1002,17 @@ fn doc_native(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<
         D_CREATE_ELEMENT => {
             let Some(tag) = sel else { return Ok(Val::Null) };
             create_element(&tag)
+        }
+        // `createElementNS(ns, "svg")`: only the local name reaches the arena
+        // (tags are interned by name, no namespace column), so an SVG element
+        // is an element whose tag happens to be `svg`/`path`/… That is enough
+        // for the page to build and insert it; the SVG *rendering* is the
+        // separate documented gap.
+        D_CREATE_ELEMENT_NS => {
+            let Some(tag) = args.get(1).and_then(|v| v.as_string()) else {
+                return Ok(Val::Null);
+            };
+            create_element(tag.rsplit(':').next().unwrap_or(&tag))
         }
         D_GET_ELEMENTS_BY_TAG => Ok(wrap_coll(LIVE_TAG, 0, &sel.unwrap_or_default())),
         D_GET_ELEMENTS_BY_CLASS => Ok(wrap_coll(LIVE_CLASS, 0, &sel.unwrap_or_default())),
@@ -1830,6 +1857,38 @@ const TAG_INTERFACES: [(&str, &[&str]); 30] = [
 /// `SVGSVGElement`.
 const DOM_INTERFACE_COUNT: usize = DOM_INTERFACES.len() + TAG_INTERFACES.len() + 1;
 
+/// Tag names that belong to the SVG namespace (icon sets and Primer's drag
+/// handles are built with `createElementNS`). Lowercase only: the arena
+/// lowercases every tag.
+const SVG_TAGS: [&str; 26] = [
+    "svg",
+    "path",
+    "g",
+    "circle",
+    "ellipse",
+    "rect",
+    "line",
+    "polyline",
+    "polygon",
+    "text",
+    "tspan",
+    "defs",
+    "use",
+    "symbol",
+    "clippath",
+    "mask",
+    "lineargradient",
+    "radialgradient",
+    "stop",
+    "filter",
+    "pattern",
+    "marker",
+    "image",
+    "foreignobject",
+    "title",
+    "desc",
+];
+
 /// `new Element()` / `new Node()`: the spec marks these interfaces as illegal
 /// constructors, and every real node comes from the parser or
 /// `document.createElement`, so throwing is the honest answer.
@@ -1915,7 +1974,14 @@ fn dom_tag_proto(tag: &str) -> Option<Rc<RefCell<js::Obj>>> {
     DOM_PROTOS.with(|p| {
         let b = p.borrow();
         let d = b.as_ref()?;
-        let i = *d.by_tag.get(tag.as_str()).unwrap_or(&DOM_HTML_ELEMENT);
+        let i = match d.by_tag.get(tag.as_str()) {
+            Some(i) => *i,
+            // the arena has no namespace column, so an SVG element is known
+            // by its tag name alone: `createElementNS(NS, "path")` and a
+            // parsed `<path>` both land here
+            None if SVG_TAGS.contains(&tag.as_str()) => DOM_SVG_ELEMENT,
+            None => DOM_HTML_ELEMENT,
+        };
         match d.chain.get(i) {
             Some(Val::Obj(o)) => Some(o.clone()),
             _ => None,
@@ -2425,6 +2491,56 @@ fn install_intersection_observer(e: &mut JsEngine, ids: Nids) {
     e.set_global("IntersectionObserver", Val::Native(ids.io_ctor));
 }
 
+/// `new ResizeObserver(callback)`, `observe(el)`.
+///
+/// shortcut: like `IntersectionObserver` above, callbacks are never
+/// delivered — a box size would have to be read out of the layout tree,
+/// which a page turn in this engine does not hold. `observe` is a no-op and
+/// the observer simply never reports; nothing in the wild requires a
+/// callback to have run, they react to one when it arrives. Noted once per
+/// page.
+fn n_ro(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == RO_CTOR {
+        if !is_ctor_call(e, this) {
+            return Err(JsError::throw(
+                "TypeError: ResizeObserver is not a constructor",
+            ));
+        }
+        let cb = args.first().cloned().unwrap_or(Val::Undefined);
+        if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
+            return Err(JsError::throw(
+                "TypeError: ResizeObserver callback is not a function",
+            ));
+        }
+        let obs = proto_instance(
+            e.native_prop(nids().ro_ctor, "prototype")
+                .unwrap_or(Val::Undefined),
+        );
+        obs.set("__cb", cb);
+        if !RO_NOTE.with(|n| n.replace(true)) {
+            eprintln!(
+                "[js] ResizeObserver: observe() records nothing and never fires (no layout box; shortcut)"
+            );
+        }
+        return Ok(obs);
+    }
+    if !matches!(this, Val::Obj(o) if !matches!(js::obj_get_own(o, "__cb"), Val::Undefined)) {
+        return Err(JsError::throw(
+            "TypeError: ResizeObserver method called on a non-observer",
+        ));
+    }
+    Ok(Val::Undefined)
+}
+
+fn install_resize_observer(e: &mut JsEngine, ids: Nids) {
+    let proto = Val::new_object();
+    proto.set("observe", Val::Native(ids.ro_observe));
+    proto.set("unobserve", Val::Native(ids.ro_unobserve));
+    proto.set("disconnect", Val::Native(ids.ro_disconnect));
+    e.set_native_prop(ids.ro_ctor, "prototype", proto);
+    e.set_global("ResizeObserver", Val::Native(ids.ro_ctor));
+}
+
 /// `requestAnimationFrame(cb)` - the callback joins this turn's queue with
 /// a one-epoch deadline; the worker's scheduler fires every queued callback
 /// in a single coalesced pass and re-lays out once if any of them mutated
@@ -2838,6 +2954,7 @@ impl PageScripts {
         OBSERVERS.with(|o| o.borrow_mut().clear());
         CUSTOM_ELEMENTS.with(|c| c.borrow_mut().clear());
         IO_NOTE.with(|n| n.set(false));
+        RO_NOTE.with(|n| n.set(false));
         runtime::set_mutation_tracking(false);
         let mut engine = JsEngine::new();
         // one native per reflected-prop accessor (getter + setter share it)
@@ -2860,6 +2977,7 @@ impl PageScripts {
             doc_query: engine.register_native("document.querySelector", doc_native, D_QUERY),
             doc_query_all: engine.register_native("document.querySelectorAll", doc_native, D_QUERY_ALL),
             doc_create: engine.register_native("document.createElement", doc_native, D_CREATE_ELEMENT),
+            doc_create_ns: engine.register_native("document.createElementNS", doc_native, D_CREATE_ELEMENT_NS),
             doc_cookie_get: engine.register_native("document.getCookie", doc_native, D_COOKIE_GET),
             doc_cookie_set: engine.register_native("document.setCookie", doc_native, D_COOKIE_SET),
             doc_get_by_tag: engine.register_native("document.getElementsByTagName", doc_native, D_GET_ELEMENTS_BY_TAG),
@@ -2961,6 +3079,10 @@ impl PageScripts {
             io_unobserve: engine.register_native("IntersectionObserver.prototype.unobserve", n_io, IO_UNOBSERVE),
             io_disconnect: engine.register_native("IntersectionObserver.prototype.disconnect", n_io, IO_DISCONNECT),
             io_take: engine.register_native("IntersectionObserver.prototype.takeRecords", n_io, IO_TAKE),
+            ro_ctor: engine.register_native("ResizeObserver", n_ro, RO_CTOR),
+            ro_observe: engine.register_native("ResizeObserver.prototype.observe", n_ro, RO_OBSERVE),
+            ro_unobserve: engine.register_native("ResizeObserver.prototype.unobserve", n_ro, RO_UNOBSERVE),
+            ro_disconnect: engine.register_native("ResizeObserver.prototype.disconnect", n_ro, RO_DISCONNECT),
         };
         NIDS.with(|c| c.set(Some(ids)));
         install_event_types(&mut engine, ids);
@@ -2968,6 +3090,7 @@ impl PageScripts {
         install_custom_elements(&mut engine, ids);
         install_mutation_observer(&mut engine, ids);
         install_intersection_observer(&mut engine, ids);
+        install_resize_observer(&mut engine, ids);
         // CSSOM bridge: the style object's member reads/writes go through
         // the shared host (js.rs itself stays DOM-free)
         engine.style_get = Some(style_get_hook);
@@ -2995,6 +3118,7 @@ impl PageScripts {
         doc.set("querySelector", Val::Native(ids.doc_query));
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
         doc.set("createElement", Val::Native(ids.doc_create));
+        doc.set("createElementNS", Val::Native(ids.doc_create_ns));
         doc.set("getElementsByTagName", Val::Native(ids.doc_get_by_tag));
         doc.set("getElementsByClassName", Val::Native(ids.doc_get_by_class));
         doc.set("getElementsByName", Val::Native(ids.doc_get_by_name));
@@ -3974,6 +4098,59 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "records"), "0");
         assert_eq!(get_global_str(&mut ps, "fired"), "0");
         assert_eq!(get_global_str(&mut ps, "isInstance"), "true");
+        assert_eq!(get_global_str(&mut ps, "badCb"), "true");
+    }
+
+    #[test]
+    fn create_element_ns_makes_svg_elements() {
+        // Primer builds its drag handle with createElementNS; the tag alone
+        // decides the family, because the arena has no namespace column
+        let (mut dom, mut ps) = page(
+            r##"<html><body><script>
+                var NS = "http://www.w3.org/2000/svg";
+                var svg = document.createElementNS(NS, "svg");
+                var path = document.createElementNS(NS, "path");
+                var div = document.createElement("div");
+                svg.appendChild(path);
+                document.body.appendChild(svg);
+                window.t = [
+                    svg instanceof SVGSVGElement,
+                    svg instanceof SVGElement,
+                    svg instanceof HTMLElement,
+                    path instanceof SVGElement,
+                    path instanceof SVGSVGElement,
+                    div instanceof SVGElement,
+                    div instanceof HTMLDivElement,
+                    document.querySelector("svg") instanceof SVGSVGElement,
+                ].join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "t"),
+            "true,true,false,true,false,false,true,true"
+        );
+    }
+
+    #[test]
+    fn resize_observer_constructs_and_observes_without_firing() {
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d"></div><script>
+                var fired = 0;
+                var ro = new ResizeObserver(function () { fired++; });
+                ro.observe(document.getElementById("d"));
+                ro.unobserve(document.getElementById("d"));
+                ro.disconnect();
+                window.isInstance = ro instanceof ResizeObserver;
+                window.fired = fired;
+                var bad = false;
+                try { new ResizeObserver(1); } catch (e) { bad = e instanceof TypeError; }
+                window.badCb = bad;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "isInstance"), "true");
+        assert_eq!(get_global_str(&mut ps, "fired"), "0");
         assert_eq!(get_global_str(&mut ps, "badCb"), "true");
     }
 
