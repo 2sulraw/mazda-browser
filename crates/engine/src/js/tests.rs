@@ -4826,3 +4826,25 @@ fn var_without_initializer_does_not_reset_the_binding() {
     // a leading `var` still declares the name (undefined until assigned)
     assert_eq!(run("var y; y").to_string(), "undefined");
 }
+
+#[test]
+fn a_destructured_parameter_binds_in_the_call_frame() {
+    // minified code names destructured parameters like its own imports:
+    //   constructor({ size: e, min: t, ttl: n, onDelete: r })
+    // binding `n` through the scope chain overwrote the module's webpack
+    // `require` (called `n`) with undefined, and the next `n("MC")` died
+    assert_eq!(
+        num("var n = function () { return 7; }; (function ({ ttl: n }) {}) ({}); n()"),
+        7.0
+    );
+    // the binding is the parameter's, inside the function
+    assert_eq!(
+        num("var x = 1; function f({ x }) { return x; } var r = f({ x: 5 }); r + (x - 1)"),
+        5.0
+    );
+    // defaults see earlier parameters
+    assert_eq!(
+        num("function f(a, { b = a + 1 } = {}) { return b; } f(4)"),
+        5.0
+    );
+}

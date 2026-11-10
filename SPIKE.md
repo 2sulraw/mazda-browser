@@ -2985,3 +2985,33 @@ parameter.
   `Cannot read property 'requestErrored' of null` — the page calls
   `Object.getPrototypeOf(document.createElement("turbo-frame").delegate)`, i.e.
   it expects `customElements.define` to have upgraded the element.
+
+## A destructured parameter binds in the call frame (P20, 2026-11-10)
+
+Upgrading `turbo-frame` got the bundle past `requestErrored`, and the next
+fatal error was `undefined is not a function` at
+`core-*.js` 27:19396 — `var rO = n("MC"), rW = n("XE")`, where `n` is the
+webpack `require` parameter of the module factory. `n` had worked 7,000
+columns earlier in the same factory, so something overwrote it.
+
+In between, the factory runs `let rP = new rT({size: 20})`, and `rT`'s
+constructor is
+
+```js
+constructor({size: e, min: t, ttl: n, onDelete: r}) { … }
+```
+
+A destructured parameter used `BindKind::Decl(VarKind::Var)`, whose name case
+called `env_set` — a *scope-chain* write. `n` already existed in the module
+env, so `ttl: n` wrote `undefined` there instead of declaring a parameter, and
+every later `n(…)` in the factory was a call on `undefined`.
+
+Spec: a parameter is bound in the function's own environment. Now
+`BindKind::Param` declares in the call frame (re-binding the same name keeps
+the last value, like sloppy duplicate parameters). Plain parameters already
+did this; destructured ones did not.
+
+- engine tests **982 → 983** green (new
+  `a_destructured_parameter_binds_in_the_call_frame`).
+- Next fatal error in `core-*.js`:
+  `Cannot read property 'distance' of undefined`.

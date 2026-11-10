@@ -341,7 +341,7 @@ pub(crate) fn bind_params(
             Some(pat) => {
                 // bind the raw arg under the hidden name, then destructure
                 env.declare(p.name.clone(), v.clone(), false);
-                bind_pat(e, env, pat, v, BindKind::Decl(VarKind::Var))?;
+                bind_pat(e, env, pat, v, BindKind::Param)?;
             }
             None => env.declare(p.name.clone(), v, false),
         }
@@ -841,8 +841,18 @@ fn bind_target(
 ) -> Result<(), JsError> {
     match t {
         BindTgt::Name(n) => match kind {
-            BindKind::Decl(VarKind::Var) | BindKind::Param => e.env_set(env, n, v),
-            BindKind::Assign => e.env_set(env, n, v),
+            BindKind::Decl(VarKind::Var) | BindKind::Assign => e.env_set(env, n, v),
+            // a parameter binds in the call frame, never through the chain:
+            // destructuring used to walk up and overwrite an outer binding
+            // with the same name (`constructor({ttl: n})` wiped the module's
+            // webpack `require` called `n`). Re-binding the same name keeps
+            // the last value, as sloppy duplicate parameters do.
+            BindKind::Param => {
+                if !env.set_own(n, v.clone())? {
+                    env.declare(n.clone(), v, false);
+                }
+                Ok(())
+            }
             BindKind::Decl(k) => {
                 env.declare(n.clone(), v, k == VarKind::Const);
                 Ok(())
