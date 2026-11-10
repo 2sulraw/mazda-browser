@@ -494,25 +494,7 @@ impl PatParser {
                 let h = self.hex(2)?;
                 A::Char(char::from_u32(h).ok_or_else(|| match_char_escape())?)
             }
-            'u' => {
-                if self.peek() == Some('{') {
-                    self.i += 1;
-                    let mut h = String::new();
-                    while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
-                        h.push(self.next().unwrap());
-                    }
-                    if !self.eat('}') || h.is_empty() {
-                        return rerr("bad \\u{...} escape");
-                    }
-                    let v = u32::from_str_radix(&h, 16).map_err(|_| match_char_escape())?;
-                    A::Char(char::from_u32(v).unwrap_or('\u{fffd}'))
-                } else {
-                    let hh = self.hex(4)?;
-                    // honest shortcut: lone surrogates map to U+FFFD (same
-                    // convention as the string-literal unescaper)
-                    A::Char(char::from_u32(hh).unwrap_or('\u{fffd}'))
-                }
-            }
+            'u' => A::Char(self.unicode_escape()?),
             'c' => {
                 // \cX control escape: A-Z -> ctrl char
                 let l = self.peek().unwrap_or('\0');
@@ -581,6 +563,28 @@ impl PatParser {
         u32::from_str_radix(&s, 16).map_err(|_| match_char_escape())
     }
 
+    /// The code unit after a `\u` escape: `\uXXXX` or `\u{...}`. Lone
+    /// surrogates map to U+FFFD (same convention as the string-literal
+    /// unescaper). Used from the atom path and both ends of a class range,
+    /// since the splitter's `[\u{E0020}-\u{E007E}]` puts the brace form at
+    /// the upper bound.
+    fn unicode_escape(&mut self) -> Result<char, RegexError> {
+        if self.peek() == Some('{') {
+            self.i += 1;
+            let mut h = String::new();
+            while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
+                h.push(self.next().unwrap());
+            }
+            if !self.eat('}') || h.is_empty() {
+                return rerr("bad \\u{...} escape");
+            }
+            let v = u32::from_str_radix(&h, 16).map_err(|_| match_char_escape())?;
+            Ok(char::from_u32(v).unwrap_or('\u{fffd}'))
+        } else {
+            Ok(char::from_u32(self.hex(4)?).unwrap_or('\u{fffd}'))
+        }
+    }
+
     fn class(&mut self) -> Result<Node, RegexError> {
         self.i += 1; // `[`
         let mut neg = false;
@@ -627,22 +631,7 @@ impl PatParser {
                     Some('v') => '\u{b}',
                     Some('0') => '\0',
                     Some('x') => char::from_u32(self.hex(2)?).ok_or_else(match_char_escape)?,
-                    Some('u') => {
-                        if self.peek() == Some('{') {
-                            self.i += 1;
-                            let mut h = String::new();
-                            while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
-                                h.push(self.next().unwrap());
-                            }
-                            if !self.eat('}') || h.is_empty() {
-                                return rerr("bad \\u{...} escape in class");
-                            }
-                            char::from_u32(u32::from_str_radix(&h, 16).map_err(|_| match_char_escape())?)
-                                .unwrap_or('\u{fffd}')
-                        } else {
-                            char::from_u32(self.hex(4)?).unwrap_or('\u{fffd}')
-                        }
-                    }
+                    Some('u') => self.unicode_escape()?,
                     Some('p') | Some('P') => {
                         let negated = self.c[self.i - 1] == 'P';
                         props.push((self.prop_kind()?, negated));
@@ -667,9 +656,7 @@ impl PatParser {
                         Some('r') => '\r',
                         Some('t') => '\t',
                         Some('x') => char::from_u32(self.hex(2)?).ok_or_else(match_char_escape)?,
-                        Some('u') => {
-                            char::from_u32(self.hex(4)?).unwrap_or('\u{fffd}')
-                        }
+                        Some('u') => self.unicode_escape()?,
                         Some(c) => c,
                         None => return rerr("unterminated character class"),
                     },

@@ -3290,6 +3290,22 @@ With `substr` in place the landing module got as far as its grapheme splitter:
 - Next fatal error: `bad hexadecimal escape in pattern` for the same regex:
   its tag-sequence class is `[\u{E0020}-\u{E007E}]` (below).
 
+## `\u{...}` at the upper bound of a class range (P33, 2026-11-10)
+
+With the emoji properties accepted, the same pattern still failed:
+`bad hexadecimal escape in pattern`. Its class is
+`[\u{E0020}-\u{E007E}]`; the atom path and the range's *lower* bound both
+understood the brace form, but the upper-bound branch only read `\uXXXX`, so
+the `{` was "not a hex digit".
+
+- one `unicode_escape` helper now reads `\uXXXX` or `\u{...}` (lone
+  surrogates still map to U+FFFD) and all three call sites use it.
+- engine tests **996 -> 997** green (new
+  `regex_unicode_escape_at_class_range_bound`).
+- github.com cold load: **zero `script error in` lines**. The only remaining
+  error is the recurring timer failure in `pb-*.js`
+  (`Cannot read property 'toUpperCase' of undefined`, 35:26875).
+
 
 
 

@@ -5040,3 +5040,16 @@ fn regex_emoji_property_escapes() {
         "(() => { try { new RegExp('\\\\p{RI}|\\\\p{Emoji}|\\\\p{EMod}|.', 'gu'); return true } catch (e) { return false } })()"
     ));
 }
+
+#[test]
+fn regex_unicode_escape_at_class_range_bound() {
+    // The splitter's tag-sequence class is `[\u{E0020}-\u{E007E}]`: the
+    // range's upper bound used the fixed `\uXXXX` form only, so a `{...}`
+    // escape there was "bad hexadecimal escape in pattern".
+    assert!(boolean(
+        "var lo = String.fromCharCode(0xDB40, 0xDC20), hi = String.fromCharCode(0xDB40, 0xDC7E); /^[\\u{E0020}-\\u{E007E}]$/u.test(lo) && /^[\\u{E0020}-\\u{E007E}]$/u.test(hi)"
+    ));
+    assert!(!boolean(
+        "var out = String.fromCharCode(0xDB40, 0xDC1F); /^[\\u{E0020}-\\u{E007E}]$/u.test(out)"
+    ));
+}
