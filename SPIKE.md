@@ -2852,3 +2852,44 @@ collapse it, but `ureq` 2.12 is 1.1-only).
 
 - engine tests **969** green (new `static_deps_lists_import_and_export_from_sources`,
   `resolve_with_map_serves_the_preloader_the_same_urls`).
+
+## The DOM surface github.com probes at load (P16, 2026-11-10)
+
+With the module graph preloading, github.com's bundles actually run — and each
+one died on the first DOM feature the engine did not have. Every fix revealed
+the next fatal error, in one greedy sequence:
+
+| after fixing | next fatal error in `core-*.js` |
+| --- | --- |
+| `Element.hasAttribute` / `matches` / `removeEventListener` | `ReferenceError: Element is not defined` |
+| `Element`, `Node` | `ReferenceError: Document is not defined` |
+| `Document`, `HTMLDocument` | `ReferenceError: customElements is not defined` |
+| `customElements` | `ReferenceError: HTMLButtonElement is not defined` |
+| per-tag element interfaces | `TypeError: undefined is not a function` (`e.head.prepend(t)`) |
+| `prepend`/`append`/`before`/`after`/`replaceWith`/`replaceChildren` | `TypeError: not an element` (`MutationObserver.observe(document)`) |
+| `document` as a node (root id + `nodeType` 9) | `ReferenceError: IntersectionObserver is not defined` |
+
+What this batch adds, and the shape it had to take:
+
+- Element wrappers stay plain objects with their surface as own props. The
+  interface globals (`EventTarget`, `Node`, `Element`, `HTMLElement`, 30 tag
+  families, `SVGElement`/`SVGSVGElement`) exist to give `instanceof` an honest
+  chain: each tag's wrapper is an `HTMLButtonElement`, a `<div>` is not. All of
+  them are illegal constructors, like the spec says.
+- `customElements.define` records the definition so `get`/`whenDefined` answer
+  truthfully, but elements are **not** upgraded: wrappers are built per access,
+  so a defined class never runs against an existing element. Logged once per
+  name; the page's own `document.createElement` path keeps working.
+- `matches`/`closest` reuse the `querySelector` matcher (`tag`, `#id`,
+  `.class`) — same documented simple-selector limit.
+- `document` carries the arena root id, because `MutationObserver.observe`
+  takes a node; its listener bucket is still the window's (it always was, since
+  a document without an id had nowhere else to go).
+
+- engine tests **969 → 976** green (new `element_wrappers_are_instances_of_element`,
+  `custom_elements_defines_and_answers_get`,
+  `dom_insertion_methods_keep_order_and_text`,
+  `document_is_a_node_for_observer_and_dispatch`).
+- Page render on github.com is unchanged (header only): the bootstrap still
+  dies, now on `IntersectionObserver`. The value of this batch is that each
+  run gets further into real site code before it stops.

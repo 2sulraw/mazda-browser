@@ -614,6 +614,12 @@ impl DomHost {
         crate::script::subtree_query_dom(self.dom_ref(), root, sel)
     }
 
+    /// Does `node` itself match `sel`? `Element.matches`, answered by the same
+    /// matcher as the `querySelector` above.
+    pub fn matches(&self, node: u32, sel: &str) -> bool {
+        crate::script::matches_simple(self.dom_ref(), node, sel)
+    }
+
     /// `getElementsByTagName`: every element with this tag in document order
     /// (`"*"` = all elements).
     pub fn by_tag(&self, name: &str) -> Vec<u32> {

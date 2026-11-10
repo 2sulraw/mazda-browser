@@ -124,6 +124,11 @@ thread_local! {
 // `PageScripts::new`; the objects also stay reachable from page JS.
 thread_local! {
     static OBSERVERS: RefCell<Vec<Val>> = const { RefCell::new(Vec::new()) };
+    /// `customElements` definitions for the current page: `(tag, ctor)`.
+    /// Elements are *not* upgraded (see `n_custom_elements`), so this only
+    /// answers `get`/`whenDefined` — but its presence is what pages probe,
+    /// and a missing global is a ReferenceError that kills the module.
+    static CUSTOM_ELEMENTS: RefCell<Vec<(String, Val)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Install the script-local context for the duration of a turn.
@@ -170,7 +175,35 @@ fn with_ctx<R>(
 fn ctx_add_listener(node: u32, kind: String, cb: Val) {
     CTX.with(|c| {
         if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.listeners.entry((node, kind)).or_default().push(cb);
+            let list = cx.listeners.entry((node, kind)).or_default();
+            // spec: the same (type, callback) pair registered twice is still
+            // one listener. Without this a page that re-registers on every
+            // render fires its handler twice (and cannot unregister both:
+            // `removeEventListener` below removes one).
+            if !list.iter().any(|x| js::strict_eq(x, &cb)) {
+                list.push(cb);
+            }
+        }
+    })
+}
+
+/// Undo one `ctx_add_listener`. There is no capture phase here, so
+/// `(node, type, callback)` is the whole key and one matching registration
+/// goes (spec: duplicates of the same triple are ignored on add, so removing
+/// the first is enough).
+fn ctx_remove_listener(node: u32, kind: &str, cb: &Val) {
+    CTX.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(cx) = c.as_mut() else { return };
+        let key = (node, kind.to_string());
+        let Some(list) = cx.listeners.get_mut(&key) else {
+            return;
+        };
+        if let Some(i) = list.iter().position(|x| js::strict_eq(x, cb)) {
+            list.remove(i);
+            if list.is_empty() {
+                cx.listeners.remove(&key);
+            }
         }
     })
 }
@@ -220,6 +253,9 @@ fn wrap_element(node: u32) -> Val {
     o.set("__node", js::Val::Num(node as f64));
     let n = nids();
     let p = runtime::host(|h| h.snapshot(node));
+    // the interface chain depends on the tag (`<button>` is an
+    // HTMLButtonElement), so resolve it before the snapshot is consumed
+    let proto = dom_tag_proto(p.as_ref().map(|p| p.tag.as_str()).unwrap_or(""));
     if let Some(p) = p {
         o.set("tagName", str_val(&p.tag));
         // `form.elements`: live collection of the form's listed controls.
@@ -291,12 +327,20 @@ fn wrap_element(node: u32) -> Val {
     o.set("getElementsByClassName", js::Val::Native(n.el_get_by_class));
     o.set("getElementsByTagName", js::Val::Native(n.el_get_by_tag));
     o.set("appendChild", js::Val::Native(n.el_append));
-    o.set("append", js::Val::Native(n.el_append)); // shortcut: element args only
+    o.set("append", js::Val::Native(n.el_append_many));
+    o.set("prepend", js::Val::Native(n.el_prepend));
+    o.set("before", js::Val::Native(n.el_before));
+    o.set("after", js::Val::Native(n.el_after));
+    o.set("replaceWith", js::Val::Native(n.el_replace_with));
+    o.set("replaceChildren", js::Val::Native(n.el_replace_children));
     o.set("remove", js::Val::Native(n.el_remove));
     o.set("setAttribute", js::Val::Native(n.el_set_attr));
     o.set("getAttribute", js::Val::Native(n.el_get_attr));
     o.set("removeAttribute", js::Val::Native(n.el_rm_attr));
     o.set("addEventListener", js::Val::Native(n.el_add_listener));
+    o.set("removeEventListener", js::Val::Native(n.el_remove_listener));
+    o.set("matches", js::Val::Native(n.el_matches));
+    o.set("hasAttribute", js::Val::Native(n.el_has_attr));
     o.set("dispatchEvent", js::Val::Native(n.el_dispatch));
     o.set("setTextContent", js::Val::Native(n.el_set_text));
     o.set("setInnerHTML", js::Val::Native(n.el_set_inner));
@@ -311,6 +355,11 @@ fn wrap_element(node: u32) -> Val {
     o.set("play", js::Val::Native(n.el_media_play));
     o.set("pause", js::Val::Native(n.el_media_noop));
     o.set("load", js::Val::Native(n.el_media_noop));
+    o.set("closest", js::Val::Native(n.el_closest));
+    // the prototype chain is only for `instanceof Element` (every method
+    // stays an own prop, one behaviour for wrappers created before and after
+    // the protos are installed)
+    set_proto(&o, proto);
     o
 }
 
@@ -389,8 +438,87 @@ fn this_node(this: &Val) -> Result<u32, JsError> {
     }
 }
 
-/// Reflected attribute property (one native per `REFLECTED` entry): a getter
-/// call arrives with no arguments, a setter with one. Both halves of the
+/// Argument list of `prepend`/`append`/… → arena ids. Elements resolve through
+/// `__node`; strings and other primitives become text nodes (the spec's
+/// `Node`-or-`DOMString` conversion). Values that are neither are skipped: one
+/// bad argument must not abort a page's render.
+fn arg_nodes(args: &[Val]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for a in args {
+        match a {
+            Val::Obj(_) => {
+                if let Ok(n) = this_node(a) {
+                    out.push(n);
+                }
+            }
+            Val::Undefined | Val::Null => {}
+            _ => {
+                let s = a.to_string();
+                if let Some(n) = runtime::host_mut(|h| h.create_text_node(&s, false)) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The insertion methods, one pass over the arena per call. `prepend`/`before`
+/// keep argument order by inserting everything before the same anchor.
+fn insert_children(node: u32, idx: u16, nodes: &[u32]) {
+    runtime::host_mut(|h| match idx {
+        E_PREPEND => {
+            let anchor = h.first_child(node);
+            for &n in nodes {
+                h.insert_before(node, n, anchor);
+            }
+        }
+        E_APPEND => {
+            for &n in nodes {
+                h.append_child(node, n);
+            }
+        }
+        E_BEFORE => {
+            let Some(parent) = h.parent_node(node) else { return };
+            for &n in nodes {
+                h.insert_before(parent, n, Some(node));
+            }
+        }
+        E_AFTER => {
+            let Some(parent) = h.parent_node(node) else { return };
+            let anchor = h.sibling_node(node, true);
+            for &n in nodes {
+                match anchor {
+                    Some(a) => {
+                        h.insert_before(parent, n, Some(a));
+                    }
+                    None => {
+                        h.append_child(parent, n);
+                    }
+                }
+            }
+        }
+        E_REPLACE_WITH => {
+            let Some(parent) = h.parent_node(node) else { return };
+            for &n in nodes {
+                h.insert_before(parent, n, Some(node));
+            }
+            h.remove_node(node);
+        }
+        E_REPLACE_CHILDREN => {
+            // collect first: removing while walking the live child list skips
+            for c in h.child_nodes(node) {
+                h.remove_node(c);
+            }
+            for &n in nodes {
+                h.append_child(node, n);
+            }
+        }
+        _ => {}
+    });
+}
+
+/// Reflected attribute property (one native per `REFLECTED` entry): a getter/// call arrives with no arguments, a setter with one. Both halves of the
 /// accessor pair point at this same native; `this` is the element wrapper.
 fn el_prop_native(_e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let node = this_node(this)?;
@@ -436,6 +564,9 @@ struct Nids {
     el_get_attr: usize,
     el_rm_attr: usize,
     el_add_listener: usize,
+    el_remove_listener: usize,
+    el_matches: usize,
+    el_has_attr: usize,
     /// one shared `dispatchEvent` native for elements, document and window
     el_dispatch: usize,
     el_set_text: usize,
@@ -478,6 +609,7 @@ struct Nids {
     loc_assign: usize,
     loc_reload: usize,
     win_add_listener: usize,
+    win_remove_listener: usize,
     match_media: usize,
     media_noop: usize,
     eme: usize,
@@ -502,10 +634,32 @@ struct Nids {
     storage_clear: usize,
     fetch: usize,
     fetch_text: usize,
-}
+    /// One native per DOM interface constructor, in chain order (the
+    /// `DOM_INTERFACES`, then `TAG_INTERFACES`, then `SVGSVGElement`)
+    dom_ctor: [usize; DOM_INTERFACE_COUNT],
+    el_closest: usize,
+    /// variadic insertion group (`prepend`/`append`/`before`/`after`/
+    /// `replaceWith`/`replaceChildren`)
+    el_prepend: usize,
+    el_append_many: usize,
+    el_before: usize,
+    el_after: usize,
+    el_replace_with: usize,
+    el_replace_children: usize,
+    /// `customElements` (CustomElementRegistry)
+    ce_define: usize,
+    ce_get: usize,
+    ce_when_defined: usize,
+    ce_noop: usize,}
 
 thread_local! {
     static NIDS: std::cell::Cell<Option<Nids>> = const { std::cell::Cell::new(None) };
+    /// This page's DOM interface prototypes (`EventTarget <- Node <- ...`).
+    /// Element and character-data wrappers chain into it, so
+    /// `ref.current instanceof Element` — how Primer components guard a ref —
+    /// answers true instead of throwing `ReferenceError`.
+    static DOM_PROTOS: std::cell::RefCell<Option<DomProtos>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn nids() -> Nids {
@@ -517,7 +671,9 @@ fn nids() -> Nids {
 // ---------------------------------------------------------------------------
 
 /// Does `node` match `sel`? Supports `tag`, `#id`, `.class` only.
-fn matches_simple(dom: &Dom, node: u32, sel: &str) -> bool {
+/// `pub(crate)`: the shared DomHost answers `Element.matches` with it, so the
+/// element and the `querySelector` that searched for it cannot disagree.
+pub(crate) fn matches_simple(dom: &Dom, node: u32, sel: &str) -> bool {
     let sel = sel.trim();
     if sel.is_empty() {
         return false;
@@ -736,6 +892,34 @@ const C_ITEM: u16 = 0;
 const C_NAMED: u16 = 1;
 /// `form.elements` (element group; distinct from every E_* above)
 const E_FORM_ELEMENTS: u16 = 48;
+/// `Element.matches(sel)` - the same simple-selector matcher `querySelector`
+/// uses, applied to the element itself (`document.body.matches(":modal")` is
+/// how GitHub feature-detects `<dialog>` support)
+const E_MATCHES: u16 = 49;
+/// `Element.hasAttribute(name)` - a boolean, where `getAttribute` answers
+/// `null` (`documentElement.hasAttribute("override-fetch")` gates GitHub's
+/// fetch wrapper)
+const E_HAS_ATTRIBUTE: u16 = 50;
+/// `Element.removeEventListener(type, cb)`
+const E_REMOVE_EVENT_LISTENER: u16 = 51;
+/// `Element.closest(sel)` — this element or its nearest ancestor that matches
+const E_CLOSEST: u16 = 52;
+/// DOM insertion group: variadic, and a string argument becomes a text node
+/// (the spec's own conversion). `append` replaces the old
+/// element-args-only alias of `appendChild`.
+const E_PREPEND: u16 = 54;
+const E_APPEND: u16 = 55;
+const E_BEFORE: u16 = 56;
+const E_AFTER: u16 = 57;
+const E_REPLACE_WITH: u16 = 58;
+const E_REPLACE_CHILDREN: u16 = 59;
+/// `window.removeEventListener(type, cb)` (document shares the bucket)
+const W_REMOVE_LISTENER: u16 = 53;
+/// `customElements` group idxs
+const CE_DEFINE: u16 = 0;
+const CE_GET: u16 = 1;
+const CE_WHEN_DEFINED: u16 = 2;
+const CE_NOOP: u16 = 3;
 
 // Scheduler budgets (MAX_PENDING_TIMERS / MAX_PENDING_FRAMES /
 // FRAME_EPOCH) live ONCE in runtime.rs — single source for both engines.
@@ -903,6 +1087,44 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
                 return Ok(Val::Undefined);
             }
             ctx_add_listener(node, kind.to_string(), cb);
+            Ok(Val::Undefined)
+        }
+        E_REMOVE_EVENT_LISTENER => {
+            if let Some(kind) = a0.as_string() {
+                if let Some(cb) = args.get(1) {
+                    ctx_remove_listener(node, &kind, cb);
+                }
+            }
+            Ok(Val::Undefined)
+        }
+        E_MATCHES => {
+            let Some(sel) = a0.as_string() else { return Ok(Val::Bool(false)) };
+            // same matcher (and same documented simple-selector limit) as
+            // querySelector, so `el.matches(s)` and
+            // `el.parentElement.querySelectorAll(s)` agree on `el`
+            Ok(Val::Bool(runtime::host(|h| h.matches(node, &sel))))
+        }
+        E_HAS_ATTRIBUTE => Ok(Val::Bool(runtime::host(|h| {
+            h.attr(node, &a0.to_string()).is_some()
+        }))),
+        E_CLOSEST => {
+            let Some(sel) = a0.as_string() else { return Ok(Val::Null) };
+            Ok(runtime::host(|h| {
+                // bounded walk: an arena cycle would otherwise spin forever
+                let mut cur = Some(node);
+                for _ in 0..1024 {
+                    let Some(n) = cur else { break };
+                    if h.matches(n, &sel) {
+                        return wrap_element(n);
+                    }
+                    cur = h.parent_element(n);
+                }
+                Val::Null
+            }))
+        }
+        E_PREPEND | E_APPEND | E_BEFORE | E_AFTER | E_REPLACE_WITH | E_REPLACE_CHILDREN => {
+            let nodes = arg_nodes(args);
+            insert_children(node, idx, &nodes);
             Ok(Val::Undefined)
         }
         E_SET_TEXT_CONTENT => {
@@ -1080,6 +1302,10 @@ fn wrap_char_data(node: u32) -> Val {
     // character data never has children; a fresh empty array keeps
     // `node.childNodes.length` truthful without a host round-trip
     o.set("childNodes", Val::new_array(Vec::new()));
+    set_proto(
+        &o,
+        dom_proto(if ty == 8 { DOM_COMMENT } else { DOM_TEXT }),
+    );
     o
 }
 
@@ -1204,6 +1430,14 @@ fn win_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<V
             ctx_add_listener(WIN_NODE, kind.to_string(), cb);
             Ok(Val::Undefined)
         }
+        W_REMOVE_LISTENER => {
+            if let Some(kind) = args.first().and_then(|v| v.as_string()) {
+                if let Some(cb) = args.get(1) {
+                    ctx_remove_listener(WIN_NODE, &kind, cb);
+                }
+            }
+            Ok(Val::Undefined)
+        }
         // shortcut: no media engine - every query reports "no match", and the
         // list is a fixed object whose listener methods do nothing
         W_MATCH_MEDIA => {
@@ -1300,10 +1534,15 @@ fn ev_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
                     "TypeError: dispatchEvent requires an event object",
                 ));
             }
-            // element calls carry `__node`; document/window do not and share
-            // the global listener bucket (WIN_NODE), but keep their own
-            // `target` object (document vs window)
-            let target = this_node(this).unwrap_or(WIN_NODE);
+            // element calls carry `__node`; document/window share the global
+            // listener bucket (WIN_NODE), but keep their own `target` object
+            // (document vs window). `document` now carries the arena root id
+            // (needed by `MutationObserver.observe(doc)`), so root maps back
+            // to the shared bucket it registers in.
+            let target = match this_node(this) {
+                Ok(0) | Err(_) => WIN_NODE,
+                Ok(n) => n,
+            };
             let target_val = if target == WIN_NODE {
                 match this {
                     Val::Obj(_) => this.clone(),
@@ -1495,6 +1734,256 @@ fn install_event_types(e: &mut JsEngine, ids: Nids) {
     })));
     e.set_native_prop(ids.cev_ctor, "prototype", cev_proto);
     e.set_global("CustomEvent", Val::Native(ids.cev_ctor));
+}
+
+// ---------------------------------------------------------------------------
+// DOM interfaces (`EventTarget`, `Node`, `Element`, ...) — presence + chain
+// ---------------------------------------------------------------------------
+//
+// The engine has no DOM classes: wrappers are plain objects with their
+// surface as own props. Real pages, though, feature-detect *interfaces*
+// (`ref.current instanceof Element`, `document instanceof Document`), and a
+// missing global is a ReferenceError that kills the module. This installs the
+// interface objects with the right prototype chain; nothing is constructed
+// through them (the parser and `document.createElement` build every node).
+
+/// Interface indices into `Nids::dom_ctor` / `DomProtos::chain`.
+const DOM_EVENT_TARGET: usize = 0;
+const DOM_NODE: usize = 1;
+const DOM_CHARACTER_DATA: usize = 2;
+const DOM_TEXT: usize = 3;
+const DOM_COMMENT: usize = 4;
+const DOM_DOCUMENT: usize = 5;
+const DOM_HTML_DOCUMENT: usize = 6;
+const DOM_DOCUMENT_FRAGMENT: usize = 7;
+const DOM_ELEMENT: usize = 8;
+const DOM_HTML_ELEMENT: usize = 9;
+const DOM_SVG_ELEMENT: usize = 10;
+
+/// The interface names installed as globals, in `DOM_*` index order.
+const DOM_INTERFACES: [&str; 11] = [    "EventTarget",
+    "Node",
+    "CharacterData",
+    "Text",
+    "Comment",
+    "Document",
+    "HTMLDocument",
+    "DocumentFragment",
+    "Element",
+    "HTMLElement",
+    "SVGElement",
+];
+
+/// Per-tag element interfaces: `(interface, tags)`. Pages check them by name
+/// (`x instanceof HTMLButtonElement`), and each one is a real step in the
+/// chain, so `el instanceof HTMLInputElement` is false for a `<div>`.
+const TAG_INTERFACES: [(&str, &[&str]); 30] = [
+    ("HTMLAnchorElement", &["a"]),
+    ("HTMLAreaElement", &["area"]),
+    ("HTMLAudioElement", &["audio"]),
+    ("HTMLBodyElement", &["body"]),
+    ("HTMLBRElement", &["br"]),
+    ("HTMLButtonElement", &["button"]),
+    ("HTMLCanvasElement", &["canvas"]),
+    ("HTMLDialogElement", &["dialog"]),
+    ("HTMLDivElement", &["div"]),
+    ("HTMLFormElement", &["form"]),
+    ("HTMLHeadElement", &["head"]),
+    ("HTMLHeadingElement", &["h1", "h2", "h3", "h4", "h5", "h6"]),
+    ("HTMLHRElement", &["hr"]),
+    ("HTMLHtmlElement", &["html"]),
+    ("HTMLIFrameElement", &["iframe"]),
+    ("HTMLImageElement", &["img"]),
+    ("HTMLInputElement", &["input"]),
+    ("HTMLLabelElement", &["label"]),
+    ("HTMLLIElement", &["li"]),
+    ("HTMLLinkElement", &["link"]),
+    ("HTMLMediaElement", &["object"]),
+    ("HTMLMetaElement", &["meta"]),
+    ("HTMLOListElement", &["ol"]),
+    ("HTMLOptionElement", &["option"]),
+    ("HTMLPreElement", &["pre"]),
+    ("HTMLScriptElement", &["script"]),
+    ("HTMLSelectElement", &["select"]),
+    ("HTMLStyleElement", &["style"]),
+    ("HTMLTemplateElement", &["template"]),
+    ("HTMLTextAreaElement", &["textarea"]),
+];
+
+/// How many interface globals exist: the fixed chain, every tag interface and
+/// `SVGSVGElement`.
+const DOM_INTERFACE_COUNT: usize = DOM_INTERFACES.len() + TAG_INTERFACES.len() + 1;
+
+/// `new Element()` / `new Node()`: the spec marks these interfaces as illegal
+/// constructors, and every real node comes from the parser or
+/// `document.createElement`, so throwing is the honest answer.
+fn n_dom_ctor(_e: &mut JsEngine, _idx: u16, _this: &Val, _args: &[Val]) -> Result<Val, JsError> {
+    Err(JsError::throw("TypeError: Illegal constructor"))
+}
+
+/// Shared prototype objects for one page: the fixed interface chain
+/// (`EventTarget <- Node <- {CharacterData <- {Text, Comment}, Document <-
+/// HTMLDocument, DocumentFragment, Element <- {HTMLElement <- every per-tag
+/// interface, SVGElement}}`) plus the tag → interface map element wrappers
+/// use.
+struct DomProtos {
+    chain: Vec<Val>,
+    /// lowercase tag → index into `chain` (`None` = plain `HTMLElement`)
+    by_tag: std::collections::HashMap<&'static str, usize>,
+}
+
+fn install_dom_types(e: &mut JsEngine, ids: &Nids) {
+    let mut chain: Vec<Val> = Vec::with_capacity(DOM_INTERFACES.len() + TAG_INTERFACES.len());
+    // EventTarget has no parent interface
+    chain.push(Val::new_object());
+    // Node <- EventTarget, CharacterData <- Node, Text/Comment <- CharacterData
+    chain.push(proto_instance(chain[DOM_EVENT_TARGET].clone()));
+    chain.push(proto_instance(chain[DOM_NODE].clone()));
+    chain.push(proto_instance(chain[DOM_CHARACTER_DATA].clone()));
+    chain.push(proto_instance(chain[DOM_CHARACTER_DATA].clone()));
+    // Document/HTMLDocument/DocumentFragment/Element <- Node
+    chain.push(proto_instance(chain[DOM_NODE].clone()));
+    chain.push(proto_instance(chain[DOM_DOCUMENT].clone()));
+    chain.push(proto_instance(chain[DOM_NODE].clone()));
+    chain.push(proto_instance(chain[DOM_NODE].clone()));
+    // HTMLElement and SVGElement are the two element families
+    chain.push(proto_instance(chain[DOM_ELEMENT].clone()));
+    chain.push(proto_instance(chain[DOM_ELEMENT].clone()));
+    // methods that do not need a wrapped node live on `Element.prototype`,
+    // so `Element.prototype.matches.call(el, sel)` works too
+    chain[DOM_ELEMENT].set("matches", Val::Native(ids.el_matches));
+    chain[DOM_ELEMENT].set("closest", Val::Native(ids.el_closest));
+    chain[DOM_ELEMENT].set("hasAttribute", Val::Native(ids.el_has_attr));
+    chain[DOM_ELEMENT].set("removeEventListener", Val::Native(ids.el_remove_listener));
+
+    // one interface per tag family, all hanging off HTMLElement
+    let mut by_tag: std::collections::HashMap<&'static str, usize> = Default::default();
+    let mut names: Vec<&str> = DOM_INTERFACES.to_vec();
+    for (name, tags) in TAG_INTERFACES {
+        let i = chain.len();
+        chain.push(proto_instance(chain[DOM_HTML_ELEMENT].clone()));
+        for tag in tags {
+            by_tag.insert(tag, i);
+        }
+        names.push(name);
+    }
+    // `<svg>` is the one element family that is not an HTMLElement
+    let svg = chain.len();
+    chain.push(proto_instance(chain[DOM_SVG_ELEMENT].clone()));
+    by_tag.insert("svg", svg);
+    names.push("SVGSVGElement");
+
+    for (i, name) in names.iter().enumerate() {
+        let id = ids.dom_ctor[i];
+        e.set_native_prop(id, "prototype", chain[i].clone());
+        e.set_global(name, Val::Native(id));
+    }
+    DOM_PROTOS.with(|p| *p.borrow_mut() = Some(DomProtos { chain, by_tag }));
+}
+
+/// This page's interface protos (`None` before `install_dom_types`).
+fn dom_proto(i: usize) -> Option<Rc<RefCell<js::Obj>>> {
+    DOM_PROTOS.with(|p| {
+        p.borrow().as_ref().and_then(|d| match d.chain.get(i) {
+            Some(Val::Obj(o)) => Some(o.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// `Element.prototype` of the interface owning `tag` (`<button>` →
+/// `HTMLButtonElement.prototype`), so `instanceof` answers by tag. Unknown and
+/// custom-element tags are plain `HTMLElement`s.
+fn dom_tag_proto(tag: &str) -> Option<Rc<RefCell<js::Obj>>> {
+    let tag = tag.to_ascii_lowercase();
+    DOM_PROTOS.with(|p| {
+        let b = p.borrow();
+        let d = b.as_ref()?;
+        let i = *d.by_tag.get(tag.as_str()).unwrap_or(&DOM_HTML_ELEMENT);
+        match d.chain.get(i) {
+            Some(Val::Obj(o)) => Some(o.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// Give a freshly built wrapper its place in the chain; `proto` is the tag's
+/// element interface for an element and `Text`/`Comment` for character data.
+fn set_proto(v: &Val, proto: Option<Rc<RefCell<js::Obj>>>) {
+    if let (Val::Obj(rc), Some(p)) = (v, proto) {
+        rc.borrow_mut().proto = Some(p);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `customElements` (CustomElementRegistry)
+// ---------------------------------------------------------------------------
+
+/// `customElements.define/get/whenDefined`. GitHub's bundles do
+/// `window.customElements.get("file-attachment") || (… define(…) …)` at load;
+/// without the global that line is a ReferenceError and the bundle dies.
+///
+/// shortcut: elements are **not** upgraded. This engine's element wrappers are
+/// plain objects built per access (no identity, no class instances), so a
+/// defined class never runs against an existing `<file-attachment>`; the
+/// definition is recorded so `get`/`whenDefined` answer truthfully and the
+/// page's own `document.createElement` path keeps working.
+fn install_custom_elements(e: &mut JsEngine, ids: Nids) {
+    let ce = Val::new_object();
+    ce.set("define", Val::Native(ids.ce_define));
+    ce.set("get", Val::Native(ids.ce_get));
+    ce.set("whenDefined", Val::Native(ids.ce_when_defined));
+    ce.set("upgrade", Val::Native(ids.ce_noop));
+    e.set_global("customElements", ce);
+}
+
+fn ce_lookup(name: &str) -> Option<Val> {
+    CUSTOM_ELEMENTS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    })
+}
+
+fn n_custom_elements(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    let name = args.first().map(|v| v.to_string()).unwrap_or_default();
+    match idx {
+        CE_DEFINE => {
+            // spec: a valid custom element name has a dash and is not a
+            // reserved name; the constructor must be callable
+            let ctor = args.get(1).cloned().unwrap_or(Val::Undefined);
+            if !name.contains('-') {
+                return Err(JsError::throw(&format!(
+                    "SyntaxError: \"{name}\" is not a valid custom element name"
+                )));
+            }
+            if !matches!(ctor, Val::Func(_) | Val::Native(_)) {
+                return Err(JsError::throw(
+                    "TypeError: customElements.define needs a constructor",
+                ));
+            }
+            let known = ce_lookup(&name).is_some();
+            if !known {
+                CUSTOM_ELEMENTS.with(|c| c.borrow_mut().push((name.clone(), ctor)));
+                eprintln!(
+                    "[js] customElements.define({name:?}): defined, elements are not upgraded (shortcut)"
+                );
+            }
+            Ok(Val::Undefined)
+        }
+        CE_GET => Ok(ce_lookup(&name).unwrap_or(Val::Undefined)),
+        CE_WHEN_DEFINED => {
+            // spec keeps the promise pending until `define`; here the page
+            // defines synchronously at load, so resolving either way is the
+            // same observable order for the `await` in the wild
+            let p = _e.new_promise();
+            let v = ce_lookup(&name).unwrap_or(Val::Undefined);
+            js::settle_promise(_e, &p, Ok(v));
+            Ok(Val::Obj(p))
+        }
+        _ => Ok(Val::Undefined),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,12 +2733,24 @@ impl PageScripts {
     pub fn new(dom: &mut Dom, base: &str) -> PageScripts {
         // a fresh page starts with no observers and no mutation logging
         OBSERVERS.with(|o| o.borrow_mut().clear());
+        CUSTOM_ELEMENTS.with(|c| c.borrow_mut().clear());
         runtime::set_mutation_tracking(false);
         let mut engine = JsEngine::new();
         // one native per reflected-prop accessor (getter + setter share it)
         let reflect = std::array::from_fn(|i| {
             engine.register_native(REFLECTED[i].0, el_prop_native, i as u16)
         });
+        // one constructor native per DOM interface, in prototype-chain order
+        let mut dom_ctor = [0usize; DOM_INTERFACE_COUNT];
+        for (slot, name) in dom_ctor.iter_mut().zip(
+            DOM_INTERFACES
+                .iter()
+                .copied()
+                .chain(TAG_INTERFACES.iter().map(|(name, _)| *name))
+                .chain(std::iter::once("SVGSVGElement")),
+        ) {
+            *slot = engine.register_native(name, n_dom_ctor, 0);
+        }
         let ids = Nids {
             doc_get_element: engine.register_native("document.getElementById", doc_native, D_GET_ELEMENT_BY_ID),
             doc_query: engine.register_native("document.querySelector", doc_native, D_QUERY),
@@ -2274,6 +2775,9 @@ impl PageScripts {
             el_get_attr: engine.register_native("Element.getAttribute", el_native, E_GET_ATTRIBUTE),
             el_rm_attr: engine.register_native("Element.removeAttribute", el_native, E_REMOVE_ATTRIBUTE),
             el_add_listener: engine.register_native("Element.addEventListener", el_native, E_ADD_EVENT_LISTENER),
+            el_remove_listener: engine.register_native("Element.removeEventListener", el_native, E_REMOVE_EVENT_LISTENER),
+            el_matches: engine.register_native("Element.matches", el_native, E_MATCHES),
+            el_has_attr: engine.register_native("Element.hasAttribute", el_native, E_HAS_ATTRIBUTE),
             el_dispatch: engine.register_native("EventTarget.dispatchEvent", ev_native, V_DISPATCH),
             el_set_text: engine.register_native("Element.setTextContent", el_native, E_SET_TEXT_CONTENT),
             el_set_inner: engine.register_native("Element.setInnerHTML", el_native, E_SET_INNER_HTML),
@@ -2311,6 +2815,7 @@ impl PageScripts {
             loc_assign: engine.register_native("location.assign", loc_native, L_ASSIGN),
             loc_reload: engine.register_native("location.reload", loc_native, L_RELOAD),
             win_add_listener: engine.register_native("window.addEventListener", win_native, W_ADD_LISTENER),
+            win_remove_listener: engine.register_native("window.removeEventListener", win_native, W_REMOVE_LISTENER),
             match_media: engine.register_native("window.matchMedia", win_native, W_MATCH_MEDIA),
             media_noop: engine.register_native("MediaQueryList.addEventListener", win_native, 35),
             eme: engine.register_native("navigator.requestMediaKeySystemAccess", win_native, W_EME),
@@ -2335,9 +2840,23 @@ impl PageScripts {
             storage_clear: engine.register_native("localStorage.clear", storage_native, S_CLEAR),
             fetch: engine.register_native("fetch", fetch_native, 0),
             fetch_text: engine.register_native("response.text", fetch_text_native, 0),
+            dom_ctor,
+            el_closest: engine.register_native("Element.closest", el_native, E_CLOSEST),
+            el_prepend: engine.register_native("Element.prepend", el_native, E_PREPEND),
+            el_append_many: engine.register_native("Element.append", el_native, E_APPEND),
+            el_before: engine.register_native("Element.before", el_native, E_BEFORE),
+            el_after: engine.register_native("Element.after", el_native, E_AFTER),
+            el_replace_with: engine.register_native("Element.replaceWith", el_native, E_REPLACE_WITH),
+            el_replace_children: engine.register_native("Element.replaceChildren", el_native, E_REPLACE_CHILDREN),
+            ce_define: engine.register_native("customElements.define", n_custom_elements, CE_DEFINE),
+            ce_get: engine.register_native("customElements.get", n_custom_elements, CE_GET),
+            ce_when_defined: engine.register_native("customElements.whenDefined", n_custom_elements, CE_WHEN_DEFINED),
+            ce_noop: engine.register_native("customElements.upgrade", n_custom_elements, CE_NOOP),
         };
         NIDS.with(|c| c.set(Some(ids)));
         install_event_types(&mut engine, ids);
+        install_dom_types(&mut engine, &ids);
+        install_custom_elements(&mut engine, ids);
         install_mutation_observer(&mut engine, ids);
         // CSSOM bridge: the style object's member reads/writes go through
         // the shared host (js.rs itself stays DOM-free)
@@ -2353,6 +2872,15 @@ impl PageScripts {
         engine.import_base = Some(Rc::from(base));
 
         let doc = Val::new_object();
+        // `document` is an HTMLDocument (so a Document and a Node), never an
+        // Element
+        set_proto(&doc, dom_proto(DOM_HTML_DOCUMENT));
+        // `document` is also a Node with methods (MutationObserver.observe,
+        // dispatchEvent, prepend on the whole document), so it carries the
+        // arena's root id: node 0 is `#document` in the parser. `nodeType` 9
+        // is the one Document property that has nothing to read from the host.
+        doc.set("__node", Val::Num(0.0));
+        doc.set("nodeType", Val::Num(9.0));
         doc.set("getElementById", Val::Native(ids.doc_get_element));
         doc.set("querySelector", Val::Native(ids.doc_query));
         doc.set("querySelectorAll", Val::Native(ids.doc_query_all));
@@ -2444,6 +2972,7 @@ impl PageScripts {
         // window aliases the global object — methods installed on the global
         // object are reachable as window.x / globalThis.x both ways
         engine.set_global("addEventListener", Val::Native(ids.win_add_listener));
+        engine.set_global("removeEventListener", Val::Native(ids.win_remove_listener));
         engine.set_global("dispatchEvent", Val::Native(ids.el_dispatch));
         engine.set_global("matchMedia", Val::Native(ids.match_media));
         engine.set_global("requestAnimationFrame", Val::Native(ids.raf));
@@ -2451,6 +2980,7 @@ impl PageScripts {
         // are page-wide targets with no own arena node, and the global stop
         // already fires after the bubble chain (logged design shortcut)
         doc.set("addEventListener", Val::Native(ids.win_add_listener));
+        doc.set("removeEventListener", Val::Native(ids.win_remove_listener));
         doc.set("dispatchEvent", Val::Native(ids.el_dispatch));
 
         // window.alert/confirm/prompt: stderr stand-ins, no dialog UI
@@ -3202,6 +3732,240 @@ mod tests {
 
     fn get_global_str(ps: &mut PageScripts, name: &str) -> String {
         js::obj_get_own(&ps.engine.global_obj, name).to_string()
+    }
+
+    #[test]
+    fn element_wrappers_are_instances_of_element() {
+        // the guard Primer uses before measuring a node:
+        // `ref.current instanceof Element`
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d"><span class="x"></span></div><script>
+                var el = document.getElementById("d");
+                window.t = [
+                    el instanceof Element,
+                    el instanceof Node,
+                    document.body instanceof Element,
+                    document instanceof Node,
+                    document instanceof Element,
+                    window instanceof Element,
+                    el.closest(".x") === null,
+                    el.closest("body").tagName,
+                    el.querySelector(".x").closest("div").id,
+                    // shortcut: wrappers are built per access, so `===` on two
+                    // wrappers of the same node is false (no identity cache);
+                    // compare the id the way a page would
+                    el.closest("#d").id,
+                ].join(",");
+                window.t2 = [
+                    document.documentElement instanceof HTMLElement,
+                    document.body instanceof HTMLElement,
+                    document.createElement("div") instanceof HTMLElement,
+                    document.createElement("div") instanceof Element,
+                    document.createTextNode("x") instanceof Text,
+                    document.createTextNode("x") instanceof CharacterData,
+                    document.createTextNode("x") instanceof Element,
+                    document instanceof Document,
+                    document instanceof HTMLDocument,
+                    document instanceof HTMLElement,
+                    typeof EventTarget,
+                    typeof Node,
+                ].join(",");
+                window.t3 = [
+                    document.createElement("button") instanceof HTMLButtonElement,
+                    document.createElement("button") instanceof HTMLElement,
+                    document.createElement("div") instanceof HTMLButtonElement,
+                    document.createElement("input") instanceof HTMLInputElement,
+                    document.body instanceof HTMLBodyElement,
+                    document.head instanceof HTMLHeadElement,
+                    document.documentElement instanceof HTMLHtmlElement,
+                    document.querySelector("svg") === null,
+                    new Event("x") instanceof Event,
+                    new CustomEvent("x") instanceof Event,
+                ].join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "t"),
+            "true,true,true,true,false,false,true,BODY,d,d"
+        );
+        assert_eq!(
+            get_global_str(&mut ps, "t2"),
+            "true,true,true,true,true,true,false,true,true,false,function,function"
+        );
+        assert_eq!(
+            get_global_str(&mut ps, "t3"),
+            "true,true,false,true,true,true,true,true,true,true"
+        );
+    }
+
+    #[test]
+    fn dom_insertion_methods_keep_order_and_text() {
+        let (mut dom, mut ps) = page(
+            r##"<html><body><ul id="l"><li id="a">a</li><li id="b">b</li></ul><script>
+                var l = document.getElementById("l");
+                var x = document.createElement("li");
+                x.id = "x";
+                l.prepend("first", x);
+                var y = document.createElement("li");
+                y.id = "y";
+                l.append(y, "last");
+                window.order = Array.prototype.map
+                    .call(l.children, function (c) { return c.id; })
+                    .join(",");
+                window.text = document.getElementById("l").textContent;
+                var z = document.createElement("li");
+                z.id = "z";
+                x.after(z);
+                x.before("b0");
+                y.replaceWith("y0");
+                window.order2 = Array.prototype.map
+                    .call(l.children, function (c) { return c.id; })
+                    .join(",");
+                l.replaceChildren("only");
+                window.order3 = l.children.length + ":" + document.getElementById("l").textContent;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "order"), "x,a,b,y");
+        assert_eq!(get_global_str(&mut ps, "text"), "firstablast");
+        assert_eq!(get_global_str(&mut ps, "order2"), "x,z,a,b");
+        assert_eq!(get_global_str(&mut ps, "order3"), "0:only");
+    }
+
+    #[test]
+    fn document_is_a_node_for_observer_and_dispatch() {
+        // GitHub observes the whole document at load; a `document` without a
+        // node id threw `TypeError: not an element` there and killed the
+        // bundle
+        let (mut dom, mut ps) = page(
+            r##"<html><head></head><body><div id="d"></div><script>
+                var seen = "";
+                var mo = new MutationObserver(function () { seen = "mutation"; });
+                window.observeOk = false;
+                try { mo.observe(document, { childList: true, subtree: true }); window.observeOk = true; } catch (e) {}
+                window.docType = document.nodeType;
+                window.fired = "";
+                document.addEventListener("ping", function () { window.fired = "ping"; });
+                document.dispatchEvent(new Event("ping"));
+                document.documentElement.appendChild(document.createElement("span"));
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "observeOk"), "true");
+        assert_eq!(get_global_str(&mut ps, "docType"), "9");
+        assert_eq!(get_global_str(&mut ps, "fired"), "ping");
+    }
+
+    #[test]
+    fn custom_elements_defines_and_answers_get() {
+        // the exact shape GitHub's bundles use at load: probe, then define
+        let (mut dom, mut ps) = page(
+            r##"<html><body><script>
+                class FileAttachment extends HTMLElement {}
+                window.probed = customElements.get("file-attachment") === undefined;
+                customElements.define("file-attachment", FileAttachment);
+                window.defined = customElements.get("file-attachment") === FileAttachment;
+                window.redefined = false;
+                try { customElements.define("other", FileAttachment); } catch (e) { window.redefined = false; }
+                var bad = false;
+                try { customElements.define("nodash", FileAttachment); } catch (e) { bad = e instanceof SyntaxError; }
+                window.badName = bad;
+                window.upgraded = customElements.get("mine-el") === undefined;
+                customElements.upgrade(document.body);
+                window.afterUpgrade = document.body !== null;
+                window.sub = FileAttachment.prototype instanceof HTMLElement;
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "probed"), "true");
+        assert_eq!(get_global_str(&mut ps, "defined"), "true");
+        assert_eq!(get_global_str(&mut ps, "badName"), "true");
+        assert_eq!(get_global_str(&mut ps, "upgraded"), "true");
+        assert_eq!(get_global_str(&mut ps, "afterUpgrade"), "true");
+        assert_eq!(get_global_str(&mut ps, "sub"), "true");
+    }
+
+    #[test]
+    fn element_surface_reports_its_methods() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="d" hidden></div><script>
+                window.t = [
+                    typeof document.body.matches,
+                    typeof document.body.hasAttribute,
+                    typeof window.removeEventListener,
+                    typeof document.removeEventListener,
+                    typeof document.body.removeEventListener,
+                ].join(",");
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "t"),
+            "function,function,function,function,function"
+        );
+    }
+
+    #[test]
+    fn matches_and_has_attribute_answer_like_the_dom() {
+        // the exact probes github.com makes: `document.body.matches(":modal")`
+        // (a `<dialog>` capability check) and
+        // `documentElement.hasAttribute("override-fetch")`
+        let (mut dom, mut ps) = page(
+            r##"<html><body><div id="d" class="a b" hidden></div><script>
+                var el = document.getElementById("d");
+                window.t = [
+                    document.body.matches("body"),
+                    el.matches("#d"),
+                    el.matches(".b"),
+                    el.matches(".zz"),
+                    document.body.matches(":modal"),
+                    el.hasAttribute("hidden"),
+                    el.hasAttribute("nope"),
+                    el.hasAttribute("hidden") && el.getAttribute("hidden") === "",
+                    document.documentElement.hasAttribute("override-fetch"),
+                ].join(",");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "t"),
+            "true,true,true,false,false,true,false,true,false"
+        );
+    }
+
+    #[test]
+    fn removeEventListener_stops_the_callback() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="d"></div><script>
+                window.calls = 0;
+                function h() { window.calls += 1; }
+                functionon = function () { window.calls += 100; };
+                var el = document.getElementById("d");
+                // duplicate registrations are one (spec), and removal takes it
+                el.addEventListener("click", h);
+                el.addEventListener("click", h);
+                el.dispatchEvent(new Event("click"));
+                el.removeEventListener("click", h);
+                el.dispatchEvent(new Event("click"));
+                // a different callback survives the removal of another
+                el.addEventListener("click", functionon);
+                el.removeEventListener("click", h);
+                el.dispatchEvent(new Event("click"));
+                // window-level removal, the react-dom feature probe shape
+                var wc = 0;
+                function w() { wc += 1; }
+                window.addEventListener("test", w);
+                window.removeEventListener("test", w);
+                window.dispatchEvent(new Event("test"));
+                window.windowCalls = wc;
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        // one fire with `h` live (the duplicate registration is still one
+        // listener), none after its removal, then +100 from the other handler
+        assert_eq!(get_global_str(&mut ps, "calls"), "101");
+        assert_eq!(get_global_str(&mut ps, "windowCalls"), "0");
     }
 
     #[test]
