@@ -616,6 +616,12 @@ pub(crate) fn install(e: &mut JsEngine) {
         let s = new_symbol(name);
         e.set_native_prop(sym, name, s);
     }
+    // `Symbol.for` / `Symbol.keyFor`: the registry is what React's bundle
+    // keys its element type on (`Symbol.for("react.transitional.element")`).
+    let sf = e.register_native("Symbol.for", n_symbol_static, SYM_FOR);
+    let kf = e.register_native("Symbol.keyFor", n_symbol_static, SYM_KEY_FOR);
+    e.set_native_prop(sym, "for", Val::Native(sf));
+    e.set_native_prop(sym, "keyFor", Val::Native(kf));
     e.set_global("Symbol", Val::Native(sym));
 
     // -- WeakMap / WeakSet --------------------------------------------------
@@ -3801,17 +3807,76 @@ fn new_symbol(desc: &str) -> Val {
     o
 }
 
+thread_local! {
+    /// The global symbol registry behind `Symbol.for`: key -> symbol. One
+    /// table per worker thread, cleared by `JsEngine::new` like the key
+    /// intern table so a later page does not keep the previous page's symbols
+    /// alive.
+    static SYMBOL_REGISTRY: std::cell::RefCell<HashMap<String, Val>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+pub(crate) fn clear_symbol_registry() {
+    SYMBOL_REGISTRY.with(|m| m.borrow_mut().clear());
+}
+
+/// The description of a symbol object (`None` for anything else).
+fn symbol_desc(v: &Val) -> Option<String> {
+    let Val::Obj(o) = v else { return None };
+    let b = o.borrow();
+    b.props
+        .iter()
+        .find(|(k, _)| &**k == "__symbol")
+        .map(|(_, v)| v.to_string())
+}
+
+const SYM_FOR: u16 = 0;
+const SYM_KEY_FOR: u16 = 1;
+
+fn n_symbol_static(_e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    match idx {
+        // Symbol.for(key): one symbol per key, shared by every caller
+        SYM_FOR => {
+            let key = arg_str(args, 0);
+            Ok(SYMBOL_REGISTRY.with(|m| {
+                let mut m = m.borrow_mut();
+                if let Some(s) = m.get(&key) {
+                    return s.clone();
+                }
+                let s = new_symbol(&key);
+                m.insert(key, s.clone());
+                s
+            }))
+        }
+        // Symbol.keyFor(sym): the registry key, or undefined for a symbol
+        // that Symbol.for did not make
+        _ => {
+            let Some(sym) = args.first() else {
+                return Err(JsError::throw(
+                    "TypeError: Symbol.keyFor called on non-symbol",
+                ));
+            };
+            if symbol_desc(sym).is_none() {
+                return Err(JsError::throw(
+                    "TypeError: Symbol.keyFor called on non-symbol",
+                ));
+            }
+            Ok(SYMBOL_REGISTRY.with(|m| {
+                for (k, v) in m.borrow().iter() {
+                    if let (Val::Obj(a), Val::Obj(b)) = (v, sym) {
+                        if Rc::ptr_eq(a, b) {
+                            return Val::Str(Rc::from(k.as_str()));
+                        }
+                    }
+                }
+                Val::Undefined
+            }))
+        }
+    }
+}
+
 fn n_symbol_proto(_e: &mut JsEngine, idx: u16, this: &Val, _args: &[Val]) -> Result<Val, JsError> {
-    let desc = match this {
-        Val::Obj(o) => o
-            .borrow()
-            .props
-            .iter()
-            .find(|(k, _)| &**k == "__symbol")
-            .map(|(_, v)| v.to_string()),
-        _ => None,
-    };
-    let Some(desc) = desc else {
+    let Some(desc) = symbol_desc(this) else {
         return Err(JsError::throw(
             "TypeError: Symbol.prototype method called on non-symbol",
         ));

@@ -1828,6 +1828,7 @@ impl JsEngine {
         // one page's property names are not the next page's; drop the old
         // table so a long session keeps interning the CURRENT page's keys
         clear_key_intern();
+        builtins::clear_symbol_registry();
         let page = page_start();
         let global_obj = new_obj(ObjKind::Plain(None, false), Vec::new(), None);
         // global code's `this` is the global object (sloppy mode)

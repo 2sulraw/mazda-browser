@@ -1390,6 +1390,13 @@ fn primitive_and_function_prototypes_exist() {
     assert!(boolean("'toString' in Number.prototype"));
     assert!(boolean("'toString' in Boolean.prototype"));
     assert!(boolean("typeof Symbol.prototype === 'object'"));
+    // Symbol.for shares one symbol per key across calls; Symbol.keyFor finds
+    // the registry key (React keys its element type on Symbol.for)
+    assert!(boolean("Symbol.for('x') === Symbol.for('x')"));
+    assert!(boolean("Symbol.for('x') !== Symbol('x')"));
+    assert_eq!(string("String(Symbol.for('x'))"), "Symbol(x)");
+    assert_eq!(string("Symbol.keyFor(Symbol.for('y'))"), "y");
+    assert!(boolean("Symbol.keyFor(Symbol('y')) === undefined"));
     // borrowed methods work through the prototype object
     assert_eq!(string("String.prototype.trimStart.call('  x  ')"), "x  ");
     assert_eq!(string("String.prototype.trim.call('  x  ')"), "x");

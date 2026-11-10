@@ -2709,3 +2709,32 @@ any React code runs.
 - the first real (non-resolution) errors now surface, both genuine engine
   gaps: `Symbol.for is not a function` in the React bundle, and a regex
   `SyntaxError` for a lookbehind/named group in `react-core`.
+
+## `Symbol.for` / `Symbol.keyFor` (P11, 2026-11-10)
+
+With the import map in place, GitHub's `react-core` bundle died on its second
+line, before doing any work:
+
+    var e = Symbol.for("react.transitional.element"), ...
+
+The engine had `Symbol` and its well-known symbols but not the global
+registry, so every React element type key vanished. The shim keeps the same
+cheap symbol representation (a plain object with a hidden `__symbol`
+description), so no `Val`/`Obj` representation changed.
+
+- `Symbol.for(key)` returns one symbol per key; `Symbol.keyFor(sym)` maps back
+  to the key and answers `undefined` for a symbol that `for` did not make.
+  Both throw `TypeError` on a non-symbol argument.
+- The registry is a thread-local table cleared by `JsEngine::new`, next to
+  `clear_key_intern`, so a later page does not keep the previous page's
+  symbols alive.
+- `symbol_desc` is now one helper shared by the prototype methods and the
+  statics (the previous inline lookup is gone).
+
+### Measured
+
+- github.com: `Symbol.for is not a function` gone; `react-core` now parses its
+  body and reaches the next engine gap instead (the regex named group below).
+- engine tests **965** green (assertions added to
+  `primitive_and_function_prototypes_exist`: registry identity, `keyFor`,
+  stringification of a registered symbol).
