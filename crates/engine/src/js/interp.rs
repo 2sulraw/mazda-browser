@@ -3033,6 +3033,11 @@ pub(crate) fn call_method(
                 .unwrap_or(0.0);
             Ok(Val::Num(ms))
         }
+        DateParse => Ok(Val::Num(
+            args.first()
+                .map(|v| parse_date_iso(&v.to_string()))
+                .unwrap_or(f64::NAN),
+        )),
         DateGetTime => match this {
             Val::Obj(o) => {
                 let b = o.borrow();
@@ -3513,4 +3518,152 @@ pub(crate) fn fmt_date_iso(ms: f64) -> Option<String> {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         y, mo, d, hh, mm, ss, millis
     ))
+}
+
+/// Days from 1970-01-01 for a civil date (Howard Hinnant's algorithm; the
+/// exact inverse of [`civil_from_days`]).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// `Date.parse` / `new Date(string)` on the ISO-8601 forms pages write:
+/// `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, each optionally followed by
+/// `THH:mm[:ss[.fff]]` and `Z` / `±HH:MM` (or `±HHMM`). Anything else is NaN.
+/// A date-time with no offset is local in the spec; this engine has no local
+/// zone, so it reads UTC (documented shortcut).
+pub(crate) fn parse_date_iso(s: &str) -> f64 {
+    parse_iso_opt(s).unwrap_or(f64::NAN)
+}
+
+fn parse_iso_opt(s: &str) -> Option<f64> {
+    /// Read exactly `n` ASCII digits at `*i`, advancing it.
+    fn digits(b: &[u8], i: &mut usize, n: usize) -> Option<i64> {
+        let end = i.checked_add(n)?;
+        let slice = b.get(*i..end)?;
+        if !slice.iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut v = 0i64;
+        for &c in slice {
+            v = v * 10 + (c - b'0') as i64;
+        }
+        *i = end;
+        Some(v)
+    }
+
+    let b = s.trim().as_bytes();
+    let mut i = 0usize;
+    let (year, mut month, mut day) = if matches!(b.first(), Some(b'+') | Some(b'-')) {
+        let neg = b[0] == b'-';
+        i += 1;
+        let y = digits(b, &mut i, 6)?;
+        (if neg { -y } else { y }, 1, 1)
+    } else {
+        (digits(b, &mut i, 4)?, 1, 1)
+    };
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+        month = digits(b, &mut i, 2)?;
+        if b.get(i) == Some(&b'-') {
+            i += 1;
+            day = digits(b, &mut i, 2)?;
+        }
+    }
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+
+    let (mut hh, mut mi, mut ss, mut ms) = (0i64, 0i64, 0i64, 0i64);
+    let mut has_time = false;
+    if matches!(b.get(i).copied(), Some(b'T') | Some(b't') | Some(b' ')) {
+        has_time = true;
+        i += 1;
+        hh = digits(b, &mut i, 2)?;
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        mi = digits(b, &mut i, 2)?;
+        if b.get(i) == Some(&b':') {
+            i += 1;
+            ss = digits(b, &mut i, 2)?;
+            if b.get(i) == Some(&b'.') {
+                i += 1;
+                let start = i;
+                while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                // milliseconds: the first three digits, zero padded
+                let frac = b.get(start..i)?;
+                let take = frac.len().min(3);
+                let mut v = 0i64;
+                for &c in &frac[..take] {
+                    v = v * 10 + (c - b'0') as i64;
+                }
+                for _ in take..3 {
+                    v *= 10;
+                }
+                ms = v;
+            }
+        }
+    }
+    // 24:00 is the only hour-24 form; it rolls into the next day below
+    if hh == 24 && (mi != 0 || ss != 0 || ms != 0) {
+        return None;
+    }
+    if hh > 24 || mi > 59 || ss > 59 {
+        return None;
+    }
+
+    let mut offset_min = 0i64;
+    if has_time {
+        match b.get(i).copied() {
+            None => {}
+            Some(b'Z') | Some(b'z') => i += 1,
+            Some(c) if c == b'+' || c == b'-' => {
+                i += 1;
+                let oh = digits(b, &mut i, 2)?;
+                let om = if b.get(i) == Some(&b':') {
+                    i += 1;
+                    digits(b, &mut i, 2)?
+                } else {
+                    digits(b, &mut i, 2)?
+                };
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                offset_min = oh * 60 + om;
+                if c == b'-' {
+                    offset_min = -offset_min;
+                }
+            }
+            Some(_) => return None,
+        }
+    }
+    if i != b.len() {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    let total = ((days * 24 + hh) * 60 + mi - offset_min) * 60 * 1000 + ss * 1000 + ms;
+    Some(total as f64)
 }

@@ -3460,6 +3460,39 @@ before `getElementById` was even reached.
 - github.com cold load: the `<tool-tip>` callback completes; the next throw is
   `<relative-time>`'s `Date.parse` (next entry).
 
+## `Date.parse` (P39, 2026-11-10)
+
+`<tool-tip>` connected, and `<relative-time>` took its place:
+
+```
+custom element <relative-time>: connectedCallback threw
+Uncaught TypeError: undefined is not a function (at 223:14589 of pb-*.js)
+```
+
+The reported site is the `datetime` getter, but the failing call is one
+statement later in the same `get date()`:
+
+```js
+get date(){ let e = Date.parse(this.datetime); return Number.isNaN(e) ? null : new Date(e); }
+```
+
+`Date.parse` sent `get_member` to a miss, so the call itself was the
+"undefined is not a function". (`call_span` is set before the arguments
+evaluate, so a nested call can be reported under the wrong column.)
+
+- `Date.parse` is a `Meth::DateParse` arm, reached through `get_member`'s
+  native `"parse"` name, the same dispatch style as `Date.now`.
+- the parser covers the ISO-8601 forms pages actually write: `YYYY`, `YYYY-MM`,
+  `YYYY-MM-DD`, each optionally with `THH:mm[:ss[.fff]]` and `Z` / `±HH:MM` /
+  `±HHMM`; `24:00` rolls into the next day; an out-of-range field (`2020-02-30`)
+  is NaN. Anything outside those forms is NaN rather than a best-effort guess.
+- a date-time with no offset is local in the spec; this engine has no local
+  zone, so it reads UTC (documented shortcut).
+- `new Date(string)` uses the same parser instead of yielding NaN.
+- engine tests **1002 -> 1003** green (new `date_parse_reads_iso_forms`).
+- github.com cold load: `Date.parse` returns, and the same getter now fails on
+  the *next* call in that line — `Number.isNaN` is missing (next entry).
+
 
 
 

@@ -138,6 +138,7 @@ pub enum Meth {
     DateGetTime,
     DateToISO,
     DateNow,
+    DateParse,
     // promise methods
     PromiseThen,
     PromiseCatch,
@@ -3595,6 +3596,8 @@ fn get_member_impl(e: &mut JsEngine, base: &Val, key: &str) -> Result<Val, JsErr
                 "apply" => Ok(Val::Method(Meth::FnApply)),
                 "bind" => Ok(Val::Method(Meth::FnBind)),
                 "now" => Ok(Val::Method(Meth::DateNow)), // Date.now
+                // Date.parse (relative-time's `date` getter is the caller)
+                "parse" => Ok(Val::Method(Meth::DateParse)),
                 _ => {
                     // own props of native constructors (`URL.prototype`, …)
                     if let Some(v) = e.native_prop(*id, key) {

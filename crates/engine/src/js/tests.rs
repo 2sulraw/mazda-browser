@@ -1678,6 +1678,25 @@ fn date_minimal() {
 }
 
 #[test]
+fn date_parse_reads_iso_forms() {
+    // GitHub's <relative-time> parses its `datetime` attribute with
+    // `Date.parse`; it was missing, so the whole `date` getter threw.
+    assert_eq!(num("Date.parse('1970-01-01T00:00:00Z')"), 0.0);
+    assert_eq!(num("Date.parse('2020-02-29T12:00:00Z')"), 1_582_977_600_000.0);
+    assert_eq!(num("Date.parse('2020-02-29')"), 1_582_934_400_000.0);
+    // an offset shifts the instant; +02:00 is two hours earlier in UTC
+    assert_eq!(num("Date.parse('2020-01-01T02:00:00+02:00')"), 1_577_836_800_000.0);
+    assert_eq!(num("Date.parse('2020-01-01T00:00:00.250Z')"), 1_577_836_800_250.0);
+    assert!(boolean("isNaN(Date.parse('2020-02-30'))"));
+    assert!(boolean("isNaN(Date.parse('not a date'))"));
+    // the constructor shares the parser
+    assert_eq!(num("new Date('2020-02-29T12:00:00Z').getTime()"), 1_582_977_600_000.0);
+    assert!(boolean("isNaN(new Date('nope').getTime())"));
+    // and the round trip both ways
+    assert!(boolean("let d = new Date('2021-06-01T03:04:05Z'); d.toISOString() == '2021-06-01T03:04:05.000Z'"));
+}
+
+#[test]
 fn timers_queue_only() {
     let mut e = JsEngine::new();
     e.exec("let calls = 0; setTimeout(function(x) { calls += x }, 100, 5); setTimeout(function() {}, 0)")

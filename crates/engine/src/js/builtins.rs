@@ -2889,19 +2889,15 @@ fn n_date(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, J
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
     if is_ctor_call(e, this) {
-        // `new Date()` / `new Date(ms)`: mutate the fresh object into a Date
-        // shortcut: `new Date(string)` (ISO date parsing) is NOT supported —
-        // it yields an invalid date (NaN).
+        // `new Date()` / `new Date(ms)` / `new Date(string)`: mutate the fresh
+        // object into a Date. The string form uses the same ISO parser as
+        // `Date.parse`.
         let ms = match args.first() {
             None => now_ms,
-            Some(v) => {
-                let n = v.to_number();
-                if matches!(v, Val::Str(_)) {
-                    f64::NAN
-                } else {
-                    n
-                }
-            }
+            Some(v) => match v {
+                Val::Str(s) => super::interp::parse_date_iso(s),
+                _ => v.to_number(),
+            },
         };
         if let Val::Obj(o) = this {
             o.borrow_mut().kind = ObjKind::Date(ms);
