@@ -3641,6 +3641,41 @@ error, so the whole code-view module (and therefore every file blob) was dead.
 - `github.com/rust-lang/rust`: the code-view module now compiles and fails one
   step later, on a *lookbehind* in `dp-*.js` (next entry).
 
+## Regex lookbehind (P45, 2026-11-10)
+
+With `\p{Bidi_Control}` known, the code-view module compiled and the *next*
+bundle in that chain reported the next gap:
+
+```
+[js] script error in code-view-*.js: dp-*.js:
+SyntaxError: /^(?!-).*(?<!-)$/: lookbehind is not supported (line 2, col 15379)
+```
+
+GitHub uses it to reject a line that starts or ends with a dash. The parser
+recognised `(?<=` / `(?<!` only to reject them.
+
+- `Node::LookBehind(negate, body)` compiles to a new `Inst::LookBack`, the
+  same shape as the lookahead `Inst::Look` (body range + `SubEnd` sentinel).
+- the VM's sub-run gained an `end_at: Option<usize>` constraint. For a
+  lookbehind the body is run from each candidate start left of the current
+  position (nearest first) and only a path that lands *exactly* on the
+  assertion's position counts — that is what makes `(?<=ab)` fail on `"bc"`,
+  and letting the constraint live inside the VM means the body still gets its
+  own backtracking instead of accepting the first early success.
+- a positive lookbehind adopts the sub-run's captures (JS semantics); a
+  negative one discards them. `MAX_LOOK_DEPTH` and the shared step budget
+  bound the extra work exactly as they do for lookahead.
+- shortcut: when the body itself is ambiguous (`(?<=(a+))`) the group comes
+  from the nearest successful start, where a browser's right-to-left run
+  prefers the greedy one. Flagged here, not silently different.
+- engine tests **1007 -> 1008** green (new `regex_lookbehind`, 10 assertions
+  including the GitHub pattern, the exact-end rule, a `\d{2}` body and
+  `split(/(?<=-)/)`). `regex_unsupported_syntax_is_clean_error` now pins
+  `(?|` as its representative unknown form instead of lookbehind.
+- `github.com/rust-lang/rust`: `dp-*.js` compiles; the module chain now stops
+  on `\p{Mn}` (next entry). Script exec rose from 8.8 s to 12.2 s because the
+  code view is running.
+
 
 
 

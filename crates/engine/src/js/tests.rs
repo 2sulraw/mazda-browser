@@ -2403,7 +2403,9 @@ fn performance_now_is_a_monotonic_clock() {
 
 #[test]
 fn regex_unsupported_syntax_is_clean_error() {
-    assert!(matches!(err("'x'.replace(/(?<=a)b/, '')"), JsError::Syntax { .. }));
+    // lookbehind used to be the representative gap; it is implemented now
+    // (see `regex_lookbehind`), so this pins a form that is still unknown
+    assert!(matches!(err("'x'.replace(/(?|a)/, '')"), JsError::Syntax { .. }));
     assert!(matches!(err("/\\p{So}/u"), JsError::Syntax { .. }));
     assert!(matches!(err("/(?<1bad>a)/"), JsError::Syntax { .. }));
     assert!(matches!(err("/[unclosed/"), JsError::Syntax { .. }));
@@ -2431,6 +2433,31 @@ fn regex_catastrophic_backtracking_bounded() {
 fn regex_lookahead() {
     assert!(boolean("/foo(?=bar)/.exec('foobar')[0] === 'foo'"));
     assert!(boolean("!/foo(?!bar)/.test('foobar') && /foo(?!bar)/.test('foobaz')"));
+}
+
+#[test]
+fn regex_lookbehind() {
+    // GitHub's code-view bundle rejects a line that starts or ends with `-`
+    // with /^(?!-).*(?<!-)$/; the lookbehind was a SyntaxError, so the whole
+    // module never compiled.
+    assert!(boolean("/^(?!-).*(?<!-)$/.test('plain')"));
+    assert!(boolean("!/^(?!-).*(?<!-)$/.test('-leading')"));
+    assert!(boolean("!/^(?!-).*(?<!-)$/.test('trailing-')"));
+    // a lookbehind must match ending exactly at the assertion's position
+    assert!(boolean("/foo(?<=foo)bar/.test('foobar')"));
+    assert!(boolean("/foo(?<=(foo))bar/.test('foobar')"));
+    assert!(boolean("!/foo(?<=bar)bar/.test('foobar')"));
+    assert!(boolean("/foo(?<!bar)bar/.test('foobar')"));
+    assert!(boolean("/(?<=a)b/.exec('ab')[0] === 'b'"));
+    assert!(boolean("!(/(?<=ab)c/.test('bc'))"));
+    assert!(boolean("/(?<=\\d{2})px/.test('10px') && !/(?<=\\d{2})px/.test('5px')"));
+    // zero-width: splitting after each dash is the classic use
+    assert_eq!(
+        string("'a-b-c'.split(/(?<=-)/).join('|')"),
+        "a-|b-|c"
+    );
+    // a quantifier still applies to the group the lookbehind sits in
+    assert!(boolean("/(?<=(a))\\1/.exec('aa')[0] === 'a'"));
 }
 
 // ---------------------------------------------------------------------------

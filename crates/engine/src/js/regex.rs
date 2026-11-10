@@ -71,6 +71,9 @@ pub(crate) enum Inst {
     /// zero-width: run sub program [start..end); if `negate`, invert result.
     /// Captures made inside a positive lookaround persist (JS semantics).
     Look(bool, usize, usize),
+    /// zero-width lookbehind: same shape, but the sub run must END at the
+    /// current position, so the VM tries the candidate starts left of it.
+    LookBack(bool, usize, usize),
     /// end of a lookaround sub program (never reached by the main path)
     SubEnd,
     Match,
@@ -173,6 +176,8 @@ enum Node {
         body: Box<Node>,
     },
     Look(bool, Box<Node>),
+    /// `(?<=…)` (false) / `(?<!…)` (true) — matches leftwards
+    LookBehind(bool, Box<Node>),
 }
 
 #[derive(Debug)]
@@ -365,12 +370,14 @@ impl PatParser {
                             Ok(Node::Look(true, Box::new(inner)))
                         }
                         Some('<') => {
-                            // `(?<=` / `(?<!` are lookbehind (still a gap);
-                            // `(?<name>` is a named capture group, numbered
-                            // exactly like a plain `(`
+                            // `(?<=` / `(?<!` are lookbehind; `(?<name>` is a
+                            // named capture group, numbered like a plain `(`
                             self.i += 1;
-                            if matches!(self.peek(), Some('=') | Some('!')) {
-                                return rerr("lookbehind is not supported");
+                            if let Some(c @ ('=' | '!')) = self.peek() {
+                                self.i += 1;
+                                let inner = self.alt()?;
+                                self.expect_rparen()?;
+                                return Ok(Node::LookBehind(c == '!', Box::new(inner)));
                             }
                             let name = self.group_name()?;
                             if self.names.iter().any(|(n, _)| n == &name) {
@@ -877,6 +884,9 @@ impl Compiler {
             Node::Look(negate, inner) => {
                 self.emit_look(*negate, inner)?;
             }
+            Node::LookBehind(negate, inner) => {
+                self.emit_look_behind(*negate, inner)?;
+            }
             Node::Repeat {
                 min,
                 max,
@@ -943,6 +953,21 @@ impl Compiler {
         self.prog.push(Inst::SubEnd);
         let end = self.prog.len();
         self.prog[look_pc] = Inst::Look(negate, look_pc + 1, end);
+        self.depth -= 1;
+        Ok(())
+    }
+
+    fn emit_look_behind(&mut self, negate: bool, inner: &Node) -> Result<(), RegexError> {
+        self.depth += 1;
+        if self.depth > MAX_LOOK_DEPTH {
+            return rerr("lookaround nested too deeply");
+        }
+        let look_pc = self.prog.len();
+        self.prog.push(Inst::LookBack(negate, 0, 0)); // targets patched below
+        self.emit(inner)?;
+        self.prog.push(Inst::SubEnd);
+        let end = self.prog.len();
+        self.prog[look_pc] = Inst::LookBack(negate, look_pc + 1, end);
         self.depth -= 1;
         Ok(())
     }
@@ -1131,6 +1156,8 @@ fn run(
     mut pos: usize,
     steps: &mut usize,
     depth: usize,
+    // lookbehind only: the sub program must finish exactly here
+    end_at: Option<usize>,
 ) -> Result<Option<Caps>, VmErr> {
     let mut stack: Vec<Frame> = Vec::new();
     loop {
@@ -1231,7 +1258,7 @@ fn run(
                 // instruction AFTER the zero-width body), so the verdict
                 // resumes there either way
                 let sub =
-                    run(prog, input, ci, caps.clone(), start, pos, steps, depth + 1)?;
+                    run(prog, input, ci, caps.clone(), start, pos, steps, depth + 1, None)?;
                 match sub {
                     Some(scaps) if !negate => {
                         caps = scaps;
@@ -1242,7 +1269,60 @@ fn run(
                     None => backtrack!(),
                 }
             }
-            Inst::SubEnd => return Ok(Some(caps)),
+            Inst::LookBack(negate, start, end) => {
+                if depth >= MAX_LOOK_DEPTH {
+                    return Err(VmErr::Limit);
+                }
+                // Try the left contexts nearest-first. `end_at` is what makes
+                // this a lookbehind: the sub run may take any path through its
+                // body, but only one that lands exactly on the current
+                // position counts, so `(?<=ab)` cannot match "b".
+                // shortcut: with a capture inside an ambiguous body the group
+                // is the nearest successful start's, where a browser's
+                // right-to-left run would prefer the greedy one.
+                let mut hit: Option<Caps> = None;
+                let mut from = pos;
+                loop {
+                    let sub = run(
+                        prog,
+                        input,
+                        ci,
+                        caps.clone(),
+                        start,
+                        from,
+                        steps,
+                        depth + 1,
+                        Some(pos),
+                    )?;
+                    if let Some(scaps) = sub {
+                        hit = Some(scaps);
+                        break;
+                    }
+                    if from == 0 {
+                        break;
+                    }
+                    from -= 1;
+                }
+                match (hit, negate) {
+                    (Some(scaps), false) => {
+                        caps = scaps;
+                        pc = end;
+                    }
+                    (Some(_), true) => backtrack!(),
+                    (None, true) => pc = end,
+                    (None, false) => backtrack!(),
+                }
+            }
+            Inst::SubEnd => {
+                // a lookbehind sub run must stop on the assertion's position;
+                // any other success is just one more dead end
+                if let Some(want) = end_at {
+                    if pos != want {
+                        backtrack!();
+                    }
+                }
+                return Ok(Some(caps));
+            }
             Inst::AssertStart(ml) => {
                 if pos == 0 || (ml && pos > 0 && input[pos - 1] == '\n') {
                     pc += 1;
@@ -1306,6 +1386,7 @@ impl Regex {
                 pos,
                 &mut steps,
                 0,
+                None,
             ) {
                 Ok(Some(mcaps)) => {
                     // overall bounds = (opening save's start, closing save's
