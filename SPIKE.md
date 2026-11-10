@@ -2632,3 +2632,42 @@ universal split in the first place.
   **2,734/2,798/2,847/3,076 ms** (~0.7 s per load).
 - engine tests **961** green (the existing index test now also covers `:is()`
   alternatives and case-insensitive attribute buckets).
+
+## Honour `preload="metadata"` on `<video>` (P9, 2026-11-10)
+
+The media probe fetched every `<video>` body in full just to read its MP4
+header. GitHub's landing page ships one hero clip marked `preload="metadata"`
+(no `autoplay`): 1.3 MB downloaded on every load, decoded into a first frame
+nobody asked to play -- 2-3 s of the cold budget for one header.
+
+A browser reads only enough of the container to size the box, then waits for
+the first play to fetch the body. That is exactly a `Range: bytes=0-65535`
+request when `moov` precedes `mdat` (faststart, what CDNs ship); the parser
+already stops at the first box that overruns the buffer, so a truncated prefix
+yields the metadata and nothing else.
+
+- The prefix bytes are kept on disk (`<hash>.head`) because a relayout rebuilds
+  the box tree from the DOM and would otherwise re-probe over the network.
+- A partial body is never written to the HTTP cache as if it were whole; a
+  server that ignores `Range` (`200`) still takes the old whole-body path.
+- The slot stays a play target: `MediaEntry` now carries `path: Option` plus
+  the source `url`, and the renderer fetches the body on the click that starts
+  playback. `shortcut:` that fetch runs on the UI thread, so the first click on
+  a deferred video waits for the body (~1 s for the 1.3 MB clip); autoplay
+  videos are never deferred.
+- With no poster the box gets an opaque black frame (what a browser paints
+  before playback), which is also the image slot the renderer swaps for real
+  frames.
+
+### Measured
+
+- `[time] media probe`: 1,899-3,777 ms across earlier cold runs -> **332-601 ms**.
+- probe traffic: 1,307,532 B -> **65,536 B**; `[net] ... (prefix)`.
+- `[time] image decode`: 383-892 ms -> **70-109 ms** (no first-frame decode).
+- cold github.com total: ~13.3 s either way (13,259 -> 13,264 ms); the page
+  variant moves the other phases by seconds, so the phase numbers above are the
+  signal, not the total.
+- local range server, real click path: probe 65,536 B / 7 ms, then the first
+  click fetched 1,307,532 B in 49 ms and opened the player.
+- engine tests **962** green (new
+  `preload_metadata_defers_the_body_but_keeps_the_play_target`).

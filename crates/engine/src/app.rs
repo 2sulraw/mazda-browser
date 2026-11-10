@@ -893,7 +893,39 @@ fn start_player(page: &Page, i: usize) -> Option<Playing> {
         .images
         .get(m.index)
         .map(|e| (e.4.w.max(1), e.4.h.max(1)))?;
-    match mazda_media::Player::open(std::path::Path::new(&m.path)) {
+    let path = match (&m.path, &m.url) {
+        (Some(p), _) => std::path::PathBuf::from(p),
+        // `preload="metadata"`: the probe left the body on the network. The
+        // click that starts playback is the gesture that fetches it.
+        // shortcut: this runs on the UI thread, so the first click on a
+        // deferred video waits for the body (GitHub's 1.3 MB clip ~1 s).
+        (None, Some(u)) => {
+            let t0 = Instant::now();
+            let bytes = match fetch(u) {
+                Ok((bytes, _)) => bytes,
+                Err(e) => {
+                    eprintln!("[media] body fetch {}: {e}", log_url(u));
+                    return None;
+                }
+            };
+            match media_file(u, &bytes) {
+                Ok((p, _)) => {
+                    eprintln!(
+                        "[media] body {} KB in {:.0} ms on first play",
+                        bytes.len() / 1024,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    p
+                }
+                Err(e) => {
+                    eprintln!("[media] body {}: {e}", log_url(u));
+                    return None;
+                }
+            }
+        }
+        (None, None) => return None,
+    };
+    match mazda_media::Player::open(std::path::Path::new(&path)) {
         Ok(mut player) => {
             player.set_looping(m.looping);
             player.set_muted(m.muted);
@@ -905,7 +937,7 @@ fn start_player(page: &Page, i: usize) -> Option<Playing> {
             })
         }
         Err(e) => {
-            eprintln!("[media] renderer open {}: {e}", m.path);
+            eprintln!("[media] renderer open {}: {e}", path.display());
             None
         }
     }
@@ -6158,6 +6190,13 @@ fn probe_media(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
             .as_ref()
             .map(|m| m.srcs.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
+        // `preload="metadata"` (and no autoplay): a browser only reads enough
+        // of the container to size the box, then waits for the first play to
+        // fetch the body. GitHub's hero clip is 1.3 MB of pure probe waste.
+        let defer = n
+            .media
+            .as_ref()
+            .is_some_and(|m| m.preload_metadata && !m.autoplay);
         let mut last_err = "no media URL".to_string();
         let mut ok = false;
         for src in &srcs {
@@ -6165,6 +6204,31 @@ fn probe_media(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
                 last_err = format!("non-navigable media URL: {src}");
                 continue;
             };
+            if defer {
+                if let Some((meta, path)) = media_prefix_probe(&abs) {
+                    let lazy = path.is_none();
+                    if let Some(m) = n.media.as_mut() {
+                        m.path = path.map(|p| std::rc::Rc::from(p.to_string_lossy().as_ref()));
+                        m.src = Some(std::rc::Rc::from(abs.as_str()));
+                        m.lazy = lazy;
+                        m.w = meta.width;
+                        m.h = meta.height;
+                        m.duration = meta.duration;
+                        if m.w == 0 || m.h == 0 {
+                            m.w = 300; // UA replaced size when the header is silent
+                            m.h = 150;
+                        }
+                    }
+                    if !lazy {
+                        // the whole file is on disk: the first frame replaces
+                        // the poster in `decode_images`
+                        n.img = None;
+                    }
+                    ok = true;
+                    break;
+                }
+                // header not in the prefix: fall through to the whole body
+            }
             let bytes = match fetch(&abs) {
                 Ok((bytes, _)) => bytes,
                 Err(e) => {
@@ -6172,10 +6236,11 @@ fn probe_media(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
                     continue;
                 }
             };
-            match media_file(src, &bytes) {
+            match media_file(&abs, &bytes) {
                 Ok((path, meta)) => {
                     if let Some(m) = n.media.as_mut() {
                         m.path = Some(std::rc::Rc::from(path.to_string_lossy().as_ref()));
+                        m.src = Some(std::rc::Rc::from(abs.as_str()));
                         m.w = meta.width;
                         m.h = meta.height;
                         m.duration = meta.duration;
@@ -6215,13 +6280,10 @@ fn probe_media(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
     (probed, failed)
 }
 
-/// Cache one fetched media file: DRM and trackless containers are refused
-/// here, before any decoder exists. The file name is the URL hash, so a
-/// relayout reuses the same bytes without touching the network.
-fn media_file(
-    src: &str,
-    bytes: &[u8],
-) -> Result<(std::path::PathBuf, mazda_media::mp4::Mp4Meta), String> {
+/// Parse and validate a media container header: DRM and trackless containers
+/// are refused here, before any decoder exists. Shared by the whole-body probe
+/// and the `preload="metadata"` header probe.
+fn media_meta(bytes: &[u8]) -> Result<mazda_media::mp4::Mp4Meta, String> {
     let meta =
         mazda_media::mp4::parse(bytes).ok_or_else(|| "not an MP4 (ISO-BMFF) file".to_string())?;
     if meta.drm {
@@ -6230,6 +6292,16 @@ fn media_file(
     if !meta.has_video && !meta.has_audio {
         return Err("no audio or video track".to_string());
     }
+    Ok(meta)
+}
+
+/// Cache one fetched media file. The file name is the URL hash, so a relayout
+/// reuses the same bytes without touching the network.
+fn media_file(
+    src: &str,
+    bytes: &[u8],
+) -> Result<(std::path::PathBuf, mazda_media::mp4::Mp4Meta), String> {
+    let meta = media_meta(bytes)?;
     let dir = cache_dir().join("media");
     std::fs::create_dir_all(&dir).map_err(|e| format!("media cache: {e}"))?;
     let path = dir.join(format!("{}.mp4", hash_str(src)));
@@ -6238,6 +6310,96 @@ fn media_file(
         std::fs::write(&path, bytes).map_err(|e| format!("media write: {e}"))?;
     }
     Ok((path, meta))
+}
+
+/// Bytes requested for a `preload="metadata"` header probe. An MP4 that puts
+/// `moov` before `mdat` (faststart, what CDNs ship) parses from this prefix;
+/// a file that buries the header at the end falls back to the whole-body
+/// fetch, exactly what the engine did before.
+const MEDIA_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Fetch at most `limit` bytes of `url`. `complete` means the server ignored
+/// `Range` and `bytes` is the whole body (which is then cached as usual); a
+/// partial body is never written to the HTTP cache as if it were whole.
+fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
+    if let Some(hit) = cache_read_in(&cache_dir(), url, now_secs()) {
+        eprintln!("[cache] hit {url}");
+        return Ok((hit.0, true));
+    }
+    let t_net = Instant::now();
+    let mut req = http_agent()
+        .get(url)
+        .set("Range", &format!("bytes=0-{}", limit - 1));
+    for (name, value) in net::request_headers(Some("video/mp4,video/*;q=0.9,*/*;q=0.8")) {
+        req = req.set(name, &value);
+    }
+    if let Some(c) = cookie::request_header(url) {
+        req = req.set("Cookie", &c);
+    }
+    let resp = req.call().map_err(|e| e.to_string())?;
+    cookie::store_response(url, &set_cookie_values(&resp));
+    let complete = resp.status() == 200;
+    let content_type = resp.header("content-type").map(|s| s.to_string());
+    // a `200` means the Range was ignored: read the whole body like `fetch`
+    const CAP: usize = 20 * 1024 * 1024;
+    let want = if complete { CAP } else { limit };
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while buf.len() < want {
+        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        let take = n.min(want - buf.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if take < n {
+            break;
+        }
+    }
+    if complete {
+        cache_write_in(&cache_dir(), url, now_secs(), &buf, content_type.as_deref());
+    }
+    if std::env::var_os("MAZDA_TIME").is_some() {
+        eprintln!(
+            "[net] {:6.1} ms {:8} B {}{}",
+            t_net.elapsed().as_secs_f64() * 1000.0,
+            buf.len(),
+            log_url(url),
+            if complete { "" } else { " (prefix)" }
+        );
+    }
+    Ok((buf, complete))
+}
+
+/// Header-only media probe: fetch the container prefix and report its
+/// metadata. `Some((meta, None))` = header known, body still on the network;
+/// `Some((meta, Some(path)))` = the server sent the whole file anyway; `None`
+/// = the header is not in the prefix (or the fetch failed), so the caller has
+/// to fetch the whole body.
+///
+/// The prefix itself is kept on disk (`<hash>.head`): a relayout rebuilds the
+/// box tree from the DOM, and re-probing from the network would pay a round
+/// trip per resize for bytes we already read.
+fn media_prefix_probe(
+    abs: &str,
+) -> Option<(mazda_media::mp4::Mp4Meta, Option<std::path::PathBuf>)> {
+    let dir = cache_dir().join("media");
+    let head = dir.join(format!("{}.head", hash_str(abs)));
+    if let Ok(bytes) = std::fs::read(&head) {
+        if let Ok(meta) = media_meta(&bytes) {
+            return Some((meta, None));
+        }
+    }
+    let (bytes, complete) = fetch_prefix(abs, MEDIA_PREFIX_BYTES).ok()?;
+    if complete {
+        let (path, meta) = media_file(abs, &bytes).ok()?;
+        return Some((meta, Some(path)));
+    }
+    let meta = media_meta(&bytes).ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&head, &bytes);
+    Some((meta, None))
 }
 
 /// Worker-side: every probed `<video>` whose first frame decoded becomes a
@@ -6635,6 +6797,7 @@ fn decode_images(
         .media
         .as_ref()
         .and_then(|m| m.path.clone().map(|p| (p, m.looping, m.muted)));
+    let media_lazy = n.media.as_ref().is_some_and(|m| m.lazy);
     if let Some((path, looping, muted)) = media_src {
         let (fx, fy, fw, fh) = n.img_fit.unwrap_or((n.x, n.y, n.w, n.h));
         let dw = fw.round().max(1.0) as u32;
@@ -6670,6 +6833,36 @@ fn decode_images(
                 }
                 Err(e) => eprintln!("[media] {}: {e}", log_url(&path)),
             }
+        }
+    } else if media_lazy && n.img.is_none() {
+        // `preload="metadata"` with no poster: a browser paints the box black
+        // until playback starts. This frame is also the slot the renderer
+        // swaps for real frames, so the video stays clickable.
+        let (fx, fy, fw, fh) = n.img_fit.unwrap_or((n.x, n.y, n.w, n.h));
+        let dw = fw.round().max(1.0) as u32;
+        let dh = fh.round().max(1.0) as u32;
+        let px = (dw as usize) * (dh as usize);
+        if px <= *budget {
+            *budget -= px;
+            let img = Rc::new(image::ImageData {
+                w: dw,
+                h: dh,
+                px: vec![0xff00_0000; px],
+            });
+            if let Some(m) = n.media.as_mut() {
+                m.img = Some(laid.images.len());
+            }
+            laid.images.push((
+                fx,
+                fy,
+                fw,
+                fh,
+                img,
+                fixed,
+                layout::eff_alpha(n.eff),
+                n.bx.filter.clone(),
+            ));
+            count += 1;
         }
     }
     // context for the children: this box's bg color (mask tint) and whether

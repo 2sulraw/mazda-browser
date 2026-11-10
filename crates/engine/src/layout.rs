@@ -539,8 +539,16 @@ pub struct MediaSlot {
     pub autoplay: bool,
     pub muted: bool,
     pub looping: bool,
+    /// `preload="metadata"`: resolve the container header, leave the body on
+    /// the network until the first play
+    pub preload_metadata: bool,
     /// worker probe results: the decoded file on disk + its dimensions
     pub path: Option<std::rc::Rc<str>>,
+    /// absolute URL the probe accepted (the body is fetched from here on the
+    /// first play when [`Self::lazy`] is set)
+    pub src: Option<std::rc::Rc<str>>,
+    /// header known, body not downloaded yet (`preload="metadata"`)
+    pub lazy: bool,
     pub w: u32,
     pub h: u32,
     pub duration: f64,
@@ -561,14 +569,23 @@ impl MediaSlot {
 
     /// playback metadata for the page wire / renderer
     pub fn entry(&self, rect: (f32, f32, f32, f32), fixed: bool) -> Option<MediaEntry> {
+        let index = self.img?;
+        // `preload="metadata"`: the body is not on disk yet, but the box is
+        // still a play target -- the renderer fetches it on the first click
+        let (path, url) = match self.path.clone() {
+            Some(p) => (Some(p.to_string()), None),
+            None if self.lazy => (None, Some(self.src.clone()?.to_string())),
+            None => return None,
+        };
         Some(MediaEntry {
             x: rect.0,
             y: rect.1,
             w: rect.2,
             h: rect.3,
             fixed,
-            path: self.path.clone()?.to_string(),
-            index: self.img?,
+            path,
+            url,
+            index,
             autoplay: self.autoplay,
             muted: self.muted,
             looping: self.looping,
@@ -586,7 +603,10 @@ pub struct MediaEntry {
     pub h: f32,
     pub fixed: bool,
     /// local file the renderer opens (the worker already fetched it)
-    pub path: String,
+    pub path: Option<String>,
+    /// source URL when [`Self::path`] is `None` (`preload="metadata"`): the
+    /// renderer fetches the body here on the first play
+    pub url: Option<String>,
     /// index into [`Layout::images`] — the renderer swaps its pixels
     pub index: usize,
     pub autoplay: bool,
@@ -1559,7 +1579,12 @@ fn build_into(
                             autoplay: dom.attr(child, "autoplay").is_some(),
                             muted: dom.attr(child, "muted").is_some(),
                             looping: dom.attr(child, "loop").is_some(),
+                            preload_metadata: dom
+                                .attr(child, "preload")
+                                .is_some_and(|v| v.eq_ignore_ascii_case("metadata")),
                             path: None,
+                            src: None,
+                            lazy: false,
                             w: 0,
                             h: 0,
                             duration: 0.0,
@@ -14351,6 +14376,46 @@ line</textarea></div>"#,
         let srcs: Vec<&str> = m.srcs.iter().map(|s| &**s).collect();
         assert_eq!(srcs, ["b.webm", "c.mp4"]);
         assert!(!m.auto_h, "no declared width -> UA 300x150 box");
+    }
+
+    #[test]
+    fn preload_metadata_defers_the_body_but_keeps_the_play_target() {
+        let mut root = boxes_of(
+            r#"<div><video id="v" src="a.mp4" preload="metadata" poster="/p.png"></video></div>"#,
+            "",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let v = &root.children[0].children[0];
+        let m = v.media.as_ref().expect("src -> media slot");
+        assert!(m.preload_metadata, "attribute parsed");
+        // the probe never ran here, so there is no entry yet
+        assert!(m.entry((0.0, 0.0, 300.0, 150.0), false).is_none());
+        // a header-only probe result: dimensions known, body still remote
+        let slot = MediaSlot {
+            srcs: vec![std::rc::Rc::from("a.mp4")],
+            autoplay: false,
+            muted: false,
+            looping: false,
+            preload_metadata: true,
+            path: None,
+            src: Some(std::rc::Rc::from("https://mazda.test/a.mp4")),
+            lazy: true,
+            w: 640,
+            h: 360,
+            duration: 4.0,
+            failed: false,
+            auto_h: false,
+            img: Some(0),
+        };
+        let e = slot.entry((1.0, 2.0, 300.0, 150.0), true).expect("lazy entry");
+        assert_eq!(e.path, None);
+        assert_eq!(e.url.as_deref(), Some("https://mazda.test/a.mp4"));
+        assert_eq!(e.index, 0);
+        assert_eq!((e.x, e.y, e.w, e.h, e.fixed), (1.0, 2.0, 300.0, 150.0, true));
+        // ... and a slot that is neither on disk nor lazy stays unplayable
+        let mut slot = slot;
+        slot.lazy = false;
+        assert!(slot.entry((0.0, 0.0, 300.0, 150.0), false).is_none());
     }
 
     // ---- ::before/::after generated content ----
