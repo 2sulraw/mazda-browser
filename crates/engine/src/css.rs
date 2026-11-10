@@ -7851,6 +7851,21 @@ fn matches(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> bool {
     leftmost_match(dom, node, segs, hover).is_some()
 }
 
+/// A selector compiled for the script-side `querySelector`/`matches` path.
+/// Both APIs must agree with the cascade on the grammar, so they share this
+/// parser and matcher rather than a second, weaker one.
+pub(crate) struct Sel(Vec<Seg>);
+
+impl Sel {
+    pub(crate) fn parse(sel: &str) -> Option<Self> {
+        parse_selector(sel).map(Sel)
+    }
+
+    pub(crate) fn matches(&self, dom: &Dom, node: u32) -> bool {
+        matches(dom, node, &self.0, None)
+    }
+}
+
 /// `matches`, returning the node that matched the selector's LEFTMOST
 /// compound — `:has()` needs it to check the relation its leading
 /// combinator names (the right end is always `node`).

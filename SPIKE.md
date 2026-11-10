@@ -3548,6 +3548,50 @@ existed, so the undefined call was `toggleAttribute` itself.
   `No embedded data provided for react element`, a *page* error whose cause is
   the selector matcher (next entry).
 
+## `querySelector` uses the cascade's selector matcher (P42, 2026-11-10)
+
+With `toggleAttribute` in place the `<react-app>` callback ran its first
+statement and then threw an error the *page* raises, not the engine:
+
+```
+custom element <react-app>: connectedCallback threw
+Uncaught Error: No embedded data provided for react element
+```
+
+Catalyst resolves its `@target` properties with a selector query, and the
+element it found nothing for is right there in the HTML:
+
+```html
+<react-app app-name="landing-pages" data-ssr="true">
+  <script type="application/json" data-target="react-app.embeddedData">{…}</script>
+</react-app>
+```
+
+```js
+function P(e, t) { Object.defineProperty(e, t, { get() { return h(this, t) } }) }
+// h queries `[data-target~="<tag>.<name>"]` inside the host
+```
+
+The script-side matcher (`querySelector`, `querySelectorAll`, `matches`,
+`closest`) only understood a bare tag, `#id` or `.class`; every attribute
+selector silently matched nothing.
+
+- `css::Sel` exposes the cascade's own parser and matcher, and the script-side
+  functions compile once per query and reuse it. `[attr]`, `[attr=v]`,
+  `[attr~=v]`, `[attr|=v]`, `[attr^=v]`, `[attr$=v]`, `[attr*=v]`, compound
+  sequences, pseudo-classes and combinators now behave the same in
+  `querySelectorAll` as in a style rule.
+- `getElementById` and element-scoped `getElementById` no longer build a `#id`
+  selector: ids are matched literally, because React's streaming markers use
+  ids like `B:0` that are not valid CSS (the shared matcher would read `:0` as
+  a pseudo-class and stop matching). This was caught by
+  `comment_and_sibling_navigation`.
+- engine tests **1004 -> 1005** green (new
+  `query_selector_supports_attribute_selectors`).
+- github.com cold load: the embedded JSON is found and React starts running;
+  the next throw is `crypto is not defined`. Script exec time rose to 17.6 s
+  because the page's React tree now actually mounts.
+
 
 
 

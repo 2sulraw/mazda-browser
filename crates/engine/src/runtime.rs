@@ -602,6 +602,23 @@ impl DomHost {
         crate::script::query_all_dom(self.dom_ref(), sel)
     }
 
+    /// `getElementById`: a literal id comparison, not a selector — React's
+    /// streaming markers use ids like `B:0`, which are not valid CSS.
+    pub fn by_id(&self, id: &str) -> Option<u32> {
+        let dom = self.dom_ref();
+        (1..dom.nodes.len() as u32)
+            .filter(|&i| dom.is_element(i))
+            .find(|&i| dom.attr(i, "id") == Some(id))
+    }
+
+    /// Element-scoped `getElementById` (same literal rule, subtree only).
+    pub fn subtree_by_id(&self, root: u32, id: &str) -> Option<u32> {
+        let dom = self.dom_ref();
+        crate::script::subtree_elements_dom(dom, root)
+            .into_iter()
+            .find(|&i| dom.attr(i, "id") == Some(id))
+    }
+
     /// First match in the subtree of `root` (root excluded; document order).
     pub fn first_subtree(&self, root: u32, sel: &str) -> Option<u32> {
         crate::script::subtree_query_dom(self.dom_ref(), root, sel)

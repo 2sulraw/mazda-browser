@@ -858,20 +858,13 @@ fn nids() -> Nids {
 /// `pub(crate)`: the shared DomHost answers `Element.matches` with it, so the
 /// element and the `querySelector` that searched for it cannot disagree.
 pub(crate) fn matches_simple(dom: &Dom, node: u32, sel: &str) -> bool {
-    let sel = sel.trim();
-    if sel.is_empty() {
-        return false;
-    }
-    if let Some(id) = sel.strip_prefix('#') {
-        return dom.attr(node, "id") == Some(id);
-    }
-    if let Some(class) = sel.strip_prefix('.') {
-        return dom
-            .attr(node, "class")
-            .map(|c| c.split_whitespace().any(|t| t == class))
-            .unwrap_or(false);
-    }
-    dom.tag(node) == sel
+    // The cascade's parser/matcher, so `querySelector` and the style rules
+    // agree on every selector form (tag, #id, .class, `[attr]` / `[attr~=v]`,
+    // `:is()`, combinators, …). This used to know only the first three, which
+    // made Catalyst's `[data-target~="tag.name"]` lookups return nothing.
+    crate::css::Sel::parse(sel)
+        .map(|s| s.matches(dom, node))
+        .unwrap_or(false)
 }
 
 /// All element nodes in document order (skips the `#document` sentinel at
@@ -936,9 +929,12 @@ pub(crate) fn class_all_dom(dom: &Dom, root: Option<u32>, names: &str) -> Vec<u3
 /// Simple-selector matches over the whole document (document order).
 /// `pub(crate)`: the shared DomHost delegates to this canonical copy.
 pub(crate) fn query_all_dom(dom: &Dom, sel: &str) -> Vec<u32> {
+    let Some(sel) = crate::css::Sel::parse(sel) else {
+        return Vec::new();
+    };
     all_elements_dom(dom)
         .into_iter()
-        .filter(|&i| matches_simple(dom, i, sel))
+        .filter(|&i| sel.matches(dom, i))
         .collect()
 }
 
@@ -1154,7 +1150,7 @@ fn doc_native(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<V
         D_GET_ELEMENT_BY_ID => {
             let Some(sel) = sel else { return Ok(Val::Null) };
             Ok(runtime::host(|h| {
-                let found = h.query_all(&format!("#{}", sel)).into_iter().next();
+                let found = h.by_id(&sel);
                 match found {
                     Some(n) => wrap_element(n),
                     None => Val::Null,
@@ -1261,7 +1257,7 @@ fn el_native(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val
         E_GET_ELEMENT_BY_ID => {
             let Some(sel) = a0.as_string() else { return Ok(Val::Null) };
             Ok(runtime::host(|h| {
-                let found = h.first_subtree(node, &format!("#{}", sel));
+                let found = h.subtree_by_id(node, &sel);
                 match found {
                     Some(n) => wrap_element(n),
                     None => Val::Null,
@@ -3298,6 +3294,9 @@ fn set_text_content(node: u32, text: &str) {
 /// Descendants of `root` matching `sel` (document order; root excluded).
 /// `pub(crate)`: the shared DomHost delegates to this canonical copy.
 pub(crate) fn subtree_query_dom(dom: &Dom, root: u32, sel: &str) -> Vec<u32> {
+    let Some(sel) = crate::css::Sel::parse(sel) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     // stack pops from the back: push the initial children reversed so the
     // FIRST child is visited first (document order)
@@ -3307,7 +3306,7 @@ pub(crate) fn subtree_query_dom(dom: &Dom, root: u32, sel: &str) -> Vec<u32> {
         .map(|n| n.children.iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(n) = stack.pop() {
-        if matches_simple(dom, n, sel) {
+        if sel.matches(dom, n) {
             out.push(n);
         }
         if let Some(node) = dom.nodes.get(n as usize) {
@@ -6570,5 +6569,37 @@ mod tests {
         ps.run_scripts(&mut dom);
         assert_eq!(get_global_str(&mut ps, "threw"), "3");
         assert_eq!(get_global_str(&mut ps, "iso"), "true");
+    }
+
+    #[test]
+    fn query_selector_supports_attribute_selectors() {
+        // Catalyst's `@target` decorator resolves a property by querying
+        // `[data-target~="tag.name"]`. The script-side matcher only knew tag,
+        // #id and .class, so `<react-app>.embeddedData` was undefined and its
+        // connectedCallback threw "No embedded data provided".
+        let (mut dom, mut ps) = page(
+            r##"<html><body><react-app app-name="landing-pages" data-ssr="true">
+                <script type="application/json" data-target="react-app.embeddedData">{"a":1}</script>
+            </react-app><div id="box" class="x" data-ids="one two"></div><script>
+                var app = document.querySelector("react-app");
+                var byWord = app.querySelector('[data-target~="react-app.embeddedData"]');
+                var byCompound = app.querySelector("script[type='application/json']");
+                var box = document.getElementById("box");
+                window.t = [
+                    !!byWord && !!byCompound,
+                    byWord.textContent,
+                    box.matches("[data-ids~='two']"),
+                    box.matches("[data-ids~='three']"),
+                    !!document.querySelector("div.x[data-ids]"),
+                    !!document.querySelector("#box.x"),
+                    document.querySelectorAll("react-app > script").length,
+                ].join("|");
+            </script></body></html>"##,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "t"),
+            "true|{\"a\":1}|true|false|true|true|1"
+        );
     }
 }
