@@ -48,11 +48,81 @@ pub struct ModuleLoader {
     cache: HashMap<String, Exports>,
     /// URLs whose body is currently executing (cycle detection)
     active: Vec<String>,
+    /// the page's `<script type="importmap">`, if any
+    import_map: Option<ImportMap>,
+}
+
+/// The `imports` half of a page's `<script type="importmap">`.
+///
+/// A bare specifier (`"react"`) has no URL of its own: the map names it. Keys
+/// match exactly first, then by the longest key ending in `/` (a prefix
+/// mapping, `"lodash/"`). Only bare specifiers consult the map -- relative and
+/// absolute specifiers resolve against the importing module's URL, which is
+/// what every map in the wild relies on.
+#[derive(Default)]
+pub struct ImportMap {
+    entries: Vec<(String, String)>,
+}
+
+impl ImportMap {
+    /// Parse the script's JSON, resolving values against the document URL.
+    /// `scopes` and integrity metadata are ignored; malformed entries are
+    /// dropped (the spec warns and continues). `None` when nothing usable is
+    /// left.
+    pub fn parse(text: &str, base: &str) -> Option<ImportMap> {
+        let doc = url::Url::parse(base).ok()?;
+        let v = super::builtins::json_parse_value(text).ok()?;
+        let Val::Obj(root) = v else { return None };
+        let Val::Obj(imports) = super::obj_get_own(&root, "imports") else {
+            return None;
+        };
+        let mut entries = Vec::new();
+        for (k, v) in imports.borrow().props.iter() {
+            let Val::Str(url) = v else { continue };
+            let Ok(abs) = doc.join(url) else { continue };
+            let abs = abs.to_string();
+            // a prefix key must name a prefix, and a file key a file
+            if k.ends_with('/') != abs.ends_with('/') {
+                continue;
+            }
+            entries.push((k.to_string(), abs));
+        }
+        (!entries.is_empty()).then_some(ImportMap { entries })
+    }
+
+    /// Number of usable entries (for the `[js]` load line).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Resolve a bare specifier through the map.
+    pub fn resolve(&self, spec: &str) -> Option<String> {
+        if let Some((_, url)) = self.entries.iter().find(|(k, _)| k == spec) {
+            return Some(url.clone());
+        }
+        let (key, url) = self
+            .entries
+            .iter()
+            .filter(|(k, _)| k.ends_with('/') && spec.starts_with(k.as_str()))
+            .max_by_key(|(k, _)| k.len())?;
+        Some(format!("{url}{}", &spec[key.len()..]))
+    }
 }
 
 impl ModuleLoader {
     pub fn new() -> ModuleLoader {
         ModuleLoader::default()
+    }
+
+    /// Install the page's import map (before any module resolves an import).
+    pub fn set_import_map(&mut self, map: ImportMap) {
+        self.import_map = Some(map);
+    }
+
+    /// `resolve_specifier`, falling back to the import map for a bare name.
+    fn resolve(&self, base: &str, spec: &str) -> Option<String> {
+        resolve_specifier(base, spec)
+            .or_else(|| self.import_map.as_ref().and_then(|m| m.resolve(spec)))
     }
 
     /// Fetch `url` and run it as a module. Errors are strings: the script
@@ -250,7 +320,8 @@ impl ModuleLoader {
         base: &str,
         spec: &str,
     ) -> Result<Exports, String> {
-        let url = resolve_specifier(base, spec)
+        let url = self
+            .resolve(base, spec)
             .ok_or_else(|| format!("cannot resolve module specifier {spec:?} from {base}"))?;
         self.load(e, &url)
     }
@@ -337,7 +408,11 @@ fn n_dynamic_import(
         .or_else(|| e.import_base.clone())
         .unwrap_or_default();
     let p = e.new_promise();
-    match resolve_specifier(&base, &spec) {
+    let resolved = match e.module_loader.as_ref() {
+        Some(l) => l.resolve(&base, &spec),
+        None => resolve_specifier(&base, &spec),
+    };
+    match resolved {
         Some(url) => e.microtasks.push(super::Job::Import {
             url: Rc::from(url.as_str()),
             promise: p.clone(),
@@ -654,6 +729,72 @@ mod tests {
         assert!(matches!(e.get_global("ok"), Val::Undefined));
         let err = e.get_global("err").to_string();
         assert!(err.contains("cannot resolve module specifier"), "{err}");
+    }
+
+    #[test]
+    fn import_map_resolves_bare_specifiers() {
+        let map = ImportMap::parse(
+            r#"{"imports":{
+                "react":"https://cdn.test/react.js",
+                "react/":"https://cdn.test/react/",
+                "local":"./local.js",
+                "bad-prefix":"https://cdn.test/x/",
+                "bad-dir/":"https://cdn.test/y.js"
+            }}"#,
+            "https://mazda.test/page/index.html",
+        )
+        .expect("usable map");
+        // the two malformed entries (file key -> prefix URL and the reverse)
+        // are dropped
+        assert_eq!(map.len(), 3);
+        assert!(map.resolve("bad-prefix").is_none());
+        assert!(map.resolve("bad-dir/x.js").is_none());
+        assert_eq!(
+            map.resolve("react").as_deref(),
+            Some("https://cdn.test/react.js")
+        );
+        // prefix mapping keeps the tail of the specifier
+        assert_eq!(
+            map.resolve("react/jsx-runtime").as_deref(),
+            Some("https://cdn.test/react/jsx-runtime")
+        );
+        // an exact key wins over a prefix
+        assert_eq!(
+            map.resolve("react/").as_deref(),
+            Some("https://cdn.test/react/")
+        );
+        // values resolve against the document URL
+        assert_eq!(
+            map.resolve("local").as_deref(),
+            Some("https://mazda.test/page/local.js")
+        );
+        assert_eq!(map.resolve("scheduler"), None);
+        assert!(ImportMap::parse("{}", "https://mazda.test/").is_none());
+        assert!(ImportMap::parse("not json", "https://mazda.test/").is_none());
+    }
+
+    #[test]
+    fn loader_consults_the_map_only_for_bare_specifiers() {
+        let mut l = ModuleLoader::new();
+        l.set_import_map(
+            ImportMap::parse(
+                r#"{"imports":{"react":"https://cdn.test/react.js"}}"#,
+                "https://mazda.test/page/",
+            )
+            .expect("map"),
+        );
+        let base = "https://mazda.test/assets/core.js";
+        assert_eq!(
+            l.resolve(base, "react").as_deref(),
+            Some("https://cdn.test/react.js")
+        );
+        // a relative specifier still resolves against the module, and a bare
+        // name the map does not know is still an error
+        assert_eq!(
+            l.resolve(base, "./chunk.js").as_deref(),
+            Some("https://mazda.test/assets/chunk.js")
+        );
+        assert_eq!(l.resolve(base, "lodash"), None);
     }
 
     #[test]

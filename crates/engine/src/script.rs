@@ -2552,6 +2552,22 @@ impl PageScripts {
 
     fn run_scripts_inner(&mut self, dom: &mut Dom) -> Turn {
         let scripts = collect_scripts(dom);
+        // `<script type="importmap">` has to be installed before the first
+        // module resolves an import: GitHub ships one mapping `react`,
+        // `react-dom/client`, `react/jsx-runtime`, ... and without it its
+        // bundle dies at its first bare import.
+        if let Some(text) = collect_import_map(dom) {
+            match js::module::ImportMap::parse(&text, &self.base) {
+                Some(map) => {
+                    eprintln!("[js] import map: {} entries", map.len());
+                    self.engine
+                        .module_loader
+                        .get_or_insert_with(js::ModuleLoader::new)
+                        .set_import_map(map);
+                }
+                None => eprintln!("[js] import map ignored (no usable entry)"),
+            }
+        }
         // a dual build (module entry + `nomodule` fallback) must run only the
         // module half; with no module script at all the legacy half still runs
         let has_modules = scripts.iter().any(|s| s.is_module);
@@ -3095,6 +3111,27 @@ pub(crate) fn collect_scripts(dom: &Dom) -> Vec<ScriptSrc> {
     out
 }
 
+/// The page's `<script type="importmap">` text. The spec allows one map and
+/// requires it to precede every module script; a second one is ignored.
+pub(crate) fn collect_import_map(dom: &Dom) -> Option<String> {
+    let mut stack: Vec<u32> = vec![0];
+    while let Some(n) = stack.pop() {
+        if let NodeKind::Element(_, _) = &dom.nodes[n as usize].kind {
+            if dom.tag(n) == "script"
+                && dom
+                    .attr(n, "type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"))
+            {
+                return Some(child_text(dom, n));
+            }
+            for &c in dom.nodes[n as usize].children.iter().rev() {
+                stack.push(c);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3108,6 +3145,22 @@ mod tests {
 
     fn get_global_str(ps: &mut PageScripts, name: &str) -> String {
         js::obj_get_own(&ps.engine.global_obj, name).to_string()
+    }
+
+    #[test]
+    fn import_map_is_collected_and_other_data_blocks_are_not() {
+        let dom = html::parse(
+            r#"<html><head>
+                <script type="application/ld+json">{"a":1}</script>
+                <script type="importmap">{"imports":{"react":"/react.js"}}</script>
+                <script type="importmap">{"imports":{"late":"/late.js"}}</script>
+            </head></html>"#,
+        );
+        // the first map wins; ld+json and later maps are not maps
+        assert_eq!(
+            collect_import_map(&dom).as_deref(),
+            Some(r#"{"imports":{"react":"/react.js"}}"#)
+        );
     }
 
     #[test]

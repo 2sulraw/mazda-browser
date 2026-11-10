@@ -965,23 +965,29 @@ fn n_perf(_e: &mut JsEngine, idx: u16, _this: &Val, _args: &[Val]) -> Result<Val
 const J_PARSE: u16 = 0;
 const J_STRINGIFY: u16 = 1;
 
+/// Parse JSON text into a value. Shared by `JSON.parse` and the
+/// `<script type="importmap">` reader (which needs the object, not the global).
+pub(crate) fn json_parse_value(s: &str) -> Result<Val, JsError> {
+    let mut jp = Jp {
+        b: s.as_bytes(),
+        i: 0,
+    };
+    jp.ws();
+    let v = jp.value()?;
+    jp.ws();
+    if jp.i != jp.b.len() {
+        return Err(JsError::throw("SyntaxError: JSON.parse trailing characters"));
+    }
+    Ok(v)
+}
+
 fn n_json(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         J_PARSE => {
             let s = args
                 .first()
                 .map_or("".to_string(), |v| v.to_string());
-            let mut jp = Jp {
-                b: s.as_bytes(),
-                i: 0,
-            };
-            jp.ws();
-            let v = jp.value()?;
-            jp.ws();
-            if jp.i != jp.b.len() {
-                return Err(JsError::throw("SyntaxError: JSON.parse trailing characters"));
-            }
-            Ok(v)
+            json_parse_value(&s)
         }
         J_STRINGIFY => {
             let v = match args.first() {

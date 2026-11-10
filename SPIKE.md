@@ -2671,3 +2671,41 @@ yields the metadata and nothing else.
   click fetched 1,307,532 B in 49 ms and opened the player.
 - engine tests **962** green (new
   `preload_metadata_defers_the_body_but_keeps_the_play_target`).
+
+## `<script type="importmap">` (P10, 2026-11-10)
+
+P8c made a bare specifier a resolution error (it must not become
+`/assets/react`). That was right per spec but left GitHub's bundle dead: its
+first line is `import * as e from "react"`, and the page ships an import map
+naming `react`, `react-dom`, `react-dom/client`, `react-is`,
+`react-reconciler`, `react/compiler-runtime`, `react/jsx-dev-runtime`,
+`react/jsx-runtime` and `scheduler`. With no map, `core-*.js` throws before
+any React code runs.
+
+- `collect_import_map` reads the first `<script type="importmap">` (later maps
+  are ignored, as the spec says) and `ImportMap::parse` keeps the `imports`
+  half, resolving each value against the document URL.
+- Keys match exactly, then by the longest key ending in `/` (a prefix mapping,
+  `"react/"`). A key whose trailing slash disagrees with its value's is dropped
+  (what the spec warns about and skips).
+- Only bare specifiers consult the map: relative and absolute specifiers keep
+  resolving against the importing module.
+- `JSON.parse` and the map share one parser (`builtins::json_parse_value`).
+- Dynamic `import()` goes through the same `ModuleLoader::resolve`.
+
+### Measured
+
+- `[js] import map: 9 entries` on github.com (the page's map has 9 imports).
+- React now loads and runs: `react-fa5e2e82…js` 10,195 B,
+  `react-core-…js` 273,907 B, `react-dom-client-…js` 204,064 B fetched; the
+  previous `cannot resolve module specifier` failures are gone.
+- 404s on the page: 1 -> **0**.
+- `[time] scripts`: 1,635 -> 1,985 ms (fetch 998 -> 1,633 ms): the extra is
+  React's own bytes, which used to be skipped entirely.
+- cold total 13,264 -> 11,912 ms (page variant noise; not a claim).
+- engine tests **965** green (`import_map_resolves_bare_specifiers`,
+  `loader_consults_the_map_only_for_bare_specifiers`,
+  `import_map_is_collected_and_other_data_blocks_are_not`).
+- the first real (non-resolution) errors now surface, both genuine engine
+  gaps: `Symbol.for is not a function` in the React bundle, and a regex
+  `SyntaxError` for a lookbehind/named group in `react-core`.
