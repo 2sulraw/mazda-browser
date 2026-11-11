@@ -4150,6 +4150,44 @@ so the property read threw.
   blob, pull-request, `/pulls`, `/issues/new`, repo, and issues pages all run
   clean as well.
 
+## Subclassing `Event` (P62, 2026-11-11)
+
+`github.com/topics/rust` and `github.com/rust-lang/rust/releases` logged:
+
+```
+custom element <relative-time>: connectedCallback threw
+(Uncaught TypeError: event has no type)
+```
+
+GitHub's relative-time element dispatches an event it builds as a subclass:
+
+```js
+class P extends Event {
+  constructor(oldText, newText, oldTitle, newTitle) {
+    super("relative-time-updated", { bubbles: true, composed: true })
+    ...
+  }
+}
+...
+this.dispatchEvent(new P(e, C, t, i))
+```
+
+Our `Event` native always allocated a fresh `Event.prototype` object and
+ignored the `this` it was handed. A plain `new Event` looked fine, but from
+`super(...)` the return value is discarded, so the subclass instance never got
+`type`, and `dispatchEvent` rejected it.
+
+- the native now initializes the instance it was given. A subclass instance
+  already has its own prototype and keeps it; a plain `new Event` (whose fresh
+  object has none) is pointed at `Event.prototype`. `dispatchEvent` then sees
+  the type and the subclass's own fields.
+- engine tests **1022 -> 1023** green (new
+  `event_subclass_super_initializes_the_instance`: type, bubbles and the
+  subclass fields before dispatch, `instanceof Event` and `instanceof Upd`
+  inside the listener, and a true `dispatchEvent` result).
+- both pages run with **no script errors** after the change.
+
+
 
 
 

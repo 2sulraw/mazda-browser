@@ -2046,7 +2046,23 @@ fn n_event(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, 
     } else {
         nids().cev_ctor
     };
-    let ev = proto_instance(e.native_prop(ctor, "prototype").unwrap_or(Val::Undefined));
+    let ev = match this {
+        // `new Event(...)` arrives with the freshly allocated instance as
+        // `this`, and a subclass's `super(...)` arrives with that subclass
+        // instance: both initialize in place. A derived instance already has
+        // its own prototype, so only a bare `new Event` gets Event.prototype.
+        // (GitHub's relative-time element dispatches an event built by
+        // `class extends Event`; returning a separate object lost its `type`.)
+        Val::Obj(o) if !Rc::ptr_eq(o, &e.global_obj) => {
+            if o.borrow().proto.is_none() {
+                if let Some(Val::Obj(p)) = e.native_prop(ctor, "prototype") {
+                    o.borrow_mut().proto = Some(p);
+                }
+            }
+            Val::Obj(o.clone())
+        }
+        _ => return Err(JsError::throw("TypeError: Event is not a constructor")),
+    };
     let kind = args.first().map(|v| v.to_string()).unwrap_or_default();
     let opts = args.get(1);
     ev.set("type", Val::Str(Rc::from(kind)));
@@ -6422,6 +6438,47 @@ mod tests {
             "POST form.submit() queues the body-carrying FormNav"
         );
         assert!(turn.nav.is_none(), "POST never rides the plain nav channel");
+    }
+
+    /// `class MyEvent extends Event`: GitHub's relative-time element builds
+    /// its `relative-time-updated` event that way and dispatches it from
+    /// `connectedCallback`. `super(...)` has to initialize the subclass
+    /// instance; returning a separate Event object left `type` undefined and
+    /// made `dispatchEvent` throw.
+    #[test]
+    fn event_subclass_super_initializes_the_instance() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="t"></div><script>
+                window.log = [];
+                class Upd extends Event {
+                    constructor(old, neu) {
+                        super("relative-time-updated", { bubbles: true });
+                        this.oldText = old;
+                        this.newText = neu;
+                    }
+                }
+                var t = document.getElementById("t");
+                t.addEventListener("relative-time-updated", function (e) {
+                    window.log.push([e.type, e.bubbles, e.oldText, e.newText,
+                        e instanceof Event, e instanceof Upd].join(","));
+                });
+                var ev = new Upd("a", "b");
+                window.self = [ev.type, ev.bubbles, ev.oldText, ev.newText].join(",");
+                window.ok = t.dispatchEvent(ev);
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        assert_eq!(
+            get_global_str(&mut ps, "self"),
+            "relative-time-updated,true,a,b",
+            "super() filled in the subclass instance itself"
+        );
+        assert_eq!(
+            get_global_str(&mut ps, "log"),
+            "relative-time-updated,true,a,b,true,true",
+            "a subclass instance is still an Event, and bubbles with its detail"
+        );
+        assert_eq!(get_global_str(&mut ps, "ok"), "true");
     }
 
     /// `new CustomEvent` + `dispatchEvent`: target first, then ancestors,
