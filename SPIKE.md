@@ -4635,3 +4635,45 @@ consumes exactly that payload: one quadratic loop cost ~0.9 s of the load,
 split across two rows. The exec row is noisier than the attributed rows (this
 host varies 60% run to run), so the attributed measurement is the one to
 trust; the run pair above is consistent with it but not controlled.
+
+## HTTP/2 is the default transport (P73, 2026-11-12)
+
+P67 added an HTTP/2 client behind `MAZDA_HTTP2=1` and P68 kept it opt-in
+because it lost on a *single warm document fetch*. That measurement never
+exercised the case it was built for: a cold page load is 69 requests, and
+every one of them paid its own round trip.
+
+Cold-request arithmetic from the P71 logs: a 596-byte bundle took 1127 ms and
+a 2.4 MB bundle took 1168 ms, so the cost is TTFB, not bandwidth. 69 requests
+over 6 HTTP/1.1 lanes is ~12 sequential rounds. Chrome does not have that
+problem because HTTP/2 puts every request on one connection as a stream.
+
+Change: `http2_on()` now defaults to true (one pooled hyper connection per
+origin, ALPN picks h2); `MAZDA_HTTP2=0` or `MAZDA_HTTP1=1` restores the old
+path for A/B. Preload concurrency follows the transport: 6 lanes over
+HTTP/1.1 (a bigger burst only queues in the accept backlog), 24 over HTTP/2,
+where the limit is memory rather than sockets.
+
+Cold github.com, fresh profile each run, alternating modes, wall clock from
+process start to exit:
+
+| Pair | HTTP/1.1 (6 lanes) | HTTP/2 (24 lanes) |
+|---|---|---|
+| 1 | 20 300 ms | 16 419 ms |
+| 2 | 19 522 ms | 15 637 ms |
+| 3 | 20 400 ms | 14 810 ms |
+| 4 | 18 398 ms | 17 959 ms |
+| median | 20 300 ms | 16 419 ms |
+
+Every pair favoured HTTP/2, median **-3.9 s (-19%)**. Both modes fetched the
+same 9.41 MB in the same 69 requests with zero script errors, so this is
+transport only. The `[time] preload` line for the 25 initial subresources went
+from 3.7-3.9 s to 2.3-2.4 s; the tail of the load did not change (`scripts`
+exec 5.3 s, `cascade + box tree` 1.6 s in the same run).
+
+Pair 4 is the honest caveat: 0.44 s apart, and one h2 preload took 3946 ms
+because the link slowed for both modes that round. 19% is a transport win of
+the size predicted by the round-trip arithmetic, not the whole gap: the phases
+still take turns (preload 2.4 s, module preload 1.5 s, exec 6.3 s, images
+1.2 s), so the network is still idle during script execution. That overlap is
+the next lever, not another transport tweak.

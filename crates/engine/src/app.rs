@@ -7367,6 +7367,12 @@ fn http_agent() -> &'static ureq::Agent {
 /// a bigger burst only queues in the server's accept backlog.
 const PRELOAD_THREADS: usize = 6;
 
+/// HTTP/2: streams, not sockets. Cold github.com issues 69 requests; with
+/// enough in flight they share one connection's round trip instead of
+/// queueing twelve behind it. The ceiling is memory for the bodies (each
+/// fetch is capped by [`HTTP_BODY_CAP`]).
+const PRELOAD_THREADS_H2: usize = 24;
+
 /// Fetch `urls` concurrently (deduped, order irrelevant). Errors are logged
 /// and swallowed: a failed preload just means the later sequential fetch
 /// retries and reports the failure in its own phase.
@@ -7397,8 +7403,9 @@ fn preload_accept(urls: &[String], accept: Option<&str>, label: &str) {
     }
     let t0 = Instant::now();
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let lanes = preload_threads().min(todo.len());
     std::thread::scope(|s| {
-        for _ in 0..PRELOAD_THREADS.min(todo.len()) {
+        for _ in 0..lanes {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(url) = todo.get(i) else { break };
@@ -7414,7 +7421,7 @@ fn preload_accept(urls: &[String], accept: Option<&str>, label: &str) {
             label,
             t0.elapsed().as_secs_f64() * 1000.0,
             todo.len(),
-            PRELOAD_THREADS.min(todo.len())
+            lanes
         );
     }
 }
@@ -7616,10 +7623,33 @@ fn finish_fetch(
     Ok((buf, ct))
 }
 
-/// `MAZDA_HTTP2=1` routes every fetch through the HTTP/2 client (P67).
+/// HTTP/2 is the default: one connection per origin, every page request a
+/// stream on it. Cold github.com is 69 requests; over HTTP/1.1 with six lanes
+/// that is ~12 sequential round trips (P71 measured ~1 s per request on this
+/// link, ~15 s cold). `MAZDA_HTTP2=0` (or `MAZDA_HTTP1=1`) keeps the old
+/// HTTP/1.1 path for A/B measurements.
 fn http2_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAZDA_HTTP2").is_some())
+    *ON.get_or_init(|| {
+        if std::env::var_os("MAZDA_HTTP1").is_some() {
+            return false;
+        }
+        !matches!(
+            std::env::var("MAZDA_HTTP2").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// How many requests to have in flight at once. HTTP/2 multiplexes them as
+/// streams on one connection, so the limit is memory, not sockets; HTTP/1.1
+/// keeps the traditional six per host.
+fn preload_threads() -> usize {
+    if http2_on() {
+        PRELOAD_THREADS_H2
+    } else {
+        PRELOAD_THREADS
+    }
 }
 
 fn set_cookie_values_of(headers: &[(String, String)]) -> Vec<String> {
