@@ -1679,6 +1679,11 @@ pub struct JsEngine {
     /// location a "not a function" error can name (see `call_site_note`).
     /// Set by every `ExprKind::Call`, read on the error path.
     pub(crate) call_span: usize,
+    /// Source id the span belongs to. Without it an error raised inside one
+    /// module was reported against whatever module happened to be current
+    /// (minified bundles make that a wrong line either way, but this one is
+    /// silently wrong). Diagnostic only.
+    pub(crate) call_src: u32,
     /// constructor value set by an enclosing `new` expression immediately
     /// before the call; `call_inner` takes it and binds `#new.target` in the
     /// callee's environment
@@ -1910,6 +1915,7 @@ impl JsEngine {
             step_budget: DEFAULT_STEP_BUDGET,
             cur_span: 0,
             call_span: 0,
+            call_src: 0,
             pending_construct: None,
             pending_label: None,
             call_names: Vec::new(),
@@ -2521,19 +2527,46 @@ impl JsEngine {
     /// no AST for a stack trace — the callee offset is the one reliable
     /// pointer a page author (or we) can read. Error path only.
     pub(crate) fn call_site_note(&self) -> String {
-        self.site_note(self.call_span)
+        let mut note = self.site_note_in(self.call_src, self.call_span);
+        // A column in a minified bundle names nothing on its own, and the
+        // failing callee is often an unnamed expression. Quote the tokens just
+        // before the span so the error is diagnosable without the bundle.
+        if let Some(src) = self.source_text(self.call_src) {
+            let mut end = self.call_span.min(src.len());
+            while !src.is_char_boundary(end) {
+                end -= 1;
+            }
+            let start = src[..end]
+                .char_indices()
+                .rev()
+                .nth(60)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let snippet: String = src[start..end].chars().filter(|c| *c != '\n').collect();
+            let snippet = snippet.trim_start();
+            if !snippet.is_empty() {
+                note.push_str(&format!(" near `{snippet}`"));
+            }
+        }
+        note
     }
 
     /// `" (at line:col of url)"` for any offset in the current source.
     pub(crate) fn site_note(&self, span: usize) -> String {
-        let src = match self.source_text(self.cur_src) {
+        self.site_note_in(self.cur_src, span)
+    }
+
+    /// The same, for an explicit source: an error raised while executing one
+    /// module's code must not be located in whatever module is current.
+    fn site_note_in(&self, src_id: u32, span: usize) -> String {
+        let src = match self.source_text(src_id) {
             Some(s) => s,
             None => return String::new(),
         };
         let (l, c) = parser::line_col(&src, span);
-        let url = match self.module_url_for(self.cur_src) {
+        let url = match self.module_url_for(src_id) {
             Some(u) => u.to_string(),
-            None => format!("src {}", self.cur_src),
+            None => format!("src {src_id}"),
         };
         format!(" (at {l}:{c} of {url})")
     }

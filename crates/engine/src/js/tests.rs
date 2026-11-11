@@ -5546,6 +5546,26 @@ fn regex_unicode_escape_at_class_range_bound() {
 }
 
 #[test]
+fn an_error_names_the_module_its_span_came_from() {
+    // github.com's landing bundle called into the webpack runtime; the error
+    // was reported against the landing-pages source (which happened to be
+    // "current") with a span that belonged to wp-runtime, so the quoted text
+    // was a Korean ad resource instead of the failing call.
+    let mut e = JsEngine::new();
+    let a = e.register_source("let a1 = 1;\nlet a2 = 2;\n");
+    let b = e.register_source("let b1 = 1;\nlet b2 = 2;\nlet b3 = 3;\n");
+    assert_ne!(a, b, "two sources get two ids");
+    e.cur_src = b;
+    e.call_src = a;
+    e.call_span = 14; // line 2, col 3 of source a
+    let note = e.call_site_note();
+    assert!(note.contains("at 2:3 of src 1"), "{note}");
+    assert!(!note.contains("src 2"), "{note}");
+    // and it quotes the tokens before the span, not bytes from the wrong file
+    assert!(note.contains("near `let a1 = 1;le`"), "{note}");
+}
+
+#[test]
 fn map_values_iterator_yields_values_not_pairs() {
     // GitHub's protobuf descriptor builder walks a Map's `values()` and reads
     // `.proto` off each entry. The values iterator returned the raw

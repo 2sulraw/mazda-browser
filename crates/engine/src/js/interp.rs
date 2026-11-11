@@ -1632,6 +1632,7 @@ fn eval_expr_inner(e: &mut JsEngine, env: &Rc<Env>, x: &Expr) -> Result<Val, JsE
         }
         ExprKind::Call { callee, args } => {
             e.call_span = callee.span.start as usize;
+            e.call_src = e.cur_src;
             let argvals = eval_args(e, env, args)?;
             match &callee.kind {
                 ExprKind::Member { base, key } => {
