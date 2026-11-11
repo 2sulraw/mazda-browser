@@ -118,6 +118,10 @@ pub(crate) enum PropKind {
     RegionalIndicator,
     /// `\p{Emoji}` - honest shortcut: the symbol and pictograph blocks
     Emoji,
+    /// `\p{Extended_Pictographic}` - the same block list as [`PropKind::Emoji`]
+    /// minus the ASCII keycap bases (`#`, `*`, digits), which are Emoji but
+    /// not Extended_Pictographic.
+    ExtendedPictographic,
     /// `\p{EMod}` - the emoji modifier (skin-tone) code points
     EmojiModifier,
     /// `\p{Bidi_Control}` - the bidirectional-formatting controls
@@ -762,6 +766,7 @@ fn prop_kind(name: &str) -> Option<PropKind> {
         // SyntaxError.
         "RI" | "Regional_Indicator" => PropKind::RegionalIndicator,
         "Emoji" => PropKind::Emoji,
+        "ExtPict" | "Extended_Pictographic" => PropKind::ExtendedPictographic,
         "EMod" | "Emoji_Modifier" => PropKind::EmojiModifier,
         // GitHub's code-view bundle classifies bidi controls to render source
         // files; without the property the whole bundle was a SyntaxError.
@@ -822,6 +827,12 @@ fn prop_matches(kind: PropKind, ch: char) -> bool {
         // the symbol/pictograph blocks (and the keycap bases). The splitter
         // only groups a cluster; it never indexes into the matched text.
         PropKind::Emoji => is_emoji(ch),
+        // the issues page's filter-token regex needs the pictographic set so
+        // an emoji is not split out of a token; same blocks as `Emoji`, minus
+        // the keycap bases
+        PropKind::ExtendedPictographic => {
+            is_emoji(ch) && !matches!(ch, '#' | '*' | '0'..='9' | '\u{20E3}')
+        }
         // shortcut: `Mn`/`Mc`/`Me` share one combining-mark block list, so a
         // spacing mark answers true for `\p{Mn}` too (see `PropKind::Mark`)
         PropKind::Mark => MARK_RANGES.iter().any(|&(a, b)| (a..=b).contains(&ch)),

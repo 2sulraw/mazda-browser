@@ -5339,6 +5339,28 @@ fn regex_emoji_property_escapes() {
 }
 
 #[test]
+fn regex_extended_pictographic_property_escape() {
+    // The issues page's filter-token regex is
+    // `([\s,"]*?)((?:>|<|>=|<=)*[\w\d\-_"'?/\.=+!@#$%^&*);:\p{Extended_Pictographic}]*)$`
+    // with the `u` flag; the unknown name made the whole repo module a
+    // SyntaxError.
+    let grin = |a: u32, b: u32| format!("String.fromCharCode(0x{a:X}, 0x{b:X})");
+    assert!(boolean(&format!(
+        "var e = {}; /^\\p{{Extended_Pictographic}}$/u.test(e)",
+        grin(0xD83D, 0xDE00)
+    )));
+    assert!(boolean(r"/^\p{Extended_Pictographic}$/u.test('\u00A9')"));
+    assert!(boolean(r"/^\p{ExtPict}$/u.test('\u2764')"));
+    // `Emoji` has the ASCII keycap bases; Extended_Pictographic does not
+    assert!(!boolean(r"/\p{Extended_Pictographic}/u.test('1')"));
+    assert!(!boolean(r"/\p{Extended_Pictographic}/u.test('a')"));
+    // the bundle's own class compiles
+    assert!(boolean(
+        "(() => { try { new RegExp('([\\\\s,\"\\\\]*?)((?:>|<|>=|<=)*[\\\\w\\\\d\\\\-_\"\\'?/\\\\.=+!@#$%^&*);:\\\\p{Extended_Pictographic}]*)$', 'gu'); return true } catch (e) { return false } })()"
+    ));
+}
+
+#[test]
 fn regex_connector_punctuation_property_escape() {
     // The issues page's "word character" class is
     // `[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]/gu`;

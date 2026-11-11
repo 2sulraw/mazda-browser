@@ -4042,6 +4042,31 @@ A `Date` object answered only `getTime`/`valueOf`/`toISOString`.
   only script error left is the filter-token regex's
   `\p{Extended_Pictographic}` (next entry).
 
+## `\p{Extended_Pictographic}` (P58, 2026-11-11)
+
+Once the Date getters landed, the issues page failed in `repo-*.js` on the
+filter-token regular expression:
+
+```
+/([\s,"]*?)((?:>|<|>=|<=)*[\w\d\-_"'?/\.=+!@#$%^&*);:\p{Extended_Pictographic}]*)$/gu
+```
+
+The `u` flag makes the unknown property name a SyntaxError for the whole
+module.
+
+- `PropKind::ExtendedPictographic` answers from `is_emoji` minus the ASCII
+  keycap bases (`#`, `*`, `0..=9`, U+20E3): those code points are Emoji but not
+  Extended_Pictographic. Both the long name and `ExtPict` are accepted.
+- shortcut: the answer is block-granular, the same approximation `Emoji`
+  already uses, so a few unassigned code points inside an emoji block report
+  true.
+- engine tests **1018 -> 1019** green (new
+  `regex_extended_pictographic_property_escape`: an emoji pair, U+00A9, U+2764,
+  the two keycap exclusions, and the bundle's own class compiling).
+- `github.com/rust-lang/rust/issues`: the SyntaxError is gone; the next script
+  error is `xf-*.js` reading `Object.prototype.constructor.toString()`.
+
+
 
 
 
