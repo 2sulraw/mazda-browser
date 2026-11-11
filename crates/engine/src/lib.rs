@@ -7,6 +7,7 @@
 
 pub mod cookie;
 pub mod css;
+pub mod h2net;
 pub mod html;
 pub mod image;
 pub mod js;

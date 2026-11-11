@@ -4225,7 +4225,7 @@ is P64's target, not this change's.
 - `cache_roundtrip_and_ttl` now also covers a year-long `max-age`, ttl 0 and
   the old entry format.
 
-## Conditional revalidation, and why github.com cannot use it (P64, 2026-11-11)
+## Conditional revalidation (P64, 2026-11-11)
 
 After P63 the only request a reopened `github.com` still makes is the
 document itself (`max-age=0, private, must-revalidate`). A validator should
@@ -4252,21 +4252,41 @@ Measured against a local server that honours validators
 
 The server logged `304 inm="v1"`, i.e. the validator really travelled.
 
-Measured against `github.com`: **no 304 is possible.** GitHub rotates the
-HTML ETag on every response:
+Measured against `github.com`, a 304 is **possible but not reliable.** GitHub's
+HTML ETag is not stable across responses: a bare `curl` cookie jar with the
+previous response's tag got a `200` and a different tag every time. The
+engine's own cookie store does better, but only sometimes — over four warm
+runs (one per document fetch) exactly one returned `304`, `0 B`:
 
 ```
-ETag: W/"ae7999c259be6c8921167e54a60c6720"
-GET with If-None-Match: that value + the same cookie jar -> 200, 525 924 B
-next GET -> ETag: W/"e7a805d7764e885332894cebd3cd6a79"
+[net] 1421.0 ms        0 B https://github.com/ (304)
+[net] 1620.4 ms   525736 B https://github.com/ (gzip)   // next run: new ETag
 ```
 
-So the document always comes back in full; on a warm cache it is still the
-4.2 s → 2.8 s item. That is worth recording because it redirects effort: the
-document cost is **latency, not bytes** (525 KB decompresses to ~92 KB on the
-wire, so transfer is not what takes 3 s).
+(An earlier note here claimed "no 304 is possible"; that was measured with a
+fresh curl jar and was too strong. The revalidation code is what makes the
+occasional 304 possible at all.)
+
+So on a warm cache the document is still usually the full body, and its cost
+is **latency, not bytes** (525 KB decompresses to ~92 KB on the wire, so
+transfer is not what takes 1.4–1.6 s).
+
+One real bug this shook out, fixed in P67: a 304 from GitHub still carries
+`Content-Encoding: gzip` and no body, so the HTTP/1.1 reader fed an empty gzip
+stream to the decoder and the whole page failed with `unexpected end of file`.
+A 304 now answers from the cache without reading a body at all.
 
 Supporting measurement — connection reuse, not multiplexing, is the lever:
+
+```
+curl https://github.com/ https://github.com/
+  req1 appconnect 1.151 s  ttfb 1.575 s
+  req2 appconnect 0.000 s  ttfb 0.394 s
+```
+
+A fresh connection pays ~1.2 s of TLS before the server even sees the
+request; a warm one answers in 0.4 s. Our cold page opens 6+ connections and
+pays that each time, which is what P65/P67 go after.
 
 ```
 curl https://github.com/ https://github.com/
@@ -4357,6 +4377,69 @@ bundle.
   `brotli_body_decodes_to_the_identity_bytes`, decoding a real 1068 B
   githubassets body kept as `tests/fixtures/rxr.js.br` into its 3819 identity
   bytes).
+
+## HTTP/2 (`MAZDA_HTTP2=1`) (P67, 2026-11-11)
+
+Over HTTP/1.1 every preload lane is its own TCP connection and its own TLS
+handshake, and requests on one connection are serialized. The P64 note already
+had the number: a fresh connection answers in **1.58 s**, a reused one in
+**0.39 s** — and the cold page opens 6+ connections across its phases.
+
+`h2net` is a hyper client over `hyper-rustls` with `h2` + `http/1.1` ALPN.
+The engine stays synchronous: a two-worker tokio runtime is created on first
+use and `block_on` bridges each fetch. Any error falls through to the ureq
+HTTP/1.1 path, so a server that only speaks HTTP/1.1 still loads. The whole
+feature is behind `MAZDA_HTTP2=1` until it has a track record.
+
+Two implementation notes worth keeping:
+
+- `hyper-rustls`'s builder **panics** on a `ClientConfig` whose ALPN list is
+  already set ("ALPN protocols should not be pre-defined"), so `tls_config_h2`
+  returns the shared base config untouched and the builder sets ALPN from the
+  enabled protocols.
+- hyper hands back the body **as sent**, so `finish_fetch` now decodes both
+  `br` (ours) and `gzip` (ureq used to do this) behind one shared tail. A 304
+  is answered from the cache before any decoding: GitHub sends
+  `Content-Encoding: gzip` with an empty body on a 304, which used to fail the
+  whole page with `unexpected end of file`.
+
+Cold, provably empty cache (`LOCALAPPDATA` pointed at a fresh dir), six
+alternating runs of the final binary:
+
+| Run | Transport | Total | Module preload | Scripts |
+|---|---|---|---|---|
+| 1 | h2 | 13.79 s | 2.27 s | 5.31 s |
+| 2 | h1 | 14.67 s | 2.68 s | 5.47 s |
+| 3 | h2 | 13.76 s | 2.22 s | 5.15 s |
+| 4 | h1 | 15.16 s | 3.11 s | 5.77 s |
+| 5 | h2 | 15.17 s | 2.40 s | 5.39 s |
+| 6 | h1 | 17.58 s | 3.18 s | 8.16 s |
+
+h2 median **13.79 s** vs h1 **15.16 s** (mean 14.24 vs 15.80); every pair
+favours h2 by 0.9–2.4 s. The gain lands where the mechanism says it should:
+the phases *after* the first connection (`module preload`, `scripts`) get
+shorter, because they reuse the handshake instead of paying it again.
+
+Warm (HTTP cache populated, DOM snapshot removed so only the document is
+fetched): h2 4.30/4.70 s vs h1 4.63/5.13 s. Warm breakdown of the h2 run:
+
+```
+[net] 1421.0 ms        0 B https://github.com/ (304)
+[time] scripts: 1649 ms (fetch 41 ms, exec 1608 ms)
+[time] cascade + box tree: 775 ms
+...
+[nav] worker finished https://github.com/ in 4309 ms
+```
+
+That is the useful new baseline: on a warm page the network is **1.4 s** and
+the engine is **2.8 s**, so the next lever is JavaScript execution and
+style/layout, not transport. Cold, the network still dominates (13.8 s), and
+the remaining transport item is per-origin lanes / connection warm-up, not
+more multiplexing.
+
+- engine tests **1027 -> 1029** green (new
+  `gzip_body_decodes_to_the_identity_bytes` and
+  `a_304_answers_from_the_cache_and_ignores_the_content_coding`).
 
 
 

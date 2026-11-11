@@ -66,6 +66,34 @@ version = "5"
 default-features = false
 features = ["std"]
 
+# HTTP/2 (P67). ureq 2 is HTTP/1.1-only, so h2 needs its own client; hyper's
+# legacy client gives per-origin connection pooling + multiplexing over one
+# TLS connection. The engine stays synchronous: h2net bridges with block_on.
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "net", "time"]
+
+[dependencies.hyper]
+version = "1"
+default-features = false
+features = ["client", "http1", "http2"]
+
+[dependencies.hyper-util]
+version = "0.1"
+default-features = false
+features = ["client-legacy", "http1", "http2", "tokio"]
+
+[dependencies.hyper-rustls]
+version = "0.27"
+default-features = false
+features = ["http1", "http2", "ring", "tls12"]
+
+[dependencies.http-body-util]
+version = "0.1"
+
+[dependencies.bytes]
+version = "1"
+
 [dependencies.wuff]
 version = "0.2.9"
 optional = true

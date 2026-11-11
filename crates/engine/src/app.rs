@@ -7419,32 +7419,47 @@ fn preload_accept(urls: &[String], accept: Option<&str>, label: &str) {
     }
 }
 
-/// `Content-Encoding: br` limit *after* decompression. The compressed read is
-/// capped at 20 MB, but brotli can expand far past that; no page needs a
-/// single response bigger than this.
+/// `Content-Encoding` limit *after* decompression. The compressed read is
+/// capped at 20 MB, but a compressed body can expand far past that; no page
+/// needs a single response bigger than this.
 const DECODE_CAP: usize = 64 * 1024 * 1024;
+
+/// Largest response body either transport will keep.
+const HTTP_BODY_CAP: usize = 20 * 1024 * 1024;
+
+/// Sink that refuses to grow past [`DECODE_CAP`], so a hostile body cannot
+/// expand without bound.
+struct Capped(Vec<u8>);
+
+impl std::io::Write for Capped {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + b.len() > DECODE_CAP {
+            return Err(std::io::Error::other("decoded body over cap"));
+        }
+        self.0.extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Decode a brotli body. ureq gunzips for us; brotli is decoded here because
 /// ureq's own `brotli` feature pins `brotli-decompressor` 4.0.0, which this
-/// project's offline registry does not carry (see Cargo.toml). The output is
-/// capped so a hostile body cannot expand without bound.
+/// project's offline registry does not carry (see Cargo.toml).
 fn decode_br(buf: &[u8]) -> Result<Vec<u8>, String> {
-    struct Cap(Vec<u8>);
-    impl std::io::Write for Cap {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            if self.0.len() + b.len() > DECODE_CAP {
-                return Err(std::io::Error::other("brotli body over cap"));
-            }
-            self.0.extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut out = Cap(Vec::with_capacity(buf.len().saturating_mul(3)));
+    let mut out = Capped(Vec::with_capacity(buf.len().saturating_mul(3)));
     brotli_decompressor::BrotliDecompress(&mut std::io::Cursor::new(buf), &mut out)
         .map_err(|e| format!("brotli decode: {e}"))?;
+    Ok(out.0)
+}
+
+/// Decode a gzip body. Only the HTTP/2 path needs this: ureq strips the coding
+/// and hands back decoded bytes already.
+fn decode_gzip(buf: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Capped(Vec::with_capacity(buf.len().saturating_mul(3)));
+    std::io::copy(&mut flate2::read::GzDecoder::new(buf), &mut out)
+        .map_err(|e| format!("gzip decode: {e}"))?;
     Ok(out.0)
 }
 
@@ -7468,29 +7483,92 @@ fn fetch_accept(
         }
         stored = Some(hit);
     }
-    let t_net = Instant::now();
-    let mut req = http_agent().get(url);
-    for (name, value) in net::request_headers(accept) {
-        req = req.set(name, &value);
-    }
+    let mut headers = net::request_headers(accept);
     if let Some(c) = cookie::request_header(url) {
-        req = req.set("Cookie", &c);
+        headers.push(("Cookie", c));
     }
     if let Some(tag) = stored.as_ref().and_then(|c| c.etag.as_deref()) {
-        req = req.set("If-None-Match", tag);
+        headers.push(("If-None-Match", tag.to_string()));
+    }
+    let t_net = Instant::now();
+    // HTTP/2 first when asked for; any failure falls through to ureq below, so
+    // a server that only speaks HTTP/1.1 still loads.
+    if http2_on() {
+        match crate::h2net::get(url, &headers, HTTP_BODY_CAP) {
+            Ok(r) => {
+                cookie::store_response(url, &set_cookie_values_of(&r.headers));
+                return finish_fetch(
+                    &dir,
+                    url,
+                    now,
+                    r.status,
+                    r.header("content-type").map(|s| s.to_string()),
+                    r.header("content-encoding").map(|s| s.to_ascii_lowercase()),
+                    r.header("cache-control").map(|cc| cache_ttl(Some(cc))),
+                    r.header("etag").map(|s| s.to_string()),
+                    r.body,
+                    stored,
+                    t_net,
+                );
+            }
+            Err(e) => eprintln!("[h2] {} failed: {e}", log_url(url)),
+        }
+    }
+    let mut req = http_agent().get(url);
+    for (name, value) in &headers {
+        req = req.set(name, value);
     }
     let resp = req.call().map_err(|e| e.to_string())?;
     cookie::store_response(url, &set_cookie_values(&resp));
+    let status = resp.status();
+    let ct = resp.header("content-type").map(|s| s.to_string());
+    let encoding = resp.header("content-encoding").map(|s| s.to_ascii_lowercase());
+    let ttl = resp.header("cache-control").map(|cc| cache_ttl(Some(cc)));
+    let etag = resp.header("etag").map(|s| s.to_string());
+    // A 304 has no body, but servers still send the selected representation's
+    // `Content-Encoding`, so feeding `into_reader` an empty gzip stream fails
+    // with "unexpected end of file". Nothing to read: answer from the cache.
+    let mut buf = Vec::new();
+    if status != 304 {
+        // into_reader transparently gunzips (ureq gzip feature); cap at 20MB
+        let mut reader = resp.into_reader();
+        let mut chunk = [0u8; 8192];
+        while buf.len() < HTTP_BODY_CAP {
+            let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+    finish_fetch(
+        &dir, url, now, status, ct, encoding, ttl, etag, buf, stored, t_net,
+    )
+}
+
+/// Shared tail of both transports: answer a 304 from the stored body, decode
+/// the content coding, write the cache entry, log the request.
+#[allow(clippy::too_many_arguments)]
+fn finish_fetch(
+    dir: &std::path::Path,
+    url: &str,
+    now: u64,
+    status: u16,
+    ct: Option<String>,
+    encoding: Option<String>,
+    ttl: Option<u64>,
+    etag: Option<String>,
+    buf: Vec<u8>,
+    stored: Option<CacheEntry>,
+    t_net: Instant,
+) -> Result<(Vec<u8>, Option<String>), String> {
     // Not Modified: the stored body is still current. Refresh its timestamp
     // (and its lifetime, if the 304 carries one) so the rest of this page load
     // does not ask again.
-    if resp.status() == 304 {
+    if status == 304 {
         let c = stored.ok_or_else(|| format!("304 without a cached body for {url}"))?;
-        let ttl = match resp.header("cache-control") {
-            Some(cc) => cache_ttl(Some(cc)),
-            None => c.ttl,
-        };
-        cache_write_in(&dir, url, now, ttl, &c.body, c.ct.as_deref(), c.etag.as_deref());
+        let ttl = ttl.unwrap_or(c.ttl);
+        cache_write_in(dir, url, now, ttl, &c.body, c.ct.as_deref(), c.etag.as_deref());
         if std::env::var_os("MAZDA_TIME").is_some() {
             eprintln!(
                 "[net] {:6.1} ms {:8} B {} (304)",
@@ -7501,38 +7579,24 @@ fn fetch_accept(
         }
         return Ok((c.body, c.ct));
     }
-    let content_type = resp.header("content-type").map(|s| s.to_string());
-    // read before `into_reader` consumes the response; `br` is ours to decode
-    let encoding = resp.header("content-encoding").map(|s| s.to_ascii_lowercase());
+    // ureq gunzips for us; the HTTP/2 path receives the bytes as sent, so both
+    // codings are decoded here whenever one is present.
+    let buf = match encoding.as_deref() {
+        Some("br") => decode_br(&buf)?,
+        Some("gzip") => decode_gzip(&buf)?,
+        _ => buf,
+    };
     // `Cache-Control` decides how long the disk entry may be reused: GitHub's
     // hashed bundles are `max-age=31536000, immutable`, its HTML is
     // `max-age=0, private, must-revalidate`. Ignoring this used to re-download
     // the whole page after 5 minutes.
-    let ttl = cache_ttl(resp.header("cache-control"));
-    let etag = resp.header("etag").map(|s| s.to_string());
-    // into_reader transparently gunzips (ureq gzip feature); cap at 20MB like a browser
-    const CAP: usize = 20 * 1024 * 1024;
-    let mut reader = resp.into_reader();
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    while buf.len() < CAP {
-        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let buf = match encoding.as_deref() {
-        Some("br") => decode_br(&buf)?,
-        _ => buf,
-    };
     cache_write_in(
-        &dir,
+        dir,
         url,
         now_secs(),
-        ttl,
+        ttl.unwrap_or(CACHE_TTL_SECS),
         &buf,
-        content_type.as_deref(),
+        ct.as_deref(),
         etag.as_deref(),
     );
     if std::env::var_os("MAZDA_TIME").is_some() {
@@ -7542,10 +7606,28 @@ fn fetch_accept(
             buf.len(),
             log_url(url),
             // the byte count is the decoded size; this says how it arrived
-            if encoding.as_deref() == Some("br") { " (br)" } else { "" }
+            match encoding.as_deref() {
+                Some("br") => " (br)",
+                Some("gzip") => " (gzip)",
+                _ => "",
+            }
         );
     }
-    Ok((buf, content_type))
+    Ok((buf, ct))
+}
+
+/// `MAZDA_HTTP2=1` routes every fetch through the HTTP/2 client (P67).
+fn http2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAZDA_HTTP2").is_some())
+}
+
+fn set_cookie_values_of(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(k, _)| k == "set-cookie")
+        .map(|(_, v)| v.clone())
+        .collect()
 }
 
 /// Decoded webfont bytes kept in RAM per page (per `Fonts` instance: the
@@ -9700,6 +9782,71 @@ mod tests {
         );
         // junk is an error, never a panic or a silently empty body
         assert!(decode_br(b"not brotli").is_err());
+    }
+
+    #[test]
+    fn gzip_body_decodes_to_the_identity_bytes() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"performance.mark(\"x\");").unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(decode_gzip(&gz).unwrap(), b"performance.mark(\"x\");");
+        // junk is an error, never a panic or a silently empty body
+        assert!(decode_gzip(b"not gzip").is_err());
+    }
+
+    /// A real 304 from github.com carries `Content-Encoding: gzip` and no
+    /// body. Reading that stream as gzip failed with "unexpected end of file";
+    /// the body must come from the cache instead.
+    #[test]
+    fn a_304_answers_from_the_cache_and_ignores_the_content_coding() {
+        let dir = test_dir("finish-304");
+        cache_write_in(
+            &dir,
+            "https://x.com/",
+            1000,
+            0,
+            b"doc",
+            Some("text/html"),
+            Some("\"v1\""),
+        );
+        let stored = cache_read_in(&dir, "https://x.com/").unwrap();
+        let (body, ct) = finish_fetch(
+            &dir,
+            "https://x.com/",
+            2000,
+            304,
+            Some("text/html".to_string()),
+            Some("gzip".to_string()),
+            Some(0),
+            Some("\"v1\"".to_string()),
+            Vec::new(),
+            Some(stored),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(body, b"doc", "the stored body answers the 304");
+        assert_eq!(ct.as_deref(), Some("text/html"));
+        // the entry's clock restarted, so the rest of this load does not ask
+        let again = cache_read_in(&dir, "https://x.com/").unwrap();
+        assert_eq!((again.ts, again.ttl), (2000, 0));
+        assert_eq!(again.etag.as_deref(), Some("\"v1\""));
+        // a 304 with nothing stored is an error, not an empty page
+        assert!(finish_fetch(
+            &dir,
+            "https://y.com/",
+            2000,
+            304,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            Instant::now(),
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

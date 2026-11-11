@@ -138,17 +138,29 @@ fn group_rank(g: rustls::NamedGroup) -> u8 {
 /// The rustls config handed to ureq. TLS 1.2 + 1.3, webpki roots (the same
 /// store ureq used before), SNI on, HTTP/1.1 ALPN only.
 pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(chrome_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .expect("TLS 1.2 + 1.3 are compiled in")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut cfg = base_config();
     // ureq 2 speaks HTTP/1.1 only. Advertising h2 and then failing the preface
     // would break every request; keep the ALPN list honest.
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(cfg)
+}
+
+/// The same identity, for the HTTP/2 client. ALPN is deliberately left empty:
+/// `hyper-rustls`'s builder panics on a config that pre-defines it ("ALPN
+/// protocols should not be pre-defined") and sets `h2` + `http/1.1` itself
+/// from the enabled protocols.
+pub(crate) fn tls_config_h2() -> rustls::ClientConfig {
+    base_config()
+}
+
+fn base_config() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder_with_provider(Arc::new(chrome_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .expect("TLS 1.2 + 1.3 are compiled in")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 #[cfg(test)]
