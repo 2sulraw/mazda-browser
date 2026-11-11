@@ -5391,6 +5391,26 @@ fn regex_extended_pictographic_property_escape() {
 }
 
 #[test]
+fn regex_empty_and_negated_empty_class() {
+    // GitHub's search bundle (`kn-*.js`) splits on `/^'([^]*?)'?$/`: `[^]` is
+    // the negated empty class, i.e. any character including a line break. The
+    // parser used to read the `]` as a literal and report an unterminated
+    // class, which made the whole bundle a SyntaxError.
+    assert!(boolean("/[^]/.test('a')"));
+    assert!(boolean("/[^]/.test('\\n')"));
+    assert!(boolean("/^'([^]*?)'?$/.test(\"'abc'\")"));
+    assert!(boolean("/^'([^]*?)'?$/.test(\"'a\\nb'\")"));
+    assert!(boolean(
+        "(() => { try { new RegExp('[^]', 'u'); return true } catch (e) { return false } })()"
+    ));
+    // `[]` is the empty class: it never matches, and it is still valid
+    assert!(!boolean("/[]/.test('a')"));
+    assert!(!boolean("/foo[]bar/.test('foobar')"));
+    // a leading literal `]` has to be escaped, as in every other engine
+    assert!(boolean("/[\\]]/.test(']')"));
+}
+
+#[test]
 fn regex_connector_punctuation_property_escape() {
     // The issues page's "word character" class is
     // `[^\p{Letter}\p{Mark}\p{Number}\p{Connector_Punctuation}\p{Emoji}]/gu`;

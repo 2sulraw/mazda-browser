@@ -4100,6 +4100,33 @@ Our built-in prototypes exposed their methods but not the spec's
   (worker 16084 -> 13292 ms across the same-run asset set; the network note
   above still dominates). The repo page keeps its zero-error run.
 
+## `[^]` is the class of every character (P60, 2026-11-11)
+
+`github.com/search?q=test&type=repositories` reached the search bundle
+`kn-*.js` and failed to parse:
+
+```
+/^'([^]*?)'?$/
+```
+
+reported as `unterminated character class`.
+
+- The class parser refused `]` while the class was still empty, so it consumed
+  the `]` of `[^]` as a literal and then ran off the end. In ECMAScript a `]`
+  closes the class wherever it appears, which makes `[]` the empty class and
+  `[^]` the negation of it: every character, line breaks included. `[^]` is
+  the standard "any character" idiom precisely because `.` excludes newlines.
+- a literal `]` at the start of a class must be escaped (`[\]]`), as the spec
+  says; the old behavior accepted the unescaped form, so this is a deliberate
+  deviation removed rather than added.
+- engine tests **1020 -> 1021** green (new
+  `regex_empty_and_negated_empty_class`: `[^]` on a letter and on a line
+  break, the bundle's own `^'([^]*?)'?$` over a multi-line string, `[]` never
+  matching, and `[\]]`).
+- `github.com/search?q=test&type=repositories`: the SyntaxError is gone; the
+  next script error is `ws-*.js` binding `BigInt.prototype.toString`.
+
+
 
 
 

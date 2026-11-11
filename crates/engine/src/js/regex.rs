@@ -626,11 +626,14 @@ impl PatParser {
         }
         let mut ranges: Vec<(char, char)> = Vec::new();
         let mut props: Vec<(PropKind, bool)> = Vec::new();
-        let mut first = true;
         loop {
             let ch = match self.peek() {
                 None => return rerr("unterminated character class"),
-                Some(']') if !first => {
+                // `]` closes the class even first, so `[]` is the empty set and
+                // `[^]` is every character - the idiom `/^'([^]*?)'?$/` in
+                // GitHub's `kn-*.js` splits on any character, newlines
+                // included. (A literal `]` at the start must be escaped.)
+                Some(']') => {
                     self.i += 1;
                     break;
                 }
@@ -639,7 +642,6 @@ impl PatParser {
                     c
                 }
             };
-            first = false;
             let lo = match ch {
                 '\\' => match self.next() {
                     None => return rerr("trailing backslash in class"),
