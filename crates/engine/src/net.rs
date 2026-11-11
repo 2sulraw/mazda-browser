@@ -74,14 +74,15 @@ pub(crate) const DOC_ACCEPT: &str =
 /// Headers every request carries. `accept` = the subresource type override
 /// (images/scripts/fonts pass their own); `None` means a document navigation.
 ///
-/// Honest capability note: `Accept-Encoding` advertises only `gzip` because
-/// that is all ureq's default decoder handles; a real Chrome also offers
-/// `deflate, br, zstd`, and that difference is visible server-side.
+/// `Accept-Encoding` offers `gzip` (decoded by ureq) and `br` (decoded by
+/// `app::decode_br`); `deflate` and `zstd` are deliberately absent because
+/// nothing here can decode them, and advertising a format with no decoder only
+/// buys unrenderable bytes.
 pub(crate) fn request_headers(accept: Option<&str>) -> Vec<(&'static str, String)> {
     let mut h = vec![
         ("User-Agent", USER_AGENT.to_string()),
         ("Accept-Language", "en-US,en;q=0.9".to_string()),
-        ("Accept-Encoding", "gzip".to_string()),
+        ("Accept-Encoding", "gzip, br".to_string()),
         ("sec-ch-ua", SEC_CH_UA.to_string()),
         ("sec-ch-ua-mobile", "?0".to_string()),
         ("sec-ch-ua-platform", SEC_CH_PLATFORM.to_string()),
@@ -225,7 +226,7 @@ mod tests {
         assert!(!get("User-Agent").unwrap().contains("Mazda"));
         assert!(get("Accept").unwrap().starts_with("text/html"));
         assert_eq!(get("Accept-Language"), Some("en-US,en;q=0.9"));
-        assert_eq!(get("Accept-Encoding"), Some("gzip"), "only what we decode");
+        assert_eq!(get("Accept-Encoding"), Some("gzip, br"), "only what we decode");
         assert_eq!(get("Upgrade-Insecure-Requests"), Some("1"));
         assert!(get("sec-ch-ua").unwrap().contains("Google Chrome"));
     }

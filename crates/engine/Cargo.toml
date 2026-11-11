@@ -58,6 +58,14 @@ optional = true
 [dependencies.flate2]
 version = "1"
 
+# HTTP `Content-Encoding: br`. Not ureq's `brotli` feature: that one pins
+# brotli-decompressor 4.0.0, which this project's offline registry does not
+# carry. 5.0.3 is available, so the header and the decode are ours.
+[dependencies.brotli-decompressor]
+version = "5"
+default-features = false
+features = ["std"]
+
 [dependencies.wuff]
 version = "0.2.9"
 optional = true

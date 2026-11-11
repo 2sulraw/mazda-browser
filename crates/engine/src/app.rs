@@ -6341,6 +6341,10 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
     for (name, value) in net::request_headers(Some("video/mp4,video/*;q=0.9,*/*;q=0.8")) {
         req = req.set(name, &value);
     }
+    // `Range` counts bytes of the *encoded* body, so a compressed answer would
+    // be an undecodable fragment. Media is already compressed; ask for it as
+    // stored.
+    req = req.set("Accept-Encoding", "identity");
     if let Some(c) = cookie::request_header(url) {
         req = req.set("Cookie", &c);
     }
@@ -6348,6 +6352,7 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
     cookie::store_response(url, &set_cookie_values(&resp));
     let complete = resp.status() == 200;
     let content_type = resp.header("content-type").map(|s| s.to_string());
+    let encoding = resp.header("content-encoding").map(|s| s.to_ascii_lowercase());
     let ttl = cache_ttl(resp.header("cache-control"));
     let etag = resp.header("etag").map(|s| s.to_string());
     // a `200` means the Range was ignored: read the whole body like `fetch`
@@ -6367,6 +6372,13 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
             break;
         }
     }
+    // a server that ignored `identity` still gets a decodable body; a partial
+    // one cannot be decoded and is left to the caller's fallback
+    let buf = if complete && encoding.as_deref() == Some("br") {
+        decode_br(&buf)?
+    } else {
+        buf
+    };
     if complete {
         cache_write_in(
             &cache_dir(),
@@ -7407,6 +7419,35 @@ fn preload_accept(urls: &[String], accept: Option<&str>, label: &str) {
     }
 }
 
+/// `Content-Encoding: br` limit *after* decompression. The compressed read is
+/// capped at 20 MB, but brotli can expand far past that; no page needs a
+/// single response bigger than this.
+const DECODE_CAP: usize = 64 * 1024 * 1024;
+
+/// Decode a brotli body. ureq gunzips for us; brotli is decoded here because
+/// ureq's own `brotli` feature pins `brotli-decompressor` 4.0.0, which this
+/// project's offline registry does not carry (see Cargo.toml). The output is
+/// capped so a hostile body cannot expand without bound.
+fn decode_br(buf: &[u8]) -> Result<Vec<u8>, String> {
+    struct Cap(Vec<u8>);
+    impl std::io::Write for Cap {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.0.len() + b.len() > DECODE_CAP {
+                return Err(std::io::Error::other("brotli body over cap"));
+            }
+            self.0.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Cap(Vec::with_capacity(buf.len().saturating_mul(3)));
+    brotli_decompressor::BrotliDecompress(&mut std::io::Cursor::new(buf), &mut out)
+        .map_err(|e| format!("brotli decode: {e}"))?;
+    Ok(out.0)
+}
+
 fn fetch_accept(
     url: &str,
     accept: Option<&str>,
@@ -7461,6 +7502,8 @@ fn fetch_accept(
         return Ok((c.body, c.ct));
     }
     let content_type = resp.header("content-type").map(|s| s.to_string());
+    // read before `into_reader` consumes the response; `br` is ours to decode
+    let encoding = resp.header("content-encoding").map(|s| s.to_ascii_lowercase());
     // `Cache-Control` decides how long the disk entry may be reused: GitHub's
     // hashed bundles are `max-age=31536000, immutable`, its HTML is
     // `max-age=0, private, must-revalidate`. Ignoring this used to re-download
@@ -7479,6 +7522,10 @@ fn fetch_accept(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+    let buf = match encoding.as_deref() {
+        Some("br") => decode_br(&buf)?,
+        _ => buf,
+    };
     cache_write_in(
         &dir,
         url,
@@ -7490,10 +7537,12 @@ fn fetch_accept(
     );
     if std::env::var_os("MAZDA_TIME").is_some() {
         eprintln!(
-            "[net] {:6.1} ms {:8} B {}",
+            "[net] {:6.1} ms {:8} B {}{}",
             t_net.elapsed().as_secs_f64() * 1000.0,
             buf.len(),
-            log_url(url)
+            log_url(url),
+            // the byte count is the decoded size; this says how it arrived
+            if encoding.as_deref() == Some("br") { " (br)" } else { "" }
         );
     }
     Ok((buf, content_type))
@@ -9636,6 +9685,21 @@ mod tests {
         });
         assert!(reads.load(Ordering::Relaxed) > 0, "the reader raced the writer");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn brotli_body_decodes_to_the_identity_bytes() {
+        // a real githubassets response: 3819 B identity, 1148 B gzip, 1068 B br
+        let raw = include_bytes!("../tests/fixtures/rxr.js.br");
+        assert_eq!(raw.len(), 1068);
+        let out = decode_br(raw).expect("decode a real brotli body");
+        assert_eq!(out.len(), 3819, "identity length");
+        assert!(
+            out.starts_with(b"performance.mark(\"js-parse-end:"),
+            "decoded bytes are the bundle"
+        );
+        // junk is an error, never a panic or a silently empty body
+        assert!(decode_br(b"not brotli").is_err());
     }
 
     #[test]

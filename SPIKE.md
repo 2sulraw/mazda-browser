@@ -4321,6 +4321,43 @@ old entry or the whole new one. Test:
 
 - engine tests **1025 -> 1026** green.
 
+## `Content-Encoding: br` (P66, 2026-11-11)
+
+Every bundle travelled in gzip while Chrome's copy was brotli. ureq has a
+`brotli` feature, but it pins `brotli-decompressor` 4.0.0, which this
+project's offline registry does not carry (5.0.3 is there), so the dependency
+is direct and the header and the decode are ours:
+
+- `Accept-Encoding: gzip, br`. `deflate` and `zstd` stay absent — advertising
+  a format with no decoder only buys unrenderable bytes.
+- `decode_br` runs after the body is read, capped at 64 MB *decoded* (the
+  compressed read was already capped at 20 MB).
+- media probes now ask for `identity`: `Range` counts bytes of the encoded
+  body, so a compressed answer would be an undecodable fragment.
+
+Measured over this page's own 50 compressible responses (curl, parallel, the
+same two header values the engine sends):
+
+| Header | Wire bytes |
+|---|---|
+| `gzip` | 2 230 680 |
+| `gzip, br` | 1 950 382 |
+
+**280 298 B saved (12.6%)**, 49 of 50 responses smaller. Examples:
+`landing-pages` 762 977 → 626 747, `primer-react` 150 309 → 131 363,
+`23-…` 129 513 → 117 755.
+
+`github.com`'s document still arrives gzip — GitHub does not brotli the HTML —
+so the asset path is what improves. The engine logged **56 `(br)` responses
+out of 69** on a cold page, with no decode errors and the same single known
+script error at the same bundle offset, i.e. the decoded bytes are the real
+bundle.
+
+- engine tests **1026 -> 1027** green (new
+  `brotli_body_decodes_to_the_identity_bytes`, decoding a real 1068 B
+  githubassets body kept as `tests/fixtures/rxr.js.br` into its 3819 identity
+  bytes).
+
 
 
 
