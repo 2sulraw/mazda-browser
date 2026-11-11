@@ -1698,6 +1698,11 @@ pub struct JsEngine {
     /// last). Only for diagnostics: a runtime TypeError names the function
     /// it happened in when the exact span is not enough.
     pub(crate) call_names: Vec<Rc<str>>,
+    /// `MAZDA_PROF=1`: accumulates wall time per native (host + builtin), so a
+    /// page load can be split between script and native cost without a
+    /// profiler. Diagnostic only.
+    pub(crate) prof_on: bool,
+    pub(crate) prof_native: HashMap<Rc<str>, (u64, u64)>,
     /// source text of every parsed script/module, indexed by
     /// `FnDef::src - 1` (see [`JsEngine::register_source`]). Keeping the text
     /// is what lets a throw report a location in the file that *defined* the
@@ -1924,6 +1929,8 @@ impl JsEngine {
             pending_construct: None,
             pending_label: None,
             call_names: Vec::new(),
+            prof_on: std::env::var_os("MAZDA_PROF").is_some(),
+            prof_native: HashMap::new(),
             sources: Vec::new(),
             sources_bytes: 0,
             cur_src: 0,
@@ -2217,6 +2224,35 @@ impl JsEngine {
     /// error carries no line/col here; `exec` resolves the recorded
     /// `cur_span` offset against the source it owns.
     #[inline]
+    /// `MAZDA_PROF=1`: print host/builtin cost collected since the last dump,
+    /// heaviest first, then reset. A tree-walker has no profile stack, so this
+    /// is the only split between native work and interpreter work.
+    pub fn prof_dump(&mut self) {
+        if !self.prof_on || self.prof_native.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(Rc<str>, u64, u64)> = self
+            .prof_native
+            .iter()
+            .map(|(n, (c, ns))| (n.clone(), *c, *ns))
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        let total: u64 = rows.iter().map(|r| r.2).sum();
+        eprintln!(
+            "[prof] native total {:.0} ms across {} calls",
+            total as f64 / 1.0e6,
+            rows.iter().map(|r| r.1).sum::<u64>()
+        );
+        for (name, calls, ns) in rows.iter().take(25) {
+            eprintln!(
+                "[prof] {:>8.1} ms {:>8} calls  {name}",
+                *ns as f64 / 1.0e6,
+                calls
+            );
+        }
+        self.prof_native.clear();
+    }
+
     pub(crate) fn tick(&mut self) -> Result<(), JsError> {
         self.steps += 1;
         if self.steps > self.step_budget {
@@ -2700,10 +2736,20 @@ impl JsEngine {
                         .ok_or_else(|| JsError::throw("ReferenceError: broken native binding"))?;
                     (en.f, en.idx, en.host)
                 };
-                match host {
+                // `MAZDA_PROF=1`: per-native wall time, the only way to see
+                // host/builtin cost from a tree-walker without a profiler
+                let prof = self.prof_on.then(std::time::Instant::now);
+                let r = match host {
                     Some(h) => h(self, &args),
                     None => f(self, idx, &this, &args),
+                };
+                if let Some(t) = prof {
+                    let name = self.natives[id].name.clone();
+                    let slot = self.prof_native.entry(name).or_insert((0, 0));
+                    slot.0 += 1;
+                    slot.1 += t.elapsed().as_nanos() as u64;
                 }
+                r
             }
             Val::Method(m) => interp::call_method(self, m, &this, &args),
             // shortcut: exotic callable objects. `Object`/`Array` are plain

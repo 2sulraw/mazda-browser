@@ -166,7 +166,9 @@ impl ModuleLoader {
             // function is called later from classic script code
             e.module_urls.insert(src_id, Rc::from(url));
         }
+        let t_parse = std::time::Instant::now();
         let program = parser::parse(src, src_id).map_err(|err| format!("{url}: {err}"))?;
+        let parse_ms = t_parse.elapsed().as_millis();
         // each module body is its own execution turn (fresh step budget), but
         // it may run re-entrantly from a microtask inside an outer call
         // (`await import(...)`), so the caller's frame depth is restored after
@@ -184,7 +186,16 @@ impl ModuleLoader {
         let ns: Exports = Rc::new(RefCell::new(HashMap::new()));
         self.cache.insert(url.to_string(), ns.clone());
         self.active.push(url.to_string());
+        let t_run = std::time::Instant::now();
         let r = self.run_body(e, url, src, src_id, &program, &ns);
+        let run_ms = t_run.elapsed().as_millis();
+        if std::env::var_os("MAZDA_TIME").is_some() {
+            eprintln!(
+                "[time] module {}: parse {parse_ms} ms, run {run_ms} ms ({} B)",
+                url.rsplit('/').next().unwrap_or(url),
+                src.len()
+            );
+        }
         self.active.pop();
         e.call_depth = saved_depth;
         e.cur_src = outer_src;

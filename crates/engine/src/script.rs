@@ -2504,9 +2504,18 @@ fn n_custom_elements(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> R
             if !known {
                 CUSTOM_ELEMENTS.with(|c| c.borrow_mut().push((name.clone(), ctor)));
                 // a definition upgrades the elements that already exist
+                let t = std::time::Instant::now();
                 let existing = runtime::host(|h| h.by_tag(&name));
-                for n in existing {
-                    upgrade_custom_element(e, n);
+                let scan_ms = t.elapsed().as_millis();
+                for n in &existing {
+                    upgrade_custom_element(e, *n);
+                }
+                let upgrade_ms = t.elapsed().as_millis() - scan_ms;                if std::env::var_os("MAZDA_PROF").is_some() && (scan_ms > 0 || upgrade_ms > 0) {
+                    eprintln!(
+                        "[prof] define <{name}>: {} existing, scan {scan_ms} ms, upgrade {} ms",
+                        existing.len(),
+                        upgrade_ms
+                    );
                 }
             }
             Ok(Val::Undefined)
@@ -3799,6 +3808,7 @@ impl PageScripts {
                 (total - fetch).max(0.0)
             );
         }
+        self.engine.prof_dump();
         turn
     }
 

@@ -4563,3 +4563,46 @@ session:
 Conclusion: `MAZDA_HTTP2=1` stays opt-in (P68 unchanged). To learn anything
 more about warm h2 the next step would have to count TLS handshakes/reused
 connections directly rather than compare wall-clock single requests.
+## Splitting a page load between the interpreter and its natives (`MAZDA_PROF=1`) (P71, 2026-11-11)
+
+Script execution was 40-70% of a github.com load (3.8 s warm, 7.0 s cold) and
+nothing said where inside it the time went. A tree-walker has no profile
+stack, so the engine now times every native (host + builtin) call wall-clock
+under `MAZDA_PROF=1` and dumps the top 25 after each script turn. Per-module
+parse/run times are printed under `MAZDA_TIME` as well. Both are diagnostic
+only: the timer is compiled in but skipped unless the variable is set.
+
+One warm load, cache populated, DOM cache deleted:
+
+```
+[time] scripts: 3939 ms (fetch 99 ms, exec 3840 ms)
+[prof] native total 1082 ms across 122776 calls
+[prof]    445.8 ms       65 calls  customElements.define
+[prof]    444.0 ms        4 calls  JSON.parse
+[prof]     29.7 ms      875 calls  Map.prototype.set
+[prof]     18.3 ms    18122 calls  Set.prototype.add
+[prof]     16.9 ms       83 calls  forEach
+[prof]     16.3 ms    12515 calls  Object.defineProperty
+[prof]     16.1 ms       10 calls  Array.from
+[prof]     12.9 ms      347 calls  map
+[prof]     10.2 ms    22230 calls  Set.prototype.has
+```
+
+Reading:
+
+- 122 776 native calls cost 1.08 s, so ~2.76 s of the 3.84 s is the
+  interpreter itself (statement dispatch, identifier lookup, property
+  access). That is the next target after the item below.
+- `customElements.define` is *inclusive*: it upgrades matching elements, and
+  the single `<react-app>` upgrade runs the page's React boot (471 ms when
+  timed separately). Not overhead, and nothing to delete.
+- 122 776 calls in 1.08 s is ~8.8 us per call overall; the per-call native
+  cost stays in the microsecond range, so the native surface is not bloating
+  loads.
+- Parsing is cheap: 275 KB `react-core` parses in 71 ms, 456 KB `pb` in 87 ms,
+  538 KB `k0` in 49 ms. The bundle time is in running, not parsing.
+
+One row was worth a second look: `JSON.parse` 444 ms over 4 calls, i.e.
+~110 ms for a single parse. The per-call log (added with P72) shows it is one
+133 KB parse, and that parse cost 461 ms: the string reader validated the
+entire remaining buffer once per character. Fixed in P72.
