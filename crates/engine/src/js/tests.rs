@@ -4287,6 +4287,36 @@ fn object_prototype_is_reachable_and_inherited() {
 }
 
 #[test]
+fn builtin_prototypes_carry_their_constructor() {
+    // Immer in GitHub's `xf-*.js` starts with
+    // `var f=Object.prototype.constructor.toString()` and then decides
+    // whether a value is draftable by checking its prototype's `constructor`
+    // against `Object`. Without the back-pointer the module threw on the very
+    // first property access.
+    assert!(boolean("Object.prototype.constructor === Object"));
+    assert!(boolean("Array.prototype.constructor === Array"));
+    assert!(boolean("Function.prototype.constructor === Function"));
+    assert!(boolean("String.prototype.constructor === String"));
+    assert!(boolean("Number.prototype.constructor === Number"));
+    assert!(boolean("Boolean.prototype.constructor === Boolean"));
+    assert!(boolean("RegExp.prototype.constructor === RegExp"));
+    assert!(boolean("Map.prototype.constructor === Map"));
+    assert!(boolean("Set.prototype.constructor === Set"));
+    assert!(boolean("WeakMap.prototype.constructor === WeakMap"));
+    assert!(boolean("Promise.prototype.constructor === Promise"));
+    assert!(boolean("URL.prototype.constructor === URL"));
+    assert!(boolean("ArrayBuffer.prototype.constructor === ArrayBuffer"));
+    assert!(boolean("(new TypeError('x')).constructor === TypeError"));
+    // the back-pointer is an own, enumerable property of the prototype
+    assert!(boolean(
+        "Object.hasOwnProperty.call(Array.prototype, 'constructor')"
+    ));
+    assert!(boolean("[].constructor === Array"));
+    // the exact expression from the bundle
+    assert_eq!(string("Object.prototype.constructor.toString()"), "[object Object]");
+}
+
+#[test]
 fn object_create_and_property_names() {
     assert_eq!(
         num("var p = {greet: function () { return 1 }}; var o = Object.create(p); o.greet()"),

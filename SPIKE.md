@@ -4066,6 +4066,41 @@ module.
 - `github.com/rust-lang/rust/issues`: the SyntaxError is gone; the next script
   error is `xf-*.js` reading `Object.prototype.constructor.toString()`.
 
+## The prototype `constructor` back-pointer (P59, 2026-11-11)
+
+With the pictograph escape in place the same page reached `xf-*.js` (Immer) and
+threw at 2:437:
+
+```js
+var f = Object.prototype.constructor.toString();
+```
+
+Our built-in prototypes exposed their methods but not the spec's
+`constructor` back-pointer, so the property was `undefined`.
+
+- `link_ctor` stamps `constructor` onto every built-in prototype object as it is
+  installed: `Object`, `Array`, `Function`, `String`, `Number`, `Boolean`,
+  `RegExp`, `Map`, `Set`, `WeakMap`, `WeakSet`, `Symbol`, `Promise`, `URL`,
+  `URLSearchParams`, `ArrayBuffer`, `DataView`, `TextEncoder`, `TextDecoder`,
+  `AbortSignal`, `AbortController`, and the two `Intl` formatters. The Error
+  family already had one.
+- `Object.prototype.constructor === Object` also fixes Immer's second use:
+  `Object.hasOwnProperty.call(t, "constructor")` is now true for built-in
+  prototype objects, so it no longer decides every plain object is
+  non-draftable.
+- shortcut: a built-in constructor is a plain callable object, so
+  `Object.prototype.constructor.toString()` answers `[object Object]` rather
+  than `function Object() { [native code] }`. The call now succeeds, which is
+  what the bundle needs; the string itself is not compared to Chrome's.
+- engine tests **1019 -> 1020** green (new
+  `builtin_prototypes_carry_their_constructor`: 13 identity checks, the Error
+  subclass, the own-property form, `[].constructor`, and the bundle's exact
+  expression).
+- `github.com/rust-lang/rust/issues`: **no script errors** for the first time
+  (worker 16084 -> 13292 ms across the same-run asset set; the network note
+  above still dominates). The repo page keeps its zero-error run.
+
+
 
 
 

@@ -214,6 +214,7 @@ pub(crate) fn install(e: &mut JsEngine) {
         e.object_proto = Some(o.clone());
     }
     obj_set_own(own(&object), "prototype", obj_proto.clone());
+    link_ctor(&obj_proto, object.clone());
 
     let arr_proto = Val::new_object();
     if let Val::Obj(o) = &arr_proto {
@@ -282,6 +283,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&array_ctor), "__call", Val::Native(ac));
     obj_set_own(own(&array_ctor), "of", Val::Native(a_of));
     obj_set_own(own(&array_ctor), "from", Val::Native(a_from));
+    link_ctor(&arr_proto, array_ctor.clone());
     obj_set_own(own(&array_ctor), "prototype", arr_proto);
     e.set_global("Array", array_ctor);
 
@@ -351,11 +353,13 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&dtf_proto), "format", Val::Native(dtf_fmt));
     let dtf_ctor = e.register_native("Intl.DateTimeFormat", n_intl, 1);
     e.set_native_prop(dtf_ctor, "prototype", dtf_proto.clone());
+    link_ctor(&dtf_proto, Val::Native(dtf_ctor));
     let nf_proto = Val::new_object();
     let nf_fmt = e.register_native("Intl.NumberFormat.prototype.format", n_intl, 2);
     obj_set_own(own(&nf_proto), "format", Val::Native(nf_fmt));
     let nf_ctor = e.register_native("Intl.NumberFormat", n_intl, 3);
     e.set_native_prop(nf_ctor, "prototype", nf_proto.clone());
+    link_ctor(&nf_proto, Val::Native(nf_ctor));
     let intl = Val::new_object();
     obj_set_own(own(&intl), "DateTimeFormat", Val::Native(dtf_ctor));
     obj_set_own(own(&intl), "NumberFormat", Val::Native(nf_ctor));
@@ -410,16 +414,19 @@ pub(crate) fn install(e: &mut JsEngine) {
         obj_set_own(own(&str_proto), name, Val::Native(id));
     }
     e.set_native_prop(str_id, "prototype", str_proto.clone());
+    link_ctor(&str_proto, Val::Native(str_id));
     let num_proto = Val::new_object();
     for (i, (name, _m)) in NUM_METHODS.iter().enumerate() {
         let id = e.register_native(&format!("Number.prototype.{name}"), n_num_proto, i as u16);
         obj_set_own(own(&num_proto), name, Val::Native(id));
     }
     e.set_native_prop(num_id, "prototype", num_proto.clone());
+    link_ctor(&num_proto, Val::Native(num_id));
     let bool_proto = Val::new_object();
     let bts = e.register_native("Boolean.prototype.toString", n_num_proto, 0);
     obj_set_own(own(&bool_proto), "toString", Val::Native(bts));
     e.set_native_prop(bool_id, "prototype", bool_proto.clone());
+    link_ctor(&bool_proto, Val::Native(bool_id));
     if let Val::Obj(o) = &str_proto {
         o.borrow_mut().proto = match &obj_proto {
             Val::Obj(p) => Some(p.clone()),
@@ -444,6 +451,7 @@ pub(crate) fn install(e: &mut JsEngine) {
         e.function_proto = Some(o.clone());
     }
     let fn_ctor = e.register_native("Function", n_fn_ctor, 0);
+    link_ctor(&fn_proto, Val::Native(fn_ctor));
     e.set_native_prop(fn_ctor, "prototype", fn_proto);
     e.set_global("Function", Val::Native(fn_ctor));
 
@@ -530,6 +538,7 @@ pub(crate) fn install(e: &mut JsEngine) {
         o.borrow_mut().proto = Some(parent.clone());
     }
     e.set_native_prop(pc, "prototype", promise_proto.clone());
+    link_ctor(&promise_proto, Val::Native(pc));
     if let Val::Obj(o) = &promise_proto {
         e.promise_proto = Some(o.clone());
     }
@@ -549,6 +558,7 @@ pub(crate) fn install(e: &mut JsEngine) {
         );
         obj_set_own(own(&re_proto), name, Val::Native(id));
     }
+    link_ctor(&re_proto, Val::Native(rc));
     e.set_native_prop(rc, "prototype", re_proto);
     e.set_global("RegExp", Val::Native(rc));
 
@@ -584,10 +594,12 @@ pub(crate) fn install(e: &mut JsEngine) {
     }
     let uc = e.register_native("URL", n_url_ctor, 0);
     e.set_native_prop(uc, "prototype", url_proto.clone());
+    link_ctor(&url_proto, Val::Native(uc));
     e.set_global("URL", Val::Native(uc));
     e.url_proto = Some(own(&url_proto).clone());
     let upc = e.register_native("URLSearchParams", n_params_ctor, 0);
     e.set_native_prop(upc, "prototype", params_proto.clone());
+    link_ctor(&params_proto, Val::Native(upc));
     e.set_global("URLSearchParams", Val::Native(upc));
     e.params_proto = Some(own(&params_proto).clone());
 
@@ -619,6 +631,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     );
     let sc = e.register_native("Set", n_set_ctor, 0);
     e.set_native_prop(sc, "prototype", set_proto.clone());
+    link_ctor(&set_proto, Val::Native(sc));
     e.set_global("Set", Val::Native(sc));
     let set_values = obj_get_own(own(&set_proto), "values");
     obj_set_own(own(&set_proto), crate::js::SYMBOL_ITERATOR, set_values);
@@ -645,6 +658,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     );
     let mc = e.register_native("Map", n_map_ctor, 0);
     e.set_native_prop(mc, "prototype", map_proto.clone());
+    link_ctor(&map_proto, Val::Native(mc));
     e.set_global("Map", Val::Native(mc));
     let map_entries = obj_get_own(own(&map_proto), "entries");
     obj_set_own(own(&map_proto), crate::js::SYMBOL_ITERATOR, map_entries);
@@ -660,6 +674,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     // Symbol.prototype`) and `defineProperty` on it do not throw.
     let sym_proto = Val::new_object();
     e.set_native_prop(sym, "prototype", sym_proto.clone());
+    link_ctor(&sym_proto, Val::Native(sym));
     if let Val::Obj(o) = &sym_proto {
         let ts = e.register_native("Symbol.prototype.toString", n_symbol_proto, 0);
         let vo = e.register_native("Symbol.prototype.valueOf", n_symbol_proto, 1);
@@ -708,6 +723,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     }
     let wmc = e.register_native("WeakMap", n_weakmap_ctor, 0);
     e.set_native_prop(wmc, "prototype", wm_proto.clone());
+    link_ctor(&wm_proto, Val::Native(wmc));
     e.set_global("WeakMap", Val::Native(wmc));
     e.weakmap_proto = Some(own(&wm_proto).clone());
 
@@ -718,6 +734,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     }
     let wsc = e.register_native("WeakSet", n_weakset_ctor, 0);
     e.set_native_prop(wsc, "prototype", ws_proto.clone());
+    link_ctor(&ws_proto, Val::Native(wsc));
     e.set_global("WeakSet", Val::Native(wsc));
     e.weakset_proto = Some(own(&ws_proto).clone());
 
@@ -729,6 +746,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&te_proto), "encode", Val::Native(te_enc));
     let tec = e.register_native("TextEncoder", n_text_ctor, 0);
     e.set_native_prop(tec, "prototype", te_proto.clone());
+    link_ctor(&te_proto, Val::Native(tec));
     e.set_global("TextEncoder", Val::Native(tec));
     e.text_encoder_proto = Some(own(&te_proto).clone());
 
@@ -738,6 +756,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&td_proto), "encoding", Val::Str(Rc::from("utf-8")));
     let tdc = e.register_native("TextDecoder", n_text_ctor, 1);
     e.set_native_prop(tdc, "prototype", td_proto.clone());
+    link_ctor(&td_proto, Val::Native(tdc));
     e.set_global("TextDecoder", Val::Native(tdc));
     e.text_decoder_proto = Some(own(&td_proto).clone());
 
@@ -815,6 +834,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&ab_proto), "slice", Val::Native(ab_slice));
     let ab_ctor = e.register_native("ArrayBuffer", n_ab, 1);
     e.set_native_prop(ab_ctor, "prototype", ab_proto.clone());
+    link_ctor(&ab_proto, Val::Native(ab_ctor));
     let ab_view = e.register_native("ArrayBuffer.isView", n_ab, 2);
     e.set_native_prop(ab_ctor, "isView", Val::Native(ab_view));
     e.set_global("ArrayBuffer", Val::Native(ab_ctor));
@@ -867,6 +887,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     }
     let dv_ctor = e.register_native("DataView", n_data_view, DV_CTOR);
     e.set_native_prop(dv_ctor, "prototype", dv_proto.clone());
+    link_ctor(&dv_proto, Val::Native(dv_ctor));
     e.data_view_proto = Some(own(&dv_proto).clone());
     e.set_global("DataView", Val::Native(dv_ctor));
 
@@ -908,6 +929,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     );
     let sig_ctor = e.register_native("AbortSignal", n_abort, A_SIGNAL_CTOR);
     e.set_native_prop(sig_ctor, "prototype", sig_proto.clone());
+    link_ctor(&sig_proto, Val::Native(sig_ctor));
     let sig_static = e.register_native("AbortSignal.abort", n_abort, A_STATIC_ABORT);
     e.set_native_prop(sig_ctor, "abort", Val::Native(sig_static));
     e.abort_signal_proto = Some(own(&sig_proto).clone());
@@ -918,6 +940,7 @@ pub(crate) fn install(e: &mut JsEngine) {
     obj_set_own(own(&ctrl_proto), "abort", Val::Native(ctrl_abort));
     let ctrl_ctor = e.register_native("AbortController", n_abort, A_CTOR);
     e.set_native_prop(ctrl_ctor, "prototype", ctrl_proto.clone());
+    link_ctor(&ctrl_proto, Val::Native(ctrl_ctor));
     e.abort_controller_proto = Some(own(&ctrl_proto).clone());
     e.set_global("AbortController", Val::Native(ctrl_ctor));
 
@@ -935,6 +958,14 @@ fn own(v: &Val) -> &Rc<RefCell<Obj>> {
         Val::Obj(o) => o,
         _ => unreachable!("builtin installed on non-object"),
     }
+}
+
+/// The `constructor` back-pointer every built-in prototype carries in the
+/// spec (`Object.prototype.constructor === Object`). Immer - inside GitHub's
+/// `xf-*.js` - reads `Object.prototype.constructor.toString()` and checks each
+/// prototype's `constructor` to decide whether a value is draftable.
+fn link_ctor(proto: &Val, ctor: Val) {
+    obj_set_own(own(proto), "constructor", ctor);
 }
 
 /// The array prototype object, for engine-side array creation.
