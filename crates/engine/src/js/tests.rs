@@ -4317,6 +4317,20 @@ fn builtin_prototypes_carry_their_constructor() {
 }
 
 #[test]
+fn bigint_prototype_methods_are_borrowable() {
+    // DOMPurify's uncurryThis table in GitHub's search bundle starts with
+    // `H(BigInt.prototype.toString)`; BigInt was a native with no prototype,
+    // so the whole `ws-*.js` module threw at its first line of setup.
+    assert!(boolean("typeof BigInt.prototype === 'object'"));
+    assert!(boolean("BigInt.prototype.constructor === BigInt"));
+    assert_eq!(string("BigInt.prototype.toString.call(255n)"), "255");
+    assert_eq!(string("BigInt.prototype.toString.call(255n, 16)"), "ff");
+    assert!(boolean(
+        "Object.hasOwnProperty.call(BigInt.prototype, 'toString')"
+    ));
+}
+
+#[test]
 fn object_create_and_property_names() {
     assert_eq!(
         num("var p = {greet: function () { return 1 }}; var o = Object.create(p); o.greet()"),

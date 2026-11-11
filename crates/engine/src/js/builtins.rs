@@ -397,6 +397,17 @@ pub(crate) fn install(e: &mut JsEngine) {
     let as_uint = e.register_native("BigInt.asUintN", n_bigint, 2);
     e.set_native_prop(bigint_id, "asIntN", Val::Native(as_int));
     e.set_native_prop(bigint_id, "asUintN", Val::Native(as_uint));
+    // `BigInt.prototype` so bundles can uncurry its methods
+    // (`H(BigInt.prototype.toString)`, where H is DOMPurify's uncurryThis) and
+    // apply them to bigint values. The native reuses the Number prototype's
+    // `toString`, which already answers a BigInt receiver.
+    let bigint_proto = Val::new_object();
+    let bi_to_str = e.register_native("BigInt.prototype.toString", n_num_proto, 0);
+    let bi_value_of = e.register_native("BigInt.prototype.valueOf", n_num_proto, 1);
+    obj_set_own(own(&bigint_proto), "toString", Val::Native(bi_to_str));
+    obj_set_own(own(&bigint_proto), "valueOf", Val::Native(bi_value_of));
+    e.set_native_prop(bigint_id, "prototype", bigint_proto.clone());
+    link_ctor(&bigint_proto, Val::Native(bigint_id));
 
     // -- primitive prototypes ----------------------------------------------
     // Bundles probe `"trimStart" in String.prototype` to decide whether to

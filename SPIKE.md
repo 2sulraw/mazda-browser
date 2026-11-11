@@ -4126,6 +4126,31 @@ reported as `unterminated character class`.
 - `github.com/search?q=test&type=repositories`: the SyntaxError is gone; the
   next script error is `ws-*.js` binding `BigInt.prototype.toString`.
 
+## `BigInt.prototype` (P61, 2026-11-11)
+
+The search page then threw at `ws-*.js` 2:2119, in DOMPurify's uncurryThis
+table:
+
+```js
+M = "u" < typeof BigInt ? null : H(BigInt.prototype.toString)
+```
+
+`H` binds the function so it can be applied to a bigint value. `BigInt`
+existed as a callable native with `asIntN`/`asUintN`, but had no `.prototype`,
+so the property read threw.
+
+- `BigInt.prototype` now holds `toString` and `valueOf`, sharing the Number
+  prototype natives: `Meth::NumToString` already answers a `Val::BigInt`
+  receiver (decimal, or the radix argument). It also gets the usual
+  `constructor` back-pointer.
+- engine tests **1021 -> 1022** green (new
+  `bigint_prototype_methods_are_borrowable`: the object, the constructor, a
+  borrowed decimal call, a borrowed base-16 call, and the own property).
+- `github.com/search?q=test&type=repositories`: **no script errors**. The
+  blob, pull-request, `/pulls`, `/issues/new`, repo, and issues pages all run
+  clean as well.
+
+
 
 
 
