@@ -4281,6 +4281,46 @@ pays that each time, which is what P65/P67 go after.
 - engine tests **1024 -> 1025** green (new
   `cache_keeps_the_validator_for_revalidation`).
 
+## Overlapping the image phase with script execution — rejected (P65, 2026-11-11)
+
+The plan was cheap on paper: the markup already names its images, so start
+those downloads before the page's scripts fetch and run, and the ~2 s image
+phase becomes a cache hit.
+
+Built it: a DOM walk that resolves `<img srcset>`/`<picture>` the way layout
+does, a thread that starts the image lanes before `run_scripts`, joined before
+layout. Measured with a *provably* cold cache (`LOCALAPPDATA` pointed at a
+fresh directory, so nothing is inherited from earlier runs):
+
+| Config | Page time |
+|---|---|
+| baseline | 14.7 s, 16.8 s |
+| prefetch on | 22.8 s, 22.4 s, 22.1 s, 23.0 s |
+| prefetch off, same binary | 18.6 s, 25.6 s |
+
+Two things went wrong:
+
+1. the CSS/JS preload grew from **3.97 s to 6.33 s**. The lanes compete for
+   the same ~300 KB/s; ordering bytes does not make them smaller.
+2. the box tree asked for 11 image URLs while the markup walk produced a
+   different set of 21, so the image phase still cost 2.1–2.8 s. GitHub's
+   images are largely inserted or rewritten by script, so the pre-script DOM
+   is not the image set the page ends up using.
+
+The A/B on one binary (alternating, empty cache each run) is inside the
+noise band: 22.1/23.0 s with prefetch, 18.6/25.6 s without. No measured win,
+so it is reverted and recorded here rather than retried — on a bandwidth-bound
+link, overlap cannot pay.
+
+The experiment did expose a real hazard, which is kept: concurrent preload
+lanes can read the cache while another lane writes it. Writes now go to a
+unique temp file and are renamed into place, so a reader sees either the whole
+old entry or the whole new one. Test:
+`cache_reader_never_sees_a_partial_entry` (a reader racing 120 writes of a
+100 KB entry never observes a torn body).
+
+- engine tests **1025 -> 1026** green.
+
 
 
 

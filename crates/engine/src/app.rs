@@ -5071,6 +5071,12 @@ fn settle_load(
     let heap_mb = || crate::live_alloc_bytes() as f64 / (1024.0 * 1024.0);
     #[cfg(feature = "count-alloc")]
     let h0 = heap_mb();
+    // The markup names its images up front, so start those downloads before
+    // the page's scripts fetch and execute instead of after layout. Cold, the
+    // image phase (~2 s) then overlaps the script phase (~5 s); warm, every
+    // lane is a cache hit and this costs a thread. Images a script inserts are
+    // still covered by the box-tree preload in `layout_page`, which also does
+    // the probe.
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = if no_js() {
@@ -5088,8 +5094,7 @@ fn settle_load(
         // inline scripts mutated the DOM before the first layout — the
         // layout below already sees the mutated tree
         eprintln!("[js] scripts mutated the DOM before layout");
-    }
-    #[cfg(feature = "count-alloc")]
+    }    #[cfg(feature = "count-alloc")]
     let h1 = heap_mb();
     kp.scripts = Some(scripts);
     let (page, form_names) = layout_page(
@@ -7211,7 +7216,16 @@ fn cache_write_in(
     };
     let mut out = format!("{now} {ttl} {tag}\n{}\n", ct.unwrap_or("")).into_bytes();
     out.extend_from_slice(bytes);
-    let _ = std::fs::write(dir.join(cache_key(url)), out);
+    // Atomically: the image prefetch (P65) writes while the script phase reads,
+    // and a reader must never see half an entry. The temp name is unique per
+    // writer so two threads fetching the same URL cannot interleave.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{}.{seq}.tmp", cache_key(url)));
+    if std::fs::write(&tmp, &out).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join(cache_key(url)));
+    }
+    let _ = std::fs::remove_file(&tmp);
 }
 
 // ---------- DOM snapshots (Phase 3) ----------
@@ -9583,6 +9597,45 @@ mod tests {
             cache_ttl(Some("max-age=99999999999")),
             CACHE_MAX_AGE_CAP
         );
+    }
+
+    /// The rejected image-prefetch experiment (SPIKE P65) still exposed a real
+    /// hazard: a reader can touch an entry while another lane writes it. A
+    /// write goes to a unique temp file and is renamed into place, so a reader
+    /// only ever sees a whole entry.
+    #[test]
+    fn cache_reader_never_sees_a_partial_entry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = test_dir("cache-race");
+        let body = vec![b'x'; 100_000];
+        let done = AtomicBool::new(false);
+        let reads = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..120 {
+                    cache_write_in(
+                        &dir,
+                        "https://race.com/",
+                        1000 + i,
+                        CACHE_TTL_SECS,
+                        &body,
+                        Some("text/plain"),
+                        None,
+                    );
+                }
+                done.store(true, Ordering::Relaxed);
+            });
+            while !done.load(Ordering::Relaxed) {
+                if let Some(e) = cache_read_in(&dir, "https://race.com/") {
+                    assert_eq!(e.body.len(), body.len(), "a read saw a partial body");
+                    assert!(e.body.iter().all(|&b| b == b'x'), "torn body");
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::yield_now();
+            }
+        });
+        assert!(reads.load(Ordering::Relaxed) > 0, "the reader raced the writer");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
