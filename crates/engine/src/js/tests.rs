@@ -1056,6 +1056,22 @@ fn json_round_trip() {
 }
 
 #[test]
+fn json_parse_keeps_plain_runs_and_escapes() {
+    // a long string with no escapes takes the slice fast path: the old loop
+    // copied one char per iteration and revalidated the whole remaining
+    // buffer each time, which was quadratic (133 KB cost 461 ms on github.com)
+    assert_eq!(
+        string("JSON.parse('\"' + 'x'.repeat(200000) + '\"').length"),
+        "200000"
+    );
+    // escapes still work, and a plain run after an escape is copied whole
+    assert_eq!(string(r#"JSON.parse('"a\\tb"') === 'a\tb'"#), "true");
+    assert_eq!(string(r#"JSON.parse('"\\u0041bc\\"d"')  === 'Abc"d'"#), "true");
+    // escape in the middle: plain run, escape, plain run
+    assert_eq!(string(r#"JSON.parse('"one\\ntwo\\u0041three"')  === 'one\ntwoAthree'"#), "true");
+}
+
+#[test]
 fn json_parse_errors_throw() {
     match err("JSON.parse('{')") {
         JsError::Throw(_) => {}

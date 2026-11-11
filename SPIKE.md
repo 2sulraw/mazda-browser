@@ -4606,3 +4606,32 @@ One row was worth a second look: `JSON.parse` 444 ms over 4 calls, i.e.
 ~110 ms for a single parse. The per-call log (added with P72) shows it is one
 133 KB parse, and that parse cost 461 ms: the string reader validated the
 entire remaining buffer once per character. Fixed in P72.
+
+## JSON string parsing was quadratic per character (P72, 2026-11-11)
+
+P71 left one native row that was pure overhead rather than page work:
+`JSON.parse` at 444-478 ms per load. The per-call log shows it is a single
+133 KB parse, and `Jp::string` had two problems on a string that size:
+
+- every plain character went through `String::push(char)` after decoding
+  `chars().next()`, so the string was built one code point at a time;
+- worse, each of those steps called `std::str::from_utf8` on the *whole
+  remaining buffer*, so one 133 KB string validated ~9 GB of bytes: O(n²).
+
+The reader now scans to the next `"` or `\`, validates that run once, and
+either returns it as-is (no escapes: no intermediate `String`) or appends it
+whole to the escape buffer. `n_json` also stops copying a `Str` argument with
+`to_string()`; a refcount bump replaces a 133 KB memcpy.
+
+| github.com warm load | before | after |
+|---|---|---|
+| `JSON.parse` 133 KB | 461 ms | 3-4 ms |
+| native total (122 776 calls) | 1271 ms | 220 ms |
+| `<react-app>` upgrade | 471 ms | 6-7 ms |
+| `[time] scripts` exec | 3.83 s / 3.84 s / 6.23 s | 3.23 s / 3.15 s |
+
+The `<react-app>` row moves with the parse because the page's React boot
+consumes exactly that payload: one quadratic loop cost ~0.9 s of the load,
+split across two rows. The exec row is noisier than the attributed rows (this
+host varies 60% run to run), so the attributed measurement is the one to
+trust; the run pair above is consistent with it but not controlled.

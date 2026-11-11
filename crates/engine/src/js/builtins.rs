@@ -1197,10 +1197,23 @@ pub(crate) fn json_parse_value(s: &str) -> Result<Val, JsError> {
 fn n_json(e: &mut JsEngine, idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     match idx {
         J_PARSE => {
-            let s = args
-                .first()
-                .map_or("".to_string(), |v| v.to_string());
-            json_parse_value(&s)
+            // a `Str` argument is already `Rc`d: cloning it is a refcount bump,
+            // while `to_string()` copied the whole payload (133 KB here)
+            let s: Rc<str> = match args.first() {
+                Some(Val::Str(s)) => s.clone(),
+                Some(v) => Rc::from(v.to_string().as_str()),
+                None => Rc::from(""),
+            };
+            let t = std::time::Instant::now();
+            let r = json_parse_value(&s);
+            if std::env::var_os("MAZDA_PROF").is_some() {
+                eprintln!(
+                    "[prof] JSON.parse {} KiB in {} ms",
+                    s.len() / 1024,
+                    t.elapsed().as_millis()
+                );
+            }
+            r
         }
         J_STRINGIFY => {
             let v = match args.first() {
@@ -1475,7 +1488,29 @@ impl<'a> Jp<'a> {
         if !self.lit("\"") {
             return self.err("expected string");
         }
-        let mut out = String::new();
+        // plain run of characters up to the closing quote or the first
+        // escape. The previous loop copied one char per iteration and
+        // revalidated *the whole remaining buffer* each time, which made a
+        // 133 KB JSON string quadratic: 461 ms of a 3.8 s page load.
+        let start = self.i;
+        while let Some(&c) = self.b.get(self.i) {
+            if c == b'"' || c == b'\\' {
+                break;
+            }
+            self.i += 1;
+        }
+        let run = std::str::from_utf8(&self.b[start..self.i])
+            .map_err(|_| JsError::throw("SyntaxError: invalid UTF-8 in JSON"))?;
+        if self.b.get(self.i) == Some(&b'"') {
+            // no escapes: hand out the slice, no intermediate String
+            self.i += 1;
+            return Ok(Val::Str(Rc::from(run)));
+        }
+        if self.b.get(self.i).is_none() {
+            return self.err("unterminated string");
+        }
+        let mut out = String::with_capacity(run.len() + 16);
+        out.push_str(run);
         loop {
             match self.b.get(self.i) {
                 None => return self.err("unterminated string"),
@@ -1528,13 +1563,17 @@ impl<'a> Jp<'a> {
                     }
                 }
                 Some(_) => {
-                    // copy one UTF-8 char
-                    let rest = &self.b[self.i..];
-                    let s = std::str::from_utf8(rest)
+                    // copy the next plain run in one go, validating it once
+                    let s0 = self.i;
+                    while let Some(&c) = self.b.get(self.i) {
+                        if c == b'"' || c == b'\\' {
+                            break;
+                        }
+                        self.i += 1;
+                    }
+                    let s = std::str::from_utf8(&self.b[s0..self.i])
                         .map_err(|_| JsError::throw("SyntaxError: invalid UTF-8 in JSON"))?;
-                    let c = s.chars().next().unwrap();
-                    out.push(c);
-                    self.i += c.len_utf8();
+                    out.push_str(s);
                 }
             }
         }
