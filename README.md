@@ -77,6 +77,12 @@ Sandbox behaviour (P2):
 - `MAZDA_SANDBOX=off` is a debugging escape hatch (local test servers,
   profilers); the normal path never uses it.
 
+Network (P63–P67): gzip and brotli request codings, an on-disk cache that
+honours `Cache-Control` and revalidates with `If-None-Match`. HTTP/2 is
+available with `MAZDA_HTTP2=1`: it shortens the multi-request phases, but a
+single warm document is measurably slower over it, so HTTP/1.1 stays the
+default until that is fixed (SPIKE P67/P68).
+
 Media (P3): `<video>` is a replaced element — layout sizes it from
 `width`/`height`, the worker fetches the file, parses the MP4 header (DRM and
 unsupported containers are refused before a decoder exists), and the renderer

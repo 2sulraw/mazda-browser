@@ -4403,43 +4403,84 @@ Two implementation notes worth keeping:
   `Content-Encoding: gzip` with an empty body on a 304, which used to fail the
   whole page with `unexpected end of file`.
 
-Cold, provably empty cache (`LOCALAPPDATA` pointed at a fresh dir), six
-alternating runs of the final binary:
+Cold, provably empty cache (`LOCALAPPDATA` pointed at a fresh dir), five
+alternating pairs. The first three were one binary, the last two a rebuild
+with the 304 fix; the fix does not touch a cold load (no validator is stored
+yet), so the pairs are comparable:
 
-| Run | Transport | Total | Module preload | Scripts |
-|---|---|---|---|---|
-| 1 | h2 | 13.79 s | 2.27 s | 5.31 s |
-| 2 | h1 | 14.67 s | 2.68 s | 5.47 s |
-| 3 | h2 | 13.76 s | 2.22 s | 5.15 s |
-| 4 | h1 | 15.16 s | 3.11 s | 5.77 s |
-| 5 | h2 | 15.17 s | 2.40 s | 5.39 s |
-| 6 | h1 | 17.58 s | 3.18 s | 8.16 s |
+| Pair | h2 total | h1 total | h2 module preload | h1 module preload | h2 scripts | h1 scripts |
+|---|---|---|---|---|---|---|
+| 1 | 13.79 s | 14.67 s | 2.27 s | 2.68 s | 5.31 s | 5.47 s |
+| 2 | 13.76 s | 15.16 s | 2.22 s | 3.11 s | 5.15 s | 5.77 s |
+| 3 | 15.17 s | 17.58 s | 2.40 s | 3.18 s | 5.39 s | 8.16 s |
+| 4 | 18.83 s | 17.34 s | 2.16 s | 2.98 s | 5.09 s | 5.94 s |
+| 5 | 15.95 s | 14.60 s | 2.08 s | 3.18 s | 4.94 s | 6.08 s |
+| **median** | **15.17 s** | **15.16 s** | **2.22 s** | **3.11 s** | **5.15 s** | **5.94 s** |
 
-h2 median **13.79 s** vs h1 **15.16 s** (mean 14.24 vs 15.80); every pair
-favours h2 by 0.9–2.4 s. The gain lands where the mechanism says it should:
-the phases *after* the first connection (`module preload`, `scripts`) get
-shorter, because they reuse the handshake instead of paying it again.
+So be precise about what this shows: the phases h2 targets are **shorter in
+every single run** (~0.9 s off module preload, ~0.8 s off scripts, because
+they reuse the handshake instead of paying it again), but the *total* is a
+tie — this link's variance (13.8–18.8 s for the same page) is bigger than the
+effect. h2 won 3 of 5 pairs.
 
-Warm (HTTP cache populated, DOM snapshot removed so only the document is
-fetched): h2 4.30/4.70 s vs h1 4.63/5.13 s. Warm breakdown of the h2 run:
+Warm, fresh process (HTTP cache populated, DOM snapshot removed so only the
+document is fetched): h2 4.30/4.49/4.70/5.59 s vs h1 4.00/4.04/4.04/4.63 s.
+h2 is **slower by ~0.45 s** here: the document fetch is one request, and h2
+pays its extra setup round trip where h1 does not.
+
+Warm, **one renderer process doing two loads** (the product's shape: the
+renderer survives navigation, so the connection pool and TLS session cache
+persist). Each transport started from an identical copy of the cache:
+
+| Transport | Second load | Document fetch |
+|---|---|---|
+| h1 | 3.57 / 3.58 / 3.61 s (median 3.58) | 0.46–0.83 s |
+| h2 | 3.21 / 3.89 / 4.27 s (median 3.89) | 0.49–1.33 s |
+
+Still no win for the single-request case. The cold page-load phases are where
+h2 helps; a reopened page does not exercise them. See P68 for the decision
+this led to.
+
+Warm breakdown (h1, one request):
 
 ```
-[net] 1421.0 ms        0 B https://github.com/ (304)
+[net]  461.9 ms        0 B https://github.com/ (304)
 [time] scripts: 1649 ms (fetch 41 ms, exec 1608 ms)
 [time] cascade + box tree: 775 ms
 ...
 [nav] worker finished https://github.com/ in 4309 ms
 ```
 
-That is the useful new baseline: on a warm page the network is **1.4 s** and
-the engine is **2.8 s**, so the next lever is JavaScript execution and
-style/layout, not transport. Cold, the network still dominates (13.8 s), and
-the remaining transport item is per-origin lanes / connection warm-up, not
-more multiplexing.
+That is the useful new baseline: on a warm page the network is **~0.5–1.4 s**
+and the engine is **~2.8 s**, so the next lever is JavaScript execution and
+style/layout, not transport.
 
 - engine tests **1027 -> 1029** green (new
   `gzip_body_decodes_to_the_identity_bytes` and
   `a_304_answers_from_the_cache_and_ignores_the_content_coding`).
+
+## HTTP/2 stays opt-in (P68, 2026-11-11)
+
+The obvious next step was to make h2 the default. The measurements above say
+no, and the rule is one measured change per commit, so this one is a decision
+with no code:
+
+- cold totals: **tie** (median 15.17 vs 15.16 s over five pairs);
+- warm, fresh process: h1 faster by **0.45 s**;
+- warm, same process: h1 faster by **~0.3 s**;
+- the multi-request phases: h2 faster by **~0.9 s** (module preload) and
+  **~0.8 s** (scripts) *every* run.
+
+Reopened pages are the common case once the cache is warm (assets are
+`immutable` for a year, the document is one request), and that is exactly the
+case h2 loses. Shipping h2 by default would trade a measured loss on the
+common path for a gain on the rare one, so `MAZDA_HTTP2=1` stays the switch.
+
+The interesting open question is *why* the single-request case is slower:
+even with a warm pool the document fetch is 0.5–1.3 s over h2 against
+0.46–0.83 s over h1, which looks like the idle connection is not being reused
+(h2 pays its setup round trip again). If that is fixed, h2 should win warm
+too. That deserves its own spike rather than a guess.
 
 
 
