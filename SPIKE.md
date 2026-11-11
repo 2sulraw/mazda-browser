@@ -4524,3 +4524,42 @@ The other two `[badcall]`s on the page are inside `try`/`catch` blocks:
 core-2d2c... probes `Intl.DateTimeFormat().resolvedOptions()` (that prototype
 only has `format`), and pb-... builds a `ClipboardItem` to test clipboard
 support. Both are candidates for a later measured pass, not page blockers.
+
+## h2 flow-control windows are not the warm-load penalty (P70, 2026-11-11)
+
+P68 left one open question: why is a warm one-request h2 load slower than h1?
+The first hypothesis was h2's default 64 KiB stream/connection window: a
+525 KB document would then stall about once per window waiting for a
+WINDOW_UPDATE round trip. `hyper-util` exposes the knobs, so the client was
+changed to `http2_adaptive_window(true)` plus a 1 MiB stream / 8 MiB
+connection window and measured against the untouched client.
+
+Method: 10 warm loads, fresh process each, alternating old and new client,
+HTTP/2, with the document cache entry deleted before every run so all ten
+transfers are 200s of the same 525 KB body (otherwise a lucky 304 hides the
+body path). Metric is the `[net]` line for the document.
+
+| Client | Document fetch (ms) |
+|---|---|
+| old windows | 1952, 2092, 1953, 4146, 4109 (median 2092) |
+| new windows | 2068, 2012, 2201, 3986, 2457 (median 2202) |
+
+Paired differences (new - old): +116, -80, +248, -160, -1652 ms. Mixed signs,
+no consistent direction; the two ~4 s pairs are a network slowdown that hit
+both clients. **Rejected**: the change was reverted, the client keeps the
+hyper defaults.
+
+So the warm penalty is not flow control. Two other observations from the same
+session:
+
+- 525 KB of HTML takes 1.9-4.1 s on this link today (~250 KB/s), which is
+  larger than the 0.3-0.45 s h2 penalty P68 measured. Warm h1/h2 comparisons
+  are dominated by whatever the network is doing, which is why P68 needed
+  alternation to see anything at all.
+- In a 10-run h1/h2 alternation, h1 got 2/5 304s and h2 0/5. Both paths build
+  the same header list (`If-None-Match` included, app.rs), so this is the
+  rotating github.com ETag, not a transport difference.
+
+Conclusion: `MAZDA_HTTP2=1` stays opt-in (P68 unchanged). To learn anything
+more about warm h2 the next step would have to count TLS handshakes/reused
+connections directly rather than compare wall-clock single requests.
