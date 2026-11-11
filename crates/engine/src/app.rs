@@ -6322,9 +6322,12 @@ const MEDIA_PREFIX_BYTES: usize = 64 * 1024;
 /// `Range` and `bytes` is the whole body (which is then cached as usual); a
 /// partial body is never written to the HTTP cache as if it were whole.
 fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
-    if let Some(hit) = cache_read_in(&cache_dir(), url, now_secs()) {
-        eprintln!("[cache] hit {url}");
-        return Ok((hit.0, true));
+    let now = now_secs();
+    if let Some(hit) = cache_read_in(&cache_dir(), url) {
+        if hit.fresh(now) {
+            eprintln!("[cache] hit {url}");
+            return Ok((hit.body, true));
+        }
     }
     let t_net = Instant::now();
     let mut req = http_agent()
@@ -6341,6 +6344,7 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
     let complete = resp.status() == 200;
     let content_type = resp.header("content-type").map(|s| s.to_string());
     let ttl = cache_ttl(resp.header("cache-control"));
+    let etag = resp.header("etag").map(|s| s.to_string());
     // a `200` means the Range was ignored: read the whole body like `fetch`
     const CAP: usize = 20 * 1024 * 1024;
     let want = if complete { CAP } else { limit };
@@ -6359,7 +6363,15 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
         }
     }
     if complete {
-        cache_write_in(&cache_dir(), url, now_secs(), ttl, &buf, content_type.as_deref());
+        cache_write_in(
+            &cache_dir(),
+            url,
+            now_secs(),
+            ttl,
+            &buf,
+            content_type.as_deref(),
+            etag.as_deref(),
+        );
     }
     if std::env::var_os("MAZDA_TIME").is_some() {
         eprintln!(
@@ -7088,11 +7100,35 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Entry format: `<unix-secs> <ttl>\n<content-type>\n<body>`. A file written
-/// by the older single-number format still parses (default TTL). None =
-/// miss/expired. `ttl == 0` means "do not serve from disk" (`no-store`/
-/// `no-cache`/`max-age=0`), matching what Chrome does for a document.
-fn cache_read_in(dir: &std::path::Path, url: &str, now: u64) -> Option<(Vec<u8>, Option<String>)> {
+/// One disk-cache entry. Format:
+/// `<unix-secs> <ttl> <etag>\n<content-type>\n<body>`.
+///
+/// `-` stands for "no validator". An entry written by an earlier format (no
+/// ttl field, or no etag field) still parses; the missing field takes the
+/// default TTL / no validator. A stale entry is returned rather than dropped,
+/// because the response body is what a 304 has to be answered with.
+#[derive(Debug, PartialEq, Eq)]
+struct CacheEntry {
+    body: Vec<u8>,
+    ct: Option<String>,
+    /// `ETag` from the response that produced `body`; `If-None-Match` for the
+    /// next request. ETag syntax has no spaces or newlines, so the first line
+    /// stays whitespace-splittable.
+    etag: Option<String>,
+    ts: u64,
+    ttl: u64,
+}
+
+impl CacheEntry {
+    /// `ttl == 0` (`no-store`/`no-cache`/`max-age=0`) never serves from disk:
+    /// it is a body kept only to answer a revalidation.
+    fn fresh(&self, now: u64) -> bool {
+        // clock skew is treated as stale: the safe direction
+        self.ttl > 0 && now.saturating_sub(self.ts) < self.ttl
+    }
+}
+
+fn cache_read_in(dir: &std::path::Path, url: &str) -> Option<CacheEntry> {
     let data = std::fs::read(dir.join(cache_key(url))).ok()?;
     let nl1 = data.iter().position(|&b| b == b'\n')?;
     let head = std::str::from_utf8(&data[..nl1]).ok()?;
@@ -7102,24 +7138,26 @@ fn cache_read_in(dir: &std::path::Path, url: &str, now: u64) -> Option<(Vec<u8>,
         .next()
         .and_then(|s| s.parse().ok())
         .unwrap_or(CACHE_TTL_SECS);
-    if ttl == 0 || now.saturating_sub(ts) >= ttl {
-        return None; // expired (clock skew treated as stale, safe direction)
-    }
+    let etag = fields
+        .next()
+        .filter(|s| *s != "-")
+        .map(|s| s.to_string());
     let rest = &data[nl1 + 1..];
     let nl2 = rest.iter().position(|&b| b == b'\n')?;
     let ct = std::str::from_utf8(&rest[..nl2]).ok()?.to_string();
-    Some((
-        rest[nl2 + 1..].to_vec(),
-        (!ct.is_empty()).then_some(ct),
-    ))
+    Some(CacheEntry {
+        body: rest[nl2 + 1..].to_vec(),
+        ct: (!ct.is_empty()).then_some(ct),
+        etag,
+        ts,
+        ttl,
+    })
 }
 
 /// Cache lifetime from `Cache-Control`: `max-age=N`, capped at a year.
-/// `no-store` / `no-cache` answer 0 ("always refetch"); a response without the
-/// header keeps the 5-minute default. shortcut: `Expires` is not parsed — every
-/// site this engine loads sends `max-age` — and no conditional revalidation is
-/// attempted, so a long `max-age` is trusted the way Chrome trusts
-/// `immutable`.
+/// `no-store` / `no-cache` answer 0 ("always revalidate"); a response without
+/// the header keeps the 5-minute default. shortcut: `Expires` is not parsed —
+/// every site this engine loads sends `max-age`.
 fn cache_ttl(cc: Option<&str>) -> u64 {
     let Some(cc) = cc else {
         return CACHE_TTL_SECS;
@@ -7147,6 +7185,7 @@ fn cache_write_in(
     ttl: u64,
     bytes: &[u8],
     ct: Option<&str>,
+    etag: Option<&str>,
 ) {
     if bytes.len() > CACHE_MAX_BODY {
         return; // huge bodies aren't worth nav latency or disk
@@ -7165,7 +7204,12 @@ fn cache_write_in(
             }
         }
     }
-    let mut out = format!("{now} {ttl}\n{}\n", ct.unwrap_or("")).into_bytes();
+    // a validator containing whitespace would break the first line's split
+    let tag = match etag {
+        Some(e) if !e.contains(char::is_whitespace) => e,
+        _ => "-",
+    };
+    let mut out = format!("{now} {ttl} {tag}\n{}\n", ct.unwrap_or("")).into_bytes();
     out.extend_from_slice(bytes);
     let _ = std::fs::write(dir.join(cache_key(url)), out);
 }
@@ -7358,9 +7402,16 @@ fn fetch_accept(
         return data_url_body(url).ok_or_else(|| format!("malformed data: url {url:?}"));
     }
     let dir = cache_dir();
-    if let Some(hit) = cache_read_in(&dir, url, now_secs()) {
-        eprintln!("[cache] hit {url}");
-        return Ok(hit);
+    let now = now_secs();
+    // A stale entry is kept, not discarded: its body answers a 304 and its
+    // ETag is what turns a re-download into one round trip.
+    let mut stored = None;
+    if let Some(hit) = cache_read_in(&dir, url) {
+        if hit.fresh(now) {
+            eprintln!("[cache] hit {url}");
+            return Ok((hit.body, hit.ct));
+        }
+        stored = Some(hit);
     }
     let t_net = Instant::now();
     let mut req = http_agent().get(url);
@@ -7370,14 +7421,38 @@ fn fetch_accept(
     if let Some(c) = cookie::request_header(url) {
         req = req.set("Cookie", &c);
     }
+    if let Some(tag) = stored.as_ref().and_then(|c| c.etag.as_deref()) {
+        req = req.set("If-None-Match", tag);
+    }
     let resp = req.call().map_err(|e| e.to_string())?;
     cookie::store_response(url, &set_cookie_values(&resp));
+    // Not Modified: the stored body is still current. Refresh its timestamp
+    // (and its lifetime, if the 304 carries one) so the rest of this page load
+    // does not ask again.
+    if resp.status() == 304 {
+        let c = stored.ok_or_else(|| format!("304 without a cached body for {url}"))?;
+        let ttl = match resp.header("cache-control") {
+            Some(cc) => cache_ttl(Some(cc)),
+            None => c.ttl,
+        };
+        cache_write_in(&dir, url, now, ttl, &c.body, c.ct.as_deref(), c.etag.as_deref());
+        if std::env::var_os("MAZDA_TIME").is_some() {
+            eprintln!(
+                "[net] {:6.1} ms {:8} B {} (304)",
+                t_net.elapsed().as_secs_f64() * 1000.0,
+                0,
+                log_url(url)
+            );
+        }
+        return Ok((c.body, c.ct));
+    }
     let content_type = resp.header("content-type").map(|s| s.to_string());
     // `Cache-Control` decides how long the disk entry may be reused: GitHub's
     // hashed bundles are `max-age=31536000, immutable`, its HTML is
     // `max-age=0, private, must-revalidate`. Ignoring this used to re-download
     // the whole page after 5 minutes.
     let ttl = cache_ttl(resp.header("cache-control"));
+    let etag = resp.header("etag").map(|s| s.to_string());
     // into_reader transparently gunzips (ureq gzip feature); cap at 20MB like a browser
     const CAP: usize = 20 * 1024 * 1024;
     let mut reader = resp.into_reader();
@@ -7390,7 +7465,15 @@ fn fetch_accept(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    cache_write_in(&dir, url, now_secs(), ttl, &buf, content_type.as_deref());
+    cache_write_in(
+        &dir,
+        url,
+        now_secs(),
+        ttl,
+        &buf,
+        content_type.as_deref(),
+        etag.as_deref(),
+    );
     if std::env::var_os("MAZDA_TIME").is_some() {
         eprintln!(
             "[net] {:6.1} ms {:8} B {}",
@@ -9398,30 +9481,34 @@ mod tests {
             CACHE_TTL_SECS,
             b"hello",
             Some("text/html"),
+            None,
         );
         // fresh read returns body + content-type
+        let hit = cache_read_in(&dir, "https://x.com/").unwrap();
         assert_eq!(
-            cache_read_in(&dir, "https://x.com/", 1000 + CACHE_TTL_SECS - 1),
-            Some((b"hello".to_vec(), Some("text/html".to_string())))
+            hit,
+            CacheEntry {
+                body: b"hello".to_vec(),
+                ct: Some("text/html".to_string()),
+                etag: None,
+                ts: 1000,
+                ttl: CACHE_TTL_SECS,
+            }
         );
-        // expired
-        assert_eq!(
-            cache_read_in(&dir, "https://x.com/", 1000 + CACHE_TTL_SECS),
-            None
-        );
+        // still fresh one second before the TTL, stale at it
+        assert!(hit.fresh(1000 + CACHE_TTL_SECS - 1));
+        assert!(!hit.fresh(1000 + CACHE_TTL_SECS));
         // different URL = miss (FNV key differs)
-        assert_eq!(cache_read_in(&dir, "https://y.com/", 1000), None);
+        assert_eq!(cache_read_in(&dir, "https://y.com/"), None);
         // a response with a year-long max-age outlives the old 5-minute
         // boundary, and its own TTL still expires it
-        cache_write_in(&dir, "https://a.com/", 1000, 86_400, b"a", None);
-        assert_eq!(
-            cache_read_in(&dir, "https://a.com/", 1000 + 20_000).map(|h| h.0),
-            Some(b"a".to_vec())
-        );
-        assert_eq!(cache_read_in(&dir, "https://a.com/", 1000 + 86_400), None);
-        // ttl 0 means "always refetch" (no-store / max-age=0)
-        cache_write_in(&dir, "https://b.com/", 1000, 0, b"b", None);
-        assert_eq!(cache_read_in(&dir, "https://b.com/", 1000), None);
+        cache_write_in(&dir, "https://a.com/", 1000, 86_400, b"a", None, None);
+        let a = cache_read_in(&dir, "https://a.com/").unwrap();
+        assert!(a.fresh(1000 + 20_000));
+        assert!(!a.fresh(1000 + 86_400));
+        // ttl 0 means "never serve from disk" (no-store / max-age=0)
+        cache_write_in(&dir, "https://b.com/", 1000, 0, b"b", None, None);
+        assert!(!cache_read_in(&dir, "https://b.com/").unwrap().fresh(1000));
         // an entry from the old single-number format still parses
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -9429,10 +9516,53 @@ mod tests {
             b"1000\ntext/plain\nold",
         )
         .unwrap();
-        assert_eq!(
-            cache_read_in(&dir, "https://old.com/", 1000 + 60).map(|h| h.0),
-            Some(b"old".to_vec())
+        let old = cache_read_in(&dir, "https://old.com/").unwrap();
+        assert_eq!(old.body, b"old");
+        assert_eq!(old.ttl, CACHE_TTL_SECS);
+        assert!(old.fresh(1000 + 60));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_keeps_the_validator_for_revalidation() {
+        let dir = test_dir("cache-etag");
+        let tag = "W/\"e45b698b3519d765491286052229fbe2\"";
+        // `max-age=0`: never fresh, but the body and the ETag survive so a
+        // later 304 can be answered without downloading it again
+        cache_write_in(
+            &dir,
+            "https://x.com/",
+            1000,
+            0,
+            b"doc",
+            Some("text/html"),
+            Some(tag),
         );
+        let hit = cache_read_in(&dir, "https://x.com/").unwrap();
+        assert!(!hit.fresh(1000), "max-age=0 is never served from disk");
+        assert_eq!(hit.etag.as_deref(), Some(tag));
+        assert_eq!(hit.body, b"doc");
+        // answering that 304 rewrites the entry with the new timestamp
+        cache_write_in(
+            &dir,
+            "https://x.com/",
+            2000,
+            0,
+            &hit.body,
+            hit.ct.as_deref(),
+            hit.etag.as_deref(),
+        );
+        let again = cache_read_in(&dir, "https://x.com/").unwrap();
+        assert_eq!((again.ts, again.ttl), (2000, 0));
+        assert_eq!(again.etag.as_deref(), Some(tag));
+        // no validator stores `-` and reads back as None
+        cache_write_in(&dir, "https://n.com/", 1000, 60, b"n", None, None);
+        assert_eq!(cache_read_in(&dir, "https://n.com/").unwrap().etag, None);
+        // a validator that would break the header line is dropped, not written
+        cache_write_in(&dir, "https://w.com/", 1000, 60, b"w", None, Some("bad tag"));
+        let w = cache_read_in(&dir, "https://w.com/").unwrap();
+        assert_eq!(w.etag, None);
+        assert_eq!(w.body, b"w");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9459,8 +9589,8 @@ mod tests {
     fn cache_oversized_body_not_stored() {
         let dir = test_dir("cache-big");
         let big = vec![0u8; CACHE_MAX_BODY + 1];
-        cache_write_in(&dir, "https://x.com/", 1000, CACHE_TTL_SECS, &big, None);
-        assert_eq!(cache_read_in(&dir, "https://x.com/", 1000), None);
+        cache_write_in(&dir, "https://x.com/", 1000, CACHE_TTL_SECS, &big, None, None);
+        assert_eq!(cache_read_in(&dir, "https://x.com/"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

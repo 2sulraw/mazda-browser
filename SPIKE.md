@@ -4225,6 +4225,62 @@ is P64's target, not this change's.
 - `cache_roundtrip_and_ttl` now also covers a year-long `max-age`, ttl 0 and
   the old entry format.
 
+## Conditional revalidation, and why github.com cannot use it (P64, 2026-11-11)
+
+After P63 the only request a reopened `github.com` still makes is the
+document itself (`max-age=0, private, must-revalidate`). A validator should
+turn that 525 KB download into one round trip.
+
+What the cache does now:
+
+- the entry remembers the response `ETag` (`<ts> <ttl> <etag>\n<ct>\n<body>`,
+  `-` = none). A stale entry is **returned**, not dropped, because its body is
+  what answers a 304.
+- `fetch_accept` sends `If-None-Match` when the entry has one. A 304 returns
+  the stored body and restarts the entry's clock (lifetime from the 304's own
+  `Cache-Control` when it carries one, else the entry's).
+- a validator containing whitespace would break the header line, so it is
+  dropped rather than written.
+
+Measured against a local server that honours validators
+(`max-age=0` + a stable ETag):
+
+| Request | Wire | Time |
+|---|---|---|
+| first (200) | 136 093 B | 3.3 ms |
+| second (`If-None-Match: "v1"`) | **0 B** | 14.6 ms |
+
+The server logged `304 inm="v1"`, i.e. the validator really travelled.
+
+Measured against `github.com`: **no 304 is possible.** GitHub rotates the
+HTML ETag on every response:
+
+```
+ETag: W/"ae7999c259be6c8921167e54a60c6720"
+GET with If-None-Match: that value + the same cookie jar -> 200, 525 924 B
+next GET -> ETag: W/"e7a805d7764e885332894cebd3cd6a79"
+```
+
+So the document always comes back in full; on a warm cache it is still the
+4.2 s → 2.8 s item. That is worth recording because it redirects effort: the
+document cost is **latency, not bytes** (525 KB decompresses to ~92 KB on the
+wire, so transfer is not what takes 3 s).
+
+Supporting measurement — connection reuse, not multiplexing, is the lever:
+
+```
+curl https://github.com/ https://github.com/
+  req1 appconnect 1.151 s  ttfb 1.575 s
+  req2 appconnect 0.000 s  ttfb 0.394 s
+```
+
+A fresh connection pays ~1.2 s of TLS before the server even sees the
+request; a warm one answers in 0.4 s. Our cold page opens 6+ connections and
+pays that each time, which is what P65/P67 go after.
+
+- engine tests **1024 -> 1025** green (new
+  `cache_keeps_the_validator_for_revalidation`).
+
 
 
 
