@@ -7,6 +7,7 @@
 
 use super::interp::{date_parts, fmt_date_iso, slice_bounds};
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// `new` vs plain call distinction for constructor natives: during a
 /// constructor call `this` is a fresh empty object, never the global.
@@ -360,12 +361,26 @@ pub(crate) fn install(e: &mut JsEngine) {
     let nf_ctor = e.register_native("Intl.NumberFormat", n_intl, 3);
     e.set_native_prop(nf_ctor, "prototype", nf_proto.clone());
     link_ctor(&nf_proto, Val::Native(nf_ctor));
+    // `Intl.Segmenter`: GitHub's landing-pages tabbable build does
+    // `"u">typeof Intl ? new Intl.Segmenter : 0` at module scope, so a
+    // missing constructor aborted the whole bundle with
+    // "undefined is not a function".
+    let seg_proto = Val::new_object();
+    let seg = e.register_native("Intl.Segmenter.prototype.segment", n_segmenter, 1);
+    obj_set_own(own(&seg_proto), "segment", Val::Native(seg));
+    let seg_ro = e.register_native("Intl.Segmenter.prototype.resolvedOptions", n_segmenter, 2);
+    obj_set_own(own(&seg_proto), "resolvedOptions", Val::Native(seg_ro));
+    let seg_ctor = e.register_native("Intl.Segmenter", n_segmenter, 0);
+    e.set_native_prop(seg_ctor, "prototype", seg_proto.clone());
+    link_ctor(&seg_proto, Val::Native(seg_ctor));
     let intl = Val::new_object();
     obj_set_own(own(&intl), "DateTimeFormat", Val::Native(dtf_ctor));
     obj_set_own(own(&intl), "NumberFormat", Val::Native(nf_ctor));
+    obj_set_own(own(&intl), "Segmenter", Val::Native(seg_ctor));
     e.set_global("Intl", intl);
     e.intl_dtf_proto = Some(own(&dtf_proto).clone());
     e.intl_nf_proto = Some(own(&nf_proto).clone());
+    e.intl_seg_proto = Some(own(&seg_proto).clone());
 
     // -- conversions + numeric globals --------------------------------------
     let str_id = e.register_native("String", n_convert, 0);
@@ -3186,6 +3201,75 @@ fn intl_get(e: &mut JsEngine, state: &Val, key: &str) -> Result<Option<Val>, JsE
     } else {
         Some(v)
     })
+}
+
+/// `Intl.Segmenter` (ES2022): default granularity is extended grapheme
+/// clusters; `word`/`sentence` use the same UAX #29 boundaries the
+/// `unicode-segmentation` crate implements. Shortcut: no locale data (the
+/// locale is always reported as `en-US`), and `segment()` returns a plain
+/// array - iterable, which is what `[...segmenter.segment(s)]` needs - instead
+/// of a Segments object with `containing()`.
+fn n_segmenter(e: &mut JsEngine, idx: u16, this: &Val, args: &[Val]) -> Result<Val, JsError> {
+    if idx == 0 {
+        let inst = proto_instance(e.intl_seg_proto.clone());
+        let mut gran = "grapheme";
+        if let Some(v) = intl_option(e, args.get(1), "granularity")? {
+            let g = v.to_string();
+            gran = match g.as_str() {
+                "grapheme" | "word" | "sentence" => match g.as_str() {
+                    "word" => "word",
+                    "sentence" => "sentence",
+                    _ => "grapheme",
+                },
+                _ => {
+                    return Err(JsError::throw(&format!(
+                        "RangeError: invalid granularity {g:?}"
+                    )))
+                }
+            };
+        }
+        let state = Val::new_object();
+        obj_set_own(own(&state), "gran", Val::Str(Rc::from(gran)));
+        obj_set_own(own(&inst), INTL_STATE, state);
+        return Ok(inst);
+    }
+    let state = intl_state(this)?;
+    let gran = intl_get(e, &state, "gran")?
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "grapheme".to_string());
+    if idx == 2 {
+        let o = Val::new_object();
+        obj_set_own(own(&o), "locale", Val::Str(Rc::from("en-US")));
+        obj_set_own(own(&o), "granularity", Val::Str(Rc::from(gran.as_str())));
+        return Ok(o);
+    }
+    let input = args.first().cloned().unwrap_or(Val::Undefined).to_string();
+    Ok(segments_value(&input, &gran))
+}
+
+/// One `{segment, index, input}` entry per boundary; `index` is measured in
+/// the engine's string units (code points, like `String.prototype.length`),
+/// not UTF-16 code units.
+fn segments_value(input: &str, gran: &str) -> Val {
+    let mut items = Vec::new();
+    let mut cursor = 0usize;
+    let mut add = |seg: &str, index: usize| {
+        let o = Val::new_object();
+        obj_set_own(own(&o), "segment", Val::Str(Rc::from(seg)));
+        obj_set_own(own(&o), "index", Val::Num(index as f64));
+        obj_set_own(own(&o), "input", Val::Str(Rc::from(input)));
+        items.push(o);
+    };
+    let parts: Vec<&str> = match gran {
+        "word" => input.split_word_bounds().collect(),
+        "sentence" => input.unicode_sentences().collect(),
+        _ => input.graphemes(true).collect(),
+    };
+    for seg in parts {
+        add(seg, cursor);
+        cursor += seg.chars().count();
+    }
+    Val::new_array(items)
 }
 
 const MONTHS_SHORT: [&str; 12] = [

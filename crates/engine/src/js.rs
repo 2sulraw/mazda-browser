@@ -1629,6 +1629,9 @@ pub struct JsEngine {
     /// instances keep the options under a hidden `__intl` prop
     pub(crate) intl_dtf_proto: Option<Rc<RefCell<Obj>>>,
     pub(crate) intl_nf_proto: Option<Rc<RefCell<Obj>>>,
+    /// `Intl.Segmenter.prototype`; instances keep the granularity under the
+    /// same hidden `__intl` prop as the formatting constructors
+    pub(crate) intl_seg_proto: Option<Rc<RefCell<Obj>>>,
     /// reused native ids for the Uint8Array/Buffer stand-ins (avoids
     /// registering a new native per created instance)
     pub(crate) uint8_to_b64: usize,
@@ -1792,6 +1795,7 @@ impl Drop for JsEngine {
         self.text_decoder_proto = None;
         self.intl_dtf_proto = None;
         self.intl_nf_proto = None;
+        self.intl_seg_proto = None;
         self.arraybuffer_proto = None;
         self.typed_proto = None;
         self.data_view_proto = None;
@@ -1896,6 +1900,7 @@ impl JsEngine {
             text_decoder_proto: None,
             intl_dtf_proto: None,
             intl_nf_proto: None,
+            intl_seg_proto: None,
             uint8_to_b64: 0,
             buffer_to_string: 0,
             arraybuffer_proto: None,

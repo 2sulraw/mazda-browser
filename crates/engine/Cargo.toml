@@ -58,6 +58,11 @@ optional = true
 [dependencies.flate2]
 version = "1"
 
+# `Intl.Segmenter`: extended grapheme clusters (UAX #29) and word/sentence
+# boundaries. Already in the lock file through eframe's text layout.
+[dependencies.unicode-segmentation]
+version = "1"
+
 # HTTP `Content-Encoding: br`. Not ureq's `brotli` feature: that one pins
 # brotli-decompressor 4.0.0, which this project's offline registry does not
 # carry. 5.0.3 is available, so the header and the decode are ours.

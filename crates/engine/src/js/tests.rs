@@ -1874,6 +1874,39 @@ fn intl_date_time_and_number_format() {
 }
 
 #[test]
+fn intl_segmenter_splits_graphemes() {
+    // github.com's landing-pages tabbable build evaluates
+    // `"u">typeof Intl ? new Intl.Segmenter : 0` at module scope and calls
+    // `[...segmenter.segment(text)].map(s => s.segment)`; a missing
+    // Segmenter aborted the whole bundle with "undefined is not a function".
+    assert!(boolean("new Intl.Segmenter() instanceof Intl.Segmenter"));
+    // extended grapheme clusters: a ZWJ family emoji stays one segment
+    assert_eq!(
+        string("[...new Intl.Segmenter().segment('a👨‍👩‍👧b')].map(s => s.segment).join('|')"),
+        "a|👨‍👩‍👧|b"
+    );
+    // `index` counts the engine's string units (code points)
+    assert_eq!(
+        string("[...new Intl.Segmenter().segment('a👨‍👩‍👧b')].map(s => s.index).join(',')"),
+        "0,1,6"
+    );
+    // combining mark stays with its base
+    assert_eq!(
+        string("new Intl.Segmenter().segment('e\u{301}x').length"),
+        "2"
+    );
+    // word granularity: every code point is accounted for exactly once
+    assert_eq!(
+        string("[...new Intl.Segmenter(void 0,{granularity:'word'}).segment('hi there!')].map(s => s.segment).join('')"),
+        "hi there!"
+    );
+    assert_eq!(
+        string("new Intl.Segmenter(void 0,{granularity:'sentence'}).resolvedOptions().granularity"),
+        "sentence"
+    );
+}
+
+#[test]
 fn timers_queue_only() {
     let mut e = JsEngine::new();
     e.exec("let calls = 0; setTimeout(function(x) { calls += x }, 100, 5); setTimeout(function() {}, 0)")

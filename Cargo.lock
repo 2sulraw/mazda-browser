@@ -1954,6 +1954,7 @@ dependencies = [
  "png 0.17.16",
  "rustls",
  "tokio",
+ "unicode-segmentation",
  "ureq",
  "url",
  "webpki-roots 0.26.11",

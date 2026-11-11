@@ -4482,11 +4482,45 @@ even with a warm pool the document fetch is 0.5–1.3 s over h2 against
 (h2 pays its setup round trip again). If that is fixed, h2 should win warm
 too. That deserves its own spike rather than a guess.
 
+## `Intl.Segmenter` removes the last github.com script error (P69, 2026-11-11)
 
+Cold github.com was down to a single uncaught error:
 
+```
+[js] script error in https://github.githubassets.com/assets/landing-pages-7116aae34b5bcfcd.js:
+     ... (throw in .../wp-runtime-4adecc5a339f60b0.js): Uncaught TypeError:
+     undefined is not a function (at 2:78064 of .../wp-runtime-...js)
+     near `Object.defineProperty(e,Symbol.toStringTag,{value:"Module"}),`
+```
 
+The reported span was stale. `call_span` is now read against `call_src`
+(P69a), but even with the right source the span had been set by the last
+explicit `Call` in the webpack runtime while the throw came from an
+*implicit* call (a `new`) inside landing-pages' `D8E` module. Walking the AST
+down to the executing statement - `cur_span`, then the quoted tokens - landed
+on tabbable's module-scope feature test:
 
+```js
+let cU,cq,cW,cJ="u">typeof Intl?new Intl.Segmenter:0,...
+```
 
+`Intl` exists in this engine but `Intl.Segmenter` did not, so the bundle's own
+feature test passed and `new Intl.Segmenter` threw while the module was
+evaluated, aborting all of `landing-pages`.
 
+Fix: implement `Intl.Segmenter` over `unicode-segmentation` 1.13.3 (already in
+the lock file through eframe's text layout - no new download): extended
+grapheme clusters by default, `word`/`sentence` when asked, `segment()`
+returns the `{segment, index, input}` entries as a plain array (iterable, all
+`[...s.segment(x)]` needs), and `resolvedOptions()` reports the granularity.
+Shortcut: no locale data, so the locale is always `en-US`, and the result has
+no `containing()`.
 
+Measured: cold github.com script errors **1 -> 0** (the only one it had), same
+frame size and title, no new `[net]`/`[js]` errors, `[mem] after layout`
+319.2 MB. engine tests **1030 -> 1031**.
 
+The other two `[badcall]`s on the page are inside `try`/`catch` blocks:
+core-2d2c... probes `Intl.DateTimeFormat().resolvedOptions()` (that prototype
+only has `format`), and pb-... builds a `ClipboardItem` to test clipboard
+support. Both are candidates for a later measured pass, not page blockers.
