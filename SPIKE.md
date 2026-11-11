@@ -4187,6 +4187,44 @@ ignored the `this` it was handed. A plain `new Event` looked fine, but from
   inside the listener, and a true `dispatchEvent` result).
 - both pages run with **no script errors** after the change.
 
+## `Cache-Control` decides the disk-cache lifetime (P63, 2026-11-11)
+
+Opening `github.com` after more than five minutes took **23.8 s**; Chromium
+re-opens the same page in about a second. The engine had one fixed TTL for
+every URL, so a page whose assets are `immutable` was re-downloaded in full
+once the TTL lapsed:
+
+```
+Cache-Control: public, max-age=31536000, immutable   // every githubassets bundle
+Cache-Control: max-age=0, private, must-revalidate   // the github.com document
+```
+
+The cache now reads the header instead of assuming:
+
+- `max-age=N` is the entry lifetime, capped at one year (a bogus header must
+  not pin a URL forever).
+- `no-store`, `no-cache` and `max-age=0` answer 0: never served from disk.
+  The body is still written, because a revalidation (P64) needs it to answer
+  a 304.
+- no `Cache-Control` at all keeps the old 300 s default.
+- entry format is now `<unix-secs> <ttl>\n<content-type>\n<body>`; an entry
+  from the single-number format still parses with the default TTL.
+
+Measured on the real page (`MAZDA_TIME=1`, 68 requests / 9.34 MB cold):
+
+| State of the cache | Net requests | Page time |
+|---|---|---|
+| 44 min old, fixed-TTL code | 68 | 23.8 s |
+| rebuilt once, then reopened | **1** | **7.3 s** |
+
+The single remaining request is the document itself, which is exactly what
+the server asks for (`max-age=0`); 4.2 s of the 7.3 s is that download. That
+is P64's target, not this change's.
+
+- engine tests **1023 -> 1024** green (new `cache_ttl_follows_cache_control`).
+- `cache_roundtrip_and_ttl` now also covers a year-long `max-age`, ttl 0 and
+  the old entry format.
+
 
 
 

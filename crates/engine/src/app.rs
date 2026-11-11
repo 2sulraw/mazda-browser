@@ -6340,6 +6340,7 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
     cookie::store_response(url, &set_cookie_values(&resp));
     let complete = resp.status() == 200;
     let content_type = resp.header("content-type").map(|s| s.to_string());
+    let ttl = cache_ttl(resp.header("cache-control"));
     // a `200` means the Range was ignored: read the whole body like `fetch`
     const CAP: usize = 20 * 1024 * 1024;
     let want = if complete { CAP } else { limit };
@@ -6358,7 +6359,7 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
         }
     }
     if complete {
-        cache_write_in(&cache_dir(), url, now_secs(), &buf, content_type.as_deref());
+        cache_write_in(&cache_dir(), url, now_secs(), ttl, &buf, content_type.as_deref());
     }
     if std::env::var_os("MAZDA_TIME").is_some() {
         eprintln!(
@@ -7049,10 +7050,13 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 // ---------- HTTP disk cache (Phase 2) ----------
 // shortcut: our own TTL instead of HTTP revalidation — no ETag/If-Modified-Since
-// or 304 handling; a cached response is served as-is until TTL expires, then
-// refetched. Eviction = oldest mtime at a file-count cap (not frequency-LRU).
+// or 304 handling; a cached response is served as-is until its max-age expires.
+// Eviction = oldest mtime at a file-count cap (not frequency-LRU).
 
 const CACHE_TTL_SECS: u64 = 300;
+/// A `max-age` larger than a year is treated as a year: without revalidation a
+/// bogus header would otherwise pin a URL forever.
+const CACHE_MAX_AGE_CAP: u64 = 365 * 24 * 3600;
 const CACHE_MAX_FILES: usize = 300;
 const CACHE_MAX_BODY: usize = 5 * 1024 * 1024;
 
@@ -7084,12 +7088,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Entry format: `<unix-secs>\n<content-type>\n<body>`. None = miss/expired.
+/// Entry format: `<unix-secs> <ttl>\n<content-type>\n<body>`. A file written
+/// by the older single-number format still parses (default TTL). None =
+/// miss/expired. `ttl == 0` means "do not serve from disk" (`no-store`/
+/// `no-cache`/`max-age=0`), matching what Chrome does for a document.
 fn cache_read_in(dir: &std::path::Path, url: &str, now: u64) -> Option<(Vec<u8>, Option<String>)> {
     let data = std::fs::read(dir.join(cache_key(url))).ok()?;
     let nl1 = data.iter().position(|&b| b == b'\n')?;
-    let ts: u64 = std::str::from_utf8(&data[..nl1]).ok()?.parse().ok()?;
-    if now.saturating_sub(ts) >= CACHE_TTL_SECS {
+    let head = std::str::from_utf8(&data[..nl1]).ok()?;
+    let mut fields = head.split_ascii_whitespace();
+    let ts: u64 = fields.next()?.parse().ok()?;
+    let ttl: u64 = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CACHE_TTL_SECS);
+    if ttl == 0 || now.saturating_sub(ts) >= ttl {
         return None; // expired (clock skew treated as stale, safe direction)
     }
     let rest = &data[nl1 + 1..];
@@ -7101,10 +7114,37 @@ fn cache_read_in(dir: &std::path::Path, url: &str, now: u64) -> Option<(Vec<u8>,
     ))
 }
 
+/// Cache lifetime from `Cache-Control`: `max-age=N`, capped at a year.
+/// `no-store` / `no-cache` answer 0 ("always refetch"); a response without the
+/// header keeps the 5-minute default. shortcut: `Expires` is not parsed — every
+/// site this engine loads sends `max-age` — and no conditional revalidation is
+/// attempted, so a long `max-age` is trusted the way Chrome trusts
+/// `immutable`.
+fn cache_ttl(cc: Option<&str>) -> u64 {
+    let Some(cc) = cc else {
+        return CACHE_TTL_SECS;
+    };
+    let cc = cc.to_ascii_lowercase();
+    if cc.contains("no-store") || cc.contains("no-cache") {
+        return 0;
+    }
+    if let Some(i) = cc.find("max-age=") {
+        let digits: String = cc[i + 8..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            return n.min(CACHE_MAX_AGE_CAP);
+        }
+    }
+    CACHE_TTL_SECS
+}
+
 fn cache_write_in(
     dir: &std::path::Path,
     url: &str,
     now: u64,
+    ttl: u64,
     bytes: &[u8],
     ct: Option<&str>,
 ) {
@@ -7125,7 +7165,7 @@ fn cache_write_in(
             }
         }
     }
-    let mut out = format!("{now}\n{}\n", ct.unwrap_or("")).into_bytes();
+    let mut out = format!("{now} {ttl}\n{}\n", ct.unwrap_or("")).into_bytes();
     out.extend_from_slice(bytes);
     let _ = std::fs::write(dir.join(cache_key(url)), out);
 }
@@ -7333,6 +7373,11 @@ fn fetch_accept(
     let resp = req.call().map_err(|e| e.to_string())?;
     cookie::store_response(url, &set_cookie_values(&resp));
     let content_type = resp.header("content-type").map(|s| s.to_string());
+    // `Cache-Control` decides how long the disk entry may be reused: GitHub's
+    // hashed bundles are `max-age=31536000, immutable`, its HTML is
+    // `max-age=0, private, must-revalidate`. Ignoring this used to re-download
+    // the whole page after 5 minutes.
+    let ttl = cache_ttl(resp.header("cache-control"));
     // into_reader transparently gunzips (ureq gzip feature); cap at 20MB like a browser
     const CAP: usize = 20 * 1024 * 1024;
     let mut reader = resp.into_reader();
@@ -7345,7 +7390,7 @@ fn fetch_accept(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    cache_write_in(&dir, url, now_secs(), &buf, content_type.as_deref());
+    cache_write_in(&dir, url, now_secs(), ttl, &buf, content_type.as_deref());
     if std::env::var_os("MAZDA_TIME").is_some() {
         eprintln!(
             "[net] {:6.1} ms {:8} B {}",
@@ -9346,7 +9391,14 @@ mod tests {
     #[test]
     fn cache_roundtrip_and_ttl() {
         let dir = test_dir("cache-rt");
-        cache_write_in(&dir, "https://x.com/", 1000, b"hello", Some("text/html"));
+        cache_write_in(
+            &dir,
+            "https://x.com/",
+            1000,
+            CACHE_TTL_SECS,
+            b"hello",
+            Some("text/html"),
+        );
         // fresh read returns body + content-type
         assert_eq!(
             cache_read_in(&dir, "https://x.com/", 1000 + CACHE_TTL_SECS - 1),
@@ -9359,14 +9411,55 @@ mod tests {
         );
         // different URL = miss (FNV key differs)
         assert_eq!(cache_read_in(&dir, "https://y.com/", 1000), None);
+        // a response with a year-long max-age outlives the old 5-minute
+        // boundary, and its own TTL still expires it
+        cache_write_in(&dir, "https://a.com/", 1000, 86_400, b"a", None);
+        assert_eq!(
+            cache_read_in(&dir, "https://a.com/", 1000 + 20_000).map(|h| h.0),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(cache_read_in(&dir, "https://a.com/", 1000 + 86_400), None);
+        // ttl 0 means "always refetch" (no-store / max-age=0)
+        cache_write_in(&dir, "https://b.com/", 1000, 0, b"b", None);
+        assert_eq!(cache_read_in(&dir, "https://b.com/", 1000), None);
+        // an entry from the old single-number format still parses
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(cache_key("https://old.com/")),
+            b"1000\ntext/plain\nold",
+        )
+        .unwrap();
+        assert_eq!(
+            cache_read_in(&dir, "https://old.com/", 1000 + 60).map(|h| h.0),
+            Some(b"old".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_ttl_follows_cache_control() {
+        assert_eq!(cache_ttl(None), CACHE_TTL_SECS);
+        assert_eq!(
+            cache_ttl(Some("public, max-age=31536000, immutable")),
+            31_536_000
+        );
+        assert_eq!(cache_ttl(Some("max-age=60")), 60);
+        assert_eq!(cache_ttl(Some("max-age=0, private, must-revalidate")), 0);
+        assert_eq!(cache_ttl(Some("no-store")), 0);
+        assert_eq!(cache_ttl(Some("no-cache")), 0);
+        assert_eq!(cache_ttl(Some("public")), CACHE_TTL_SECS);
+        // an absurd max-age is capped instead of pinning a URL forever
+        assert_eq!(
+            cache_ttl(Some("max-age=99999999999")),
+            CACHE_MAX_AGE_CAP
+        );
     }
 
     #[test]
     fn cache_oversized_body_not_stored() {
         let dir = test_dir("cache-big");
         let big = vec![0u8; CACHE_MAX_BODY + 1];
-        cache_write_in(&dir, "https://x.com/", 1000, &big, None);
+        cache_write_in(&dir, "https://x.com/", 1000, CACHE_TTL_SECS, &big, None);
         assert_eq!(cache_read_in(&dir, "https://x.com/", 1000), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
