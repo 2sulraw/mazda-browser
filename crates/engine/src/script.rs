@@ -112,8 +112,9 @@ use crate::runtime::{self, Turn, FRAME_EPOCH, MAX_PENDING_FRAMES, MAX_PENDING_TI
 struct Ctx {
     /// (node id, event kind) → registered handler functions
     listeners: HashMap<(u32, String), Vec<Val>>,
-    /// callbacks queued by `requestAnimationFrame` this turn
-    raf: Vec<Val>,
+    /// callbacks queued by `requestAnimationFrame` this turn, with the id
+    /// `cancelAnimationFrame` can name
+    raf: Vec<(f64, Val)>,
 }
 
 thread_local! {
@@ -248,10 +249,10 @@ fn ctx_remove_listener(node: u32, kind: &str, cb: &Val) {
 
 /// rAF callback queued during the current turn (folded into the runtime's
 /// frame queue by the turn drivers).
-fn ctx_queue_raf(cb: Val) {
+fn ctx_queue_raf(id: f64, cb: Val) {
     CTX.with(|c| {
         if let Some(cx) = c.borrow_mut().as_mut() {
-            cx.raf.push(cb);
+            cx.raf.push((id, cb));
         }
     })
 }
@@ -812,6 +813,7 @@ struct Nids {
     mo_take: usize,
     mo_ctor: usize,
     raf: usize,
+    raf_cancel: usize,
     storage_get: usize,
     storage_set: usize,
     storage_remove: usize,
@@ -1154,8 +1156,8 @@ const CE_NOOP: u16 = 3;
 // Scheduler budgets (MAX_PENDING_TIMERS / MAX_PENDING_FRAMES /
 // FRAME_EPOCH) live ONCE in runtime.rs — single source for both engines.
 
-/// Monotonic rAF callback id (returned to script; nothing consumes it —
-/// cancelAnimationFrame is not implemented yet).
+/// Monotonic rAF callback id (returned to script; `cancelAnimationFrame`
+/// names it to remove the frame before it fires).
 fn next_raf_id() -> f64 {
     use std::cell::Cell;
     thread_local! {
@@ -3010,7 +3012,8 @@ fn install_resize_observer(e: &mut JsEngine, ids: Nids) {
 /// `requestAnimationFrame(cb)` - the callback joins this turn's queue with
 /// a one-epoch deadline; the worker's scheduler fires every queued callback
 /// in a single coalesced pass and re-lays out once if any of them mutated
-/// the DOM (not per callback, not vsync-locked — module docs).
+/// the DOM (not per callback, not vsync-locked — module docs). The id it
+/// returns can be passed to `cancelAnimationFrame` until the pass runs.
 fn raf_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result<Val, JsError> {
     let cb = args.first().cloned().unwrap_or(Val::Undefined);
     if !matches!(cb, Val::Func(_) | Val::Native(_) | Val::Method(_)) {
@@ -3019,8 +3022,26 @@ fn raf_native(_e: &mut JsEngine, _idx: u16, _this: &Val, args: &[Val]) -> Result
     }
     // the callback joins the turn's rAF queue; the turn driver folds it
     // into the runtime's frame queue (next epoch) when the turn ends
-    ctx_queue_raf(cb);
-    Ok(Val::Num(next_raf_id()))
+    let id = next_raf_id();
+    ctx_queue_raf(id, cb);
+    Ok(Val::Num(id))
+}
+
+/// `cancelAnimationFrame(id)` - drops a frame that is queued but has not
+/// fired. Pages use the pair for one-shot animation loops (GSAP's ticker,
+/// measured on github.com's homepage: without this the ticker threw on its
+/// first cancel and the hero stayed at its `opacity:0` start state).
+fn raf_cancel_native(
+    e: &mut JsEngine,
+    _idx: u16,
+    _this: &Val,
+    args: &[Val],
+) -> Result<Val, JsError> {
+    let id = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+    if id.is_finite() {
+        e.cancelled_frames.push(id);
+    }
+    Ok(Val::Undefined)
 }
 
 /// `localStorage` / `sessionStorage` (merged): an in-memory map per page,
@@ -3403,9 +3424,10 @@ pub struct PageScripts {
     listeners: HashMap<(u32, String), Vec<Val>>,
     /// absolute deadline → (callback, args) — drives worker recv_timeout
     timers: Vec<Timer>,
-    /// (`requestAnimationFrame` deadline, callback) — due frames fire in
-    /// one coalesced pass per epoch (see module docs)
-    raf: Vec<(Instant, Val)>,
+    /// (`requestAnimationFrame` id, deadline, callback) — due frames fire in
+    /// one coalesced pass per epoch (see module docs); the id lets
+    /// `cancelAnimationFrame` drop a frame before it fires
+    raf: Vec<(f64, Instant, Val)>,
     /// in-memory localStorage (worker RAM, dropped per navigation) shared
     /// with the natives through the shared host handle
     storage: runtime::Storage,
@@ -3537,6 +3559,7 @@ impl PageScripts {
             mo_take: engine.register_native("MutationObserver.prototype.takeRecords", n_mo, MO_TAKE),
             mo_ctor: engine.register_native("MutationObserver", n_mo, MO_CTOR),
             raf: engine.register_native("requestAnimationFrame", raf_native, 0),
+            raf_cancel: engine.register_native("cancelAnimationFrame", raf_cancel_native, 0),
             storage_get: engine.register_native("localStorage.getItem", storage_native, S_GET),
             storage_set: engine.register_native("localStorage.setItem", storage_native, S_SET),
             storage_remove: engine.register_native("localStorage.removeItem", storage_native, S_REMOVE),
@@ -3703,6 +3726,7 @@ impl PageScripts {
         engine.set_global("dispatchEvent", Val::Native(ids.el_dispatch));
         engine.set_global("matchMedia", Val::Native(ids.match_media));
         engine.set_global("requestAnimationFrame", Val::Native(ids.raf));
+        engine.set_global("cancelAnimationFrame", Val::Native(ids.raf_cancel));
         // document-level listeners share the global (window) bucket: both
         // are page-wide targets with no own arena node, and the global stop
         // already fires after the bubble chain (logged design shortcut)
@@ -4172,13 +4196,23 @@ impl PageScripts {
 
     /// Absorb rAF callbacks queued by listeners/timers during the last
     /// native call(s) into the frame queue (deadline = now + one epoch).
-    fn harvest_raf_from(&mut self, queued: &[Val]) {
+    fn harvest_raf_from(&mut self, queued: &[(f64, Val)]) {
+        // a `cancelAnimationFrame` may name a callback that is still in this
+        // batch or already queued from an earlier turn: drop it here so a
+        // cancelled frame never runs
+        let cancelled = self.engine.drain_cancelled_frames();
+        if !cancelled.is_empty() {
+            self.raf.retain(|(id, _, _)| !cancelled.contains(id));
+        }
         if queued.is_empty() {
             return;
         }
         let deadline = Instant::now() + Duration::from_millis(FRAME_EPOCH);
-        for cb in queued {
-            self.raf.push((deadline, cb.clone()));
+        for (id, cb) in queued {
+            if cancelled.contains(id) {
+                continue;
+            }
+            self.raf.push((*id, deadline, cb.clone()));
         }
         if self.raf.len() > MAX_PENDING_FRAMES {
             let drop = self.raf.len() - MAX_PENDING_FRAMES;
@@ -4263,14 +4297,20 @@ impl PageScripts {
     /// deadline on the wake queue automatically.
     pub fn run_due_frames(&mut self, dom: &mut Dom) -> Turn {
         let now = Instant::now();
+        // a cancel can arrive after the frame was queued (from a listener or
+        // timer turn): drop those ids before picking the due batch
+        let cancelled = self.engine.drain_cancelled_frames();
+        if !cancelled.is_empty() {
+            self.raf.retain(|(id, _, _)| !cancelled.contains(id));
+        }
         // due callbacks, oldest first (enqueue order preserved)
         let mut due: Vec<Val> = Vec::new();
-        let mut alive: Vec<(Instant, Val)> = Vec::new();
-        for (deadline, cb) in self.raf.drain(..) {
+        let mut alive: Vec<(f64, Instant, Val)> = Vec::new();
+        for (id, deadline, cb) in self.raf.drain(..) {
             if deadline <= now {
                 due.push(cb);
             } else {
-                alive.push((deadline, cb));
+                alive.push((id, deadline, cb));
             }
         }
         self.raf = alive;
@@ -4326,7 +4366,7 @@ impl PageScripts {
 
     /// Next frame-epoch deadline (`None` = no queued rAF callbacks).
     pub fn next_frame_deadline(&self) -> Option<Instant> {
-        self.raf.iter().map(|(t, _)| *t).min()
+        self.raf.iter().map(|(_, t, _)| *t).min()
     }
 }
 
@@ -6144,6 +6184,43 @@ mod tests {
         assert_eq!(get_global_str(&mut ps, "ok"), "true", "timestamp is a number on the perf clock");
         let ts: f64 = get_global_str(&mut ps, "ts").parse().expect("numeric timestamp");
         assert!(ts.is_finite() && ts >= 0.0);
+    }
+
+    /// `cancelAnimationFrame(id)` drops a frame that is still queued: the
+    /// cancelled callback never runs, its neighbour does.
+    #[test]
+    fn cancel_animation_frame_drops_queued_callback() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.fired = "";
+                var a = requestAnimationFrame(function () { window.fired = window.fired + "a"; });
+                requestAnimationFrame(function () { window.fired = window.fired + "b"; });
+                cancelAnimationFrame(a);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        std::thread::sleep(Duration::from_millis(18));
+        ps.run_due_frames(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "fired"), "b", "cancelled frame never runs");
+    }
+
+    /// A frame can also be cancelled from a later turn (github.com's ticker
+    /// cancels the previous epoch from a timer/rAF callback): the id stays
+    /// meaningful after the queueing turn ends.
+    #[test]
+    fn cancel_animation_frame_from_a_timer_drops_queued_frame() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><script>
+                window.fired = 0;
+                window.id = requestAnimationFrame(function () { window.fired = 1; });
+                setTimeout(function () { cancelAnimationFrame(window.id); }, 0);
+            </script></body></html>"#,
+        );
+        let _ = ps.run_scripts(&mut dom);
+        ps.run_due_timers(&mut dom);
+        std::thread::sleep(Duration::from_millis(18));
+        ps.run_due_frames(&mut dom);
+        assert_eq!(get_global_str(&mut ps, "fired"), "0", "timer cancelled the queued frame");
     }
 
     /// The rAF backlog guard: a page queueing more than the cap (without

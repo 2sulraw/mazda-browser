@@ -1469,6 +1469,13 @@ impl DomHost {
             } else {
                 false
             }
+        } else if q.contains("prefers-reduced-motion") {
+            if q.contains("no-preference") {
+                !PREFERS_REDUCED_MOTION_MIRROR
+            } else {
+                // `reduce` and the boolean form
+                PREFERS_REDUCED_MOTION_MIRROR
+            }
         } else {
             false
         }

@@ -4950,3 +4950,29 @@ flat-block render) to `4.1 s 18.85 % 223 colours` (hero text, logo, CTAs), with
 the finished frame at 19.18 % / 281 colours. `example.com` reads 148 colours and
 the local test pages 124-235, which is what a text page looks like.
 
+## `cancelAnimationFrame` actually cancels (P80, 2026-11-12)
+
+`requestAnimationFrame` has always returned an id; nothing consumed it. The id
+was a counter with a comment saying so, and `cancelAnimationFrame` was simply
+not a global - so a page that called it threw `ReferenceError` and the effect
+that made the call died with the turn. github.com's `landing-pages` bundle
+calls the pair in four places: its hero canvas cancels the frame it queued
+from a `ResizeObserver` callback, and GSAP's ticker cancels the previous
+tick's frame every tick.
+
+Change: the id now travels with the callback. `Ctx.raf` and
+`PageScripts.raf` hold `(id, callback)`, `cancelAnimationFrame(id)` records
+the id in the engine (`JsEngine::cancelled_frames`, the same shape as
+`cancelled_timers`), and both harvest points - `harvest_raf_from` when a turn
+ends and `run_due_frames` before a pass picks its due batch - drop the named
+frames first. A cancel therefore works from the same turn, from a later timer
+turn, and for a callback already sitting in the queue.
+
+Measured: no pixels of its own - github's hero reveal it unblocks is the
+subject of the next two rules. What changes is the console: the
+`ReferenceError: cancelAnimationFrame is not defined` line is gone and the
+effects that used to abort now reach their next statement. Tests
+**1037 -> 1039** green (`cancel_animation_frame_drops_queued_callback`,
+`cancel_animation_frame_from_a_timer_drops_queued_frame`).
+
+

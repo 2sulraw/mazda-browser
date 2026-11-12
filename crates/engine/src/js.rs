@@ -1596,6 +1596,9 @@ pub struct JsEngine {
     /// ids passed to `clearTimeout`/`clearInterval` since the last drain;
     /// the embedder removes already-queued jobs with these ids
     pub(crate) cancelled_timers: Vec<f64>,
+    /// ids passed to `cancelAnimationFrame` since the last drain; the
+    /// embedder removes frames that have been queued but not yet fired
+    pub(crate) cancelled_frames: Vec<f64>,
     pub(crate) microtasks: Vec<Job>,
     /// per-page ES module registry, owned by the engine so the dynamic
     /// `import()` job can run the loader from inside the microtask pump.
@@ -1889,6 +1892,7 @@ impl JsEngine {
             env_pool: Vec::new(),
             timers: Vec::new(),
             cancelled_timers: Vec::new(),
+            cancelled_frames: Vec::new(),
             microtasks: Vec::new(),
             module_loader: None,
             promise_slots: Vec::new(),
@@ -2314,6 +2318,11 @@ impl JsEngine {
     /// Ids cancelled with `clearTimeout`/`clearInterval` since the last call.
     pub fn drain_cancelled_timers(&mut self) -> Vec<f64> {
         std::mem::take(&mut self.cancelled_timers)
+    }
+
+    /// Ids cancelled with `cancelAnimationFrame` since the last call.
+    pub fn drain_cancelled_frames(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.cancelled_frames)
     }
 
     /// Run queued microtask jobs (Promise reactions) until the queue is
