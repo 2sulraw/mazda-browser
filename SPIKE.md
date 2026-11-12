@@ -4912,3 +4912,41 @@ What this rules out is *asking twice*; it does not rule out reading the one
 response as it arrives (streaming decode of the gzip/br body, parse the head
 from the first chunk, preload from there), which is what the next attempt
 should do - and what `coalesce_fetch` above exists to make safe.
+
+## Measure the frame, not the screenshot (P79, 2026-11-12)
+
+Two statements were both true and neither was checkable: "first paint 4.7 s"
+and "the page is blank for twenty seconds". A load publishes *several* frames -
+the markup + stylesheet pass, then the post-script layout, then any relayout a
+later script mutation forces - so a single number says which moment was
+measured, never how the page looked in between. A screenshot says even less:
+it shows whatever frame was last presented, and on this host a screen capture
+of the shell returned another window at the same rectangle, so it cannot be
+trusted either.
+
+`tools/paint-timeline.ps1` drives the renderer exactly the way the shell does
+(`resize`, `load`, frames announced on stdout) and samples the published frame
+buffer every 200 ms, printing a row whenever the sequence number changes:
+
+```
+Time Frame  Ink Colours Note
+ 4.1     1 18.85     223 new frame
+```
+
+Both numbers come from the renderer's own pixels: `Ink %` is the share of
+sampled pixels that differ from the dominant colour, `Colours` the count of
+distinct RGB values in the sample. A blank window reads 0 % / 1 colour, a
+text-only first paint a couple of percent, the finished page two digits. `Ink`
+alone is easy to mistake (one large flat block scores high), so the pair is the
+reading: **26.4 % ink in 5 colours** is a page of solid rectangles, **18.9 % in
+223 colours** is text with antialiasing. Every 4th row and every 4th pixel is
+sampled, so a sample costs a sixteenth of a frame and does not itself slow the
+load down. `-PngDir` writes each new frame as a PNG (the renderer's pixels, not
+a capture) when the frame needs looking at.
+
+The tool's first use is the three render rules that follow: cold github.com,
+fresh profile, `-Seconds 30 -Every 5` went from `4.7 s 26.42 % 5 colours` (the
+flat-block render) to `4.1 s 18.85 % 223 colours` (hero text, logo, CTAs), with
+the finished frame at 19.18 % / 281 colours. `example.com` reads 148 colours and
+the local test pages 124-235, which is what a text page looks like.
+
