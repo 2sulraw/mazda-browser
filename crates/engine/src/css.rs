@@ -3044,7 +3044,12 @@ impl Sheet {
         let vars = self.scope_of(dom, node, inline, parent_vars.cloned());
         let mut style = base;
         let mut bg = None;
-        let mut display_none = false;
+        // one hide verdict per property: a later declaration of the same
+        // property replaces the earlier one (`opacity:1` after `opacity:0`
+        // shows the element), and the element is hidden if any says so
+        let mut display_hidden = false;
+        let mut opacity_zero = false;
+        let mut visibility_hidden = false;
         let mut bx = ua_box(dom.tag(node));
         // used color scheme for THIS element (own declaration, else the
         // nearest ancestor's — the property inherits) — decides light-dark().
@@ -3111,9 +3116,16 @@ impl Sheet {
                     color_declared |= d.0 == "color";
                     let sd = self.subst_scoped(d, vars.as_deref());
                     let fs = self.fam_stack_of(&sd, parent_size, self.vp);
-                    if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, parent_color, self.vp, dark, fs)
-                    {
-                        display_none = true;
+                    let hides = apply_decl(
+                        &sd, &mut style, &mut bg, &mut bx, parent_size, parent_color, self.vp, dark, fs,
+                    );
+                    match (d.0.as_str(), hides) {
+                        ("display", Some(h)) => display_hidden = h,
+                        ("opacity", Some(h)) => opacity_zero = h,
+                        ("visibility", Some(h)) => visibility_hidden = h,
+                        // another property, or an invalid value: keep the
+                        // earlier verdict for this one
+                        _ => {}
                     }
                 }
             }
@@ -3124,33 +3136,42 @@ impl Sheet {
         });
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
-            let hidden_by_css = display_none;
-            let mut opacity_start_state = false;
+            let hidden_by_css = display_hidden || opacity_zero || visibility_hidden;
+            let mut inline_opacity_zero = false;
             let mut inline_display_none = false;
             for d in &parse_decls(inline) {
                 color_declared |= d.0 == "color";
                 let sd = self.subst_scoped(d, vars.as_deref());
                 let fs = self.fam_stack_of(&sd, parent_size, self.vp);
-                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, parent_color, self.vp, dark, fs) {
-                    display_none = true;
-                    // an INLINE `opacity:0` is how a page marks an element
-                    // whose fade-in has not run yet (`style="opacity:0"` in
-                    // the HTML, github.com's hero). This engine paints a
-                    // static frame and runs no tweens, so the end state has
-                    // to be painted now or the content is never seen; a
-                    // stylesheet `opacity:0` still hides (drawers, modals).
-                    if d.0 == "opacity" {
-                        opacity_start_state = true;
-                    } else if d.0 == "display" {
-                        inline_display_none = true;
+                let hides = apply_decl(
+                    &sd, &mut style, &mut bg, &mut bx, parent_size, parent_color, self.vp, dark, fs,
+                );
+                match (d.0.as_str(), hides) {
+                    ("display", Some(h)) => {
+                        display_hidden = h;
+                        inline_display_none = h;
                     }
+                    ("opacity", Some(h)) => {
+                        opacity_zero = h;
+                        inline_opacity_zero = h;
+                    }
+                    ("visibility", Some(h)) => visibility_hidden = h,
+                    _ => {}
                 }
             }
-            if opacity_start_state && !hidden_by_css && !inline_display_none {
-                display_none = false;
+            // An INLINE `opacity:0` is how a page marks an element whose
+            // fade-in has not run yet (`style="opacity:0"` in the HTML,
+            // github.com's hero). This engine paints a static frame and runs
+            // no tweens, so the end state has to be painted now or the
+            // content is never seen; a stylesheet `opacity:0` still hides
+            // (drawers, modals). Only the opacity verdict is dropped here:
+            // an inline `display:none`/`visibility:hidden` still hides.
+            if inline_opacity_zero && !hidden_by_css && !inline_display_none {
+                opacity_zero = false;
                 bx.opacity = 1.0;
             }
         }
+        let display_none = display_hidden || opacity_zero || visibility_hidden;
         // UA margins last: they are em-based, so they need the FINAL
         // font-size (author `font-size` may win over the UA one), and they
         // only fill sides the cascade did not declare.
@@ -3202,7 +3223,9 @@ impl Sheet {
         }
         let mut style = base;
         let mut bg = None;
-        let mut display_none = false;
+        let mut display_hidden = false;
+        let mut opacity_zero = false;
+        let mut visibility_hidden = false;
         let mut bx = BoxStyle::default();
         // the origin element's used scheme decides light-dark() branches
         // (see resolve_with_parent for the declared/fallback distinction)
@@ -3221,14 +3244,19 @@ impl Sheet {
                     color_declared |= d.0 == "color";
                     let sd = self.subst(d);
                     let fs = self.fam_stack_of(&sd, base.size, self.vp);
-                    if apply_decl(
+                    let hides = apply_decl(
                         &sd, &mut style, &mut bg, &mut bx, base.size, base.color, self.vp, dark, fs,
-                    ) {
-                        display_none = true;
+                    );
+                    match (d.0.as_str(), hides) {
+                        ("display", Some(h)) => display_hidden = h,
+                        ("opacity", Some(h)) => opacity_zero = h,
+                        ("visibility", Some(h)) => visibility_hidden = h,
+                        _ => {}
                     }
                 }
             }
         });
+        let display_none = display_hidden || opacity_zero || visibility_hidden;
         // same scheme-blind default flip as `resolve_with_parent` (the
         // pseudo inherits the origin's color, which is already flipped)
         if dark && scheme.is_some() && !color_declared && style.color == 0x00_00_00 {
@@ -3863,6 +3891,13 @@ fn span_count(v: &str) -> u32 {
 
 /// `dark` = the element's used color scheme — picks the `light-dark()` branch
 /// on color-bearing values before they reach `parse_color`.
+///
+/// The return value is the declaration's verdict on hiding the element:
+/// `Some(true)` hides it (`display:none`, `opacity:0`, `visibility:hidden`),
+/// `Some(false)` is a valid declaration of one of those properties that shows
+/// it, and `None` is every other property or an invalid value. Callers keep
+/// one verdict per property, so a later `opacity:1` clears an earlier
+/// `opacity:0` while an invalid value leaves the earlier verdict alone.
 fn apply_decl(
     d: &Decl,
     style: &mut Style,
@@ -3877,7 +3912,7 @@ fn apply_decl(
     dark: bool,
     // interned font-family stack id for this decl (from the shared table)
     fam_stack: u16,
-) -> bool {
+) -> Option<bool> {
     match d.0.as_str() {
         "color" => {
             let v = pick_light_dark(&d.1, dark).trim();
@@ -4162,31 +4197,37 @@ fn apply_decl(
             // size); `normal` = the layout default
             style.lh = parse_line_height(&d.1, style.size, vp);
         }
-        "display" => match d.1.as_str() {
-            "none" => return true,
-            "flex" => bx.display = Display::Flex,
-            "grid" => bx.display = Display::Grid,
-            "block" => bx.display = Display::Block,
-            // display:contents — no box of its own; layout hoists the
-            // children into the parent flow (see layout::build_into)
-            "contents" => bx.display = Display::Contents,
-            // inline-block: a real box that still sits on the text line
-            // (layout.rs `block()` places `inline` boxes mid-line)
-            "inline-block" => bx.display = Display::InlineBlock,
-            // inline-flex/inline-grid: same inner layout, inline-LEVEL box
-            // (shrink-to-fit, sits on the text line) — an icon button must
-            // not fill its parent the way a block flex would
-            "inline-flex" => {
-                bx.display = Display::Flex;
-                bx.inline_box = true;
+        "display" => {
+            match d.1.as_str() {
+                "none" => return Some(true),
+                "flex" => bx.display = Display::Flex,
+                "grid" => bx.display = Display::Grid,
+                "block" => bx.display = Display::Block,
+                // display:contents — no box of its own; layout hoists the
+                // children into the parent flow (see layout::build_into)
+                "contents" => bx.display = Display::Contents,
+                // inline-block: a real box that still sits on the text line
+                // (layout.rs `block()` places `inline` boxes mid-line)
+                "inline-block" => bx.display = Display::InlineBlock,
+                // inline-flex/inline-grid: same inner layout, inline-LEVEL box
+                // (shrink-to-fit, sits on the text line) — an icon button must
+                // not fill its parent the way a block flex would
+                "inline-flex" => {
+                    bx.display = Display::Flex;
+                    bx.inline_box = true;
+                }
+                "inline-grid" => {
+                    bx.display = Display::Grid;
+                    bx.inline_box = true;
+                }
+                "inline" => bx.display = Display::Inline,
+                // an unknown keyword is an invalid declaration: dropped, so it
+                // must not clear an earlier `display:none`
+                _ => return None,
             }
-            "inline-grid" => {
-                bx.display = Display::Grid;
-                bx.inline_box = true;
-            }
-            "inline" => bx.display = Display::Inline,
-            _ => {}
-        },
+            // a valid non-`none` display value shows the element again
+            return Some(false);
+        }
         // shadows carry their own alpha (rgba() is the common case) and may
         // stack — parse the whole list, first shadow paints on top
         "box-shadow" => bx.shadows = parse_box_shadows(&d.1, dark, vp),
@@ -4197,15 +4238,15 @@ fn apply_decl(
         // painted at the end state instead (see `resolve_with_parent`)
         "opacity" => {
             let Ok(v) = d.1.parse::<f32>() else {
-                return false;
+                return None;
             };
             // non-finite numbers are invalid CSS - ignore the declaration
             if !v.is_finite() {
-                return false;
+                return None;
             }
             let v = v.clamp(0.0, 1.0);
             bx.opacity = v;
-            return v <= 0.0;
+            return Some(v <= 0.0);
         }
         // `filter` — collapse the shorthand list into one affine colour
         // transform (see [`Filter`]). Invalid lists are dropped whole, like
@@ -4223,7 +4264,13 @@ fn apply_decl(
         // shortcut: hidden/collapse treated as display:none (real CSS keeps
         // the box in flow — usually fine, sites use it on off-screen
         // measurement clones)
-        "visibility" => return matches!(d.1.as_str(), "hidden" | "collapse"),
+        "visibility" => {
+            return match d.1.as_str() {
+                "hidden" | "collapse" => Some(true),
+                "visible" => Some(false),
+                _ => None,
+            }
+        }
         // accepted no-ops (see the KNOWN table comment): none of these move
         // a static box in this engine
         "pointer-events" | "user-select" | "will-change" | "contain"
@@ -5274,7 +5321,7 @@ fn apply_decl(
         }
         _ => {}
     }
-    false
+    None
 }
 
 /// `counter-reset` / `counter-increment` / `counter-set` value → `(name,
@@ -11132,6 +11179,50 @@ mod tests {
         assert!(sheet_none
             .resolve(&dom3, by_attr(&dom3, "id", "y"), Style::new(), Some("opacity:0"))
             .display_none);
+    }
+
+    #[test]
+    fn a_later_declaration_clears_an_earlier_hide() {
+        // The cascade kept a single "hidden" bit, so a later `opacity:1`
+        // could never clear an earlier `opacity:0` and the element stayed
+        // invisible. Each hiding property now carries its own last verdict.
+        let sheet = parse(
+            ".a { opacity: 0 } .a.on { opacity: 1 } \
+             .b { display: none } .b.on { display: block } \
+             .c { visibility: hidden } .c.on { visibility: visible } \
+             .d { opacity: 0 } .d.on { opacity: bogus } \
+             .e { display: none } .e.on { opacity: 1 } \
+             .f { opacity: 0; opacity: 1 } \
+             .g { opacity: 0; opacity: bogus }",
+        );
+        let dom = dom_of(
+            "<div id=a class=\"a on\"></div><div id=b class=\"b on\"></div>\
+             <div id=c class=\"c on\"></div><div id=d class=\"d on\"></div>\
+             <div id=e class=\"e on\"></div><div id=f class=f></div>\
+             <div id=g class=g></div>",
+        );
+        let out = |id: &str| sheet.resolve(&dom, by_attr(&dom, "id", id), Style::new(), None);
+        let a = out("a");
+        assert!(!a.display_none, "opacity:1 clears an earlier opacity:0");
+        assert_eq!(a.bx.opacity, 1.0);
+        assert!(!out("b").display_none, "display:block clears display:none");
+        assert!(!out("c").display_none, "visibility:visible clears hidden");
+        // an invalid value is dropped, so the earlier verdict stays
+        assert!(out("d").display_none, "opacity:bogus keeps opacity:0");
+        // different properties stay independent
+        assert!(out("e").display_none, "opacity:1 does not clear display:none");
+        // the same order rule holds inside one declaration block
+        assert!(!out("f").display_none, "the later opacity:1 wins");
+        assert!(out("g").display_none, "the invalid later opacity is dropped");
+        // and in the inline style attribute
+        let dom2 = dom_of("<div id=h class=a style=\"opacity:0;opacity:1\"></div>");
+        let h = sheet.resolve(
+            &dom2,
+            by_attr(&dom2, "id", "h"),
+            Style::new(),
+            Some("opacity:0;opacity:1"),
+        );
+        assert!(!h.display_none);
     }
 
     #[test]

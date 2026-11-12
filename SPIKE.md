@@ -5711,3 +5711,38 @@ image in that batch, not a repeated probe. Box construction is 0.3-0.5 s per
 pass, and the cascade is no longer the cost (P98: 12 ms on a restyle).
 
 Cost: four `Instant` pairs per load, inside `MAZDA_TIME` only.
+
+## A later declaration can clear an earlier hide (P100, 2026-11-13)
+
+`display_none` was one bit for the whole cascade: every hiding declaration set
+it and nothing could unset it. So `.x{opacity:0}` followed by `.x.ready{opacity:1}`
+left the element invisible forever - the same for `display:none` then
+`display:block`, and `visibility:hidden` then `visibility:visible`. These are
+the normal shape of a reveal (tabs, drawers, a hero after its script runs), so
+any page using one lost content.
+
+`apply_decl` now answers `Option<bool>`: `Some(true)` hides, `Some(false)` is a
+valid declaration of one of those three properties that shows, `None` is
+another property or an invalid value. The cascade keeps one verdict per
+property and the last one wins; an invalid value is dropped, so it leaves the
+earlier verdict alone. The inline `opacity:0` fade-in exception now clears only
+the opacity verdict (an inline `display:none` still hides), and
+`resolve_pseudo` uses the same three verdicts.
+
+Measured on a local page with the four constructs (release renderer,
+`MAZDA_DUMP_BOXES=2`):
+
+| page | boxes | text runs | painted |
+|---|---|---|---|
+| before | 6 | 0 | none of the four divs |
+| after | 12 | 3 | `.hero.ready`, `.drawer.open`, `.a11y.shown`; `.trap.ready` (invalid `opacity:bogus`) stays hidden |
+
+github.com, same build: 1110 boxes / 509 runs (the pre-fix run had 1075 / 454
+with 15 fewer DOM elements), no errors, first paint 9.3 s in a 6.3 s fetch
+window - i.e. no regression, and no claim that github itself uses the pattern.
+
+Cost: one `Option` instead of a bool per declaration, and three bools per
+element instead of one.
+
+Test: `a_later_declaration_clears_an_earlier_hide` (rule order, one block,
+inline, invalid value, independent properties). 1068 green.
