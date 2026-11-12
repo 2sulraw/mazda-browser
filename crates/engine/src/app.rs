@@ -5220,6 +5220,16 @@ fn settle_load(
     std::thread::spawn(move || {
         preload_accept(&early_imgs, Some(IMAGE_ACCEPT), "preload (images, early)");
     });
+    // same story for `<video>`: the probe only needs the container header
+    // (64 KB), and the layout-time probe reads it back off disk
+    let early_media = media_urls(&kp.dom, url);
+    if !early_media.is_empty() {
+        std::thread::spawn(move || {
+            for u in early_media.iter().take(4) {
+                let _ = media_prefix_probe(u);
+            }
+        });
+    }
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = if no_js() {
@@ -5946,6 +5956,35 @@ fn image_urls(dom: &html::Dom, url: &str) -> Vec<String> {
         }
         if let Some(abs) = resolve_img(url, src) {
             out.push(abs);
+        }
+    }
+    out
+}
+
+/// `<video>` sources the markup names — the element's own `src` plus its
+/// `<source>` children — resolved against the page. The media probe later
+/// asks for exactly these; warming their container header early means it
+/// reads them off disk instead of paying a round trip after script execution.
+fn media_urls(dom: &html::Dom, url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 1..dom.nodes.len() as u32 {
+        if !dom.tag(i).eq_ignore_ascii_case("video") {
+            continue;
+        }
+        if let Some(src) = dom.attr(i, "src") {
+            if let Some(abs) = resolve_img(url, src) {
+                out.push(abs);
+            }
+        }
+        for &c in &dom.nodes[i as usize].children {
+            if !dom.tag(c).eq_ignore_ascii_case("source") {
+                continue;
+            }
+            if let Some(src) = dom.attr(c, "src") {
+                if let Some(abs) = resolve_img(url, src) {
+                    out.push(abs);
+                }
+            }
         }
     }
     out
@@ -11483,6 +11522,27 @@ mod tests {
             vec![
                 "https://e.com/x/a.png".to_string(),
                 "https://e.com/b.png".to_string()
+            ]
+        );
+    }
+
+    /// `<video>` and its `<source>` children name the URLs the media probe
+    /// will ask for; the early warm must collect the same ones.
+    #[test]
+    fn media_urls_collect_video_and_source_children() {
+        let dom = html::parse(
+            r#"<html><body>
+            <video src="v.mp4"></video>
+            <video><source src="a.webm"><source src="/b.mp4"></video>
+            <img src="not-media.png">
+            </body></html>"#,
+        );
+        assert_eq!(
+            media_urls(&dom, "https://e.com/x/y"),
+            vec![
+                "https://e.com/x/v.mp4".to_string(),
+                "https://e.com/x/a.webm".to_string(),
+                "https://e.com/b.mp4".to_string()
             ]
         );
     }

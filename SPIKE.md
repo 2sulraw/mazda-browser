@@ -4821,3 +4821,37 @@ Still serialized after execution, and the next candidates: `media probe`
 
 Tests **1034 -> 1035** green (new
 `image_urls_resolve_markup_sources_and_skip_inline_ones`).
+
+## The `<video>` header was fetched after the scripts too (P77, 2026-11-12)
+
+The same shape as P76, one stage later. github.com's hero clip is
+`preload="metadata"`, so `probe_media` only needs the MP4 container header
+(64 KB range request) to size the box - but it asked for it *after* layout,
+i.e. after scripts, as a single round trip with nothing to overlap:
+`[time] media probe` was 1.0-2.1 s of pure TTFB.
+
+Change (`app.rs`): `media_urls` collects each `<video>`'s own `src` plus its
+`<source>` children, resolved against the page. `settle_load` gives the first
+four to a second detached thread that runs the probe's own
+`media_prefix_probe`, so the header lands in `<cache>/media/<hash>.head`
+before the layout-time probe asks for it. The probe keeps its range request
+and its cache, so a miss (slow link, cache cleared) is exactly the old
+behavior.
+
+Cold github.com, fresh profile each run, alternating, A/B via a temporary
+`MAZDA_EARLY_MEDIA` switch, three pairs:
+
+| pair | off: media probe | on: media probe | off: wall | on: wall |
+|---|---|---|---|---|
+| 1 | 2 106 ms | 1 ms | 16 905 ms | 17 314 ms |
+| 2 | 1 734 ms | 1 ms | 16 762 ms | 15 339 ms |
+| 3 | 1 023 ms | 1 ms | 18 082 ms | 14 989 ms |
+| median | 1 734 ms | 1 ms | 16 905 ms | 15 339 ms |
+
+The stage is eliminated outright (**-1.7 s** on the probe itself); total median
+**-1.57 s (-9.3%)**, two of three pairs in favour and the third +0.4 s, i.e.
+inside this link's pair-to-pair spread. The `[net] ... (prefix)` line moves
+into the script phase, where its round trip is free.
+
+Tests **1035 -> 1036** green (new
+`media_urls_collect_video_and_source_children`).
