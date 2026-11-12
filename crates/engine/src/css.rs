@@ -1370,6 +1370,12 @@ enum Pseudo {
     Enabled,
     /// `:disabled` — a form control carrying the `disabled` attribute.
     Disabled,
+    /// `:checked` — markup state: a checkbox/radio carrying `checked`, or an
+    /// `<option>` carrying `selected` (an option's checkedness IS its
+    /// selectedness). A script toggling the property instead of the attribute
+    /// is not seen until it rewrites the attribute — the static pass reads the
+    /// DOM, like `:disabled`.
+    Checked,
     /// `:root` — a direct child of the document root (the `<html>` element).
     Root,
     /// `:first-child` — first ELEMENT child of its parent (text nodes don't
@@ -7874,12 +7880,12 @@ fn flush<'a>(tokens: &mut Vec<&'a str>, s: &'a str, start: usize, end: usize) {
 /// against the sheet's hover cell at cascade time, so `:not(:hover)` is a
 /// real (negated) match too.
 ///
-/// Note: `:enabled`/`:disabled` are NOT here — they are markup state (the
-/// `disabled` attribute), which the static cascade evaluates directly, and
-/// neither is `:placeholder-shown` (empty value + a `placeholder` attribute,
-/// the initial state of every text field — github's floating label flips on
-/// `:not(:placeholder-shown)`, so misreading it as "never holds" scaled the
-/// label's text on top of itself).
+/// Note: `:enabled`/`:disabled`/`:checked` are NOT here — they are markup
+/// state (the `disabled`/`checked`/`selected` attribute), which the static
+/// cascade evaluates directly, and neither is `:placeholder-shown` (empty
+/// value + a `placeholder` attribute, the initial state of every text field —
+/// github's floating label flips on `:not(:placeholder-shown)`, so misreading
+/// it as "never holds" scaled the label's text on top of itself).
 fn is_dynamic_pseudo(s: &str) -> bool {
     let Some(name) = s.strip_prefix(':') else {
         return false;
@@ -7889,7 +7895,7 @@ fn is_dynamic_pseudo(s: &str) -> bool {
     }
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "focus" | "focus-within" | "focus-visible" | "active" | "checked"
+        "focus" | "focus-within" | "focus-visible" | "active"
             | "target" | "default" | "required" | "optional"
             | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
             | "read-only" | "read-write"
@@ -8217,6 +8223,9 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     // attribute), not interaction state — statically evaluable.
                     ("enabled", None) => seg.pseudos.push(Pseudo::Enabled),
                     ("disabled", None) => seg.pseudos.push(Pseudo::Disabled),
+                    // checkedness is markup state too (`checked` on a
+                    // checkbox/radio, `selected` on an option)
+                    ("checked", None) => seg.pseudos.push(Pseudo::Checked),
                     // the input hint is showing: an empty value + a
                     // `placeholder` attribute. Static (the cascade keeps no
                     // live values); `:not(:placeholder-shown)` is how a
@@ -8745,6 +8754,19 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
         // parse-time note.)
         Pseudo::Disabled => is_form_control(dom, node) && dom.attr(node, "disabled").is_some(),
         Pseudo::Enabled => is_form_control(dom, node) && dom.attr(node, "disabled").is_none(),
+        // an option is checked when selected; a checkbox/radio when its
+        // `checked` attribute is present (the initial state a server render
+        // can express)
+        Pseudo::Checked => match dom.tag(node) {
+            "option" => dom.attr(node, "selected").is_some(),
+            "input" => {
+                matches!(
+                    dom.attr(node, "type").unwrap_or("text").to_ascii_lowercase().as_str(),
+                    "checkbox" | "radio"
+                ) && dom.attr(node, "checked").is_some()
+            }
+            _ => false,
+        },
         // the hint is showing: a text control with a non-empty `placeholder`
         // and no current value (the `value` attribute absent or empty).
         // Shortcut: a `<textarea>`'s element content isn't read, so a
@@ -11289,6 +11311,36 @@ mod tests {
             2,
             "a supported selector still parses"
         );
+    }
+
+    #[test]
+    fn checked_reads_markup_state() {
+        // `:checked` is the initial state a server render can express:
+        // `checked` on a checkbox/radio, `selected` on an option. It used to
+        // drop the whole rule (113 of them on github.com).
+        assert!(parse_selector_why(":checked").is_ok());
+        let sheet = parse(":checked{color:#111111} :not(:checked){color:#222222}");
+        let dom = dom_of(
+            "<input id=cb type=checkbox checked>\
+             <input id=cb0 type=checkbox>\
+             <input id=rd type=radio checked>\
+             <input id=tx type=text checked>\
+             <select><option id=o1 selected>x</option><option id=o2>y</option></select>\
+             <div id=dv checked></div>",
+        );
+        let color = |id: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        assert_eq!(color("cb"), 0x0011_1111, "checked checkbox");
+        assert_eq!(color("cb0"), 0x0022_2222, "unchecked checkbox");
+        assert_eq!(color("rd"), 0x0011_1111, "checked radio");
+        assert_eq!(color("tx"), 0x0022_2222, "`checked` on a text field is not checkedness");
+        assert_eq!(color("o1"), 0x0011_1111, "selected option");
+        assert_eq!(color("o2"), 0x0022_2222, "unselected option");
+        assert_eq!(color("dv"), 0x0022_2222, "a div never matches :checked");
     }
 
     #[test]

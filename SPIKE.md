@@ -5835,3 +5835,28 @@ in a normal fetch window.
 
 Test: `legacy_grid_gap_spellings_alias_the_gap_properties` (shorthand two
 values, each longhand, vendor prefix). 1070 green.
+
+## :checked is markup state, not a dropped rule (P103, 2026-11-13)
+
+P101 ranked `:checked` third among static states (113 rules on github). The
+cascade already evaluates `:enabled`/`:disabled` from the markup, but
+`:checked` was in the "interaction state" list, so every `:checked` selector
+dropped its rule and a checked radio/option painted unchecked.
+
+`Pseudo::Checked` reads the initial state a server render can express: a
+checkbox or radio carrying `checked`, and an `<option>` carrying `selected`
+(an option's checkedness is its selectedness). A text field with a `checked`
+attribute is not checked, and a script toggling the property without touching
+the attribute is not seen — the static pass reads the DOM, like `:disabled`.
+
+`is_dynamic_pseudo` no longer lists `:checked`, so `:not(:checked)` is a real
+negation now instead of a vacuously-true member: unchecked controls and every
+non-control element match it.
+
+Measured on github.com (release, `MAZDA_MISS=1`): `pseudo-class :checked`
+(113) is gone from the report, 51 -> 50 distinct dropped selector reasons,
+box tree unchanged (1110 boxes), text runs 512 in a run whose markup differed
+from the previous one (507/509), so no layout claim is made.
+
+Test: `checked_reads_markup_state` (checkbox, unchecked, radio, text field,
+selected/unselected option, a div with the attribute). 1071 green.
