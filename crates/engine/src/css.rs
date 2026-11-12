@@ -1397,6 +1397,9 @@ enum Pseudo {
     /// whitespace text node does (Selectors 4: any data with non-zero length
     /// makes the element non-empty).
     Empty,
+    /// `:target` — the element named by the document URL's fragment. The
+    /// loader stores the decoded fragment on the DOM; no fragment = no match.
+    Target,
     /// `:root` — a direct child of the document root (the `<html>` element).
     Root,
     /// `:first-child` — first ELEMENT child of its parent (text nodes don't
@@ -7965,7 +7968,7 @@ fn is_dynamic_pseudo(s: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "focus" | "focus-within" | "focus-visible" | "active"
-            | "target" | "default" | "required" | "optional"
+            | "default" | "required" | "optional"
             | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
             | "read-only" | "read-write"
     )
@@ -8297,6 +8300,8 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     ("checked", None) => seg.pseudos.push(Pseudo::Checked),
                     // emptiness is pure structure
                     ("empty", None) => seg.pseudos.push(Pseudo::Empty),
+                    // the URL fragment names this element (static per load)
+                    ("target", None) => seg.pseudos.push(Pseudo::Target),
                     // the input hint is showing: an empty value + a
                     // `placeholder` attribute. Static (the cascade keeps no
                     // live values); `:not(:placeholder-shown)` is how a
@@ -8853,6 +8858,10 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
             .children
             .iter()
             .all(|&c| matches!(dom.nodes[c as usize].kind, NodeKind::Comment(_))),
+        // the URL's `#fragment` names this element
+        Pseudo::Target => dom
+            .target()
+            .is_some_and(|t| dom.attr(node, "id") == Some(t)),
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
@@ -11445,6 +11454,31 @@ mod tests {
         assert_eq!(color("comment"), 0x0011_1111, "comments don't count");
         assert_eq!(color("child"), 0x0022_2222, "an element child");
         assert_eq!(color("text"), 0x0022_2222, "text");
+    }
+
+    #[test]
+    fn target_reads_the_url_fragment() {
+        // 11 rules on github.com dropped for `:target`; the fragment is part
+        // of the loaded URL, so a static frame can evaluate it.
+        let sheet = parse(".o{color:#222222} :target{color:#111111}");
+        let mut dom = dom_of("<div id=t class=o></div><div id=u class=o></div>");
+        let color = |dom: &Dom, id: &str| {
+            sheet
+                .resolve(dom, by_attr(dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        dom.set_target(Some("t".to_string()));
+        assert_eq!(color(&dom, "t"), 0x0011_1111, "the named element");
+        assert_eq!(color(&dom, "u"), 0x0022_2222, "every other element");
+        dom.set_target(None);
+        assert_eq!(
+            color(&dom, "t"),
+            0x0022_2222,
+            "no fragment matches nothing"
+        );
+        // `:not(:target)` is a real negation now
+        assert!(parse_selector_why(":not(:target)").is_ok());
     }
 
     #[test]

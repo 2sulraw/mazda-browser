@@ -5248,7 +5248,8 @@ fn do_load_full(
 /// The parsed tree is snapshotted BEFORE scripts run: a restore replays the
 /// scripts, so listeners/state are rebuilt exactly as on a fresh load.
 fn parse_source_with_styles(url: &str, source: String) -> (html::Dom, String, Vec<css::FontFace>) {
-    let dom = html::parse(&source);
+    let mut dom = html::parse(&source);
+    dom.set_target(url_fragment(url));
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
     let (css_text, faces) = styles_for(&dom, url);
     (dom, css_text, faces)
@@ -6012,7 +6013,8 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
     // re-fetching + re-tokenizing. The tree is the PRE-SCRIPT one, so
     // `settle_load` still replays the page's scripts (listeners intact).
     if restore {
-        if let Some(dom) = snapshot_read(url) {
+        if let Some(mut dom) = snapshot_read(url) {
+            dom.set_target(url_fragment(url));
             eprintln!(
                 "[dom] restored snapshot for {url} ({} nodes, no fetch)",
                 dom.nodes.len()
@@ -6061,7 +6063,8 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
             return (dom, css_text, faces, true);
         }
     };
-    let dom = html::parse(&source);
+    let mut dom = html::parse(&source);
+    dom.set_target(url_fragment(url));
     stage!("html parse");
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
     snapshot_write(url, &dom);
@@ -7523,6 +7526,14 @@ fn percent_decode(s: &str) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// The decoded `#fragment` of a URL, if it has one (`:target` reads it).
+/// An empty fragment (`url#`) names no element, like no fragment at all.
+fn url_fragment(url: &str) -> Option<String> {
+    let frag = url.split_once('#')?.1;
+    let decoded = String::from_utf8_lossy(&percent_decode(frag)).into_owned();
+    (!decoded.is_empty()).then_some(decoded)
 }
 
 fn hex_val(c: u8) -> Option<u8> {
@@ -12337,6 +12348,14 @@ mod tests {
     }
 
     /// data: URL decoding (the inline-document pages this shell can open
+    #[test]
+    fn url_fragment_decodes_and_ignores_empty() {
+        assert_eq!(url_fragment("https://x/a#sec"), Some("sec".to_string()));
+        assert_eq!(url_fragment("https://x/a#C%2B%2B"), Some("C++".to_string()));
+        assert_eq!(url_fragment("https://x/a"), None);
+        assert_eq!(url_fragment("https://x/a#"), None);
+    }
+
     /// with no network): plain, percent-encoded, base64 and malformed.
     #[test]
     fn data_urls_decode_inline_documents() {

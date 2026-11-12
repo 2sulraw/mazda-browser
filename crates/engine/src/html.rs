@@ -56,6 +56,10 @@ pub struct Dom {
     /// interned tag-name table; TagId.0 indexes here
     tags: Vec<Box<str>>,
     tag_index: std::collections::HashMap<Box<str>, u16>,
+    /// URL fragment the page was loaded with (`#id`), if any - `:target`
+    /// reads it. Not part of the snapshot: the URL is the source of truth,
+    /// so a restored tree gets it again from the loader.
+    target: Option<Box<str>>,
 }
 
 impl Dom {
@@ -64,6 +68,7 @@ impl Dom {
             nodes: Vec::new(),
             tags: Vec::new(),
             tag_index: std::collections::HashMap::new(),
+            target: None,
         };
         let root = dom.intern("#document");
         dom.nodes.push(Node {
@@ -127,6 +132,19 @@ impl Dom {
                 .map(|(_, v)| v.as_str()),
             _ => None,
         }
+    }
+
+    /// Set the URL fragment the document was loaded with (`#id`, decoded).
+    /// `:target` matches the element whose `id` equals it.
+    pub fn set_target(&mut self, target: Option<String>) {
+        self.target = target
+            .filter(|t| !t.is_empty())
+            .map(|t| t.into_boxed_str());
+    }
+
+    /// The URL fragment set by [`Self::set_target`], if any.
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
     }
 
     /// First `body` descendant, else the document root.
@@ -781,7 +799,7 @@ impl Dom {
         if nodes[0].parent != 0 {
             return None;
         }
-        Some(Dom { nodes, tags, tag_index })
+        Some(Dom { nodes, tags, tag_index, target: None })
     }
 }
 

@@ -5911,3 +5911,23 @@ so no layout claim is made beyond the box count.
 Test: `grid_row_placement_parses_lines_spans_and_names`,
 `grid_explicit_rows_place_items_and_auto_flow_skips_them`,
 `grid_row_end_line_spans_to_a_negative_line`. 1075 green.
+
+## :target is URL state, not a dropped interaction state (P106, 2026-11-13)
+
+`:target` was on the "interaction state" list, so all 11 selectors on
+github.com dropped their rules even though the fragment is fixed for the whole
+load. A static frame knows it: the URL is the input.
+
+The loader now decodes the fragment (percent-decoding, empty fragment = none)
+and stores it on the DOM, on both a fresh parse and a snapshot restore.
+`:target` matches an element whose `id` equals it, and leaving the list of
+dynamic pseudo-classes makes `:not(:target)` a real negation. shortcut: a
+script that rewrites `location.hash` after load does not re-cascade; the
+fragment is read once per load, like the other markup-state pseudos.
+
+Measured on github.com (release, `MAZDA_MISS=1`): 48 -> 47 distinct dropped
+selector reasons (`:target` is gone), box tree unchanged at 1110 boxes.
+
+Test: `target_reads_the_url_fragment` (named element, other elements, no
+fragment, `:not(:target)`), `url_fragment_decodes_and_ignores_empty` (plain,
+percent-encoded, missing, empty). 1077 green.
