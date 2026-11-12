@@ -5247,6 +5247,16 @@ fn settle_load(
         // inline scripts mutated the DOM before the first layout — the
         // layout below already sees the mutated tree
         eprintln!("[js] scripts mutated the DOM before layout");
+    }
+    // scripts that render markup add `<img>` elements the parse-time preload
+    // could not know about; those are the ones the final probe still pays for
+    // (~0.4 s). Start them now, on a side thread, so the round trips overlap
+    // the cascade instead of following it.
+    let post_imgs = image_urls(&kp.dom, url);
+    if !post_imgs.is_empty() {
+        std::thread::spawn(move || {
+            preload_accept(&post_imgs, Some(IMAGE_ACCEPT), "preload (images, post-script)");
+        });
     }    #[cfg(feature = "count-alloc")]
     let h1 = heap_mb();
     kp.scripts = Some(scripts);
@@ -6641,6 +6651,7 @@ fn fetch_prefix(url: &str, limit: usize) -> Result<(Vec<u8>, bool), String> {
     Ok((buf, complete))
 }
 
+
 /// Header-only media probe: fetch the container prefix and report its
 /// metadata. `Some((meta, None))` = header known, body still on the network;
 /// `Some((meta, Some(path)))` = the server sent the whole file anyway; `None`
@@ -7717,6 +7728,68 @@ fn fetch_accept(
     if url.starts_with("data:") {
         return data_url_body(url).ok_or_else(|| format!("malformed data: url {url:?}"));
     }
+    coalesce_fetch(url, || fetch_accept_raw(url, accept))
+}
+
+/// One answer per URL per page load: the preload bursts and the sequential
+/// phases that follow ask for the same URLs, and a URL already downloading on
+/// another thread is joined, not fetched a second time. The earlier a preload
+/// starts, the more of its work the sequential phase would otherwise repeat.
+fn coalesce_fetch(
+    url: &str,
+    work: impl FnOnce() -> Result<(Vec<u8>, Option<String>), String>,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    type Slot = std::sync::Arc<(
+        std::sync::Mutex<Option<Result<(Vec<u8>, Option<String>), String>>>,
+        std::sync::Condvar,
+    )>;
+    fn slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, Slot>> {
+        static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Slot>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+    fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    let follower = {
+        let mut map = lock(slots());
+        match map.get(url) {
+            Some(s) => Some(s.clone()),
+            None => {
+                map.insert(
+                    url.to_string(),
+                    std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+                );
+                None
+            }
+        }
+    };
+    let Some(slot) = follower else {
+        // this thread owns the URL: run the request, publish it, then drop the
+        // slot. A panic is published as an error so a waiter cannot hang on a
+        // leader that died.
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            .unwrap_or_else(|_| Err(format!("fetch panicked: {url}")));
+        if let Some(slot) = lock(slots()).remove(url) {
+            let (cell, cv) = &*slot;
+            *lock(cell) = Some(out.clone());
+            cv.notify_all();
+        }
+        return out;
+    };
+    let (cell, cv) = &*slot;
+    let mut g = lock(cell);
+    while g.is_none() {
+        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    g.as_ref().expect("slot filled").clone()
+}
+
+/// [`fetch_accept`] without the in-flight table: disk cache, network, cache.
+fn fetch_accept_raw(
+    url: &str,
+    accept: Option<&str>,
+) -> Result<(Vec<u8>, Option<String>), String> {
     let dir = cache_dir();
     let now = now_secs();
     // A stale entry is kept, not discarded: its body answers a 304 and its
@@ -11503,6 +11576,39 @@ mod tests {
             }, &mut last_geom, &mut last_forms, None);
         assert!(nav2.is_none() && !nav_done2 && !panicked2 && wire2.is_some(),
             "formless activation = plain relayout");
+    }
+
+    /// A preload burst and the sequential phase that follows ask for the same
+    /// URLs: the second caller must join the download in flight, not start a
+    /// second one. Eight threads, one request.
+    #[test]
+    fn coalesce_fetch_runs_one_request_per_url() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let out: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        coalesce_fetch("https://e.com/one", || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Ok((vec![7u8], None))
+                        })
+                        .map(|(b, _)| b)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect()
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one download, not eight");
+        assert!(out.iter().all(|b| b == &vec![7u8]), "every caller got the bytes");
+        // the slot is gone once answered: the next caller runs its own request
+        coalesce_fetch("https://e.com/one", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok((vec![8u8], None))
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// The markup's own `<img>` sources are fetched on a side thread while the

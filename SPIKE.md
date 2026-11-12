@@ -4855,3 +4855,60 @@ into the script phase, where its round trip is free.
 
 Tests **1035 -> 1036** green (new
 `media_urls_collect_video_and_source_children`).
+
+## One download per URL, however many threads ask (P78, 2026-11-12)
+
+Every phase added since P74 starts its round trips earlier, which is the right
+direction and also the way to pay twice: a burst preloads URLs, the sequential
+phase that follows asks for the same ones before the burst finished, and both
+hit the network. Nothing in the loader coordinated them - the disk cache only
+helps *after* an entry is written, and an entry is written when the fetch ends.
+
+Change (`app.rs`): `fetch_accept` now goes through `coalesce_fetch`, a small
+in-flight table keyed by URL. The first caller for a URL becomes the leader
+and runs the request; everyone who asks while it is running joins its answer
+(a `Condvar` on a shared slot) instead of issuing a second request. The slot
+is removed when the answer is published, so a later ask behaves exactly as
+before (it reads the cache the leader wrote). A leader that panics publishes
+an error rather than leaving waiters blocked.
+
+Measured honestly: **no wall-clock change**, and no duplicate fetches to
+remove today. Logging every `[net]` line of four cold loads (before and after)
+gives 82 network fetches and **0** URLs fetched twice in each. The overlap we
+have today happens to be ordered such that the disk cache always wins. So this
+is a guarantee, not a saving - it is the piece that makes it safe to start a
+preload *earlier* than the phase that consumes it, which is the only remaining
+way to attack the first frame (see the rejected experiment below).
+
+Tests **1036 -> 1037** green (new `coalesce_fetch_runs_one_request_per_url`:
+eight threads, one request, every caller gets the bytes, and the slot is gone
+afterwards).
+
+### Rejected: warming the `<head>` with a second range request
+
+The first frame waits on: document (1.3-2.1 s) -> stylesheet burst (1.6-2.9 s)
+-> cascade (0.9 s). The stylesheet links sit at byte 3 334 of github's HTML, so
+a 64 KB `Range` read of the same URL could name them ~0.5 s before the full
+document lands, and the burst would start that much earlier.
+
+Implemented and measured with `MAZDA_TIME` (fresh profile, three runs): the
+prefix *is* the HTML (25 stylesheets parsed out of the 64 KB prefix, correctly
+cut at the last whole tag), and it arrives at **2 319 ms** while the document
+itself - 525 802 bytes of gzip - arrives at **1 736 ms**. The prefix is a fresh
+round trip with no compression and it competes with the document for the same
+link, so it lands *later* than the thing it was meant to beat. First paint:
+4 941 ms, i.e. unchanged from the 4.2-5.3 s baseline, for one extra request.
+
+Two bugs found on the way, worth keeping in mind for a future attempt:
+
+- a *second* `Accept-Encoding` header is another candidate, not an override:
+  the first attempt pushed `identity` next to the shared `gzip, br` and got
+  brotli bytes back, which `from_utf8_lossy` turned into 118 KB of U+FFFD and
+  a 64-node "document" with no stylesheets. Replace, never append.
+- the cut has to be at the last whole tag, or a truncated `href=` becomes a
+  request for a truncated URL.
+
+What this rules out is *asking twice*; it does not rule out reading the one
+response as it arrives (streaming decode of the gzip/br body, parse the head
+from the first chunk, preload from there), which is what the next attempt
+should do - and what `coalesce_fetch` above exists to make safe.
