@@ -1414,7 +1414,7 @@ fn build_into(
                 // author CSS (rules + inline style) cascades over UA defaults;
                 // relative font-sizes compute against the TRUE parent (style),
                 // not the UA-bumped child_style (headings would compound 2x)
-                let outcome = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, vars);
+                let outcome = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, style.color, vars);
                 // the element's own counter operations happen before its
                 // ::before and its content; they stay in scope for its
                 // following siblings (unwound at the end of this child list)

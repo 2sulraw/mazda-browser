@@ -5256,6 +5256,26 @@ real frame is the `7.98 %` one. `paint-timeline.ps1` now deletes the file
 before it starts the renderer, and a rerun reports `no frame yet` until the
 real paint instead of a stale image.
 
+## `color: inherit` takes the parent's colour (P88, 2026-11-12)
+
+With the icons on screen the logo painted in link blue. github writes
+`.logo__bX9RKh{color:inherit}`, and `inherit` was silently dropped: the child's
+`Style` already held the UA `<a>` colour (`#6AB3FF`) before the author CSS
+ran, so "keep what you have" looked the same as "copy the parent".
+
+The cascade can't read the parent off that `Style` - that is the UA default, not
+the parent's computed colour - so it is threaded in explicitly
+(`apply_decl(..., parent_color, ...)`, `resolve_scoped(..., parent_color, ...)`,
+fed from `layout`'s `style.color`). `inherit` and `unset` now copy it; `initial`
+is CanvasText (`#000000`).
+
+Sampled the logo box in the 1000x670 first frame (x 466..506, y 8..38): the
+octocat's fill is now `#000000` (50 px, dominant) beside the LogoSlot's
+`#e4ebe6` border, where it used to be the link blue. It is black rather than
+github's `#1f2328` because the header's own `color` comes through a `var()`
+chain that still lands on the initial value - smaller, separate gap. Tests
+**1049 -> 1050** green (`color_inherit_reinstates_the_parent_colour`).
+
 
 
 

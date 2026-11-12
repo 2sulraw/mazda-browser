@@ -2762,12 +2762,14 @@ impl Sheet {
         inline: Option<&str>,
         parent_size: f32,
     ) -> StyleOutcome {
-        self.resolve_scoped(dom, node, base, inline, parent_size, None)
+        self.resolve_scoped(dom, node, base, inline, parent_size, base.color, None)
     }
 
     /// `resolve_with_parent` with the parent element's custom-property chain:
     /// `var()` in this element's declarations sees its own `--*` rules first,
     /// then `parent_vars` (the ancestor chain), then the sheet-wide palette.
+    /// `parent_color` is the parent's computed colour, which `base` no longer
+    /// carries once a UA default (`<a>`'s blue) replaced it.
     pub fn resolve_scoped(
         &self,
         dom: &Dom,
@@ -2775,6 +2777,7 @@ impl Sheet {
         base: Style,
         inline: Option<&str>,
         parent_size: f32,
+        parent_color: u32,
         parent_vars: Option<&std::rc::Rc<VarScope>>,
     ) -> StyleOutcome {
         let vars = self.scope_of(dom, node, inline, parent_vars.cloned());
@@ -2838,7 +2841,7 @@ impl Sheet {
                     color_declared |= d.0 == "color";
                     let sd = self.subst_scoped(d, vars.as_deref());
                     let fs = self.fam_stack_of(&sd, parent_size, self.vp);
-                    if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs)
+                    if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, parent_color, self.vp, dark, fs)
                     {
                         display_none = true;
                     }
@@ -2858,7 +2861,7 @@ impl Sheet {
                 color_declared |= d.0 == "color";
                 let sd = self.subst_scoped(d, vars.as_deref());
                 let fs = self.fam_stack_of(&sd, parent_size, self.vp);
-                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
+                if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, parent_color, self.vp, dark, fs) {
                     display_none = true;
                     // an INLINE `opacity:0` is how a page marks an element
                     // whose fade-in has not run yet (`style="opacity:0"` in
@@ -2945,7 +2948,7 @@ impl Sheet {
                 let sd = self.subst(d);
                 let fs = self.fam_stack_of(&sd, base.size, self.vp);
                 if apply_decl(
-                    &sd, &mut style, &mut bg, &mut bx, base.size, self.vp, dark, fs,
+                    &sd, &mut style, &mut bg, &mut bx, base.size, base.color, self.vp, dark, fs,
                 ) {
                     display_none = true;
                 }
@@ -3591,6 +3594,9 @@ fn apply_decl(
     bg: &mut Option<u32>,
     bx: &mut BoxStyle,
     parent: f32,
+    // the parent's computed colour: `color: inherit/unset` reinstates it
+    // (the UA link blue is already in `style`, so it can't come from there)
+    parent_color: u32,
     // viewport (w, h) for vw/vh/vmin/vmax — read off the sheet at resolve
     vp: (f32, f32),
     dark: bool,
@@ -3599,7 +3605,15 @@ fn apply_decl(
 ) -> bool {
     match d.0.as_str() {
         "color" => {
-            if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
+            let v = pick_light_dark(&d.1, dark).trim();
+            // `inherit`/`unset` mean the parent's computed colour, which the
+            // cascade can't read off `style` (a UA default like the link blue
+            // is already in it) — the caller passes it separately
+            if v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("unset") {
+                style.color = parent_color;
+            } else if v.eq_ignore_ascii_case("initial") {
+                style.color = 0x00_00_00_00;
+            } else if let Some(c) = parse_color(v) {
                 style.color = c;
             }
         }
@@ -9026,6 +9040,32 @@ mod tests {
     }
 
     #[test]
+    fn color_inherit_reinstates_the_parent_colour() {
+        // `<a>` carries the UA link colour before the cascade runs, so
+        // `color: inherit` (github's `.logo { color: inherit }`) has to come
+        // from the parent, not from `style.color` — otherwise the logo keeps
+        // the link blue while the real engine paints it in the header colour
+        let dom = dom_of(r#"<div id=p><a id=c class=logo href="/">x</a></div>"#);
+        let sheet = parse(".logo { color: inherit }");
+        let p = by_attr(&dom, "id", "p");
+        let c = by_attr(&dom, "id", "c");
+        let parent = sheet.resolve(&dom, p, Style::new(), None);
+        assert_eq!(parent.style.color, 0x00_00_00_00, "parent is plain black");
+        // the child's pre-cascade style is the UA link blue, as in layout
+        let mut ua = Style::new();
+        ua.color = 0x00_00_6a_b3_ff;
+        let out = sheet.resolve_scoped(&dom, c, ua, None, 16.0, parent.style.color, None);
+        assert_eq!(out.style.color, 0x00_00_00_00, "inherit = the parent's black");
+        // without the rule the UA colour survives (no accidental reset)
+        let out = parse("").resolve_scoped(&dom, c, ua, None, 16.0, parent.style.color, None);
+        assert_eq!(out.style.color, 0x00_00_6a_b3_ff);
+        // `initial` is CanvasText (black), `unset` inherits like `inherit`
+        let sheet = parse("#c { color: initial }");
+        let out = sheet.resolve_scoped(&dom, c, ua, None, 16.0, 0x00_00_11_22_33, None);
+        assert_eq!(out.style.color, 0x00_00_00_00);
+    }
+
+    #[test]
     fn equal_specificity_uses_source_order() {
         let sheet = parse("p { color: #111111 } p { color: #222222 }");
         let dom = dom_of("<p></p>");
@@ -9756,6 +9796,7 @@ mod tests {
                     Style::new(),
                     None,
                     16.0,
+                    Style::new().color,
                     scope.vars.as_ref(),
                 )
                 .bg
@@ -9782,7 +9823,7 @@ mod tests {
         let body = by_tag(&dom, "body");
         assert_eq!(
             sheet
-                .resolve_scoped(&dom, body, Style::new(), None, 16.0, root.vars.as_ref())
+                .resolve_scoped(&dom, body, Style::new(), None, 16.0, Style::new().color, root.vars.as_ref())
                 .bg,
             Some(0xf8f9fa),
             "the root's own :root value beats the flat last-wins map"
