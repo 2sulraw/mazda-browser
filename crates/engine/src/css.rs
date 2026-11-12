@@ -1516,6 +1516,24 @@ pub fn cascade_stats_take() -> (usize, usize, usize) {
     CASCADE_STATS.with(|c| c.replace((0, 0, 0)))
 }
 
+thread_local! {
+    /// Ancestor steps taken inside a selector test: the walk the candidate
+    /// count does not show. Diagnostic only (`MAZDA_TIME`).
+    static SEL_HOPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Take (and reset) the ancestor-hop counter.
+pub fn sel_hops_take() -> u64 {
+    SEL_HOPS.with(|c| c.replace(0))
+}
+
+/// The hop counter is a diagnostic: `MAZDA_TIME=1` pays for it, a normal run
+/// only pays one atomic load per hop.
+fn hop_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAZDA_TIME").is_some())
+}
+
 /// Rightmost-compound buckets over one cascade-ordered rule list.
 ///
 /// A selector can only match an element if its LAST compound's id, class,
@@ -8098,6 +8116,9 @@ fn leftmost_match(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> Opt
                 return None; // reached document root
             }
             cur = parent;
+            if hop_stats_on() {
+                SEL_HOPS.with(|c| c.set(c.get() + 1));
+            }
             if seg_matches(dom, cur, &segs[idx], hover) {
                 break;
             }

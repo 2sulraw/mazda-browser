@@ -5307,6 +5307,29 @@ resolves relative subresources against the wrong base, and the address bar
 keeps showing the old URL. Fixing that means separating a page's identity from
 its base URL (`KeptPage.url` vs a new `base`), which is a follow-up.
 
+## The cascade walks 4.1 M ancestors on github's front page (P90, 2026-11-12)
+
+The `cascade + box tree` stage is the second largest of a cold load, and the
+question was whether that time is the tree walk. It is not the *element* walk -
+github's front page is 2663 nodes, a few microseconds - but it is a walk:
+matching one rule against one element steps up the ancestor chain compound by
+compound. A new counter (`MAZDA_TIME=1`, printed next to the candidate count)
+says how much:
+
+| | count |
+|---|---|
+| candidate selector tests | 608 340 |
+| **ancestor hops inside those tests** | **4 142 084** |
+| hops per candidate | 6.8 |
+| stage | 1412-3006 ms (host load varies) |
+
+So ~7 ancestor steps per candidate is where the time goes, and the fix is not
+a faster walk: it is not walking. Blink keeps a bloom filter of the element's
+ancestor classes/ids/tags as it descends the tree and rejects a rule whose
+left-hand compound requires a name that filter does not contain - one bit test
+instead of an ancestor chain. That is the next change; this counter is the
+before-number for it (4.1 M hops) and it stays, gated on `MAZDA_TIME`.
+
 
 
 

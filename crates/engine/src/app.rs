@@ -6110,6 +6110,10 @@ fn layout_page(
         eprintln!(
             "[css] {tested} candidates tested, {matched} matched, {decls} declarations applied"
         );
+        eprintln!(
+            "[css] selector: {} ancestor hops",
+            css::sel_hops_take()
+        );
         eprintln!("[css] color-scheme: {probes} selector tests, {hops} ancestor hops");
     }
     eprintln!(
