@@ -5041,6 +5041,44 @@ Diagnostic added with it: `MAZDA_JS_STYLE=1` prints
 instead of a screenshot. On github it reports exactly one write, a
 `display: none` on the cookie banner.
 
+## `grid-column: span N` covers N tracks (P83, 2026-11-12)
+
+With the hero painted (P81/P82) it was still unreadable: the headline wrapped
+one character per line and the whole page was 14 645 px tall. The box dump
+named the container: github's homepage grid is twelve `minmax(0,1fr)` tracks
+(`Primer_Brand__Grid-module__Grid___H4Yx1`), every content column inside it
+says `grid-column: span 12`, and the column came out 72 px wide.
+
+Cause: the parser took `span 12` for a *line name* - `grid_col = Some("span
+12")` - which never matches a `col_lines` entry, so placement fell through to
+auto and the item took a single track. `grid-column-end: span N` was dropped
+outright by a `starts_with("span")` guard.
+
+Change: `BoxStyle::grid_col_span` (0 = one track) filled from either half of
+the `grid-column` shorthand and from `grid-column-end`, via one small
+`span_count()` helper; `grid()` placement wraps the item to the next row when
+`span` no longer fits the explicit template and occupies the covered tracks.
+Named lines still win when the value is a name, so the `content` /
+`extended-full-end` bleeding (MDN's header) is unchanged.
+
+Measured (all four rules in the build): cold github.com, fresh profile,
+`tools/paint-timeline.ps1 -Seconds 30 -Every 5`:
+
+| | first frame | finished frame | stage lines |
+|---|---|---|---|
+| before (flat blocks) | 4.7 s, 26.42 % ink, 5 colours | 19.3 s, 55.74 %, 10 colours | first paint 4 907 ms, scripts 5 067 ms |
+| after | 4.1 s, 18.85 % ink, 223 colours | 19.5 s, 19.18 %, 281 colours | first paint 4 295 ms, scripts 4 627 ms |
+
+The number that matters is the colour count: 5 colours is a page of solid
+rectangles, 223 is text with antialiasing - the banner, the centred "Software
+still starts / with you", the CTA row, the logo and the nav icons are all in
+the first frame. The ink percentage *fell* because a correct layout is mostly
+white page; it is read together with `Colours`, never alone (P79). Frames
+3 at 4.09 / 11.5 / 19.5 s (markup+CSS, post-script, relayout). Tests
+**1039 -> 1041** green (`grid_column_span_parses_from_shorthand_and_longhand`,
+`grid_column_span_covers_its_tracks`).
+
+
 
 
 

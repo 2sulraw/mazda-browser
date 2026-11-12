@@ -7480,6 +7480,10 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     // (row0, row1, col0, col1) — row1/col1 exclusive
     let mut spots: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(items.len());
     for it in &items {
+        let span = match it {
+            Item::Grp(i) => n.children[*i].bx.grid_col_span as usize,
+            Item::Text(..) => 0,
+        };
         let (area, named) = match it {
             Item::Grp(i) => {
                 let b = &n.children[*i].bx;
@@ -7500,6 +7504,7 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                 (r0, r1, c0, c1)
             }
             (None, Some((s, e))) => {
+                let e = e.max(s + span).min(nc0);
                 let r = (s..e).map(|c| col_row[c]).max().unwrap_or(0);
                 for c in s..e {
                     col_row[c] = r + 1;
@@ -7519,8 +7524,15 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                     }
                     sp
                 } else {
-                    let sp = (ar, ar + 1, ac, (ac + 1).min(nc0));
-                    ac += 1;
+                    // `grid-column: span N` covers N tracks; wrap when it no
+                    // longer fits the explicit template
+                    let width = span.max(1).min(nc0);
+                    if ac + width > nc0 {
+                        ac = 0;
+                        ar += 1;
+                    }
+                    let sp = (ar, ar + 1, ac, (ac + width).min(nc0));
+                    ac += width;
                     if ac >= nc0 {
                         ac = 0;
                         ar += 1;
@@ -10172,6 +10184,46 @@ mod tests {
         assert_eq!(n.children[0].w, 190.0);
         assert_eq!(n.children[1].x, 210.0);
         assert_eq!(n.children[1].w, 190.0);
+    }
+
+    #[test]
+    fn grid_column_span_covers_its_tracks() {
+        // github.com's homepage hero: a 12 x minmax(0,1fr) template and a
+        // content column declared `grid-column: span 12`. The item used to
+        // take one 1fr track (72px at 976), which wrapped the h1 one
+        // character per line; the span must cover all twelve.
+        let mut grid = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::MinMax(TrackBreadth::Px(0.0), TrackBreadth::Fr(1.0)); 12],
+                ..BoxStyle::default()
+            },
+        );
+        let mut hero = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grid_col_span: 12,
+                ..BoxStyle::default()
+            },
+        );
+        hero.children = vec![leaf("hero")];
+        let mut half = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grid_col_span: 6,
+                ..BoxStyle::default()
+            },
+        );
+        half.children = vec![leaf("half")];
+        grid.children = vec![hero, half];
+        layout_tree(&mut grid, 960.0, &m4);
+        assert_eq!(grid.children[0].w, 960.0, "span 12 fills the template");
+        assert_eq!(grid.children[0].x, 0.0);
+        assert_eq!(grid.children[1].w, 480.0, "span 6 wraps to the next row");
+        assert_eq!(grid.children[1].x, 0.0);
     }
 
     #[test]

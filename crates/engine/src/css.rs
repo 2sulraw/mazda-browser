@@ -800,6 +800,12 @@ pub struct BoxStyle {
     /// header relies on it (`grid-column: content` + `grid-column-end:
     /// extended-full-end`) to bleed past the content column.
     pub grid_col_end: Option<String>,
+    /// `grid-column: span N` (either half of the shorthand, or
+    /// `grid-column-end: span N`): how many explicit columns the item
+    /// covers when placed. 0 = one. GitHub's homepage grid gives every
+    /// content column `grid-column: span 12`; without this the whole hero
+    /// collapsed into a single 72px track.
+    pub grid_col_span: u32,
     /// `grid-template-areas` rows of cell names; `None` = an empty `.` cell.
     /// Items name a cell with `grid-area` and are placed into its rect.
     pub areas: Vec<Vec<Option<String>>>,
@@ -1180,6 +1186,7 @@ impl Default for BoxStyle {
             col_lines: Vec::new(),
             grid_col: None,
             grid_col_end: None,
+            grid_col_span: 0,
             areas: Vec::new(),
             grid_area: None,
             grid_flow: GridFlow::Row,
@@ -3544,6 +3551,15 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
     out
 }
 
+/// `span N` → N (0 when the value is not a positive span). Used by
+/// `grid-column` / `grid-column-end` placement.
+fn span_count(v: &str) -> u32 {
+    v.trim()
+        .strip_prefix("span")
+        .and_then(|rest| rest.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// `dark` = the element's used color scheme — picks the `light-dark()` branch
 /// on color-bearing values before they reach `parse_color`.
 fn apply_decl(
@@ -4196,14 +4212,19 @@ fn apply_decl(
         "grid-column" => {
             let mut parts = d.1.split('/');
             let first = parts.next().unwrap_or("").trim();
-            if !first.is_empty() && first != "auto" && first.parse::<u32>().is_err() {
+            let first_span = span_count(first);
+            if first_span > 0 {
+                bx.grid_col_span = first_span;
+            } else if !first.is_empty() && first != "auto" && first.parse::<u32>().is_err() {
                 bx.grid_col = Some(first.to_string());
             }
             if let Some(end) = parts.next() {
                 let end = end.trim();
-                if !end.is_empty()
+                let end_span = span_count(end);
+                if end_span > 0 {
+                    bx.grid_col_span = end_span;
+                } else if !end.is_empty()
                     && end != "auto"
-                    && !end.starts_with("span")
                     && end.parse::<u32>().is_err()
                 {
                     bx.grid_col_end = Some(end.to_string());
@@ -4218,9 +4239,11 @@ fn apply_decl(
         }
         "grid-column-end" => {
             let first = d.1.split('/').next().unwrap_or("").trim();
-            if !first.is_empty()
+            let span = span_count(first);
+            if span > 0 {
+                bx.grid_col_span = span;
+            } else if !first.is_empty()
                 && first != "auto"
-                && !first.starts_with("span")
                 && first.parse::<u32>().is_err()
             {
                 bx.grid_col_end = Some(first.to_string());
@@ -10915,6 +10938,27 @@ mod tests {
         let sheet = parse(".s { grid-area: 1 / 2 / 3 / 4 }");
         let s = sheet.resolve(&dom, by_attr(&dom, "class", "s"), Style::new(), None).bx;
         assert_eq!(s.grid_area, None);
+    }
+
+    #[test]
+    fn grid_column_span_parses_from_shorthand_and_longhand() {
+        // github.com's homepage: every content column is `span 12` on a
+        // 12-track template. The value used to fall through to `grid_col`
+        // and never match a line, so the item silently took one track.
+        let sheet = parse(
+            ".a { grid-column: span 12 } \
+             .b { grid-column-end: span 4 } \
+             .c { grid-column: content / span 3 } \
+             .d { grid-column: 2 / span 5 }",
+        );
+        let dom = dom_of("<div class=a></div><div class=b></div><div class=c></div><div class=d></div>");
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(bx("a").grid_col_span, 12);
+        assert_eq!(bx("a").grid_col, None, "`span` is not a line name");
+        assert_eq!(bx("b").grid_col_span, 4);
+        assert_eq!(bx("c").grid_col.as_deref(), Some("content"));
+        assert_eq!(bx("c").grid_col_span, 3);
+        assert_eq!(bx("d").grid_col_span, 5);
     }
 
     #[test]
