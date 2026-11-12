@@ -1455,12 +1455,14 @@ impl DomHost {
         Ok((String::from_utf8_lossy(&bytes).into_owned(), ct))
     }
 
-    /// `matchMedia("(prefers-color-scheme: …)")` — mirrors the single OS
-    /// preference constant css.rs resolves elements with; other queries →
-    /// no match. Keep this mirror in sync with css.rs.
-    pub fn match_media_dark(&self, q: &str) -> bool {
-        // this mirror must stay in sync with css.rs PREFERS_DARK (= true)
+    /// `matchMedia("(prefers-color-scheme: …)")` / `(prefers-reduced-motion)`
+    /// — mirrors the single globals css.rs resolves with, so JS and the
+    /// cascade always agree. Other queries → no match. Keep this mirror in
+    /// sync with css.rs.
+    pub fn match_media(&self, q: &str) -> bool {
+        // these mirrors must stay in sync with css.rs
         const PREFERS_DARK_MIRROR: bool = true;
+        const PREFERS_REDUCED_MOTION_MIRROR: bool = true;
         if q.contains("prefers-color-scheme") {
             if q.contains("dark") {
                 PREFERS_DARK_MIRROR
@@ -1646,8 +1648,8 @@ pub fn host_mut_opt<R>(f: impl FnOnce(&mut DomHost) -> R) -> Option<R> {
 // (`run_jobs` after every turn) and its internal event model's promises
 // therefore behave. Unmapped pieces: the engine core has no timers of its
 // own to reconcile (setTimeout lives on our side in both engines), and
-// `cancelAnimationFrame` does not exist yet in either engine (callback ids
-// are returned but unused — same shortcut in script.rs).
+// `cancelAnimationFrame` exists in Option A (script.rs) but not in this
+// adapter, whose frame ids are returned but unused.
 //
 // Wave 18 (live `element.style` / `classList` / `parentElement` /
 // `document.currentScript`, zero-size layout reads) landed on Option A's
@@ -2177,7 +2179,7 @@ pub mod engine_b {
 
     fn b_match_media(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
         let q = arg_str(args, 0, ctx).unwrap_or_default();
-        let dark = host(|h| h.match_media_dark(&q));
+        let dark = host(|h| h.match_media(&q));
         let o = obj_val(ctx);
         set_own(&o, ctx, "matches", JsValue::from(dark));
         set_own(&o, ctx, "media", s_val(&q));

@@ -3099,15 +3099,15 @@ fn n_prompt(_e: &mut JsEngine, _args: &[Val]) -> Result<Val, JsError> {
 }
 
 /// `matchMedia("(prefers-color-scheme: dark)")` — reports the same
-/// system preference the cascade's dark-mode logic uses. shortcut: css.rs
-/// resolves the per-element scheme itself (its globals are private); the
-/// mirror lives on the shared host (single copy for both engines).
+/// preferences the cascade uses: color scheme and reduced motion. shortcut:
+/// css.rs resolves the per-element scheme itself (its globals are private);
+/// the mirror lives on the shared host (single copy for both engines).
 /// Other media queries → no match.
 fn n_match_media(_e: &mut JsEngine, args: &[Val]) -> Result<Val, JsError> {
     let q = args.first().map(|v| v.to_string()).unwrap_or_default();
-    let dark = runtime::host(|h| h.match_media_dark(&q));
+    let matches = runtime::host(|h| h.match_media(&q));
     let o = Val::new_object();
-    o.set("matches", Val::Bool(dark));
+    o.set("matches", Val::Bool(matches));
     o.set("media", str_val(&q));
     // shortcut: no media engine, so the list never changes and its change
     // listeners are recorded nowhere — themes just read `.matches` once
@@ -6405,6 +6405,9 @@ mod tests {
                 window.ua = navigator.userAgent;
                 window.dark = matchMedia("(prefers-color-scheme: dark)").matches;
                 window.light = matchMedia("(prefers-color-scheme: light)").matches;
+                window.rm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+                window.rmBool = matchMedia("(prefers-reduced-motion)").matches;
+                window.rmNo = matchMedia("(prefers-reduced-motion: no-preference)").matches;
                 window.other = matchMedia("(max-width: 1px)").matches;
                 console.info("info-out"); console.warn("warn-out"); console.error("err-out");
                 alert("alerted");
@@ -6420,6 +6423,10 @@ mod tests {
         assert!(get_global_str(&mut ps, "ua").contains("Chrome/"));
         assert_eq!(get_global_str(&mut ps, "dark"), "true");
         assert_eq!(get_global_str(&mut ps, "light"), "false");
+        // this build reports reduced motion so animation-gated content shows
+        assert_eq!(get_global_str(&mut ps, "rm"), "true");
+        assert_eq!(get_global_str(&mut ps, "rmBool"), "true");
+        assert_eq!(get_global_str(&mut ps, "rmNo"), "false");
         assert_eq!(get_global_str(&mut ps, "other"), "false");
         assert_eq!(get_global_str(&mut ps, "c"), "true");
         assert_eq!(get_global_str(&mut ps, "p"), "null");

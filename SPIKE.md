@@ -4975,4 +4975,36 @@ effects that used to abort now reach their next statement. Tests
 **1037 -> 1039** green (`cancel_animation_frame_drops_queued_callback`,
 `cancel_animation_frame_from_a_timer_drops_queued_frame`).
 
+## Report reduced motion, because this build does not animate (P81, 2026-11-12)
+
+github.com's homepage decides how to reveal its hero from
+`window.matchMedia("(prefers-reduced-motion)").matches`:
+
+```js
+z = W || er ? {} : { opacity: 0 }   // W = prefersReducedMotion
+```
+
+`W` true means "no intro animation, render the content as it is"; false means
+"start the hero at `opacity:0` and let the GSAP timeline bring it in". This
+engine has no transitions and no Web Animations: it paints a frame and moves
+on. So reporting `no-preference` was a promise it cannot keep - the hero got
+its `opacity:0` start state and the timeline that was supposed to lift it
+waits on `document.fonts.ready` and a vsync that never arrive.
+
+`css.rs` now has `PREFERS_REDUCED_MOTION = true`, used by `media_feature` for
+`@media (prefers-reduced-motion: reduce)` (and the boolean form), mirrored on
+the shared host (`DomHost::match_media`, renamed from `match_media_dark`) so
+`matchMedia` in JS and the cascade always agree. A page that respects the
+preference paints its end state immediately instead of waiting for a tick.
+
+Measured together with P82 below (they are the two halves of the same reveal,
+and separating them would have meant a build that paints a hero nobody can
+see): cold github.com, fresh profile, `tools/paint-timeline.ps1`: the flat
+block render (`26.42 %` ink in `5` colours) becomes `5.00 %` ink in `92`
+colours - real text, in a page that is now `14 645 px` tall because the hero
+grid lays out at full width (P83 fixes the width itself). Tests stay at
+**1039**; `media_queries_evaluated_against_viewport` and the `matchMedia` test
+grew the reduce / boolean / no-preference assertions.
+
+
 

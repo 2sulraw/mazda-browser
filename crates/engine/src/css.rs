@@ -2380,6 +2380,19 @@ pub fn dump_misses() {
 /// the light one, with `prefers-color-scheme: light` blocks applying instead.
 const PREFERS_DARK: bool = true;
 
+/// The motion preference this build reports (`true` = reduced motion).
+///
+/// shortcut: the engine paints frames, not tweens (no CSS transitions, no
+/// Web Animations), so animation-gated content would otherwise stay at its
+/// start state forever. Reporting `reduce` is the honest stand-in: a page
+/// that respects the preference shows the end state immediately instead of
+/// waiting for a tick that never comes. Measured on github.com's homepage
+/// (`Intro__content`, `style="opacity:0"`): with `no-preference` the hero
+/// is never revealed and the first real text sits 781 px down the page;
+/// with `reduce` its React/GSAP path takes the static branch and the hero
+/// is in the frame (see SPIKE P81).
+const PREFERS_REDUCED_MOTION: bool = true;
+
 /// Parse a stylesheet (concatenated `<style>` + fetched sheets) into a
 /// cascade-sorted rule list, assuming a 1000px desktop viewport.
 #[cfg(test)] // production uses parse_for (media queries need the viewport)
@@ -8549,12 +8562,21 @@ fn media_feature(part: &str, vw: f32) -> bool {
                 // no-preference/bogus: we always model a definite preference
                 _ => false,
             },
+            // this build does not animate: reduce is the honest value
+            "prefers-reduced-motion" => match v {
+                "reduce" => PREFERS_REDUCED_MOTION,
+                "no-preference" => !PREFERS_REDUCED_MOTION,
+                _ => false,
+            },
             _ => false,
         };
     }
     // boolean form `(prefers-color-scheme)` = "does the system prefer dark"
     if inner == "prefers-color-scheme" {
         return PREFERS_DARK;
+    }
+    if inner == "prefers-reduced-motion" {
+        return PREFERS_REDUCED_MOTION;
     }
     // range syntax (Media Queries L4 / Tailwind v4): (width >= 48rem),
     // (640px > width), (48rem <= width)
@@ -10310,6 +10332,13 @@ mod tests {
         assert_eq!(style_for_tag(&parse(h), &dom, "p").color, 0x111111);
         let or = "@media (scripting: none), (hover: hover) { p { color: #111111 } }";
         assert_eq!(style_for_tag(&parse(or), &dom, "p").color, 0x111111);
+        // reduced motion is the reported preference (this build does not animate)
+        let rm = "@media (prefers-reduced-motion: reduce) { p { color: #111111 } }";
+        assert_eq!(style_for_tag(&parse(rm), &dom, "p").color, 0x111111);
+        let rmBool = "@media (prefers-reduced-motion) { p { color: #111111 } }";
+        assert_eq!(style_for_tag(&parse(rmBool), &dom, "p").color, 0x111111);
+        let rmNo = "@media (prefers-reduced-motion: no-preference) { p { color: #111111 } }";
+        assert_eq!(parse(rmNo).rule_count(), 0, "we never claim no-preference");
         // unsupported constructs skip the block (never applied blindly)
         let not = "@media not screen { p { color: #111111 } }";
         assert_eq!(parse(not).rule_count(), 0);
