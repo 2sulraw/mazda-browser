@@ -5330,6 +5330,50 @@ left-hand compound requires a name that filter does not contain - one bit test
 instead of an ancestor chain. That is the next change; this counter is the
 before-number for it (4.1 M hops) and it stays, gated on `MAZDA_TIME`.
 
+## A bloom filter of the ancestor names deletes 96 % of the climb (P91, 2026-11-12)
+
+Blink's selector filter, in this engine: while the cascade descends the tree,
+each node keeps a 1024-bit bloom filter of its ancestors' tag, id and class
+names (`Bloom`, `bloom_fill`, `Sheet::ancestors`). Before a left-hand compound
+is walked against the ancestor chain, its guaranteed names are tested against
+the filter; a name that cannot be there means the rule cannot match, and the
+climb is skipped.
+
+Only names the compound *guarantees* are used: its tag, its id, and its own
+classes. `:is()` alternatives, `:not()` exclusions and attribute tests are
+left to the normal matcher, because rejecting on those could reject a real
+match. Two relations need care and are handled explicitly:
+
+- `+` (adjacent sibling) is not an ancestor, so the filter is never consulted
+  there (`the_ancestor_filter_never_rejects_a_sibling_combinator`).
+- `slot[name=x]` can match a projected (slotted) element that is not a real
+  `<slot>` (`see seg_matches`), so a `slot` compound is always walked.
+
+A bloom filter can only produce false positives, and a false positive costs the
+walk that would have happened anyway; it can never turn a match into a
+non-match. That is why this is safe to land without a rendering A/B.
+
+Cold github.com, `MAZDA_TIME=1`, same page and same stylesheets:
+
+| | before | after |
+|---|---|---|
+| candidates tested | 608 340 | 608 340 (identical) |
+| matched / declarations | 21 924 / 36 800 | 21 924 / 36 800 (identical) |
+| **ancestor hops** | **4 142 084** | **178 417** (-95.7 %) |
+| `cascade + box tree` | 1412 ms | 849-1020 ms, 894 ± 25 over three passes |
+| first frame | 7.98 % ink, 232 colours | 7.98 % ink, 232 colours |
+| last frame | 8.14 % ink, 283 colours | 8.14 % ink, 283 colours |
+
+The identical candidate/match/declaration counts say no rule was lost; the
+identical frame ink says the pixels did not change either. The stage timing is
+the noisiest number on this host (the same stage measured 3006 ms in an earlier
+run), so the hop count is the honest before/after: 4.1 M walks became 178 k,
+one bit test each.
+
+Cost: one 136-byte filter per node, ~0.36 MB on a 2663-node page, filled
+lazily and dropped with the sheet at the end of the pass. Tests
+**1053 -> 1057** green.
+
 
 
 

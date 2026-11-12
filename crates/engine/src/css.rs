@@ -1534,6 +1534,129 @@ fn hop_stats_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAZDA_TIME").is_some())
 }
 
+/// Bits in an [`Bloom`] filter: 1024, the size Blink's selector filter uses.
+const BLOOM_BITS: usize = 1024;
+
+/// Bloom filter over a node's ancestor `tag`/`id`/`class` names.
+///
+/// Matching is right-to-left and compound by compound: a rule like
+/// `.header .nav a` costs a climb up the ancestor chain for every element that
+/// carries `a`. Blink answers that climb with a filter built while descending
+/// the tree - if the chain does not contain the name a left-hand compound
+/// requires, the rule cannot match and the walk is skipped.
+///
+/// A bloom filter can only produce FALSE POSITIVES: a name it reports as
+/// present may be absent, which costs the climb that would have happened
+/// anyway. It never rejects a match that exists, so no style can change.
+#[derive(Clone)]
+struct Bloom {
+    bits: [u64; BLOOM_BITS / 64],
+}
+
+impl Default for Bloom {
+    fn default() -> Self {
+        Bloom {
+            bits: [0; BLOOM_BITS / 64],
+        }
+    }
+}
+
+impl Bloom {
+    /// Add one name (two bit positions, from two ends of one FNV hash).
+    fn add(&mut self, name: &str) {
+        let h = fnv1a(name);
+        self.set(h);
+        self.set(h.rotate_left(23));
+    }
+
+    /// Could this name have been added? `false` is exact.
+    fn may_contain(&self, name: &str) -> bool {
+        let h = fnv1a(name);
+        self.has(h) && self.has(h.rotate_left(23))
+    }
+
+    fn set(&mut self, h: u64) {
+        let b = (h as usize) & (BLOOM_BITS - 1);
+        self.bits[b / 64] |= 1u64 << (b % 64);
+    }
+
+    fn has(&self, h: u64) -> bool {
+        let b = (h as usize) & (BLOOM_BITS - 1);
+        self.bits[b / 64] & (1u64 << (b % 64)) != 0
+    }
+}
+
+/// 64-bit FNV-1a: the hash the image cache already keys with, plenty uniform
+/// for a filter whose false positives cost a walk and nothing else.
+fn fnv1a(s: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Add a node's own matching names (its tag, id and every class) to a filter.
+fn bloom_add_node(b: &mut Bloom, dom: &Dom, node: u32) {
+    b.add(dom.tag(node));
+    if let Some(id) = dom.attr(node, "id") {
+        b.add(id);
+    }
+    if let Some(cls) = dom.attr(node, "class") {
+        for c in cls.split_ascii_whitespace() {
+            b.add(c);
+        }
+    }
+}
+
+/// Fill the filter for `node` and every ancestor still missing one: a node's
+/// filter is its parent's plus the parent's own names. The cascade descends
+/// the tree, so in practice the parent is already filled and this is one
+/// clone plus a handful of hashes per element.
+fn bloom_fill(v: &mut Vec<Option<Bloom>>, dom: &Dom, node: u32) {
+    let i = node as usize;
+    if v.len() <= i {
+        v.resize(i + 1, None);
+    }
+    if v[i].is_some() {
+        return;
+    }
+    let parent = dom.nodes[i].parent;
+    let mut b = if parent == 0 || parent == node {
+        Bloom::default()
+    } else {
+        bloom_fill(v, dom, parent);
+        v[parent as usize].clone().unwrap_or_default()
+    };
+    bloom_add_node(&mut b, dom, parent);
+    v[i] = Some(b);
+}
+
+/// `true` when an ancestor could still satisfy this compound. Only names the
+/// compound *guarantees* are tested: tag, id, and classes in the compound
+/// itself. A compound carrying only `:is()` alternatives or attribute tests
+/// has nothing to reject with, so the caller walks as before.
+fn ancestor_could_match(seg: &Seg, f: &Bloom) -> bool {
+    // `slot[name=x]` also matches the light-DOM nodes projected into it
+    // (see `seg_matches`), and those are not real `<slot>` elements - their
+    // tag is not in the filter, so this compound has to be walked
+    if seg.tag.as_deref() == Some("slot") {
+        return true;
+    }
+    if let Some(tag) = &seg.tag {
+        if !f.may_contain(tag) {
+            return false;
+        }
+    }
+    if let Some(id) = &seg.id {
+        if !f.may_contain(id) {
+            return false;
+        }
+    }
+    seg.classes.iter().all(|c| f.may_contain(c))
+}
+
 /// Rightmost-compound buckets over one cascade-ordered rule list.
 ///
 /// A selector can only match an element if its LAST compound's id, class,
@@ -1752,6 +1875,11 @@ pub struct Sheet {
     scheme_rules: Vec<Rule>,
     /// rightmost-compound buckets over `scheme_rules`
     scheme_index: RuleIndex,
+    /// Per-node ancestor filters (see [`Bloom`]): `None` = not computed yet.
+    /// Filled lazily while the cascade descends the tree, and dropped with the
+    /// sheet - a page load builds a fresh sheet for each pass, so a stale
+    /// filter can never outlive the DOM it describes.
+    ancestors: std::cell::RefCell<Vec<Option<Bloom>>>,
     /// Memoized [`Self::declared_dark`] per node: 0 = not computed, 1 = no
     /// ancestor declares `color-scheme`, 2 = light, 3 = dark. The property
     /// inherits, so a node's answer is its own declaration else its parent's
@@ -2620,6 +2748,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         var_index,
         scheme_rules,
         scheme_index,
+        ancestors: std::cell::RefCell::new(Vec::new()),
         scheme_memo: std::cell::RefCell::new(Vec::new()),
         scheme_probes: std::cell::Cell::new(0),
         scheme_hops: std::cell::Cell::new(0),
@@ -2821,6 +2950,15 @@ impl Sheet {
         } else {
             &[]
         };
+        // the ancestor filter for THIS element: one bit test per name a rule's
+        // left-hand compound requires, instead of climbing the chain for it
+        let ancestors = {
+            let mut v = self.ancestors.borrow_mut();
+            bloom_fill(&mut v, dom, node);
+            drop(v);
+            self.ancestors.borrow()
+        };
+        let filter = ancestors.get(node as usize).and_then(|b| b.as_ref());
         RULE_SCRATCH.with(|scratch| {
             let mut cand = scratch.borrow_mut();
             self.index.candidates(dom, node, &mut cand);
@@ -2850,7 +2988,7 @@ impl Sheet {
                     }
                     (None, None) => break,
                 };
-                if !matches(dom, node, &rule.segs, self.hovered.get()) {
+                if !matches_filtered(dom, node, &rule.segs, self.hovered.get(), filter) {
                     continue;
                 }
                 stats.1 += 1;
@@ -8056,7 +8194,19 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
 /// Right-to-left selector match against the ancestor chain. `hover` is the
 /// sheet's hover cell — only a `:hover` pseudo-class reads it.
 fn matches(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> bool {
-    leftmost_match(dom, node, segs, hover).is_some()
+    leftmost_match(dom, node, segs, hover, None).is_some()
+}
+
+/// [`matches`] with the element's ancestor filter: rules that name an ancestor
+/// name the chain does not contain are rejected without walking it.
+fn matches_filtered(
+    dom: &Dom,
+    node: u32,
+    segs: &[Seg],
+    hover: Option<u32>,
+    filter: Option<&Bloom>,
+) -> bool {
+    leftmost_match(dom, node, segs, hover, filter).is_some()
 }
 
 /// A selector compiled for the script-side `querySelector`/`matches` path.
@@ -8077,7 +8227,13 @@ impl Sel {
 /// `matches`, returning the node that matched the selector's LEFTMOST
 /// compound — `:has()` needs it to check the relation its leading
 /// combinator names (the right end is always `node`).
-fn leftmost_match(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> Option<u32> {
+fn leftmost_match(
+    dom: &Dom,
+    node: u32,
+    segs: &[Seg],
+    hover: Option<u32>,
+    filter: Option<&Bloom>,
+) -> Option<u32> {
     let mut idx = segs.len() - 1;
     let mut cur = node;
     if !seg_matches(dom, cur, &segs[idx], hover) {
@@ -8109,6 +8265,14 @@ fn leftmost_match(dom: &Dom, node: u32, segs: &[Seg], hover: Option<u32>) -> Opt
             }
             cur = sib;
             continue;
+        }
+        // not a sibling: the left compound has to be an ancestor, so the
+        // filter can reject it without walking. A `>` compound is the direct
+        // parent, which is an ancestor too (a weaker but valid test).
+        if let Some(f) = filter {
+            if !ancestor_could_match(&segs[idx], f) {
+                return None;
+            }
         }
         loop {
             let parent = dom.nodes[cur as usize].parent;
@@ -8142,7 +8306,7 @@ fn has_match(dom: &Dom, node: u32, rel: Rel, segs: &[Seg], hover: Option<u32>) -
             let mut stack: Vec<u32> = dom.nodes[node as usize].children.clone();
             while let Some(c) = stack.pop() {
                 if is_element(dom, c)
-                    && leftmost_match(dom, c, segs, hover)
+                    && leftmost_match(dom, c, segs, hover, None)
                         .is_some_and(|lm| rel_holds(dom, lm, node, rel))
                 {
                     return true;
@@ -8180,7 +8344,7 @@ fn subtree_any(
     let mut stack: Vec<u32> = vec![root];
     while let Some(c) = stack.pop() {
         if is_element(dom, c)
-            && leftmost_match(dom, c, segs, hover)
+            && leftmost_match(dom, c, segs, hover, None)
                 .is_some_and(|lm| rel_holds(dom, lm, anchor, rel))
         {
             return true;
@@ -9084,6 +9248,57 @@ mod tests {
         let sheet = parse("#c { color: initial }");
         let out = sheet.resolve_scoped(&dom, c, ua, None, 16.0, 0x00_00_11_22_33, None);
         assert_eq!(out.style.color, 0x00_00_00_00);
+    }
+
+    #[test]
+    fn the_ancestor_filter_skips_rules_whose_ancestor_class_is_absent() {
+        // right-to-left matching climbs for `.nav`: the filter answers "this
+        // subtree has no .nav ancestor" without the climb, and the element
+        // under .nav still matches
+        let dom = dom_of(
+            r#"<div class="nav"><p id=hit class="item">a</p></div><div class="other"><p id=miss class="item">b</p></div>"#,
+        );
+        let sheet = parse(".nav .item { color: #111111 }");
+        let hit = by_attr(&dom, "id", "hit");
+        let miss = by_attr(&dom, "id", "miss");
+        assert_eq!(sheet.resolve(&dom, hit, Style::new(), None).style.color, 0x111111);
+        assert_eq!(
+            sheet.resolve(&dom, miss, Style::new(), None).style.color,
+            Style::new().color,
+            "no .nav ancestor: the rule must not apply"
+        );
+    }
+
+    #[test]
+    fn the_ancestor_filter_never_rejects_a_sibling_combinator() {
+        // `div + .x` matches a SIBLING, not an ancestor, so the filter (which
+        // only knows ancestors) must not be consulted: this <p> has no <div>
+        // anywhere above it
+        let dom = dom_of(r#"<div>a</div><p id=t class="x">b</p>"#);
+        let sheet = parse("div + .x { color: #222222 }");
+        let t = by_attr(&dom, "id", "t");
+        assert_eq!(sheet.resolve(&dom, t, Style::new(), None).style.color, 0x222222);
+    }
+
+    #[test]
+    fn the_ancestor_filter_keeps_a_child_combinator() {
+        // `>` is the direct parent, which the filter also covers (as a weaker
+        // test): it may not reject a parent that is there
+        let dom = dom_of(r#"<div class="wrap"><p id=t class="x">b</p></div>"#);
+        let sheet = parse(".wrap > .x { color: #333333 }");
+        let t = by_attr(&dom, "id", "t");
+        assert_eq!(sheet.resolve(&dom, t, Style::new(), None).style.color, 0x333333);
+    }
+
+    #[test]
+    fn a_bloom_filter_never_reports_a_name_it_never_saw() {
+        let mut b = Bloom::default();
+        b.add("header");
+        b.add("octicon-mark-github");
+        assert!(b.may_contain("header"));
+        assert!(b.may_contain("octicon-mark-github"));
+        assert!(!b.may_contain("signup-form"));
+        assert!(!b.may_contain(""));
     }
 
     #[test]
