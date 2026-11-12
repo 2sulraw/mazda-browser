@@ -2821,13 +2821,31 @@ impl Sheet {
         });
         if let Some(inline) = inline {
             // inline style = specificity (1,0,0,0): applied last, wins
+            let hidden_by_css = display_none;
+            let mut opacity_start_state = false;
+            let mut inline_display_none = false;
             for d in &parse_decls(inline) {
                 color_declared |= d.0 == "color";
                 let sd = self.subst_scoped(d, vars.as_deref());
                 let fs = self.fam_stack_of(&sd, parent_size, self.vp);
                 if apply_decl(&sd, &mut style, &mut bg, &mut bx, parent_size, self.vp, dark, fs) {
                     display_none = true;
+                    // an INLINE `opacity:0` is how a page marks an element
+                    // whose fade-in has not run yet (`style="opacity:0"` in
+                    // the HTML, github.com's hero). This engine paints a
+                    // static frame and runs no tweens, so the end state has
+                    // to be painted now or the content is never seen; a
+                    // stylesheet `opacity:0` still hides (drawers, modals).
+                    if d.0 == "opacity" {
+                        opacity_start_state = true;
+                    } else if d.0 == "display" {
+                        inline_display_none = true;
+                    }
                 }
+            }
+            if opacity_start_state && !hidden_by_css && !inline_display_none {
+                display_none = false;
+                bx.opacity = 1.0;
             }
         }
         // UA margins last: they are em-based, so they need the FINAL
@@ -3838,7 +3856,9 @@ fn apply_decl(
         "box-shadow" => bx.shadows = parse_box_shadows(&d.1, dark, vp),
         // fully transparent = invisible; partial opacity paints with
         // per-primitive alpha (see BoxStyle::opacity), so only 0 hides the
-        // subtree outright
+        // subtree outright — and only when it comes from a stylesheet: the
+        // element's own INLINE `opacity:0` is a fade-in start state and is
+        // painted at the end state instead (see `resolve_with_parent`)
         "opacity" => {
             let Ok(v) = d.1.parse::<f32>() else {
                 return false;
@@ -10466,9 +10486,26 @@ mod tests {
         let dom2b = dom_of("<div class=a></div><div class=b></div>");
         assert_eq!(sheet2.resolve(&dom2b, by_attr(&dom2b, "class", "a"), Style::new(), None).bx.opacity, 1.0);
         assert_eq!(sheet2.resolve(&dom2b, by_attr(&dom2b, "class", "b"), Style::new(), None).bx.opacity, 0.0);
-        // inline style too
+        // inline `opacity:0` is an animation START state, not a hide: it is
+        // painted (end state) because this engine runs no tweens
         let dom2 = dom_of(r#"<div id=x style="opacity:0"></div>"#);
-        assert!(sheet.resolve(&dom2, by_attr(&dom2, "id", "x"), Style::new(), Some("opacity:0")).display_none);
+        let start = sheet.resolve(&dom2, by_attr(&dom2, "id", "x"), Style::new(), Some("opacity:0"));
+        assert!(!start.display_none, "inline opacity:0 is a start state, not display:none");
+        assert_eq!(start.bx.opacity, 1.0, "painted at the end state");
+        // an inline display:none still wins over the start-state rule
+        let dom3 = dom_of(r#"<div id=y style="opacity:0;display:none"></div>"#);
+        assert!(sheet
+            .resolve(&dom3, by_attr(&dom3, "id", "y"), Style::new(), Some("opacity:0;display:none"))
+            .display_none);
+        // whichever order the two declarations appear in
+        assert!(sheet
+            .resolve(&dom3, by_attr(&dom3, "id", "y"), Style::new(), Some("display:none;opacity:0"))
+            .display_none);
+        // and a stylesheet display:none is not undone by the inline opacity
+        let sheet_none = parse("#y { display: none }");
+        assert!(sheet_none
+            .resolve(&dom3, by_attr(&dom3, "id", "y"), Style::new(), Some("opacity:0"))
+            .display_none);
     }
 
     #[test]

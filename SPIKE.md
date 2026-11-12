@@ -5006,5 +5006,41 @@ grid lays out at full width (P83 fixes the width itself). Tests stay at
 **1039**; `media_queries_evaluated_against_viewport` and the `matchMedia` test
 grew the reduce / boolean / no-preference assertions.
 
+## An inline `opacity:0` is a start state, not a hide (P82, 2026-11-12)
+
+`opacity: 0` used to mean "invisible, skip the subtree" (`display_none`), which
+is right for the common drawer/modal pattern - hidden until a class flips it -
+and wrong for the other common pattern: a page writing its fade-in *start
+state* into the markup, `style="opacity:0"`, and expecting a tween to lift it.
+This engine runs no tweens, so the element was never shown at all.
+
+On github.com that element is the hero's entire content column
+(`div.Intro__content__klpGdB style="opacity:0"`), `<h1>Software still starts
+with you</h1>` included. The `MAZDA_DUMP_BOXES=2` walk said it plainly:
+`Intro__content` `h=0`, `Intro__grid_content` `h=0`, and no `h1` box anywhere.
+The CSS for it is `display:flex` with `container:homepage-signup/inline-size` -
+nothing hides it.
+
+The rule now splits by origin: an **inline** `opacity:0` is an animation start
+state and is painted at its end state (`opacity = 1.0`), because painting the
+start state would mean painting nothing; an **inline** `display:none` still
+wins, and a stylesheet `opacity:0` still hides (the drawer/modal shortcut is
+kept). `resolve_with_parent` tracks both while it applies the inline block and
+only undoes the hide when no `display:none` came from either side.
+
+Measured with P81 (same reveal): `26.42 %` ink in `5` colours -> `5.00 %` in
+`92`, i.e. text where there was a flat block; the frame shows the banner, the
+centred headline, the CTA row and the octocat. The page was still `14 645 px`
+tall and the headline wrapped to one character per line - that is the grid bug
+in P83, not this rule. Tests stay **1039**; `opacity_zero_hides_subtree` grew
+the inline-start-state and inline/stylesheet `display:none` cases.
+
+Diagnostic added with it: `MAZDA_JS_STYLE=1` prints
+`[style] node N <prop>: <value>` for script writes of `opacity`, `display` and
+`visibility`, so "why did this element disappear" can be answered from the log
+instead of a screenshot. On github it reports exactly one write, a
+`display: none` on the cookie banner.
+
+
 
 

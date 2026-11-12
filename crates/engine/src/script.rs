@@ -3226,6 +3226,14 @@ fn style_get_hook(node: u32, key: &str) -> String {
 }
 
 fn style_set_hook(node: u32, key: &str, val: &str) {
+    // diagnostic: `MAZDA_JS_STYLE=1` prints the CSS properties that decide
+    // visibility (and nothing else), so "why is this element missing" can be
+    // answered without guessing from a screenshot
+    if std::env::var("MAZDA_JS_STYLE").as_deref() == Ok("1")
+        && matches!(key, "opacity" | "display" | "visibility")
+    {
+        eprintln!("[style] node {node} {key}: {val}");
+    }
     runtime::host_mut_opt(|h| h.style_set(node, key, val));
 }
 
