@@ -6127,7 +6127,8 @@ fn layout_page(
         preload_accept(&img_urls, Some(IMAGE_ACCEPT), "preload (images)");
     }
     let (n_img, skipped) = if first_paint {
-        (0, 0)
+        // inline <svg> costs no request, so it already has pixels to paint
+        probe_images_local(&mut root_box)
     } else {
         probe_images(&mut root_box, url)
     };
@@ -6349,6 +6350,17 @@ enum SheetSrc {
 /// space even when the pixels will never decode. No budget here: headers cost
 /// no pixels — the budget is charged at decode time against display size.
 fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
+    probe_images_in(n, base, true)
+}
+
+/// The first frame's probe: inline `<svg>` only. Its markup needs no
+/// download, so the logo/nav icons can be rasterized with the early frame
+/// instead of waiting for the network images the second pass fetches.
+fn probe_images_local(n: &mut layout::BoxNode) -> (usize, usize) {
+    probe_images_in(n, "", false)
+}
+
+fn probe_images_in(n: &mut layout::BoxNode, base: &str, network: bool) -> (usize, usize) {
     if no_images() {
         // diagnostic switch (reload soak): no image fetch/decode at all
         n.img = None;
@@ -6371,6 +6383,8 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
                 }
                 None => skipped += 1,
             }
+        } else if !network {
+            // leave Pending: the final pass fetches it
         } else if let Some(abs) = resolve_img(base, &src) {
             match fetch_image(&abs) {
                 Ok((bytes, _)) => match image::probe(&bytes).or_else(|| svg::probe(&bytes)) {
@@ -6398,7 +6412,7 @@ fn probe_images(n: &mut layout::BoxNode, base: &str) -> (usize, usize) {
         }
     }
     for c in &mut n.children {
-        let (p, s) = probe_images(c, base);
+        let (p, s) = probe_images_in(c, base, network);
         probed += p;
         skipped += s;
     }
@@ -12219,6 +12233,39 @@ mod tests {
             .map(|(_, _, _, _, img, _, _, _)| (img.w, img.h, img.px.clone()));
         let rcs = laid.images.iter().map(|e| e.4.clone()).collect();
         (probed, skipped, dims, drawn, rcs)
+    }
+
+    #[test]
+    fn first_frame_probes_inline_svg_but_not_network_images() {
+        // the early frame skips network images (a download would delay the
+        // paint) but an inline <svg> is markup, so its logo/icon pixels are
+        // available immediately — they must not be blank until the second
+        // pass the way a fetched <img> is
+        let dom = html::parse(
+            r#"<div><svg width="16" height="16" viewBox="0 0 16 16"><path d="M0 0h16v16H0z"/></svg><img src="a.png"></div>"#,
+        );
+        let mut root = layout::build(
+            &dom,
+            dom.body_root(),
+            Style::new(),
+            css::BoxStyle::default(),
+            &css::parse_for("", 1000.0),
+        );
+        let (probed, skipped) = probe_images_local(&mut root);
+        assert_eq!((probed, skipped), (1, 0), "the svg was probed, the img left alone");
+        fn slots(n: &layout::BoxNode, out: &mut Vec<String>) {
+            match &n.img {
+                Some(layout::ImgSlot::Probed { w, h, .. }) => out.push(format!("probed {w}x{h}")),
+                Some(layout::ImgSlot::Pending(s)) => out.push(format!("pending {s}")),
+                _ => {}
+            }
+            for c in &n.children {
+                slots(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        slots(&root, &mut out);
+        assert_eq!(out, ["probed 16x16", "pending a.png"]);
     }
 
     #[test]

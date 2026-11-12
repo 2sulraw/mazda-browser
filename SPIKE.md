@@ -5223,6 +5223,39 @@ unimplemented - a genuinely scaled run still overlaps, because text scaling
 needs an affine glyph raster path this engine doesn't have (documented at
 `transform_runs`). Tests **1045 -> 1048** green.
 
+## The first frame can paint an inline `<svg>` (P87, 2026-11-12)
+
+github.com at 1000 px serves its *compact* header: the logo, the person icon
+and the hamburger are inline `<svg>` markup, not files. The early frame ran no
+image work at all - it skipped every `<img>` *and* every `<svg>` - so the
+header painted as three empty slots and only got its icons after the second
+pass, ~7 s later on the same visit.
+
+An inline `<svg>` needs no request: its markup is already in the document, so
+`probe_images_local` walks the same tree on the first pass and probes only
+`src` starting with `<`; a real URL stays `Pending` for the final pass, where
+it is fetched as before (`first_frame_probes_inline_svg_but_not_network_images`
+asserts one `probed 16x16` beside one `pending a.png`).
+
+Measured with `tools/paint-timeline.ps1` on cold github.com, fresh profile:
+
+| | first frame | header icons | `image probe` |
+|---|---|---|---|
+| before | 7.82 % ink, 229 colours | absent | 0 ms |
+| after | 7.98 % ink, 235 colours | logo, person, hamburger | 0 ms |
+
+A local page (`%TEMP%\mazda-local\svgfirst.html`) confirms the inline icon is
+rasterized in the very first frame, not the second. Tests **1048 -> 1049**
+green.
+
+Measurement note: the earlier run also reported a `0.0 s, 55.74 % ink,
+10 colours` frame - a *dark* page with a white header. That was the previous
+renderer's last frame: the frame file is named by pid, the OS reused the pid,
+and the checker sampled the leftover before this process repainted. The first
+real frame is the `7.98 %` one. `paint-timeline.ps1` now deletes the file
+before it starts the renderer, and a rerun reports `no frame yet` until the
+real paint instead of a stale image.
+
 
 
 
