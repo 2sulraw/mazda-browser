@@ -169,6 +169,9 @@ $p = [Diagnostics.Process]::Start($psi)
 $err = $p.StandardError.ReadToEndAsync()
 
 $framePath = Join-Path $env:TEMP ("mazda-frame-{0}-{1}x{2}.bin" -f $p.Id, $Width, $Height)
+# a previous renderer whose pid the OS reused leaves its last frame here; the
+# first sample would then report that stale image as this run's first paint
+Remove-Item -Force $framePath -ErrorAction SilentlyContinue
 
 $p.StandardInput.WriteLine("resize $Width $Height")
 Start-Sleep -Milliseconds 250
