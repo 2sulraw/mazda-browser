@@ -5564,3 +5564,36 @@ on this host; the split is the signal.
 
 Cost: one `Instant::now()` pair per element and per pseudo pair, unconditionally
 (about 40 ns each). Tests unchanged at **1062**.
+
+## Pseudo-element rules get their own buckets (P97, 2026-11-12)
+
+`resolve_pseudo` walked every `::before` (1124) and `::after` (994) rule on the
+page for every element, twice: 1075 elements x 2118 rules = 2.3 M selector
+tests per pass, and on github that was the larger half of the cascade (P96:
+483 ms of a 781 ms walk).
+
+Each pseudo bucket now carries a `RuleIndex` built by the same
+rightmost-compound bucketing the element cascade uses: a pseudo rule can only
+match an element whose tag/id/class/attribute is named in the rule's last
+compound, so `resolve_pseudo` tests just the candidates instead of the list.
+
+github.com, `MAZDA_TIME=1`:
+
+| pass | cascade + box tree | cascade rules | cascade rules before |
+|---|---|---|---|
+| cold load, pre-script | 638 ms | **220 ms** | 483 ms |
+| cold load, post-script | 546 ms | **204 ms** | 479 ms |
+| later relayout | 585 ms | **205 ms** | 665 ms |
+
+The cascade is 2.2-3.2x faster and the rest of the walk (box construction) is
+unchanged, as expected. The result is the same: 1075/1075/1078 boxes,
+21924/21925/21929 matched rules and 36800/36801/36805 declarations in both
+runs. The candidate counter moves by 1-2 between two runs of the *same* binary
+(github varies its HTML), so it is not a signal here. Parsing went 157 -> 162 ms
+(2171 extra rules to bucket, inside noise).
+
+Cost: four more `RuleIndex`es per sheet, one per pseudo-element kind, built at
+parse and kept for the page's life.
+
+Tests **1062 -> 1063** green: a pseudo rule is found through the tag, class,
+id, attribute, universal and `:is()` bucket, and misses a stranger.

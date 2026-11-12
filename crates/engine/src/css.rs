@@ -1728,6 +1728,12 @@ fn keys_of(seg: &Seg, out: &mut Vec<Key>) -> bool {
 
 impl RuleIndex {
     fn build(rules: &[Rule]) -> Self {
+        RuleIndex::build_named(rules, "")
+    }
+
+    /// `build`, but the `MAZDA_TIME` line names the rule list it indexed —
+    /// a sheet now has several of them (elements, pseudo-elements, ...).
+    fn build_named(rules: &[Rule], what: &str) -> Self {
         let mut ix = RuleIndex::default();
         let mut keys: Vec<Key> = Vec::new();
         for (i, r) in rules.iter().enumerate() {
@@ -1760,7 +1766,8 @@ impl RuleIndex {
         }
         if std::env::var_os("MAZDA_TIME").is_some() {
             eprintln!(
-                "[css] index: universal {}, ids {}, classes {}, attrs {}, tags {}",
+                "[css] index{what}: {} rules, universal {}, ids {}, classes {}, attrs {}, tags {}",
+                rules.len(),
                 ix.universal.len(),
                 ix.ids.len(),
                 ix.classes.len(),
@@ -1856,6 +1863,11 @@ pub struct Sheet {
     /// slice never see them — a `p::before` rule must not style the `p` —
     /// and so pages without pseudo rules pay nothing extra.
     pseudo: [Vec<Rule>; 4],
+    /// rightmost-compound buckets over each `pseudo` list — the origin element
+    /// must also match the pseudo rule's last compound, so `resolve_pseudo`
+    /// tests only the buckets the element falls into instead of every pseudo
+    /// rule on the page (github ships ~3k of them).
+    pseudo_index: [RuleIndex; 4],
     /// `:hover` rules whose LAST segment carries the flag (and no
     /// pseudo-element), cascade-sorted like `rules`. Kept apart so a page
     /// with no pointer on it skips them entirely; `cascade_rules` merges
@@ -2756,6 +2768,11 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         })
         .collect();
     let scheme_index = RuleIndex::build(&scheme_rules);
+    // each pseudo-element bucket cascades on its own, so each gets its own
+    // rightmost-compound buckets
+    const PSEUDO_NAMES: [&str; 4] = [" ::before", " ::after", " ::marker", " ::placeholder"];
+    let pseudo_index: [RuleIndex; 4] =
+        std::array::from_fn(|i| RuleIndex::build_named(&pseudo[i], PSEUDO_NAMES[i]));
     Sheet {
         rules,
         index,
@@ -2768,6 +2785,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         scheme_probes: std::cell::Cell::new(0),
         scheme_hops: std::cell::Cell::new(0),
         pseudo,
+        pseudo_index,
         hover,
         hovered: std::cell::Cell::new(None),
         vars,
@@ -3110,21 +3128,26 @@ impl Sheet {
         let scheme = self.declared_dark(dom, node, dom.attr(node, "style"));
         let dark = scheme.unwrap_or_else(|| used_scheme(None, self.root_pol, PREFERS_DARK));
         let mut color_declared = false;
-        for rule in rules {
-            if !matches(dom, node, &rule.segs, self.hovered.get()) {
-                continue;
-            }
-            for d in &rule.decls {
-                color_declared |= d.0 == "color";
-                let sd = self.subst(d);
-                let fs = self.fam_stack_of(&sd, base.size, self.vp);
-                if apply_decl(
-                    &sd, &mut style, &mut bg, &mut bx, base.size, base.color, self.vp, dark, fs,
-                ) {
-                    display_none = true;
+        RULE_SCRATCH.with(|scratch| {
+            let mut cand = scratch.borrow_mut();
+            self.pseudo_index[kind.idx()].candidates(dom, node, &mut cand);
+            for &ri in cand.iter() {
+                let rule = &rules[ri as usize];
+                if !matches(dom, node, &rule.segs, self.hovered.get()) {
+                    continue;
+                }
+                for d in &rule.decls {
+                    color_declared |= d.0 == "color";
+                    let sd = self.subst(d);
+                    let fs = self.fam_stack_of(&sd, base.size, self.vp);
+                    if apply_decl(
+                        &sd, &mut style, &mut bg, &mut bx, base.size, base.color, self.vp, dark, fs,
+                    ) {
+                        display_none = true;
+                    }
                 }
             }
-        }
+        });
         // same scheme-blind default flip as `resolve_with_parent` (the
         // pseudo inherits the origin's color, which is already flipped)
         if dark && scheme.is_some() && !color_declared && style.color == 0x00_00_00 {
@@ -10486,6 +10509,53 @@ mod tests {
                 .resolve_pseudo(&dom, li, Style::new(), PseudoEl::Before)
                 .is_some_and(|o| o.display_none)
         );
+    }
+
+    #[test]
+    fn a_pseudo_rule_is_found_through_every_bucket_it_lands_in() {
+        // the pseudo buckets are indexed by the origin element's own facts
+        // (tag/id/class/attribute/`:is()` alternatives/universal), so each
+        // kind of key has to reach a matching origin and skip a stranger
+        let cases: [(&str, &str, &str, &str); 6] = [
+            ("p::before { content: \"tag\" }", "<p>x</p>", "<span>x</span>", "\"tag\""),
+            (".a::before { content: \"cls\" }", "<p class=a>x</p>", "<p class=b>x</p>", "\"cls\""),
+            ("#i::before { content: \"id\" }", "<p id=i>x</p>", "<p id=j>x</p>", "\"id\""),
+            (
+                "[data-x]::before { content: \"attr\" }",
+                "<p data-x=1>x</p>",
+                "<p>x</p>",
+                "\"attr\"",
+            ),
+            ("*::before { content: \"any\" }", "<p>x</p>", "x", "\"any\""),
+            (
+                ":is(p, div)::before { content: \"is\" }",
+                "<p>x</p>",
+                "<span>x</span>",
+                "\"is\"",
+            ),
+        ];
+        for (css, hit, miss, want) in cases {
+            let sheet = parse(css);
+            let dom = dom_of(hit);
+            let pe = sheet
+                .resolve_pseudo(&dom, by_tag(&dom, "p"), Style::new(), PseudoEl::Before)
+                .expect("bucket non-empty");
+            assert_eq!(pe.bx.content.as_deref(), Some(want), "{css}");
+            // a universal rule matches everything, so there is no stranger
+            if !css.starts_with('*') {
+                let other_dom = dom_of(miss);
+                let tag = if miss.starts_with("<span") { "span" } else { "p" };
+                let other = sheet
+                    .resolve_pseudo(
+                        &other_dom,
+                        by_tag(&other_dom, tag),
+                        Style::new(),
+                        PseudoEl::Before,
+                    )
+                    .expect("bucket non-empty");
+                assert!(other.bx.content.is_none(), "{css} must not match {miss}");
+            }
+        }
     }
 
     #[test]
