@@ -5813,3 +5813,25 @@ What that ranks:
 
 Cost: one `String` per dropped selector at sheet-parse time, nothing when
 nothing drops. Test `a_dropped_selector_names_why`; 1069 green.
+
+## Legacy grid-gap spellings now reach the gap code (P102, 2026-11-13)
+
+The P101 report's cheapest item: `grid-gap` (93 declarations on github),
+`grid-row-gap` (20) and `grid-column-gap` (16) were dropped by the `KNOWN`
+gate. They are the pre-rename spellings of `gap`, `row-gap` and
+`column-gap`, which this engine implements - the gate simply never mapped
+them, so 129 real gaps (grid rows and columns, and the multicol column gap
+the `gap` arm also sets) were silently lost.
+
+`legacy_alias` maps the three names before the gate, next to the existing
+logical-to-physical mapping, so a vendor-prefixed spelling still strips
+first (`-webkit-grid-gap` works too). No layout code changed: the aliases
+land on the same `apply_decl` arms as the modern names.
+
+Measured on github.com (release, `MAZDA_MISS=1`): 46 -> 43 distinct dropped
+properties, with 129 fewer dropped declarations; box tree 1110 boxes (same),
+text runs 507 (was 509 - the applied gaps changed a wrap), first paint 3.9 s
+in a normal fetch window.
+
+Test: `legacy_grid_gap_spellings_alias_the_gap_properties` (shorthand two
+values, each longhand, vendor prefix). 1070 green.

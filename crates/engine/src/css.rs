@@ -3861,6 +3861,20 @@ fn logical_physical(p: &str) -> Option<&'static str> {
     })
 }
 
+/// Legacy spelling of a property this engine implements under its current
+/// name. Like [`logical_physical`], the mapping happens BEFORE the [`KNOWN`]
+/// gate. The `grid-*-gap` longhands were renamed to `gap`/`row-gap`/
+/// `column-gap` in the CSS Grid draft, but github.com still ships ~130 of the
+/// old spellings, and dropping them silently lost real gaps.
+fn legacy_alias(p: &str) -> Option<&'static str> {
+    Some(match p {
+        "grid-gap" => "gap",
+        "grid-row-gap" => "row-gap",
+        "grid-column-gap" => "column-gap",
+        _ => return None,
+    })
+}
+
 /// Parse a declaration block: `color: #fff; font-size: 16px` (no braces).
 pub fn parse_decls(block: &str) -> Vec<Decl> {
     let mut out = Vec::new();
@@ -3872,8 +3886,9 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         // a prefixed spelling strips to its bare property before the gate
         // (`--custom` properties pass through `unprefix` untouched)
         let p = unprefix(&p).to_string();
-        // logical → physical alias (see [`logical_physical`])
-        let p = match logical_physical(&p) {
+        // logical → physical alias (see [`logical_physical`]) and legacy
+        // spellings of a property we implement (see [`legacy_alias`])
+        let p = match logical_physical(&p).or_else(|| legacy_alias(&p)) {
             Some(q) => q.to_string(),
             None => p,
         };
@@ -13871,6 +13886,31 @@ mod tests {
         let d = bx("d");
         assert_eq!(d.border[0], Len::Px(4.0), "border-block-start -> border-top");
         assert_eq!(d.bcolor, Some(0x00ff_0000), "colour carried through");
+    }
+
+    #[test]
+    fn legacy_grid_gap_spellings_alias_the_gap_properties() {
+        // github.com still ships `grid-gap`/`grid-row-gap`/`grid-column-gap`
+        // (renamed to gap/row-gap/column-gap in the CSS Grid draft); the KNOWN
+        // gate used to drop all ~130 of them, losing real gaps.
+        let sheet = parse(
+            ".a{grid-gap:8px 12px} .b{grid-row-gap:4px} .c{grid-column-gap:6px}",
+        );
+        let dom = dom_of("<div class=a></div><div class=b></div><div class=c></div>");
+        let bx = |cls: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None)
+                .bx
+        };
+        let a = bx("a");
+        assert_eq!((a.gap_row, a.gap_col), (8.0, 12.0), "grid-gap: row column");
+        assert_eq!(bx("b").gap_row, 4.0, "grid-row-gap -> row-gap");
+        assert_eq!(bx("c").gap_col, 6.0, "grid-column-gap -> column-gap");
+        // the vendor prefix is stripped before the alias is looked up
+        let sheet2 = parse(".p{-webkit-grid-gap:3px}");
+        let dom2 = dom_of("<div class=p></div>");
+        let p = sheet2.resolve(&dom2, by_attr(&dom2, "class", "p"), Style::new(), None);
+        assert_eq!(p.bx.gap_row, 3.0, "a vendor prefix is stripped before the alias");
     }
 
     #[test]
