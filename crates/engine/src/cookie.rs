@@ -21,8 +21,10 @@
 //! - No public-suffix list: a `Domain` attribute must still be a suffix of
 //!   the request host, so a page can only widen its cookie to its own
 //!   subdomains — never to a sibling or a TLD.
-//! - Cookies set on an HTTP redirect hop are lost (the client follows
-//!   redirects internally and only the final response is exposed).
+//! - Cookies set on an HTTP redirect hop are stored on the HTTP/2 path, which
+//!   follows the chain itself; the HTTP/1.1 path hands the chain to `ureq`,
+//!   which exposes only the final response, so a hop's `Set-Cookie` is lost
+//!   there.
 //! - There is no per-site partition: the jar is one process-wide store, like
 //!   a browser profile with a single context.
 

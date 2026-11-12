@@ -5896,7 +5896,9 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
             eprintln!("[nav] fetch failed for {url}: {e}");
             // never snapshot an error page: a later restore would show it
             // forever even after the site came back
-            return parse_source_with_styles(url, format!("<p>Failed to load: {e}</p>"));
+            let (dom, css_text, faces) =
+                parse_source_with_styles(url, format!("<p>Failed to load: {e}</p>"));
+            return (dom, css_text, faces);
         }
     };
     let dom = html::parse(&source);
@@ -7835,7 +7837,10 @@ fn fetch_accept_raw(
     if http2_on() {
         match crate::h2net::get(url, &headers, HTTP_BODY_CAP) {
             Ok(r) => {
-                cookie::store_response(url, &set_cookie_values_of(&r.headers));
+                // the response belongs to the last hop, not to the URL that was
+                // asked for: cookies are host-scoped, and the page resolves its
+                // subresources against it
+                cookie::store_response(&r.final_url, &set_cookie_values_of(&r.headers));
                 return finish_fetch(
                     &dir,
                     url,
@@ -7858,7 +7863,9 @@ fn fetch_accept_raw(
         req = req.set(name, value);
     }
     let resp = req.call().map_err(|e| e.to_string())?;
-    cookie::store_response(url, &set_cookie_values(&resp));
+    // ureq already followed the chain: this is where the body came from
+    let final_url = resp.get_url().to_string();
+    cookie::store_response(&final_url, &set_cookie_values(&resp));
     let status = resp.status();
     let ct = resp.header("content-type").map(|s| s.to_string());
     let encoding = resp.header("content-encoding").map(|s| s.to_ascii_lowercase());

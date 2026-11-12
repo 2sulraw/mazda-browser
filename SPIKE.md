@@ -5276,6 +5276,37 @@ github's `#1f2328` because the header's own `color` comes through a `var()`
 chain that still lands on the initial value - smaller, separate gap. Tests
 **1049 -> 1050** green (`color_inherit_reinstates_the_parent_colour`).
 
+## The HTTP/2 path follows redirects (P89, 2026-11-12)
+
+Typing `google.com` showed a page that said "301 Moved". The document was
+fetched, so it was not a transport failure: `https://google.com/` answers `301`
+to `https://www.google.com/`, and the two transports disagreed about who
+follows it. `ureq` (the HTTP/1.1 path) follows redirects itself; hyper does
+not, so the HTTP/2 path - the default - handed the redirect body to the HTML
+parser and painted the server's own "301 Moved" page.
+
+`h2net::get` now follows the chain: 301/302/303/307/308 with a `Location`, up to
+ten hops (Chrome's limit is 20; ten is past any real chain and still bounds a
+loop). A relative `Location` resolves against the URL that answered it, the
+fragment is dropped, and each hop rebuilds the headers that belong to a URL:
+`Cookie` comes from the jar for that hop's host/path, `If-None-Match` is
+dropped (a conditional tag belongs to the URL it was stored for). A `Set-Cookie`
+on a hop is stored for that hop - the hop response is dropped, so nothing else
+can - which removes the "hop cookies are lost" shortcut for the HTTP/2 path.
+
+Measured on this host, `MAZDA_TIME=1`: before, `google.com` rendered the
+redirect body; after, the document is the real page (224 899 bytes, 528 nodes,
+its `/xjs/` stylesheet and script follow). Tests **1050 -> 1053** green
+(`next_hop_follows_the_redirect_and_resolves_it`,
+`next_hop_stops_on_anything_that_is_not_a_usable_redirect`,
+`a_hop_drops_the_previous_urls_cookie_and_etag`).
+
+Still open: the page's identity (address bar, tab url, relative `src`/`href`
+base) stays the URL that was typed. A redirect to a different origin therefore
+resolves relative subresources against the wrong base, and the address bar
+keeps showing the old URL. Fixing that means separating a page's identity from
+its base URL (`KeptPage.url` vs a new `base`), which is a follow-up.
+
 
 
 
