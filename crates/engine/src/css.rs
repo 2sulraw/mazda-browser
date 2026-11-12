@@ -791,6 +791,9 @@ pub struct BoxStyle {
     /// `[line-name]` boundaries from `grid-template-columns`
     /// (name → track index it precedes)
     pub col_lines: Vec<(String, usize)>,
+    /// `[line-name]` boundaries from `grid-template-rows` (name → row index
+    /// it precedes), the row-axis twin of [`Self::col_lines`].
+    pub row_lines: Vec<(String, usize)>,
     /// this grid item's `grid-column-start` (or the first half of the
     /// `grid-column` shorthand) — resolved against the container's
     /// `col_lines` (`name-start`…`name-end`) at layout
@@ -806,6 +809,16 @@ pub struct BoxStyle {
     /// content column `grid-column: span 12`; without this the whole hero
     /// collapsed into a single 72px track.
     pub grid_col_span: u32,
+    /// this grid item's `grid-row-start` (or the first half of the
+    /// `grid-row` shorthand): a row line NUMBER or a name from
+    /// [`Self::row_lines`], resolved at layout. None = auto.
+    pub grid_row: Option<String>,
+    /// `grid-row-end`: the row line the item ends before; a lone end with an
+    /// auto start occupies the row above it, like the column axis.
+    pub grid_row_end: Option<String>,
+    /// `grid-row: span N` / `grid-row-end: span N` - rows covered when the
+    /// start is auto or the end is a span. 0 = one.
+    pub grid_row_span: u32,
     /// `grid-template-areas` rows of cell names; `None` = an empty `.` cell.
     /// Items name a cell with `grid-area` and are placed into its rect.
     pub areas: Vec<Vec<Option<String>>>,
@@ -1189,9 +1202,13 @@ impl Default for BoxStyle {
             cols: Vec::new(),
             rows: Vec::new(),
             col_lines: Vec::new(),
+            row_lines: Vec::new(),
             grid_col: None,
             grid_col_end: None,
             grid_col_span: 0,
+            grid_row: None,
+            grid_row_end: None,
+            grid_row_span: 0,
             areas: Vec::new(),
             grid_area: None,
             grid_flow: GridFlow::Row,
@@ -2336,6 +2353,9 @@ const KNOWN: &[&str] = &[
     "grid-column",
     "grid-column-start",
     "grid-column-end",
+    "grid-row",
+    "grid-row-start",
+    "grid-row-end",
     "grid-auto-flow",
     "width",
     "max-width",
@@ -4590,7 +4610,11 @@ fn apply_decl(
             bx.cols = cols;
             bx.col_lines = lines;
         }
-        "grid-template-rows" => bx.rows = parse_tracks(&d.1, vp).0,
+        "grid-template-rows" => {
+            let (rows, lines) = parse_tracks(&d.1, vp);
+            bx.rows = rows;
+            bx.row_lines = lines;
+        }
         // `grid-template-areas: "a b" "c d"` — one quoted string per row,
         // whitespace-separated names, a run of dots is an empty cell. Only
         // whole quoted rows are read; an unquoted value (or `none`) clears.
@@ -4674,6 +4698,47 @@ fn apply_decl(
                 && first.parse::<u32>().is_err()
             {
                 bx.grid_col_end = Some(first.to_string());
+            }
+        }
+        // row placement, the row-axis twin of `grid-column`: a line NUMBER
+        // (`grid-row: 2`, `2 / 4`, negative from the end) or a bracket name
+        // from `grid-template-rows`; `span N` in either half. The shorthand
+        // and both longhands feed the same fields.
+        "grid-row" => {
+            let mut parts = d.1.split('/');
+            let first = parts.next().unwrap_or("").trim();
+            let first_span = span_count(first);
+            if first_span > 0 {
+                bx.grid_row_span = first_span;
+            } else if !first.is_empty() && first != "auto" {
+                bx.grid_row = Some(first.to_string());
+            }
+            if let Some(end) = parts.next() {
+                let end = end.trim();
+                let end_span = span_count(end);
+                if end_span > 0 {
+                    bx.grid_row_span = end_span;
+                } else if !end.is_empty() && end != "auto" {
+                    bx.grid_row_end = Some(end.to_string());
+                }
+            }
+        }
+        "grid-row-start" => {
+            let first = d.1.split('/').next().unwrap_or("").trim();
+            let span = span_count(first);
+            if span > 0 {
+                bx.grid_row_span = span;
+            } else if !first.is_empty() && first != "auto" {
+                bx.grid_row = Some(first.to_string());
+            }
+        }
+        "grid-row-end" => {
+            let first = d.1.split('/').next().unwrap_or("").trim();
+            let span = span_count(first);
+            if span > 0 {
+                bx.grid_row_span = span;
+            } else if !first.is_empty() && first != "auto" {
+                bx.grid_row_end = Some(first.to_string());
             }
         }
         // `grid-auto-flow: [row|column] || dense` — tokens in any order;
@@ -11854,6 +11919,41 @@ mod tests {
         assert_eq!(bx("c").grid_col.as_deref(), Some("content"));
         assert_eq!(bx("c").grid_col_span, 3);
         assert_eq!(bx("d").grid_col_span, 5);
+    }
+
+    #[test]
+    fn grid_row_placement_parses_lines_spans_and_names() {
+        let sheet = parse(
+            ".a { grid-template-rows: [head] 40px [body] 1fr [foot] } \
+             .b { grid-row: 2 } \
+             .c { grid-row: 1 / span 2 } \
+             .d { grid-row: auto / span 3 } \
+             .e { grid-row-start: 4; grid-row-end: -1 } \
+             .f { grid-row: head } \
+             .g { grid-row-end: span 2 }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div><div class=f></div><div class=g></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        assert_eq!(
+            bx("a").row_lines,
+            vec![
+                ("head".to_string(), 0),
+                ("body".to_string(), 1),
+                ("foot".to_string(), 2),
+            ]
+        );
+        assert_eq!(bx("b").grid_row.as_deref(), Some("2"));
+        assert_eq!(bx("c").grid_row.as_deref(), Some("1"));
+        assert_eq!(bx("c").grid_row_span, 2);
+        assert_eq!(bx("d").grid_row, None, "auto start leaves the row to flow");
+        assert_eq!(bx("d").grid_row_span, 3);
+        assert_eq!(bx("e").grid_row.as_deref(), Some("4"));
+        assert_eq!(bx("e").grid_row_end.as_deref(), Some("-1"));
+        assert_eq!(bx("f").grid_row.as_deref(), Some("head"), "a bracket name");
+        assert_eq!(bx("g").grid_row_span, 2);
     }
 
     #[test]

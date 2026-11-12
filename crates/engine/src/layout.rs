@@ -7737,74 +7737,219 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
         }
         found.then_some((r0, r1, c0.min(nc0), c1.min(nc0)))
     };
+    // Rows known to the template: negative `grid-row` line numbers count from
+    // the end of THESE rows (line -1 is one past the last explicit row).
+    let nr_rows = n.bx.rows.len().max(n.bx.areas.len());
+    let resolve_row = |start: Option<&str>, end: Option<&str>| -> Option<(usize, usize)> {
+        let line = |name: &str, suffix: &str| -> Option<usize> {
+            if let Ok(k) = name.parse::<i32>() {
+                return Some(if k > 0 {
+                    (k - 1) as usize
+                } else {
+                    (nr_rows as i32 + k + 1).max(0) as usize
+                });
+            }
+            n.bx
+                .row_lines
+                .iter()
+                .find(|(l, _)| l == name || l == &format!("{name}{suffix}"))
+                .map(|(_, i)| *i)
+        };
+        let s = start.and_then(|nm| line(nm, "-start"));
+        let e = end.and_then(|nm| line(nm, "-end"));
+        match (s, e) {
+            (Some(s), Some(e)) if e > s => Some((s, e)),
+            (Some(s), _) => Some((s, s + 1)),
+            (None, Some(e)) if e > 0 => Some((e - 1, e)),
+            _ => None,
+        }
+    };
     let mut col_row = vec![0usize; nc0]; // next free row per column (named)
     let mut ar = 0usize; // auto cursor row
     let mut ac = 0usize; // auto cursor col
-    // (row0, row1, col0, col1) — row1/col1 exclusive
-    let mut spots: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(items.len());
-    for it in &items {
+    // (row0, row1, col0, col1) — row1/col1 exclusive; None = auto, filled
+    // by the second pass once every explicit/grid-row placement is known
+    let mut spots: Vec<Option<(usize, usize, usize, usize)>> = vec![None; items.len()];
+    // Only a `grid-row` placement makes the auto flow avoid occupied cells;
+    // a page without one keeps the historical cursor byte-identical.
+    let row_aware = items.iter().any(|it| match it {
+        Item::Grp(i) => {
+            let b = &n.children[*i].bx;
+            b.grid_row.is_some() || b.grid_row_end.is_some() || b.grid_row_span > 0
+        }
+        Item::Text(..) => false,
+    });
+    let mut occ: Vec<Vec<bool>> = Vec::new();
+    let mark = |occ: &mut Vec<Vec<bool>>, r0: usize, r1: usize, c0: usize, c1: usize| {
+        let (rows, cols) = (r1.max(1), c1.max(1));
+        while occ.len() < rows {
+            occ.push(vec![false; cols]);
+        }
+        for row in occ.iter_mut() {
+            if row.len() < cols {
+                row.resize(cols, false);
+            }
+        }
+        for r in r0..r1 {
+            for c in c0..c1 {
+                occ[r][c] = true;
+            }
+        }
+    };
+    let fits = |occ: &Vec<Vec<bool>>, r0: usize, r1: usize, c0: usize, c1: usize| {
+        (r0..r1).all(|r| {
+            (c0..c1).all(|c| {
+                !occ
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .copied()
+                    .unwrap_or(false)
+            })
+        })
+    };
+    // Pass 1: every placement that does not depend on the auto cursor. Items
+    // with `grid-row` take their row from the template (and, with an auto
+    // column, the first free column in that row).
+    for (i, it) in items.iter().enumerate() {
         let span = match it {
-            Item::Grp(i) => n.children[*i].bx.grid_col_span as usize,
+            Item::Grp(k) => n.children[*k].bx.grid_col_span as usize,
             Item::Text(..) => 0,
         };
-        let (area, named) = match it {
-            Item::Grp(i) => {
-                let b = &n.children[*i].bx;
+        let (area, named, row, rowspan) = match it {
+            Item::Grp(k) => {
+                let b = &n.children[*k].bx;
                 (
                     b.grid_area.as_deref().and_then(|nm| area_rect(nm)),
                     resolve_col(b.grid_col.as_deref(), b.grid_col_end.as_deref()),
+                    resolve_row(b.grid_row.as_deref(), b.grid_row_end.as_deref()),
+                    b.grid_row_span as usize,
                 )
             }
-            Item::Text(..) => (None, None),
+            Item::Text(..) => (None, None, None, 0),
         };
-        spots.push(match (area, named) {
+        let placed = match (area, named, row) {
             // a named AREA wins over line placement: its cell rect can span
             // rows (the sidebar of a header/body/sidebar template)
-            (Some((r0, r1, c0, c1)), _) => {
+            (Some((r0, r1, c0, c1)), _, _) => {
                 for c in c0..c1 {
                     col_row[c] = col_row[c].max(r1);
                 }
-                (r0, r1, c0, c1)
+                Some((r0, r1, c0, c1))
             }
-            (None, Some((s, e))) => {
+            // an explicit row line fixes the start; a span covers forward
+            (None, named, Some((r0, r1))) => {
+                let r1 = if rowspan > 0 {
+                    r0.max(r1.saturating_sub(1)) + rowspan
+                } else {
+                    r1
+                };
+                let (c0, c1) = match named {
+                    Some((s, e)) => (s, e.max(s + span).min(nc0)),
+                    None => {
+                        let w = span.max(1).min(nc0);
+                        let mut c = 0;
+                        while row_aware && c + w <= nc0 && !fits(&occ, r0, r1, c, c + w) {
+                            c += 1;
+                        }
+                        c = c.min(nc0.saturating_sub(w));
+                        (c, (c + w).min(nc0))
+                    }
+                };
+                for c in c0..c1 {
+                    col_row[c] = col_row[c].max(r1);
+                }
+                Some((r0, r1, c0, c1))
+            }
+            // named columns keep stacking in successive rows, as before,
+            // but a `grid-row-end: span N` still covers N rows
+            (None, Some((s, e)), None) => {
                 let e = e.max(s + span).min(nc0);
                 let r = (s..e).map(|c| col_row[c]).max().unwrap_or(0);
+                let h = rowspan.max(1);
                 for c in s..e {
-                    col_row[c] = r + 1;
+                    col_row[c] = r + h;
                 }
-                (r, r + 1, s, e)
+                Some((r, r + h, s, e))
             }
-            (None, None) => {
-                if n.bx.grid_flow == GridFlow::Column {
-                    // column flow: fill the current column top→bottom, then
-                    // wrap to the next column once the template's rows are
-                    // used up (implicit rows never grow this grid)
-                    let sp = (ar, ar + 1, ac, ac + 1);
-                    ar += 1;
-                    if ar >= nr_flow {
-                        ar = 0;
-                        ac += 1;
-                    }
-                    sp
-                } else {
-                    // `grid-column: span N` covers N tracks; wrap when it no
-                    // longer fits the explicit template
-                    let width = span.max(1).min(nc0);
+            (None, None, None) => None,
+        };
+        if let Some((r0, r1, c0, c1)) = placed {
+            if row_aware {
+                mark(&mut occ, r0, r1, c0, c1);
+            }
+            spots[i] = Some((r0, r1, c0, c1));
+        }
+    }
+    // Pass 2: auto items. Only a grid with `grid-row` needs occupancy-aware
+    // packing (it must skip a row-spanning item); otherwise this is the old
+    // row-major cursor unchanged.
+    for (i, it) in items.iter().enumerate() {
+        if spots[i].is_some() {
+            continue;
+        }
+        let (span, rowspan) = match it {
+            Item::Grp(k) => {
+                let b = &n.children[*k].bx;
+                (b.grid_col_span as usize, b.grid_row_span as usize)
+            }
+            Item::Text(..) => (0, 0),
+        };
+        let sp = if n.bx.grid_flow == GridFlow::Column {
+            // column flow: fill the current column top→bottom, then wrap to
+            // the next column once the template's rows are used up (implicit
+            // rows never grow this grid)
+            let sp = (ar, ar + 1, ac, ac + 1);
+            ar += 1;
+            if ar >= nr_flow {
+                ar = 0;
+                ac += 1;
+            }
+            sp
+        } else {
+            // `grid-column: span N` covers N tracks, `grid-row: span N` N rows;
+            // wrap when the item no longer fits the explicit template
+            let width = span.max(1).min(nc0);
+            let height = rowspan.max(1);
+            let (r, c) = if row_aware {
+                loop {
                     if ac + width > nc0 {
                         ac = 0;
                         ar += 1;
                     }
-                    let sp = (ar, ar + 1, ac, (ac + width).min(nc0));
-                    ac += width;
-                    if ac >= nc0 {
-                        ac = 0;
-                        ar += 1;
+                    if fits(&occ, ar, ar + height, ac, ac + width) {
+                        break (ar, ac);
                     }
-                    sp
+                    ac += 1;
+                }
+            } else {
+                if ac + width > nc0 {
+                    ac = 0;
+                    ar += 1;
+                }
+                (ar, ac)
+            };
+            let sp = (r, r + height, c, (c + width).min(nc0));
+            if row_aware {
+                mark(&mut occ, r, r + height, c, (c + width).min(nc0));
+                ac = c + width;
+                if ac >= nc0 {
+                    ac = 0;
+                    ar = r + 1;
+                } else {
+                    ar = r;
+                }
+            } else {
+                ac += width;
+                if ac >= nc0 {
+                    ac = 0;
+                    ar += 1;
                 }
             }
-        });
+            sp
+        };
+        spots[i] = Some(sp);
     }
+    let spots: Vec<(usize, usize, usize, usize)> = spots.into_iter().map(|s| s.unwrap()).collect();
     // column flow can place items past the explicit template: those implicit
     // tracks are auto-sized (row flow never exceeds nc0, so this is a no-op
     // there and every reference row stays byte-identical)
@@ -10596,6 +10741,71 @@ mod tests {
         assert_eq!(pos(1), (30.0, 0.0), "b");
         assert_eq!(pos(2), (0.0, 50.0), "c");
         assert_eq!(pos(3), (30.0, 50.0), "d");
+    }
+
+    #[test]
+    fn grid_explicit_rows_place_items_and_auto_flow_skips_them() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Px(30.0), Track::Px(30.0)],
+                rows: vec![Track::Px(40.0), Track::Px(40.0), Track::Px(40.0)],
+                ..BoxStyle::default()
+            },
+        );
+        let mut push = |text: &str, row: Option<&str>, rowspan: u32| {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    grid_row: row.map(str::to_string),
+                    grid_row_span: rowspan,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(text)];
+            n.children.push(g);
+        };
+        push("a", Some("2"), 0);
+        push("b", Some("1"), 0);
+        push("c", None, 0);
+        push("d", None, 2);
+        push("e", None, 0);
+        layout_tree(&mut n, 300.0, &m4);
+        let pos = |i: usize| (n.children[i].x, n.children[i].y);
+        assert_eq!(pos(0), (0.0, 40.0), "a starts at row line 2");
+        assert_eq!(pos(1), (0.0, 0.0), "b starts at row line 1");
+        assert_eq!(pos(2), (30.0, 0.0), "c fills the free cell next to b");
+        assert_eq!(pos(3), (30.0, 40.0), "d spans two rows below c");
+        assert_eq!(pos(4), (0.0, 80.0), "e skips the occupied cells");
+    }
+
+    #[test]
+    fn grid_row_end_line_spans_to_a_negative_line() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Px(300.0)],
+                rows: vec![Track::Px(40.0), Track::Px(40.0), Track::Px(40.0)],
+                ..BoxStyle::default()
+            },
+        );
+        let mut g = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                grid_row: Some("1".to_string()),
+                grid_row_end: Some("-1".to_string()),
+                ..BoxStyle::default()
+            },
+        );
+        g.children = vec![leaf("a")];
+        n.children.push(g);
+        layout_tree(&mut n, 300.0, &m4);
+        assert_eq!((n.children[0].x, n.children[0].y), (0.0, 0.0));
+        assert_eq!(n.h, 120.0, "the item spans all three explicit rows");
     }
 
     #[test]

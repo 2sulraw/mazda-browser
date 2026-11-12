@@ -5880,3 +5880,34 @@ selector reasons, box tree unchanged at 1110 boxes / 506 text runs.
 
 Test: `empty_ignores_comments_but_not_whitespace` (no children, whitespace,
 comment, element child, text). 1072 green.
+
+## put grid items on the row the page asked for (P105, 2026-11-13)
+
+`grid-row` (384 declarations on github), `grid-row-start` (196) and
+`grid-row-end` (4) were simply not in the accepted-property list, so every
+explicit row placement disappeared and those items were auto-placed in
+document order instead. GitHub's homepage uses the pair heavily: a two-row
+hero and a repository panel whose cells name their rows.
+
+The row axis now mirrors the column axis it already had. `grid-row: 2`,
+`grid-row: 1 / span 2`, `grid-row: auto / span 3`, `grid-row-start: 4`,
+`grid-row-end: -1` and bracket names from `grid-template-rows`
+(`grid-template-rows: [head] 40px [body] 1fr`) all parse into the item's
+box style. Negative line numbers count from the end of the explicit row
+template, exactly as the column side resolves them.
+
+In layout, explicit placements are resolved in a first pass; auto items then
+flow as before. The auto cursor becomes occupancy-aware only when some item
+in that grid actually carries a `grid-row`, so a page that does not use the
+feature keeps its historical placement byte for byte. shortcut: an
+explicit-row item with an auto column takes the first free cell in that row,
+and column flow still ignores row spans on auto items.
+
+Measured on github.com (release, `MAZDA_MISS=1`): 43 -> 40 distinct dropped
+properties (the three row properties are gone), box tree unchanged at 1110
+boxes. Text runs 503 in a run whose scripts mutated the markup (506 before),
+so no layout claim is made beyond the box count.
+
+Test: `grid_row_placement_parses_lines_spans_and_names`,
+`grid_explicit_rows_place_items_and_auto_flow_skips_them`,
+`grid_row_end_line_spans_to_a_negative_line`. 1075 green.
