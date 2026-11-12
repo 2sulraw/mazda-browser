@@ -5860,3 +5860,23 @@ from the previous one (507/509), so no layout claim is made.
 
 Test: `checked_reads_markup_state` (checkbox, unchecked, radio, text field,
 selected/unselected option, a div with the attribute). 1071 green.
+
+## :empty is pure structure, so stop dropping its rules (P104, 2026-11-13)
+
+`:empty` was on the "not statically evaluable" list, so 32 rules on github.com
+dropped whole - and `:not(:empty)` was worse: the member failed to parse, which
+dropped the rule that was supposed to apply to every NON-empty element, so the
+`:not()` case silently painted nothing where it should have painted everywhere.
+
+Emptiness is structure, not state: `Pseudo::Empty` matches an element whose
+children are all comments. Whitespace text counts as content (Selectors 4: any
+data with non-zero length makes the element non-empty), and so does an element
+child - which is exactly what distinguishes the two selectors on a page that
+uses them to add spacing between icon-only and labelled children.
+
+Measured on github.com (release, `MAZDA_MISS=1`): `pseudo-class :empty` (32) and
+`complex :not(:empty) argument` (3) are both gone, 50 -> 48 distinct dropped
+selector reasons, box tree unchanged at 1110 boxes / 506 text runs.
+
+Test: `empty_ignores_comments_but_not_whitespace` (no children, whitespace,
+comment, element child, text). 1072 green.

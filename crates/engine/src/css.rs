@@ -1376,6 +1376,10 @@ enum Pseudo {
     /// is not seen until it rewrites the attribute — the static pass reads the
     /// DOM, like `:disabled`.
     Checked,
+    /// `:empty` — no element or text children. Comments don't count, but a
+    /// whitespace text node does (Selectors 4: any data with non-zero length
+    /// makes the element non-empty).
+    Empty,
     /// `:root` — a direct child of the document root (the `<html>` element).
     Root,
     /// `:first-child` — first ELEMENT child of its parent (text nodes don't
@@ -8226,6 +8230,8 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     // checkedness is markup state too (`checked` on a
                     // checkbox/radio, `selected` on an option)
                     ("checked", None) => seg.pseudos.push(Pseudo::Checked),
+                    // emptiness is pure structure
+                    ("empty", None) => seg.pseudos.push(Pseudo::Empty),
                     // the input hint is showing: an empty value + a
                     // `placeholder` attribute. Static (the cascade keeps no
                     // live values); `:not(:placeholder-shown)` is how a
@@ -8776,6 +8782,12 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
                 && dom.attr(node, "placeholder").is_some_and(|p| !p.is_empty())
                 && dom.attr(node, "value").map_or(true, |v| v.is_empty())
         }
+        // no element or text children; comments don't count, whitespace text
+        // does (Selectors 4: non-zero-length data makes it non-empty)
+        Pseudo::Empty => dom.nodes[node as usize]
+            .children
+            .iter()
+            .all(|&c| matches!(dom.nodes[c as usize].kind, NodeKind::Comment(_))),
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
@@ -11341,6 +11353,33 @@ mod tests {
         assert_eq!(color("o1"), 0x0011_1111, "selected option");
         assert_eq!(color("o2"), 0x0022_2222, "unselected option");
         assert_eq!(color("dv"), 0x0022_2222, "a div never matches :checked");
+    }
+
+    #[test]
+    fn empty_ignores_comments_but_not_whitespace() {
+        // 32 rules on github.com were dropped for `:empty`, and 3 more for
+        // `:not(:empty)` (the member failed to parse, which dropped the rule).
+        assert!(parse_selector_why(":empty").is_ok());
+        assert!(parse_selector_why(":not(:empty)").is_ok());
+        let sheet = parse(":empty{color:#111111} :not(:empty){color:#222222}");
+        let dom = dom_of(
+            "<div id=bare></div>\
+             <div id=ws> </div>\
+             <div id=comment><!--x--></div>\
+             <div id=child><span></span></div>\
+             <div id=text>x</div>",
+        );
+        let color = |id: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        assert_eq!(color("bare"), 0x0011_1111, "no children at all");
+        assert_eq!(color("ws"), 0x0022_2222, "a whitespace text node is content");
+        assert_eq!(color("comment"), 0x0011_1111, "comments don't count");
+        assert_eq!(color("child"), 0x0022_2222, "an element child");
+        assert_eq!(color("text"), 0x0022_2222, "text");
     }
 
     #[test]
