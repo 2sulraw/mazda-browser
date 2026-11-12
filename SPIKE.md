@@ -4677,3 +4677,73 @@ the size predicted by the round-trip arithmetic, not the whole gap: the phases
 still take turns (preload 2.4 s, module preload 1.5 s, exec 6.3 s, images
 1.2 s), so the network is still idle during script execution. That overlap is
 the next lever, not another transport tweak.
+
+## Progressive first paint: content before the scripts finish (P74, 2026-11-12)
+
+After P73 the total is 14-16 s cold, and the window is blank for all of it:
+the pipeline fetched the markup, ran 34 modules for ~5 s, laid out, and only
+then produced a frame. No amount of shaving the total fixes how that feels -
+a browser is expected to show the page while it is still loading.
+
+Chrome paints a frame as soon as it has the markup and its render-blocking
+stylesheets; scripts can mutate it afterwards and it repaints. That is a
+pipeline order, not a speed trick, and it costs one extra cascade.
+
+Change (all in `crates/engine/src/app.rs`):
+
+- `LoadDone` grows `partial`. The worker pushes one *partial* page (same
+  `PageWire`, same job id) from inside the load, then the final page as
+  before; `NavGate` accepts both because both carry the current id.
+- `settle_load` takes an `Option<&dyn Fn(PageWire)>` sink. When present (and
+  not a snapshot restore) it lays out the post-parse DOM *before* running a
+  script, sets `FontsChoice::B` for that pass (system fonts, no webfont
+  decode), and hands the wire to the sink. It runs on a scratch `ImgCache`.
+- `layout_page` grows `first_paint: bool`: on the early pass it skips
+  `probe_images` / `probe_media` and the image preload burst, i.e. every
+  round trip only the final pass needs. Boxes still size from whatever the
+  cache already holds; the final pass replaces them.
+- The preload split follows the frame: `fetch_and_parse` now preloads only
+  `stylesheet_urls` (the first paint needs those to be render-blocking), and
+  `script_urls` are preloaded from inside `settle_load` once the frame is out.
+- Shell: `drain_results` adopts a partial wire via `show_partial` (page,
+  scroll clamp, repaint) and leaves the navigation markers, history and
+  address to the final page. `run_headless` paints it and logs
+  `[time] first paint`. Restores (`restore == true`) skip the early pass:
+  they replay scripts from the disk cache and are already fast.
+- `MAZDA_FIRSTPAINT=0` disables the pass for A/B.
+
+Cold github.com, fresh profile each run, alternating modes, process start to
+exit, `MAZDA_TIME=1`, four pairs per session:
+
+| session | off: median total | on: median total | on: first paint (per run) |
+|---|---|---|---|
+| 1 | 14 592 ms | 14 866 ms | 4 543 / 4 475 / 4 229 / 4 297 ms |
+| 2 (link degraded) | 20 994 ms | 18 357 ms | 4 706 / 4 682 / 6 490 / 5 835 ms |
+
+The three frames a user now gets are: blank -> markup+CSS at ~4.5 s -> final
+page at ~14.9 s. Cost is **+274 ms** median total in session 1 (one extra
+cascade: 1.4 s in the on-runs vs 1.1 s final) - inside the noise, which is
++-1.5 s pair to pair. Session 2 is the useful control: the link got twice as
+slow and the totals moved by ~6 s while the first frame stayed under 6.5 s,
+because it only depends on the document, the stylesheets and the cascade.
+
+Warm (populated profile, same binary): first paint 4 102 ms, total 13 411 ms.
+
+Where the 4.5 s floor comes from, so a later change knows what it is fighting:
+
+| phase before the early frame | cold |
+|---|---|
+| document fetch (200, 514 KB gzip, always revalidated) | 1.3-1.7 s |
+| stylesheet preload (20 sheets, one h2 round trip) | 1.2-2.4 s |
+| css parse + cascade + box tree + text | 0.9-2.5 s |
+
+The cascade is the part we own: `[css] 31644 rules`, `491563 candidates
+tested, 19249 matched` for the early pass, same again for the final. So
+200-400 ms is not reachable by reordering anything - the document alone is
+1.7 s from this host - and the next real lever is that cascade, which is now
+paid twice per load and is what holds the first frame at 4.5 s.
+
+Tests **1032 -> 1033** green (new
+`first_paint_shows_the_markup_before_scripts_add_to_it`: a page whose script
+rewrites its heading; the sink sees the markup, the final wire sees the
+script's text).

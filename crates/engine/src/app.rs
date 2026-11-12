@@ -1178,6 +1178,10 @@ fn tick_players(
 pub fn run_headless() {
     use std::io::BufRead;
 
+    // cold-start accounting: `[time] first paint` / `[time] painted at` are
+    // the two numbers a user feels (content on screen vs. load finished)
+    let t_start = Instant::now();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut url: Option<String> = None;
     let once = args.iter().any(|a| a == "--once");
@@ -1307,6 +1311,36 @@ pub fn run_headless() {
                     println!("{}", mazda_ipc::Event::Error("pipeline panic".into()).encode());
                     continue;
                 }
+                if done.partial {
+                    // first paint: markup + stylesheets are laid out, the
+                    // page's scripts are still running. Show it now; the
+                    // job's final page replaces it when the scripts settle.
+                    let Some(mut wire) = done.page else { continue };
+                    let stacks = std::mem::take(&mut wire.stacks);
+                    let faces = std::mem::take(&mut wire.faces);
+                    fonts.begin_page(faces);
+                    *fonts.stacks.borrow_mut() = stacks;
+                    let p = wire_to_page(wire);
+                    scroll = scroll.min((p.laid.height - zoomed_h(ph, zoom)).max(0.0));
+                    page = Some(p);
+                    if let Some(p) = page.as_ref() {
+                        headless_paint(
+                            p,
+                            &fonts,
+                            pw,
+                            ph,
+                            zoom,
+                            scroll,
+                            find.as_ref(),
+                            &mut frame,
+                            &mut seq,
+                        );
+                    }
+                    if std::env::var_os("MAZDA_TIME").is_some() {
+                        eprintln!("[time] first paint: {} ms", t_start.elapsed().as_millis());
+                    }
+                    continue;
+                }
                 let nav_done = done.nav.is_some() && done.nav_done;
                 if let Some(nav) = done.nav {
                     if !done.nav_done {
@@ -1350,6 +1384,9 @@ pub fn run_headless() {
                 }
                 if let Some(p) = page.as_ref() {
                     headless_paint(p, &fonts, pw, ph, zoom, scroll, find.as_ref(), &mut frame, &mut seq);
+                }
+                if std::env::var_os("MAZDA_TIME").is_some() {
+                    eprintln!("[time] painted at {} ms", t_start.elapsed().as_millis());
                 }
                 println!("{}", mazda_ipc::Event::Title(title).encode());
                 if cfg!(feature = "count-alloc") {
@@ -2124,6 +2161,15 @@ impl App {
             // accepted ⇒ dispatched at/after our newest hover job, so its
             // page carries the current hover cell — the wait is over
             self.hover_wait = false;
+            if done.partial {
+                // first paint of a load in progress: adopt the markup+CSS
+                // layout and paint it. Navigation state (pending marker,
+                // history, address) belongs to the final page of this job.
+                if let Some(wire) = done.page {
+                    self.show_partial(wire, pw, ph);
+                }
+                continue;
+            }
             if done.panicked {
                 eprintln!("[nav] load #{} failed (pipeline panic)", done.id);
                 // a failed job must not leave the shell thinking it is still
@@ -2224,6 +2270,23 @@ impl App {
             self.repaint_page(pw, ph);
             eprintln!("[nav] applied #{} → {}", self.nav.next, self.page.url);
         }
+    }
+
+    /// Adopt a first-paint snapshot: markup + stylesheets are laid out while
+    /// the load's scripts are still running. Paints now, keeps every
+    /// navigation marker untouched, and is replaced by the job's final page.
+    fn show_partial(&mut self, mut wire: PageWire, pw: usize, ph: usize) {
+        let stacks = std::mem::take(&mut wire.stacks);
+        let faces = std::mem::take(&mut wire.faces);
+        self.fonts.begin_page(faces);
+        *self.fonts.stacks.borrow_mut() = stacks;
+        self.form_names = std::mem::take(&mut wire.form_names);
+        self.page = wire_to_page(wire);
+        self.scroll = self
+            .scroll
+            .min((self.page.laid.height - page_h(ph)).max(0.0));
+        self.repaint_page(pw, ph);
+        eprintln!("[nav] first paint of #{} in progress", self.nav.next);
     }
 
     /// Re-rasterize the active page into `pixels` (marks the texture dirty).
@@ -4103,6 +4166,9 @@ struct LoadDone {
     prevent_default: bool,
     /// the worker's pipeline panicked (caught; process survives)
     panicked: bool,
+    /// a first-paint snapshot (markup + stylesheets, no scripts yet): the UI
+    /// shows it and keeps waiting for the final page of the same job
+    partial: bool,
 }
 
 /// Convert a `Page` (worker-side, holds `Rcs`) into the `Send` wire form.
@@ -4308,10 +4374,31 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
             let id = job.id();
             let url = job.url().to_string();
             let scroll_like = matches!(job, LoadReq::Scroll { .. });
+            // first paint goes out mid-job: markup + stylesheets, laid out,
+            // before the scripts run. A load can take 10+ s on this link and
+            // a blank window for all of it is the worst part of it.
+            let early = |wire: PageWire| {
+                let _ = results.send(LoadDone {
+                    id,
+                    page: Some(wire),
+                    nav: None,
+                    nav_done: false,
+                    prevent_default: false,
+                    panicked: false,
+                    partial: true,
+                });
+            };
             // worker panics must not take the process down (employed for
             // loads, relayouts AND events alike)
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process_job(&mut kept, &mut fonts, &job, &mut last_geom, &mut last_forms)
+                process_job(
+                    &mut kept,
+                    &mut fonts,
+                    &job,
+                    &mut last_geom,
+                    &mut last_forms,
+                    Some(&early),
+                )
             }));
             let (wire, nav, pd, panicked, nav_done) = match outcome {
                 Ok(r) => r,
@@ -4335,7 +4422,15 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
                     current_id = id;
                 }
                 if results
-                    .send(LoadDone { id, page: wire, nav, nav_done, prevent_default: pd, panicked })
+                    .send(LoadDone {
+                    id,
+                    page: wire,
+                    nav,
+                    nav_done,
+                    prevent_default: pd,
+                    panicked,
+                    partial: false,
+                })
                     .is_err()
                 {
                     break; // UI side gone
@@ -4493,6 +4588,7 @@ fn fire_due(
             nav_done: done,
             prevent_default: false,
             panicked: false,
+            partial: false,
         });
         return;
     }
@@ -4500,7 +4596,15 @@ fn fire_due(
         // a timer/rAF callback asked to navigate: hand it up untouched
         eprintln!("[js] timer navigation → {nav_url}");
         if results
-            .send(LoadDone { id: current_id, page: None, nav: Some(nav_url), nav_done: false, prevent_default: false, panicked: false })
+            .send(LoadDone {
+            id: current_id,
+            page: None,
+            nav: Some(nav_url),
+            nav_done: false,
+            prevent_default: false,
+            panicked: false,
+            partial: false,
+        })
             .is_err()
         {
             return; // UI side gone
@@ -4512,14 +4616,22 @@ fn fire_due(
     }
     if dirty {
         let (page, form_names) = layout_page(
-            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover, imgs,
+            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover, imgs, false,
         );
         let stacks = fonts.stacks.borrow().clone();
         let out_faces = collect_out_faces(fonts);
         let wire = page_to_wire(page, stacks, out_faces, form_names);
         eprintln!("[js] timer/frame mutated the page; pushed relayout");
         if results
-            .send(LoadDone { id: current_id, page: Some(wire), nav: None, nav_done: false, prevent_default: false, panicked: false })
+            .send(LoadDone {
+            id: current_id,
+            page: Some(wire),
+            nav: None,
+            nav_done: false,
+            prevent_default: false,
+            panicked: false,
+            partial: false,
+        })
             .is_err()
         {
             // UI side gone
@@ -4537,6 +4649,7 @@ fn process_job(
     job: &LoadReq,
     last_geom: &mut (f32, f32),
     last_forms: &mut layout::FormState,
+    early: Option<&dyn Fn(PageWire)>,
 ) -> (Option<PageWire>, Option<String>, bool, bool, bool) {
     // a fresh navigation adopts the settings-page webfont policy; layout
     // runs (relayout/event/scroll) keep the loaded page's policy
@@ -4547,14 +4660,14 @@ fn process_job(
         LoadReq::Load { url, max_w, vh, restore, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = layout::FormState::default();
-            let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), *restore);
+            let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), *restore, early);
             (r.0, r.1, false, r.2, r.3)
         }
         LoadReq::Relayout { url, max_w, vh, forms, hover, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), false);
+                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), false, None);
                 return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
@@ -4563,7 +4676,7 @@ fn process_job(
             kp.hover = *hover;
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, *hover,
-                &mut kp.imgs,
+                &mut kp.imgs, false,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -4573,7 +4686,7 @@ fn process_job(
             *last_geom = (*max_w, *vh);
             *last_forms = forms.clone();
             if !kept_matches(kept, url) {
-                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), false);
+                let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), false, None);
                 return (r.0, r.1, false, r.2, r.3);
             }
             let kp = kept.as_mut().unwrap();
@@ -4697,7 +4810,7 @@ fn process_job(
                                     SubmitMethod::Get => {
                                         eprintln!("[nav] queued load (form GET {})", sub.target);
                                         let (wire, script_nav, panicked, nav_done) =
-                                            do_load(kept, fonts, &sub.target, *max_w, *vh, job.engine(), false);
+                                            do_load(kept, fonts, &sub.target, *max_w, *vh, job.engine(), false, None);
                                         if let Some(s) = &script_nav {
                                             // the fetched page's scripts asked for
                                             // a plain nav: it wins (the ordinary
@@ -4734,7 +4847,7 @@ fn process_job(
             // always re-layout: the event likely changed the DOM
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, kp.hover,
-                &mut kp.imgs,
+                &mut kp.imgs, false,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -4788,7 +4901,7 @@ fn process_job(
                     }
                 let (page, fnames) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
-                    kp.hover, &mut kp.imgs,
+                    kp.hover, &mut kp.imgs, false,
                 );
                 (page, fnames)
             };
@@ -4887,9 +5000,14 @@ fn do_load(
     vh: f32,
     engine: EngineChoice,
     restore: bool,
+    early: Option<&dyn Fn(PageWire)>,
 ) -> (Option<PageWire>, Option<String>, bool, bool) {
+    // a snapshot restore (tab switch / back) replays scripts from the disk
+    // cache and is already fast: a pre-script frame there only pays a cascade
+    let early = if restore { None } else { early };
     let (dom, css_text, faces) = fetch_and_parse(url, restore);
-    let (wire, nav, form_nav) = settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces);
+    let (wire, nav, form_nav) =
+        settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces, early);
     if let Some(f) = form_nav {
         // an inline script form.submit()ed a POST during the load — the
         // worker executes it now (the first page's wire is replaced). Same
@@ -4985,7 +5103,7 @@ fn do_load_full(
             parse_source_with_styles(url, format!("<p>Failed to load: {e}</p>"))
         }
     };
-    settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces)
+    settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces, None)
 }
 
 /// Parse an HTML source + collect its stylesheets (`fetch_and_parse`'s back
@@ -5056,6 +5174,7 @@ fn settle_load(
     dom: html::Dom,
     css_text: String,
     faces: Vec<css::FontFace>,
+    early: Option<&dyn Fn(PageWire)>,
 ) -> (Option<PageWire>, Option<String>, Option<runtime::FormNav>) {
     let mut kp = KeptPage {
         url: url.to_string(),
@@ -5071,12 +5190,27 @@ fn settle_load(
     let heap_mb = || crate::live_alloc_bytes() as f64 / (1024.0 * 1024.0);
     #[cfg(feature = "count-alloc")]
     let h0 = heap_mb();
-    // The markup names its images up front, so start those downloads before
-    // the page's scripts fetch and execute instead of after layout. Cold, the
-    // image phase (~2 s) then overlaps the script phase (~5 s); warm, every
-    // lane is a cache hit and this costs a thread. Images a script inserts are
-    // still covered by the box-tree preload in `layout_page`, which also does
-    // the probe.
+    // Progressive first paint: the markup and its stylesheets, laid out,
+    // before a single script runs. A cold github.com load spends ~5-7 s in
+    // script execution and ~2 s more in the image phase; a window that stays
+    // blank through all of it reads as broken no matter what the total is.
+    // This pass skips webfonts (system fonts until the final paint) and every
+    // image/media round trip, so it costs one cascade and puts text on screen.
+    if let (Some(sink), true) = (early, first_paint_on()) {
+        let saved = fonts.webfonts;
+        fonts.set_choice(FontsChoice::B);
+        let mut scratch = ImgCache::default();
+        let (page, form_names) = layout_page(
+            &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
+            &layout::FormState::default(), None, &mut scratch, true,
+        );
+        fonts.set_choice(saved);
+        let stacks = fonts.stacks.borrow().clone();
+        sink(page_to_wire(page, stacks, collect_out_faces(fonts), form_names));
+    }
+    // the script bodies are about to be asked for one by one: overlap their
+    // round trips now that the first frame is out (see `preload`)
+    preload(&script_urls(&kp.dom, url));
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = if no_js() {
@@ -5103,6 +5237,7 @@ fn settle_load(
         // fresh page: the shell clears its hover cell on navigation too
         None,
         &mut kp.imgs,
+        false,
     );
     #[cfg(feature = "count-alloc")]
     let h2 = heap_mb();
@@ -5733,8 +5868,10 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
     snapshot_write(url, &dom);
     // overlap the page's subresource round trips before the sequential
-    // phases start asking for them (see `preload`)
-    preload(&subresource_urls(&dom, url));
+    // phases start asking for them (see `preload`). Stylesheets first: the
+    // first paint only needs those, and `settle_load` fetches the script
+    // bodies once that frame is out.
+    preload(&stylesheet_urls(&dom, url));
     let (css_text, faces) = styles_for(&dom, url);
     (dom, css_text, faces)
 }
@@ -5742,10 +5879,12 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
 /// The markup's own subresources: external stylesheets and `<script src>`
 /// (module entries included, a `nomodule` fallback skipped when the page has
 /// a module build — it never runs, so it is never worth a request).
-fn subresource_urls(dom: &html::Dom, url: &str) -> Vec<String> {
-    let mut out = Vec::new();
+/// Stylesheet URLs of the document, in order: the first paint needs these and
+/// nothing else.
+fn stylesheet_urls(dom: &html::Dom, url: &str) -> Vec<String> {
     let mut sheets = Vec::new();
     collect_sheets(dom, 0, &mut sheets);
+    let mut out = Vec::new();
     for s in &sheets {
         if let SheetSrc::Link(href) = s {
             if let Some(abs) = resolve(url, href) {
@@ -5753,8 +5892,15 @@ fn subresource_urls(dom: &html::Dom, url: &str) -> Vec<String> {
             }
         }
     }
+    out
+}
+
+/// `<script src>` URLs (module/nomodule selection applied): the bodies the
+/// script phase is about to ask for.
+fn script_urls(dom: &html::Dom, url: &str) -> Vec<String> {
     let scripts = crate::script::collect_scripts(dom);
     let has_modules = scripts.iter().any(|s| s.is_module);
+    let mut out = Vec::new();
     for s in &scripts {
         if s.is_nomodule && has_modules {
             continue;
@@ -5765,6 +5911,13 @@ fn subresource_urls(dom: &html::Dom, url: &str) -> Vec<String> {
             }
         }
     }
+    out
+}
+
+/// Every subresource the markup names (stylesheets, then script bodies).
+fn subresource_urls(dom: &html::Dom, url: &str) -> Vec<String> {
+    let mut out = stylesheet_urls(dom, url);
+    out.extend(script_urls(dom, url));
     out
 }
 
@@ -5783,6 +5936,11 @@ fn layout_page(
     state: &layout::FormState,
     hover: Option<u32>,
     imgs: &mut ImgCache,
+    // first_paint: the caller is going to lay this page out again once the
+    // scripts have run, so skip everything that only the final pass needs
+    // (image + media probing, i.e. network round trips). The early frame
+    // shows markup + stylesheets and nothing that costs a download.
+    first_paint: bool,
 ) -> (Page, HashMap<u32, String>) {
     let root = dom.body_root();
     // MAZDA_TIME=1 prints per-stage layout timings: the reflow cost is what
@@ -5877,16 +6035,26 @@ fn layout_page(
     // the probe fetches every image in document order, one at a time; overlap
     // the round trips first (same reason as the markup preload)
     let mut img_urls = Vec::new();
-    pending_image_urls(&root_box, url, &mut img_urls);
-    preload_accept(&img_urls, Some(IMAGE_ACCEPT), "preload (images)");
-    let (n_img, skipped) = probe_images(&mut root_box, url);
+    if !first_paint {
+        pending_image_urls(&root_box, url, &mut img_urls);
+        preload_accept(&img_urls, Some(IMAGE_ACCEPT), "preload (images)");
+    }
+    let (n_img, skipped) = if first_paint {
+        (0, 0)
+    } else {
+        probe_images(&mut root_box, url)
+    };
     stage!("image probe");
     if n_img > 0 || skipped > 0 {
         eprintln!("[img] {n_img} probed, {skipped} skipped (format)");
     }
     // `<video>`: fetch + container probe (no decoding yet — the renderer owns
     // the player; layout only needs the intrinsic size and the DRM answer)
-    let (n_media, bad_media) = probe_media(&mut root_box, url);
+    let (n_media, bad_media) = if first_paint {
+        (0, 0)
+    } else {
+        probe_media(&mut root_box, url)
+    };
     stage!("media probe");
     if n_media > 0 || bad_media > 0 {
         eprintln!("[media] {n_media} playable, {bad_media} refused");
@@ -7621,6 +7789,15 @@ fn finish_fetch(
         );
     }
     Ok((buf, ct))
+}
+
+/// Progressive first paint (markup + stylesheets laid out before the scripts
+/// run) is on by default: it is what makes a slow load show content instead of
+/// a blank window. It costs one extra cascade; `MAZDA_FIRSTPAINT=0` turns it
+/// off for A/B measurements.
+fn first_paint_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("MAZDA_FIRSTPAINT").ok().as_deref(), Some("0") | Some("off")))
 }
 
 /// HTTP/2 is the default: one connection per origin, every page request a
@@ -11205,7 +11382,7 @@ mod tests {
                 submit: true,
                 forms: layout::FormState::default(),
                 engine: EngineChoice::A,
-            }, &mut last_geom, &mut last_forms);
+            }, &mut last_geom, &mut last_forms, None);
         assert!(nav.is_none(), "vetoed submission must not navigate");
         assert!(!nav_done, "no worker-executed navigation on veto");
         assert!(!panicked);
@@ -11252,9 +11429,60 @@ mod tests {
                 submit: true,
                 forms: layout::FormState::default(),
                 engine: EngineChoice::A,
-            }, &mut last_geom, &mut last_forms);
+            }, &mut last_geom, &mut last_forms, None);
         assert!(nav2.is_none() && !nav_done2 && !panicked2 && wire2.is_some(),
             "formless activation = plain relayout");
+    }
+
+    /// Progressive first paint: the frame the worker pushes before the scripts
+    /// run must show the markup as written. A cold load spends seconds in
+    /// script execution, and a blank window for all of it reads as broken.
+    #[test]
+    fn first_paint_shows_the_markup_before_scripts_add_to_it() {
+        if !first_paint_on() {
+            return; // A/B run with MAZDA_FIRSTPAINT=0 in the environment
+        }
+        let dom = html::parse(
+            r#"<html><body><h1 id="t">markup</h1>
+            <script>document.getElementById("t").setTextContent("scripted");</script>
+            </body></html>"#,
+        );
+        let text = |w: &PageWire| {
+            w.runs
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let seen = std::cell::RefCell::new(Vec::<String>::new());
+        let sink = |wire: PageWire| seen.borrow_mut().push(text(&wire));
+        let mut kept = None;
+        let mut fonts = Fonts::load();
+        let (final_wire, _, _) = settle_load(
+            &mut kept,
+            &mut fonts,
+            "http://src/",
+            800.0,
+            600.0,
+            EngineChoice::A,
+            dom,
+            String::new(),
+            Vec::new(),
+            Some(&sink),
+        );
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 1, "one early frame per load");
+        assert!(
+            seen[0].contains("markup") && !seen[0].contains("scripted"),
+            "early frame carries the pre-script DOM: {:?}",
+            seen[0]
+        );
+        let final_wire = final_wire.expect("the final page is still pushed");
+        assert!(
+            text(&final_wire).contains("scripted"),
+            "the final page carries the script's mutation: {:?}",
+            text(&final_wire)
+        );
     }
 
     /// Worker coalescing collapses superseded relayouts but must never drop
