@@ -1017,8 +1017,19 @@ impl Shell {
         while let Ok(ev) = self.r.rx.try_recv() {
             match ev {
                 Event::Frame {
-                    path, width, height, seq, ..
+                    path, width, height, seq, url, ..
                 } => {
+                    // A frame belongs to the page that painted it. A load
+                    // that finished after the user switched tabs publishes
+                    // the page they left, and painting it would show another
+                    // tab's page until this tab's own frame arrives (a second
+                    // on a heavy page). A URL no tab claims (a redirect, say)
+                    // is still shown: better a frame than a blank window.
+                    let mine = url == self.tabs[self.active].url;
+                    if !mine && self.tabs.iter().any(|t| t.url == url) {
+                        println!("[frame] dropped a frame for {url} (not the active tab)");
+                        continue;
+                    }
                     if seq == self.seq {
                         continue;
                     }
@@ -1294,6 +1305,8 @@ impl Shell {
                     self.loading = true;
                     self.title.clear();
                     self.r.url = self.tabs[self.active].url.clone();
+                    // the address bar follows the tab, like every navigation
+                    self.url_edit = self.r.url.clone();
                     self.inflight
                         .push_back((self.active, self.r.url.clone(), false));
                     self.r.send(Command::Load(self.tabs[self.active].url.clone()));
@@ -2017,6 +2030,11 @@ impl eframe::App for Shell {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+            } else {
+                // no frame for this tab yet (a fresh tab, or a frame that
+                // belonged to another tab was dropped): the page's default
+                // background, not the window's
+                painter.rect_filled(page_rect, 0.0, Color32::from_gray(248));
             }
         } else {
             painter.rect_filled(page_rect, 0.0, Color32::from_gray(248));

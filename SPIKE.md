@@ -5471,3 +5471,37 @@ tab's page for one restore). Frames should carry their page's URL.
 
 Verified end to end with the release shell + release renderer; the renderer-side
 parking rules are covered by the four `park_page`/`bind_parked` tests.
+
+## A frame knows which page it belongs to (P94, 2026-11-12)
+
+A frame event carried the buffer path, the size and the sequence number - and
+no URL. The renderer publishes a frame when a load *finishes*, and the user may
+have switched tabs while it was in flight, so the shell painted whatever
+arrived on whichever tab was active. Two slow pages (a 2 s server delay) make
+it visible: A (red) loads, B (blue) is opened while A is still being fetched,
+and at 3.1 s the window shows **RED PAGE A** with tab 2/2 selected and B's
+address in the bar. The page stayed wrong for the whole of B's load.
+
+The frame now carries `page.url`, the page that painted it, as the last field
+of the wire line (a space in a URL is sent as `%20`). The shell drops a frame
+whose URL belongs to a tab that is not the active one; a URL no tab claims (a
+redirect, say) is still shown, because a frame beats a blank window. The same
+run after the change: at 3.1 s the page area is the default page background
+(the shell used to paint nothing there, i.e. the window's black), at 4.4 s it
+is **BLUE PAGE B**, and the log says
+
+```
+[frame] dropped a frame for http://127.0.0.1:8766/slow-red.html (not the active tab)
+[frame] dropped a frame for http://127.0.0.1:8766/slow-red.html (not the active tab)
+```
+
+twice, because a fresh load paints twice (pre-script, then final). github.com
+still paints normally (two titles, no dropped lines) and a switch back binds
+the parked page as in P92.
+
+Also: opening a tab through the control verb put the URL in the tab but not in
+the address bar, so the bar kept showing the page the tab had left. One line,
+found by looking at the screenshots.
+
+Tests: the ipc round-trip covers the new field (5 green), engine unchanged at
+**1061**.

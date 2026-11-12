@@ -853,6 +853,10 @@ fn headless_paint(
             height: ph,
             doc_height: page.laid.height,
             seq: *seq,
+            // the page this frame belongs to: a load that finishes after the
+            // user switched tabs still publishes, and the shell must not paint
+            // it on the tab that is now active
+            url: page.url.clone(),
         }
         .encode()
     );

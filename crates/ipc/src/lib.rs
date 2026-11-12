@@ -301,6 +301,11 @@ pub enum Event {
         height: usize,
         doc_height: f32,
         seq: u32,
+        /// the page that painted it. A frame is published when a load
+        /// finishes, and the user may have switched tabs while it was in
+        /// flight: without the URL the shell cannot tell whose page it is
+        /// looking at and would paint a background tab's page.
+        url: String,
     },
     Title(String),
     Nav(String),
@@ -326,9 +331,11 @@ pub enum Event {
 impl Event {
     pub fn encode(&self) -> String {
         match self {
-            Event::Frame { path, width, height, doc_height, seq } => format!(
-                "frame {} {width} {height} {doc_height:.2} {seq}",
-                path.display()
+            Event::Frame { path, width, height, doc_height, seq, url } => format!(
+                "frame {} {width} {height} {doc_height:.2} {seq} {}",
+                path.display(),
+                // a space would end the field; %20 is the same URL
+                url.replace(' ', "%20")
             ),
             Event::Title(t) => format!("title {t}"),
             Event::Nav(u) => format!("nav {u}"),
@@ -357,18 +364,22 @@ impl Event {
         let rest = rest.trim_start();
         match head {
             "frame" => {
-                let mut it = rest.splitn(5, ' ');
+                let mut it = rest.splitn(6, ' ');
                 let path = it.next()?.to_string();
                 let width = it.next()?.parse().ok()?;
                 let height = it.next()?.parse().ok()?;
                 let doc_height = it.next()?.parse().ok()?;
                 let seq = it.next()?.parse().ok()?;
+                // the URL is the rest of the line (a space in it is sent as
+                // %20, see `encode`)
+                let url = it.next()?.to_string();
                 Some(Event::Frame {
                     path: PathBuf::from(path),
                     width,
                     height,
                     doc_height,
                     seq,
+                    url,
                 })
             }
             "title" => Some(Event::Title(rest.to_string())),
@@ -507,6 +518,7 @@ mod tests {
                 height: 670,
                 doc_height: 12220.0,
                 seq: 7,
+                url: "https://github.com/".into(),
             },
             Event::Title("https://example.com".into()),
             Event::Nav("https://example.com/next".into()),
