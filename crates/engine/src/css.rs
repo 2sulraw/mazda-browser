@@ -2574,12 +2574,14 @@ const KNOWN: &[&str] = &[
 ];
 
 /// Observed CSS misses (`MAZDA_MISS=1`, dev-only): property names dropped by
-/// the [`KNOWN`] gate and at-rule names this parser does not implement, each
-/// with a count. Off by default - every recording call is one `OnceLock` load
-/// and returns; nothing is allocated.
+/// the [`KNOWN`] gate, at-rule names this parser does not implement, and why
+/// selectors were dropped (the unsupported pseudo-class/element or construct),
+/// each with a count. Off by default - every recording call is one `OnceLock`
+/// load and returns; nothing is allocated.
 struct Misses {
     props: std::collections::HashMap<String, u32>,
     at: std::collections::HashMap<String, u32>,
+    sel: std::collections::HashMap<String, u32>,
 }
 
 fn miss_enabled() -> bool {
@@ -2593,6 +2595,7 @@ fn misses() -> &'static std::sync::Mutex<Misses> {
         std::sync::Mutex::new(Misses {
             props: std::collections::HashMap::new(),
             at: std::collections::HashMap::new(),
+            sel: std::collections::HashMap::new(),
         })
     })
 }
@@ -2612,6 +2615,17 @@ fn note_unknown_at_rule(name: &str) {
     }
     if let Ok(mut m) = misses().lock() {
         *m.at.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Record why a selector was dropped (the reason names the unsupported
+/// pseudo-class/element or construct, see `parse_selector_why`).
+fn note_dropped_selector(why: &str) {
+    if !miss_enabled() {
+        return;
+    }
+    if let Ok(mut m) = misses().lock() {
+        *m.sel.entry(why.to_string()).or_insert(0) += 1;
     }
 }
 
@@ -2640,6 +2654,13 @@ pub fn dump_misses() {
         eprintln!("[css-miss] {} distinct unimplemented at-rules", at.len());
         for (name, n) in at {
             eprintln!("[css-miss] at {n} @{name}");
+        }
+    }
+    let sel = ranked(&m.sel);
+    if !sel.is_empty() {
+        eprintln!("[css-miss] {} distinct dropped selector reasons", sel.len());
+        for (why, n) in sel {
+            eprintln!("[css-miss] sel {n} {why}");
         }
     }
 }
@@ -2746,41 +2767,55 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                 .filter(|d| d.0.starts_with("--"))
                 .map(|d| (d.0.clone(), d.1.clone()))
                 .collect();
+            // a rule that declares ONLY custom properties never reaches the
+            // real-declaration loop below, so it is the one that reports a
+            // dropped selector here (the other loop reports it otherwise)
+            let var_only = real.is_empty();
             if !own_vars.is_empty() {
                 for sel in split_selectors(sel_text) {
-                    if let Some(segs) = parse_selector(sel) {
-                        let spec = spec_of(&segs);
-                        var_rules.push(Rule {
-                            segs,
-                            decls: Vec::new(),
-                            vars: own_vars.clone(),
-                            spec,
-                            order: var_order,
-                        });
-                        var_order += 1;
+                    match parse_selector_why(sel) {
+                        Ok(segs) => {
+                            let spec = spec_of(&segs);
+                            var_rules.push(Rule {
+                                segs,
+                                decls: Vec::new(),
+                                vars: own_vars.clone(),
+                                spec,
+                                order: var_order,
+                            });
+                            var_order += 1;
+                        }
+                        Err(why) => {
+                            if var_only {
+                                note_dropped_selector(&why);
+                            }
+                        }
                     }
                 }
             }
-            if real.is_empty() {
+            if var_only {
                 i = cb + 1;
                 continue;
             }
             for sel in split_selectors(sel_text) {
-                if let Some(segs) = parse_selector(sel) {
-                    let spec = spec_of(&segs);
-                    rules.push(Rule {
-                        segs,
-                        decls: real.clone(),
-                        vars: Vec::new(),
-                        spec,
-                        order,
-                    });
-                    order += 1;
+                match parse_selector_why(sel) {
+                    Ok(segs) => {
+                        let spec = spec_of(&segs);
+                        rules.push(Rule {
+                            segs,
+                            decls: real.clone(),
+                            vars: Vec::new(),
+                            spec,
+                            order,
+                        });
+                        order += 1;
+                    }
+                    // selectors we can't parse (state pseudo-classes other
+                    // than :hover, unknown pseudo-elements, malformed syntax)
+                    // are dropped, but the rule still applies via its other
+                    // comma-separated parts. `MAZDA_MISS` names the feature.
+                    Err(why) => note_dropped_selector(&why),
                 }
-                // selectors we can't parse (state pseudo-classes other
-                // than :hover, unknown pseudo-elements, malformed syntax)
-                // are dropped, but the rule still applies via its other
-                // comma-separated parts
             }
         }
         i = cb + 1;
@@ -7879,10 +7914,18 @@ fn parse_nth(expr: &str) -> Option<(i32, i32)> {
     }
 }
 
+/// `parse_selector_why(s).ok()` — the `Option` shape the matchers and tests use.
 fn parse_selector(s: &str) -> Option<Vec<Seg>> {
+    parse_selector_why(s).ok()
+}
+
+/// Parse one complex selector. A failure's message says WHY, in the terms the
+/// `MAZDA_MISS` report ranks (`:focus-visible`, `::selection`, `~`, …), so a
+/// dropped rule names the feature that would bring it back.
+fn parse_selector_why(s: &str) -> Result<Vec<Seg>, String> {
     let s = s.trim();
     if s.is_empty() {
-        return None;
+        return Err("empty selector".into());
     }
     // Tokenize on whitespace, '>' and '+' — but NOT inside `(...)` (pseudo-
     // class args like `:is(h1, h2)` or `:nth-child(2n + 1)` may contain
@@ -7930,19 +7973,26 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
     for t in tokens {
         if t == ">" {
             if segs.is_empty() {
-                return None; // stray combinator
+                return Err("stray combinator".into());
             }
             pending_child = true;
             continue;
         }
         if t == "+" {
             if segs.is_empty() {
-                return None; // stray combinator
+                return Err("stray combinator".into());
             }
             pending_adj = true;
             continue;
         }
-        let mut seg = parse_compound(t)?;
+        if t.starts_with('~') {
+            // `a ~ b`: no general-sibling relation in `Seg` (only `>`/`+`)
+            return Err("general sibling ~".into());
+        }
+        if t.starts_with("||") {
+            return Err("column combinator ||".into());
+        }
+        let mut seg = parse_compound_why(t)?;
         seg.child = pending_child;
         seg.adj = pending_adj;
         pending_child = false;
@@ -7950,17 +8000,19 @@ fn parse_selector(s: &str) -> Option<Vec<Seg>> {
         segs.push(seg);
     }
     if segs.is_empty() {
-        None
+        Err("empty selector".into())
     } else if segs[..segs.len() - 1].iter().any(|s| s.pseudo_el.is_some()) {
         // a pseudo-element may only CLOSE the selector — `li::before span`
         // (one before the final compound) is invalid CSS and drops
-        None
+        Err("pseudo-element before the last compound".into())
     } else {
-        Some(segs)
+        Ok(segs)
     }
 }
 
-fn parse_compound(s: &str) -> Option<Seg> {
+/// One compound (`.a.b#c[attr]:hover`) — see [`parse_selector_why`] for the
+/// error message.
+fn parse_compound_why(s: &str) -> Result<Seg, String> {
     let mut seg = Seg {
         tag: None,
         id: None,
@@ -8009,7 +8061,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     }
                 }
                 if name.is_empty() {
-                    return None;
+                    return Err("empty class/id name".into());
                 }
                 if is_id {
                     seg.id = Some(name);
@@ -8072,7 +8124,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     i += 1;
                 }
                 if name.is_empty() {
-                    return None;
+                    return Err("empty attribute name".into());
                 }
                 seg.attrs.push((name, op, val));
             }
@@ -8098,7 +8150,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     // `::marker` accepted with either colon count (spelling
                     // leniency, like :before); CSS only defines `::marker`.
                     if seg.pseudo_el.is_some() || i < b.len() {
-                        return None;
+                        return Err("pseudo-element must close the compound".into());
                     }
                     seg.pseudo_el = Some(match name.as_str() {
                         "before" => PseudoEl::Before,
@@ -8111,9 +8163,9 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     break; // compound closed
                 }
                 if double {
-                    // any other pseudo-element (`::placeholder`,
-                    // `::backdrop`, …) is out of scope — drop the selector
-                    return None;
+                    // any other pseudo-element (`::selection`, `::backdrop`,
+                    // …) is out of scope — drop the selector, but say which
+                    return Err(format!("pseudo-element ::{name}"));
                 }
                 // optional `(args)` with balanced-paren scan
                 let mut args: Option<String> = None;
@@ -8134,7 +8186,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         i += 1;
                     }
                     if pdepth != 0 {
-                        return None; // unbalanced parens
+                        return Err("unbalanced parens".into());
                     }
                     args = Some(b[ast..i].iter().collect::<String>());
                     i += 1; // consume ')'
@@ -8169,19 +8221,23 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     ("last-of-type", None) => seg.pseudos.push(Pseudo::LastOfType),
                     ("only-child", None) => seg.pseudos.push(Pseudo::OnlyChild),
                     ("nth-child", Some(a)) => {
-                        let (a_, b_) = parse_nth(&a)?;
+                        let (a_, b_) =
+                            parse_nth(&a).ok_or_else(|| format!("bad :nth-child({a})"))?;
                         seg.pseudos.push(Pseudo::NthChild(a_, b_));
                     }
                     ("nth-last-child", Some(a)) => {
-                        let (a_, b_) = parse_nth(&a)?;
+                        let (a_, b_) =
+                            parse_nth(&a).ok_or_else(|| format!("bad :nth-last-child({a})"))?;
                         seg.pseudos.push(Pseudo::NthLastChild(a_, b_));
                     }
                     ("nth-of-type", Some(a)) => {
-                        let (a_, b_) = parse_nth(&a)?;
+                        let (a_, b_) =
+                            parse_nth(&a).ok_or_else(|| format!("bad :nth-of-type({a})"))?;
                         seg.pseudos.push(Pseudo::NthOfType(a_, b_));
                     }
                     ("nth-last-of-type", Some(a)) => {
-                        let (a_, b_) = parse_nth(&a)?;
+                        let (a_, b_) =
+                            parse_nth(&a).ok_or_else(|| format!("bad :nth-last-of-type({a})"))?;
                         seg.pseudos.push(Pseudo::NthLastOfType(a_, b_));
                     }
                     ("not", Some(a)) => {
@@ -8203,11 +8259,17 @@ fn parse_compound(s: &str) -> Option<Seg> {
                             // simple-selector members only; anything more
                             // complex (combinators, nested :is()) drops the
                             // rule (shortcut: no complex :not() args)
-                            let m_seg = parse_compound(m)?;
+                            // shortcut: a space inside the argument is taken
+                            // as part of the class name (`:not(.a .b)` becomes
+                            // class "a .b", which matches nothing) instead of
+                            // dropping — same silent misparse as Selectors 4
+                            // complex arguments, rare in practice
+                            let m_seg = parse_compound_why(m)
+                                .map_err(|_| format!("complex :not({m}) argument"))?;
                             // a pseudo-element can't appear inside :not()
                             // (invalid — the whole selector drops)
                             if m_seg.pseudo_el.is_some() {
-                                return None;
+                                return Err("pseudo-element in :not()".into());
                             }
                             seg.nots.push(m_seg);
                         }
@@ -8223,13 +8285,14 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     // drops — usually `display:contents`, a no-op here anyway
                     ("host", Some(a)) => {
                         let raw = b[pstart..i].iter().collect::<String>();
-                        let arg = parse_compound(a.trim())?;
+                        let arg = parse_compound_why(a.trim())
+                            .map_err(|_| format!("complex :host({}) argument", a.trim()))?;
                         if arg.pseudo_el.is_some() {
-                            return None; // invalid — see the :not() note
+                            return Err("pseudo-element in :host()".into());
                         }
                         seg.pseudos.push(Pseudo::Host(Box::new(arg), raw));
                     }
-                    ("host", None) => return None,
+                    ("host", None) => return Err("bare :host".into()),
                     ("is" | "where", Some(a)) => {
                         // each comma-separated alternate must match; :where()
                         // contributes no specificity, :is() its best argument.
@@ -8240,14 +8303,14 @@ fn parse_compound(s: &str) -> Option<Seg> {
                         let counts = name == "is";
                         let mut alts = Vec::new();
                         for part in split_selectors(&a) {
-                            let alt = parse_selector(part)?;
+                            let alt = parse_selector_why(part)?;
                             if alt.iter().any(|s| s.pseudo_el.is_some()) {
-                                return None; // invalid — see the :not() note
+                                return Err("pseudo-element in :is()/:where()".into());
                             }
                             alts.push(alt);
                         }
                         if alts.is_empty() {
-                            return None;
+                            return Err("empty :is()/:where() argument".into());
                         }
                         seg.pseudos.push(Pseudo::Is(alts, counts));
                     }
@@ -8272,28 +8335,32 @@ fn parse_compound(s: &str) -> Option<Seg> {
                                 b'~' => (Rel::Sibling, p[1..].trim()),
                                 _ => (Rel::Descendant, p),
                             };
-                            let segs = parse_selector(rest)?;
+                            let segs = parse_selector_why(rest)?;
                             if segs.iter().any(|s| s.pseudo_el.is_some()) {
-                                return None; // invalid — see the :not() note
+                                return Err("pseudo-element in :has()".into());
                             }
                             rels.push((rel, segs));
                         }
                         if rels.is_empty() {
-                            return None;
+                            return Err("empty :has() argument".into());
                         }
                         seg.pseudos.push(Pseudo::Has(rels));
                     }
                     // state pseudo-classes other than :hover (:focus,
                     // :active, …) and anything unknown: not statically
                     // evaluable — the whole selector is dropped (module
-                    // docs)
-                    _ => return None,
+                    // docs), but the report names it
+                    _ => return Err(format!("pseudo-class :{name}")),
                 }
             }
-            _ => return None, // unexpected char (space/combinator inside a compound)
+            // `a~b` (no spaces) never reached the tokenizer's split point
+            '~' => return Err("general sibling ~".into()),
+            '|' => return Err("column combinator ||".into()),
+            // unexpected char (space/combinator inside a compound)
+            c => return Err(format!("unexpected '{c}' in a compound")),
         }
     }
-    Some(seg)
+    Ok(seg)
 }
 
 fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
@@ -11179,6 +11246,34 @@ mod tests {
         assert!(sheet_none
             .resolve(&dom3, by_attr(&dom3, "id", "y"), Style::new(), Some("opacity:0"))
             .display_none);
+    }
+
+    #[test]
+    fn a_dropped_selector_names_why() {
+        // the MAZDA_MISS report ranks these strings, so they must name the
+        // feature that would bring the rule back, not just "syntax"
+        assert_eq!(
+            parse_selector_why("a:focus-visible").err().unwrap(),
+            "pseudo-class :focus-visible"
+        );
+        assert_eq!(
+            parse_selector_why(".x ~ .y").err().unwrap(),
+            "general sibling ~"
+        );
+        assert_eq!(
+            parse_selector_why("li::selection").err().unwrap(),
+            "pseudo-element ::selection"
+        );
+        assert_eq!(
+            parse_selector_why(":nth-child(2n of .x)").err().unwrap(),
+            "bad :nth-child(2n of .x)"
+        );
+        assert_eq!(parse_selector_why(":host").err().unwrap(), "bare :host");
+        assert_eq!(
+            parse_selector_why(".a[title] > .b:hover").unwrap().len(),
+            2,
+            "a supported selector still parses"
+        );
     }
 
     #[test]

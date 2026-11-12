@@ -5746,3 +5746,70 @@ element instead of one.
 
 Test: `a_later_declaration_clears_an_earlier_hide` (rule order, one block,
 inline, invalid value, independent properties). 1068 green.
+
+## The CSS we drop now says which feature would bring it back (P101, 2026-11-13)
+
+`MAZDA_MISS=1` ranked the properties dropped by the `KNOWN` gate and the
+at-rules this parser does not implement, but a dropped SELECTOR was silent: a
+whole rule vanished and nothing said whether it was `:checked`, `::selection`
+or `a ~ b`. The 100 % CSS/HTML phase needs that list to pick work by impact
+instead of by guess.
+
+`parse_selector_why` now returns the reason, in the terms a work item is
+written in: the pseudo-class or pseudo-element name (`:focus-visible`,
+`::selection`), the combinator (`~`, `||`), a complex `:not(...)`/`:host(...)`
+argument, or a bad `:nth-child(...)` argument. `parse_selector` and
+`parse_compound` keep their `Option` shape, so matchers and tests are
+untouched. The rule parser records one miss per dropped selector; a rule that
+only declares custom properties never reaches the real-declaration loop, so it
+reports its own (nothing is counted twice).
+
+github.com, release, 32 073 rules, `MAZDA_MISS=1`:
+
+| reason | rules |
+|---|---|
+| `pseudo-class :focus` | 442 |
+| `pseudo-class :focus-visible` | 395 |
+| `pseudo-class :active` | 351 |
+| `pseudo-class :focus-within` | 140 |
+| `pseudo-class :checked` | 113 |
+| `pseudo-class :indeterminate` | 37 |
+| `pseudo-class :empty` | 32 |
+| `pseudo-element ::backdrop` | 26 |
+| `pseudo-element ::-webkit-details-marker` | 22 |
+| `pseudo-class :popover-open` | 16 |
+| `general sibling ~` | 15 |
+| `pseudo-class :target` | 11 |
+| `pseudo-element ::selection` | 10 |
+| complex `:not(...)` argument | 9 |
+
+51 distinct reasons in all. The at-rules: `@container` 83 blocks,
+`@position-try` 36. And 46 dropped properties, headed by `grid-row` 456,
+`grid-row-start` 196, `grid-gap` 93, `border-image` 73,
+`box-decoration-break` 40, `mask-composite` 35, `font-stretch` 34,
+`container-type` 33.
+
+What that ranks:
+
+- **Grid rows.** `grid-column*` is implemented; `grid-row` (456),
+  `grid-row-start` (196) and `grid-row-end` (4) are not, and the legacy
+  `grid-gap` (93) / `grid-row-gap` (20) / `grid-column-gap` (16) spellings are
+  aliases of `gap`/`row-gap`/`column-gap` that the gate never maps. ~830
+  declarations, the largest single layout gap on the page.
+- **Static states.** `:checked` 113, `:empty` 32, `:popover-open` 16 and
+  `:target` 11 are markup/URL state this engine could evaluate today.
+- **Interaction states are not a painting gap.** `:focus`/`:focus-visible`/
+  `:active`/`:focus-within` (1 328 rules) match nothing in a static frame, so
+  dropping the rule paints the same pixels as keeping it and matching nothing;
+  `:not(:focus)` already works. They rank high only because github styles
+  buttons for every state.
+- **`~` and complex `:not()`** are parser features, not states.
+- **`@container`** drops 83 conditional blocks whole (container queries would
+  be a real feature, not a fix).
+- **Cosmetic:** border-image, box-decoration-break, mask-composite,
+  font-stretch, and vendor pseudo-elements (`::backdrop`,
+  `::-webkit-details-marker`, scrollbar/range/progress internals) change
+  decoration, not layout.
+
+Cost: one `String` per dropped selector at sheet-parse time, nothing when
+nothing drops. Test `a_dropped_selector_names_why`; 1069 green.
