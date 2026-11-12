@@ -6022,9 +6022,27 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
         }
         eprintln!("[dom] no snapshot for {url} - fetching");
     }
+    // The cold-load budget before the first frame is network + tokenizing:
+    // `MAZDA_TIME` splits it so the next optimization targets the stage that
+    // actually costs, instead of the one that reads expensive.
+    let timing = std::env::var_os("MAZDA_TIME").is_some();
+    let mut stage_at = Instant::now();
+    macro_rules! stage {
+        ($name:expr) => {
+            if timing {
+                eprintln!(
+                    "[time] {}: {:.0} ms",
+                    $name,
+                    stage_at.elapsed().as_secs_f64() * 1000.0
+                );
+                stage_at = Instant::now();
+            }
+        };
+    }
     let source = match fetch(url) {
         Ok((bytes, ct)) => {
             let s = html::decode_html(&bytes, ct.as_deref());
+            stage!("html fetch");
             eprintln!(
                 "[mem] after fetch: {:.1} MB (html {} KB, {})",
                 working_set_mb(),
@@ -6044,14 +6062,17 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
         }
     };
     let dom = html::parse(&source);
+    stage!("html parse");
     eprintln!("[mem] after parse: {:.1} MB ({} nodes)", working_set_mb(), dom.nodes.len());
     snapshot_write(url, &dom);
+    stage!("snapshot write");
     // overlap the page's subresource round trips before the sequential
     // phases start asking for them (see `preload`). Stylesheets first: the
     // first paint only needs those, and `settle_load` fetches the script
     // bodies once that frame is out.
     preload(&stylesheet_urls(&dom, url));
     let (css_text, faces) = styles_for(&dom, url);
+    stage!("stylesheets (incl. parse)");
     (dom, css_text, faces, false)
 }
 

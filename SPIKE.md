@@ -5669,3 +5669,45 @@ Tests **1063 -> 1067** green: a restyle reuses what the report does not name
 `:has()` rule makes its subject depend on a descendant, a mutation report
 names exactly the nodes a turn touched, and a child-list change names the
 parent that owns the list.
+
+## Where a cold load's first four seconds go (P99, 2026-11-13)
+
+`[time] first paint` says when the markup frame is built, but not what the
+worker was doing before it. The two phases outside `layout_page` - fetching the
+document and collecting its stylesheets - were one unmeasured gap, and they are
+exactly what a "first paint is slow" report points at.
+
+`fetch_and_parse` now reports `html fetch` (request + decode), `html parse`,
+`snapshot write` and `stylesheets (incl. parse)` under `MAZDA_TIME`, next to the
+`preload` line they overlap. github.com, release, fresh profile:
+
+| stage | time |
+|---|---|
+| html fetch (525 KB, gzip) | 1654 ms |
+| html parse (2663 nodes) | 10 ms |
+| snapshot write | 2 ms |
+| stylesheets, 20 requests on 20 lanes (parse 153 ms of it) | 1387 ms |
+| cascade + box tree (cascade 194 ms) | 476 ms |
+| **first paint** | **3723 ms** |
+
+So 3.0 of the 3.7 s are two serial network phases and only ~0.7 s is this
+engine's own work. Across runs the document alone took 1.65-7.8 s on this link,
+always with the same shape: a long wait, then the body.
+
+That ruled out the next idea before it was built. A streaming head scan
+(decode the `<head>` while the body arrives, start the sheet requests from a
+side thread) is what Chrome does, and it would remove the serial sheet phase.
+Implemented and measured, it found the 15 sheet links at 1450, 2163 and
+6860 ms into fetches that took 2009, 2442 and 7087 ms: 3-28 % of the document
+was left to overlap, because the compressed body arrives as one burst at the
+end of the server's think time, not as a trickle. Nothing to hide the sheet
+phase behind, so the scanner was dropped instead of kept as speculative code.
+`MAZDA_HEADSCAN=0` never shipped.
+
+The same run says what the post-script frame waits for: scripts (4.2 s in this
+one, 3.4 s of it execution) and a 255 ms image probe that fetches the 12 images
+the post-script DOM added; the 3 s probe seen in an earlier run was a slow
+image in that batch, not a repeated probe. Box construction is 0.3-0.5 s per
+pass, and the cascade is no longer the cost (P98: 12 ms on a restyle).
+
+Cost: four `Instant` pairs per load, inside `MAZDA_TIME` only.
