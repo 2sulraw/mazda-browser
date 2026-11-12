@@ -101,6 +101,12 @@ pub trait ScriptRuntime {
     /// Earlier of (next timer deadline, next rAF epoch) — drives the
     /// worker's `recv_timeout`. None = block until an input job arrives.
     fn next_wake_deadline(&self) -> Option<Instant>;
+    /// DOM nodes mutated since the last call, as `(node, child_list_moved)`.
+    /// The loader re-cascades only those subtrees (`StyleCache`); `None` =
+    /// this engine cannot say, so every cached style is dropped.
+    fn take_dirty(&mut self) -> Option<Vec<(u32, bool)>> {
+        None
+    }
 }
 
 /// Build the runtime for `choice` against a fresh page (per-navigation
@@ -742,7 +748,7 @@ impl DomHost {
         if ok {
             dom.nodes[child as usize].parent = parent;
             dom.nodes[parent as usize].children.push(child);
-            self.dirty = true;
+            self.touch_tree(Some(parent));
             if tracking_mutations() {
                 self.mutations.push(MutationRec::ChildList {
                     parent,
@@ -780,7 +786,7 @@ impl DomHost {
                 *attrs = v.into_boxed_slice();
             }
         }
-        self.dirty = true;
+        self.touch(node);
         if tracking_mutations() {
             self.mutations.push(MutationRec::Attr {
                 node,
@@ -896,7 +902,7 @@ impl DomHost {
                 }
                 let old = s.clone();
                 *s = text.to_string();
-                self.dirty = true;
+                self.touch(node);
                 if tracking_mutations() {
                     self.mutations.push(MutationRec::CharData {
                         node,
@@ -1008,7 +1014,10 @@ impl DomHost {
         };
         dom.nodes[parent as usize].children.insert(pos, new);
         dom.nodes[new as usize].parent = parent;
-        self.dirty = true;
+        self.touch_tree(Some(parent));
+        if let Some(old_parent) = removed_from {
+            self.touch_tree(Some(old_parent));
+        }
         if tracking_mutations() {
             if let Some(old_parent) = removed_from {
                 self.mutations.push(MutationRec::ChildList {
@@ -1116,7 +1125,7 @@ impl DomHost {
         };
         if removed {
             dom.nodes[node as usize].parent = 0;
-            self.dirty = true;
+            self.touch_tree(Some(parent));
             if tracking_mutations() {
                 self.mutations.push(MutationRec::ChildList {
                     parent,
@@ -1142,7 +1151,7 @@ impl DomHost {
             let old = v[i].1.clone();
             v.remove(i);
             *attrs = v.into_boxed_slice();
-            self.dirty = true;
+            self.touch(node);
             if tracking_mutations() {
                 self.mutations.push(MutationRec::Attr {
                     node,
@@ -1176,7 +1185,7 @@ impl DomHost {
             dom.nodes[node as usize].children.push(id);
             added.push(id);
         }
-        self.dirty = true;
+        self.touch_tree(Some(node));
         if tracking_mutations() {
             self.mutations.push(MutationRec::ChildList {
                 parent: node,
@@ -1207,7 +1216,7 @@ impl DomHost {
             children: Vec::new(),
             kind: NodeKind::Element(tid, Box::from([])),
         });
-        self.dirty = true;
+        self.touch_tree(None);
         Some(id)
     }
 
@@ -1276,7 +1285,7 @@ impl DomHost {
                 }
             }
         }
-        self.dirty = true;
+        self.touch_tree(None);
         Some(id)
     }
 
@@ -1307,7 +1316,7 @@ impl DomHost {
                 NodeKind::Text(text.to_string())
             },
         });
-        self.dirty = true;
+        self.touch_tree(None);
         Some(id)
     }
 
@@ -1342,6 +1351,26 @@ impl DomHost {
         self.form_nav.take()
     }
 
+    /// Note that `node`'s own style inputs changed (attribute or text write):
+    /// its subtree re-cascades, plus the siblings after it (`+`/`~`).
+    fn touch(&mut self, node: u32) {
+        self.dirty = true;
+        DIRTY_REPORT.with(|r| r.borrow_mut().push((node, false)));
+    }
+
+    /// Note that `node`'s CHILD LIST moved: its whole subtree re-cascades
+    /// (the moved children and their new sibling indexes). `None` = a node
+    /// was created for a later insertion: nothing in the tree moved yet, and
+    /// the insertion itself reports its parent.
+    fn touch_tree(&mut self, node: Option<u32>) {
+        self.dirty = true;
+        if let Some(n) = node {
+            DIRTY_REPORT.with(|r| r.borrow_mut().push((n, true)));
+        }
+    }
+
+    /// Turn-internal flag only; the restyle report is thread-wide because the
+    /// host is owned by the turn (see [`take_dirty_report`]).
     pub fn dirty(&self) -> bool {
         self.dirty
     }
@@ -1586,6 +1615,20 @@ fn all_elements_dom(dom: &Dom) -> Vec<u32> {
 
 thread_local! {
     static HOST: RefCell<Option<DomHost>> = const { RefCell::new(None) };
+    /// Nodes whose style inputs changed since the loader last took the
+    /// report, and whether the change was their CHILD LIST moving (true) or
+    /// their own attributes/text (false). Written by the host's write ops —
+    /// which run inside a turn, where the host itself is owned by the turn
+    /// driver — and taken by the loader before it re-cascades the page: one
+    /// worker thread, one page, one take per layout.
+    static DIRTY_REPORT: RefCell<Vec<(u32, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Nodes mutated since the last take, as `(node, child_list_moved)`.
+/// A restyle re-cascades only the subtrees these name (see
+/// [`StyleCache`](crate::layout::StyleCache)).
+pub fn take_dirty_report() -> Vec<(u32, bool)> {
+    DIRTY_REPORT.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
 /// Re-point the host at `dom`/`base`/`storage` for the duration of a turn.

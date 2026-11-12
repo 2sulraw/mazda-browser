@@ -1490,6 +1490,7 @@ struct Seg {
     adj: bool,
 }
 
+#[derive(Clone)]
 struct Rule {
     segs: Vec<Seg>,
     decls: Vec<Decl>,
@@ -1502,6 +1503,18 @@ struct Rule {
     order: u32,
 }
 
+/// Does this compound (or anything it nests) test `:has()`? A `:has()`
+/// anywhere makes the subject's style depend on other nodes (`:is()` and
+/// `:not()` nest compounds, `:host()` boxes one).
+fn seg_tests_has(s: &Seg) -> bool {
+    s.pseudos.iter().any(|p| match p {
+        Pseudo::Has(_) => true,
+        Pseudo::Is(alts, _) => alts.iter().any(|chain| chain.iter().any(seg_tests_has)),
+        Pseudo::Host(inner, _) => seg_tests_has(inner),
+        _ => false,
+    }) || s.nots.iter().any(seg_tests_has)
+}
+
 thread_local! {
     /// Cascade profiling counters, cheap enough to always run: candidate rules
     /// tested, rules matched, declarations those matches applied. `MAZDA_TIME`
@@ -1509,6 +1522,10 @@ thread_local! {
     /// handing out too many candidates or the per-declaration work.
     static CASCADE_STATS: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// Candidate scratch for [`Sheet::has_subject`] (kept apart from
+    /// `RULE_SCRATCH`, which the cascade itself borrows).
+    static HAS_SCRATCH: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Take (and reset) the cascade counters (tested, matched, declarations).
@@ -1868,6 +1885,12 @@ pub struct Sheet {
     /// tests only the buckets the element falls into instead of every pseudo
     /// rule on the page (github ships ~3k of them).
     pseudo_index: [RuleIndex; 4],
+    /// Element rules (`rules` + `hover`) whose selector tests `:has()`, in one
+    /// list for [`Sheet::has_subject`]: those are the elements whose style a
+    /// mutation ELSEWHERE can move.
+    has_rules: Vec<Rule>,
+    /// rightmost-compound buckets over `has_rules`
+    has_index: RuleIndex,
     /// `:hover` rules whose LAST segment carries the flag (and no
     /// pseudo-element), cascade-sorted like `rules`. Kept apart so a page
     /// with no pointer on it skips them entirely; `cascade_rules` merges
@@ -2026,6 +2049,51 @@ impl Sheet {
         self.rules.len() + self.hover.len() + self.pseudo[0].len() + self.pseudo[1].len()
     }
 
+    /// Does any rule in the sheet test `:has()`?
+    ///
+    /// An element's `:has` answer depends on its descendants and siblings, so
+    /// a mutation anywhere can change an ANCESTOR's style — and through
+    /// inheritance that ancestor's whole subtree. A restyle that reuses
+    /// cached per-node styles (`layout::StyleCache`) is then unsafe no matter
+    /// which node the mutation report names, so the loader drops the cache
+    /// for such a sheet. A sheet without `:has` (the common case) pays a
+    /// single boolean.
+    /// Does `node` match a rule whose selector tests `:has()`?
+    ///
+    /// Such an element's style depends on its DESCENDANTS (`:has(.x)`,
+    /// `:has(> .x)`) and/or its following SIBLINGS (`:has(+ .x)`,
+    /// `:has(~ .x)`), so a mutation elsewhere can restyle it — and, through
+    /// inheritance, its whole subtree. A restyle asks this for the ancestors
+    /// and preceding siblings of every mutated node (see
+    /// [`layout::StyleCache`]); everything else keeps its cached style.
+    pub fn has_subject(&self, dom: &Dom, node: u32) -> bool {
+        if self.has_rules.is_empty() {
+            return false;
+        }
+        HAS_SCRATCH.with(|scratch| {
+            let mut cand = scratch.borrow_mut();
+            self.has_index.candidates(dom, node, &mut cand);
+            cand.iter().any(|&ri| {
+                matches(
+                    dom,
+                    node,
+                    &self.has_rules[ri as usize].segs,
+                    self.hovered.get(),
+                )
+            })
+        })
+    }
+
+    /// Rules whose selector tests `:has()` (diagnostic: `MAZDA_TIME`).
+    pub fn has_rule_count(&self) -> usize {
+        self.has_rules.len()
+    }
+
+    /// Does any rule in the sheet test `:has()` at all?
+    pub fn uses_has(&self) -> bool {
+        !self.has_rules.is_empty()
+    }
+
     /// Set the hovered leaf node (the shell hit-tests the pointer each
     /// frame and re-cascades through [`Self::resolve`] after calling this).
     /// `None` clears it — no `:hover` matches then.
@@ -2175,6 +2243,7 @@ impl Sheet {
 }
 
 /// Result of cascading all rules + inline style onto one element's base style.
+#[derive(Clone)]
 pub struct StyleOutcome {
     pub style: Style,
     /// background-color (only meaningful for body/html — page fill)
@@ -2768,6 +2837,16 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         })
         .collect();
     let scheme_index = RuleIndex::build(&scheme_rules);
+    // `:has()` subjects read state outside themselves (see `has_subject`),
+    // so a restyle has to know which elements those are. `Seg::has` walks the
+    // same nesting (`:is()`/`:not()`/`:host()`) the matcher does.
+    let mut has_rules: Vec<Rule> = rules
+        .iter()
+        .filter(|r| r.segs.iter().any(seg_tests_has))
+        .cloned()
+        .collect();
+    has_rules.extend(hover.iter().filter(|r| r.segs.iter().any(seg_tests_has)).cloned());
+    let has_index = RuleIndex::build_named(&has_rules, " :has");
     // each pseudo-element bucket cascades on its own, so each gets its own
     // rightmost-compound buckets
     const PSEUDO_NAMES: [&str; 4] = [" ::before", " ::after", " ::marker", " ::placeholder"];
@@ -2786,6 +2865,8 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         scheme_hops: std::cell::Cell::new(0),
         pseudo,
         pseudo_index,
+        has_rules,
+        has_index,
         hover,
         hovered: std::cell::Cell::new(None),
         vars,

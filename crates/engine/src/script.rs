@@ -4409,6 +4409,10 @@ impl runtime::ScriptRuntime for PageScripts {
     fn next_wake_deadline(&self) -> Option<Instant> {
         PageScripts::next_wake_deadline(self)
     }
+
+    fn take_dirty(&mut self) -> Option<Vec<(u32, bool)>> {
+        Some(runtime::take_dirty_report())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5463,6 +5467,40 @@ mod tests {
         assert!(turn.dirty);
         let out = query_all_dom(&dom, "#out")[0];
         assert_eq!(child_text(&dom, out), "clicked");
+    }
+
+    #[test]
+    fn a_mutation_report_names_the_nodes_a_turn_touched() {
+        let (mut dom, mut ps) = page(
+            r#"<html><body><p id="a">x</p><p id="b">y</p><script>
+                document.getElementById("a").setAttribute("data-x", "1");
+            </script></body></html>"#,
+        );
+        let turn = ps.run_scripts(&mut dom);
+        assert!(turn.dirty);
+        let a = query_all_dom(&dom, "#a")[0];
+        let b = query_all_dom(&dom, "#b")[0];
+        // the trait call the loader makes before re-cascading
+        let nodes = runtime::ScriptRuntime::take_dirty(&mut ps).expect("A reports its writes");
+        assert_eq!(nodes, vec![(a, false)], "only the written node, not its sibling {b}");
+        // taking again sees only what happened since (nothing)
+        let nodes = runtime::ScriptRuntime::take_dirty(&mut ps).expect("still a report");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn a_child_list_change_names_the_parent_that_owns_the_list() {
+        // the restyle re-cascades a dirty node's PARENT subtree, which is what
+        // covers a moved child list: the new child and its siblings
+        let (mut dom, mut ps) = page(
+            r#"<html><body><div id="d"></div><script>
+                document.getElementById("d").appendChild(document.createElement("p"));
+            </script></body></html>"#,
+        );
+        ps.run_scripts(&mut dom);
+        let d = query_all_dom(&dom, "#d")[0];
+        let nodes = runtime::ScriptRuntime::take_dirty(&mut ps).expect("A reports its writes");
+        assert_eq!(nodes, vec![(d, true)], "the list that moved, named once");
     }
 
     #[test]

@@ -955,6 +955,163 @@ fn media_srcs(dom: &Dom, node: u32) -> Vec<std::rc::Rc<str>> {
     out
 }
 
+/// Per-node cascade results kept between passes, so a restyle only re-cascades
+/// the subtrees a script actually touched.
+///
+/// A cached outcome stays valid while the node's own style inputs, its
+/// ancestors' and the ambient `:hover` cell are unchanged. The loader hands
+/// over the nodes the last script turn touched. An attribute/text write on a
+/// node invalidates its subtree and the siblings after it (`+`/`~`); a child
+/// list moving at a node invalidates that node's subtree, which is where the
+/// moved children and their new `:nth-child` answers live. `None` means the
+/// engine cannot name what moved, so everything is dropped.
+///
+/// `:has()` rules break the local reasoning above: an element's `:has` answer
+/// depends on its descendants and its following siblings, so a mutation can
+/// restyle an ancestor — and, through inheritance, its whole subtree. Each
+/// dirty node therefore also asks its ancestors and its preceding siblings
+/// whether they are `:has()` subjects ([`Sheet::has_subject`]); only those
+/// subtrees are dropped. Without `:has` rules the question costs one bool.
+///
+/// `Style::fam_stack` is an id into the page's shared stack table, so the
+/// table must keep its ids for as long as the cache is warm (see
+/// `Fonts::begin_page`'s `reset_stacks`).
+#[derive(Default)]
+pub struct StyleCache {
+    slots: Vec<Option<crate::css::StyleOutcome>>,
+    /// viewport width the styles were computed for: a new width re-parses the
+    /// sheet (media queries are decided at parse time), so nothing is valid
+    width: Option<f32>,
+    /// the pointer cell the last pass ran with
+    hover: Option<u32>,
+    /// nodes re-cascaded and reused in the pass that just ran (`MAZDA_TIME`)
+    pub misses: usize,
+    pub hits: usize,
+}
+
+impl StyleCache {
+    /// Start a pass: drop what the mutation report says may have moved.
+    /// `width` is the viewport the sheet was parsed for (a new width parses
+    /// different media queries, so nothing is valid); `dirty` = `None` is the
+    /// "cannot say" case, which also covers a newly parsed sheet.
+    pub fn begin_pass(
+        &mut self,
+        dom: &Dom,
+        sheet: &Sheet,
+        width: f32,
+        hover: Option<u32>,
+        dirty: Option<&[(u32, bool)]>,
+    ) {
+        self.hits = 0;
+        self.misses = 0;
+        let Some(dirty) = dirty.filter(|_| Some(width) == self.width && hover == self.hover) else {
+            self.slots.clear();
+            self.width = Some(width);
+            self.hover = hover;
+            return;
+        };
+        for &(n, child_list) in dirty {
+            self.invalidate_subtree(dom, n);
+            // an attribute/text change also flips the `+`/`~` rules that read
+            // this node from a FOLLOWING sibling. A moved child list only
+            // moves the answers INSIDE `n`, which just re-cascaded.
+            if !child_list {
+                let parent = dom.nodes.get(n as usize).map(|x| x.parent).unwrap_or(0);
+                if let Some(kids) = Self::children_of(dom, parent) {
+                    let mut seen = false;
+                    for &c in kids {
+                        if seen {
+                            self.invalidate_subtree(dom, c);
+                        }
+                        seen |= c == n;
+                    }
+                }
+            }
+        }
+        if !sheet.uses_has() {
+            return;
+        }
+        // A mutation can also move the style of nodes that read it from
+        // OUTSIDE: an ancestor (`a:has(.x)`, `a:has(> .x)`) and a preceding
+        // sibling (`a:has(+ n)`, `a:has(~ n)`). Only elements matching a
+        // `:has()` rule can move, and when one does its whole subtree
+        // follows (the descendants inherit). `asked` keeps the ancestors the
+        // dirty nodes share from being re-asked.
+        let mut asked = std::collections::HashSet::new();
+        for &(n, _) in dirty {
+            let mut cur = Some(n);
+            while let Some(m) = cur {
+                let parent = dom.nodes.get(m as usize).map(|x| x.parent).unwrap_or(0);
+                // parent 0 = the document (or a detached fragment): no real
+                // siblings to ask, and `parent` is not a node to walk to
+                let up = parent != 0 && parent != m;
+                match Self::children_of(dom, parent).filter(|_| up) {
+                    Some(kids) => {
+                        // `m` itself and the siblings it reads with `:has(+ …)`
+                        for &x in kids
+                            .iter()
+                            .take_while(|&&c| c != m)
+                            .chain(std::iter::once(&m))
+                        {
+                            if asked.insert(x) && sheet.has_subject(dom, x) {
+                                self.invalidate_subtree(dom, x);
+                            }
+                        }
+                    }
+                    None => {
+                        if asked.insert(m) && sheet.has_subject(dom, m) {
+                            self.invalidate_subtree(dom, m);
+                        }
+                    }
+                }
+                cur = up.then_some(parent);
+            }
+        }
+    }
+
+    /// The child list of `node`, if it is a real node in the arena.
+    fn children_of(dom: &Dom, node: u32) -> Option<&[u32]> {
+        dom.nodes.get(node as usize).map(|n| n.children.as_slice())
+    }
+
+    /// Forget `root`'s subtree (the node itself included).
+    fn invalidate_subtree(&mut self, dom: &Dom, root: u32) {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if let Some(slot) = self.slots.get_mut(n as usize) {
+                *slot = None;
+            }
+            stack.extend(dom.nodes[n as usize].children.iter().copied());
+        }
+    }
+
+    /// The style `node` resolved to last pass, if it is still valid.
+    fn get(&mut self, node: u32) -> Option<crate::css::StyleOutcome> {
+        match self.slots.get(node as usize).and_then(|s| s.as_ref()) {
+            Some(o) => {
+                self.hits += 1;
+                Some(o.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn put(&mut self, node: u32, out: &crate::css::StyleOutcome) {
+        if self.slots.len() <= node as usize {
+            self.slots.resize(node as usize + 1, None);
+        }
+        self.slots[node as usize] = Some(out.clone());
+    }
+
+    /// Would a pass with the same sheet and hover reuse anything?
+    pub fn warm(&self) -> bool {
+        !self.slots.is_empty()
+    }
+}
+
 /// Build the box tree for `node`'s subtree. `style`/`bx` are the cascade
 /// result for `node` itself (main resolves body before calling).
 pub fn build(dom: &Dom, node: u32, style: Style, bx: BoxStyle, sheet: &Sheet) -> BoxNode {
@@ -970,6 +1127,20 @@ pub fn build_scoped(
     bx: BoxStyle,
     sheet: &Sheet,
     vars: Option<&std::rc::Rc<VarScope>>,
+) -> BoxNode {
+    build_cached(dom, node, style, bx, sheet, vars, &mut StyleCache::default())
+}
+
+/// `build_scoped` with a [`StyleCache`] the caller keeps between passes: a
+/// node whose cascade result is still valid is reused instead of matched.
+pub fn build_cached(
+    dom: &Dom,
+    node: u32,
+    style: Style,
+    bx: BoxStyle,
+    sheet: &Sheet,
+    vars: Option<&std::rc::Rc<VarScope>>,
+    cache: &mut StyleCache,
 ) -> BoxNode {
     // BoxStyle moves into the root below; the cursor seed threads down first
     let seed = bx.cursor;
@@ -1019,6 +1190,7 @@ pub fn build_scoped(
         vars,
         &mut counters,
         &mut root.children,
+        cache,
     );
     if let Some(a) = pseudo_box(
         sheet,
@@ -1370,6 +1542,7 @@ fn build_into(
     // siblings, so the stack is only unwound when this child list ends
     counters: &mut CounterEnv,
     out: &mut Vec<BoxNode>,
+    cache: &mut StyleCache,
 ) {
     let counter_mark = counters.mark();
     // Per-list item numbering: `node` is the PARENT whose children are being
@@ -1428,7 +1601,14 @@ fn build_into(
                 // relative font-sizes compute against the TRUE parent (style),
                 // not the UA-bumped child_style (headings would compound 2x)
                 let t0 = std::time::Instant::now();
-                let outcome = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, style.color, vars);
+                let outcome = match cache.get(child) {
+                    Some(o) => o,
+                    None => {
+                        let o = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, style.color, vars);
+                        cache.put(child, &o);
+                        o
+                    }
+                };
                 CASCADE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
                 // the element's own counter operations happen before its
                 // ::before and its content; they stay in scope for its
@@ -1679,7 +1859,7 @@ fn build_into(
                     if let Some(b) = before {
                         g.children.push(b);
                     }
-                    build_into(dom, child, outcome.style, sheet, child_link.clone(), cur, outcome.vars.as_ref(), counters, &mut g.children);
+                    build_into(dom, child, outcome.style, sheet, child_link.clone(), cur, outcome.vars.as_ref(), counters, &mut g.children, cache);
                     if let Some(a) = after {
                         g.children.push(a);
                     }
@@ -1862,7 +2042,7 @@ fn build_into(
                 // boxes generate none) and margins/padding/borders are
                 // ignored. shortcut: on the root/body it still makes a box.
                 if outcome.bx.display == Display::Contents {
-                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, out);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, out, cache);
                     continue;
                 }
                 // which elements get a box: flex/grid/block/inline-block
@@ -1976,7 +2156,7 @@ fn build_into(
                     // border paint) placed ON the surrounding text line by
                     // block()'s inline branch instead of stacking
                     g.inline = inline_level(&g.bx);
-                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children, cache);
                     if let Some(a) = after {
                         g.children.push(a);
                     }
@@ -2006,7 +2186,7 @@ fn build_into(
                         if let Some(b) = before {
                             g.children.push(b);
                         }
-                        build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children);
+                        build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children, cache);
                         if let Some(a) = after {
                             g.children.push(a);
                         }
@@ -2033,7 +2213,7 @@ fn build_into(
                             if let Some(b) = before {
                                 g.children.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children, cache);
                             if let Some(a) = after {
                                 g.children.push(a);
                             }
@@ -2042,7 +2222,7 @@ fn build_into(
                             if let Some(b) = before {
                                 out.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, out);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, out, cache);
                             if let Some(a) = after {
                                 out.push(a);
                             }
@@ -14500,6 +14680,81 @@ line</textarea></div>"#,
         let dom = crate::html::parse(markup);
         let sheet = crate::css::parse(css);
         build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet)
+    }
+
+    #[test]
+    fn a_restyle_reuses_the_styles_the_mutation_report_does_not_name() {
+        // two unrelated subtrees; a mutation in one must re-cascade only it
+        // (plus whatever reads it from a following sibling)
+        let dom = crate::html::parse(
+            "<div id=one><p class=a>x</p><p class=c>z</p></div><section id=two><p class=b>y</p></section>",
+        );
+        let sheet = crate::css::parse("p.a { color: #111111 } p.b { color: #222222 }");
+        let body = dom.body_root();
+        let mut cache = StyleCache::default();
+        let mut pass = |cache: &mut StyleCache, width, dirty: Option<&[(u32, bool)]>| {
+            cache.begin_pass(&dom, &sheet, width, None, dirty);
+            build_cached(
+                &dom,
+                body,
+                Style::new(),
+                BoxStyle::default(),
+                &sheet,
+                None,
+                cache,
+            );
+            (cache.hits, cache.misses)
+        };
+        // cold: div, p.a, p.c, section, p.b all resolve
+        assert_eq!(pass(&mut cache, 800.0, Some(&[])), (0, 5));
+        // nothing reported: every element is reused
+        assert_eq!(pass(&mut cache, 800.0, Some(&[])), (5, 0));
+        // `.a` changed: its own subtree and the sibling AFTER it (what `+`
+        // and `~` read) re-cascade; everything else is reused
+        let by_class = |want: &str| {
+            (0..dom.nodes.len() as u32)
+                .find(|&i| dom.attr(i, "class") == Some(want))
+                .unwrap_or_else(|| panic!("the .{want} paragraph"))
+        };
+        let a = by_class("a");
+        assert_eq!(pass(&mut cache, 800.0, Some(&[(a, false)])), (3, 2));
+        // a child list moved under #one: that subtree re-cascades, the other
+        // side of the page does not
+        let one = (0..dom.nodes.len() as u32)
+            .find(|&i| dom.attr(i, "id") == Some("one"))
+            .expect("the #one div");
+        assert_eq!(pass(&mut cache, 800.0, Some(&[(one, true)])), (2, 3));
+        // a report that cannot name what moved, or a new viewport width:
+        // nothing is valid
+        assert_eq!(pass(&mut cache, 800.0, None), (0, 5));
+        assert_eq!(pass(&mut cache, 640.0, Some(&[])), (0, 5));
+    }
+
+    #[test]
+    fn a_has_rule_makes_its_subject_depend_on_a_descendant() {
+        // `div:has(.a)` turns the DIV's style on a descendant's class, and the
+        // descendants inherit it: the cache must drop the whole div, not just
+        // the mutated paragraph. Without `:has` the same report is cheap and
+        // the div is reused — that is the point of asking per subject.
+        let dom = crate::html::parse("<div id=d><p class=a>x</p><p class=b>y</p></div>");
+        let body = dom.body_root();
+        let a = (0..dom.nodes.len() as u32)
+            .find(|&i| dom.attr(i, "class") == Some("a"))
+            .unwrap();
+        let pass = |css: &str| {
+            let sheet = crate::css::parse(css);
+            let mut cache = StyleCache::default();
+            let mut run = |cache: &mut StyleCache, dirty: &[(u32, bool)]| {
+                cache.begin_pass(&dom, &sheet, 800.0, None, Some(dirty));
+                build_cached(&dom, body, Style::new(), BoxStyle::default(), &sheet, None, cache);
+                (cache.hits, cache.misses)
+            };
+            assert_eq!(run(&mut cache, &[]), (0, 3), "cold {css}");
+            run(&mut cache, &[(a, false)])
+        };
+        // the div plus the two paragraphs = 3 nodes
+        assert_eq!(pass("p.a { color: #111111 }"), (1, 2), "div reused");
+        assert_eq!(pass("div:has(.a) { color: #ff0000 }"), (0, 3), "div dropped");
     }
 
     #[test]

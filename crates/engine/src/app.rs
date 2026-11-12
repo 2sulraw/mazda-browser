@@ -1322,7 +1322,7 @@ pub fn run_headless() {
                     let Some(mut wire) = done.page else { continue };
                     let stacks = std::mem::take(&mut wire.stacks);
                     let faces = std::mem::take(&mut wire.faces);
-                    fonts.begin_page(faces);
+                    fonts.begin_page(faces, true);
                     *fonts.stacks.borrow_mut() = stacks;
                     let p = wire_to_page(wire);
                     scroll = scroll.min((p.laid.height - zoomed_h(ph, zoom)).max(0.0));
@@ -1362,7 +1362,7 @@ pub fn run_headless() {
                 // adopt the worker's font state exactly like the shell does
                 let stacks = std::mem::take(&mut wire.stacks);
                 let faces = std::mem::take(&mut wire.faces);
-                fonts.begin_page(faces);
+                fonts.begin_page(faces, true);
                 *fonts.stacks.borrow_mut() = stacks;
                 let p = wire_to_page(wire);
                 // navigation drops every decoder; the new page's videos open
@@ -2247,7 +2247,7 @@ impl App {
             // index this table, and the renderer must resolve webfonts too
             let stacks = std::mem::take(&mut wire.stacks);
             let faces = std::mem::take(&mut wire.faces);
-            self.fonts.begin_page(faces); // resets the stack table to [id 0]
+            self.fonts.begin_page(faces, true); // resets the stack table to [id 0]
             *self.fonts.stacks.borrow_mut() = stacks;
             // the worker built node→name for [form] submit logging
             let form_names = std::mem::take(&mut wire.form_names);
@@ -2283,7 +2283,7 @@ impl App {
     fn show_partial(&mut self, mut wire: PageWire, pw: usize, ph: usize) {
         let stacks = std::mem::take(&mut wire.stacks);
         let faces = std::mem::take(&mut wire.faces);
-        self.fonts.begin_page(faces);
+        self.fonts.begin_page(faces, true);
         *self.fonts.stacks.borrow_mut() = stacks;
         self.form_names = std::mem::take(&mut wire.form_names);
         self.page = wire_to_page(wire);
@@ -4337,6 +4337,9 @@ struct KeptPage {
     /// The parsed stylesheet, keyed by the viewport width it was parsed for
     /// (media queries are decided at parse time). See `layout_page`.
     sheet: Option<(f32, css::Sheet)>,
+    /// Per-node cascade results from the last pass, so a restyle only
+    /// re-cascades what a script touched (see `layout::StyleCache`).
+    styles: layout::StyleCache,
     /// This page is `fetch_and_parse`'s "Failed to load" error page. It is
     /// kept like any page (a resize re-lays it out without refetching), but a
     /// Restore must never REUSE it: the site may be back, and reusing would
@@ -4581,7 +4584,7 @@ fn fire_due(
     // engine of the kept page (form-submission loads fired from timer/rAF
     // turns re-run the full pipeline and must use the same runtime choice)
     let engine = kept.as_ref().map(|k| k.engine).unwrap_or(EngineChoice::A);
-    let KeptPage { dom, scripts, css_text, faces, url, hover, imgs, sheet, .. } =
+    let KeptPage { dom, scripts, css_text, faces, url, hover, imgs, sheet, styles, .. } =
         kept.as_mut().unwrap();
     let (mw, vh) = *last_geom;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4661,9 +4664,10 @@ fn fire_due(
         return;
     }
     if dirty {
+        let dirty_nodes = scripts.as_mut().and_then(|s| s.take_dirty());
         let (page, form_names) = layout_page(
             &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover, imgs, sheet,
-            false,
+            styles, dirty_nodes.as_deref(), false,
         );
         let stacks = fonts.stacks.borrow().clone();
         let out_faces = collect_out_faces(fonts);
@@ -4723,7 +4727,8 @@ fn process_job(
                 kp.hover = None;
                 let (page, form_names) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh,
-                    last_forms, None, &mut kp.imgs, &mut kp.sheet, false,
+                    last_forms, None, &mut kp.imgs, &mut kp.sheet,
+                    &mut kp.styles, Some(&[]), false,
                 );
                 let stacks = fonts.stacks.borrow().clone();
                 let out_faces = collect_out_faces(fonts);
@@ -4745,7 +4750,7 @@ fn process_job(
             kp.hover = *hover;
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, *hover,
-                &mut kp.imgs, &mut kp.sheet, false,
+                &mut kp.imgs, &mut kp.sheet, &mut kp.styles, Some(&[]), false,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -4914,9 +4919,15 @@ fn process_job(
                 }
             }
             // always re-layout: the event likely changed the DOM
+            let mut dirty_nodes = kp.scripts.as_mut().and_then(|s| s.take_dirty());
+            // the value/checked push below the DOM, not through a script turn
+            if target != 0 && (value_kinds || kinds.iter().any(|k| k == "click")) {
+                dirty_nodes.get_or_insert_with(Vec::new).push((target, false));
+            }
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, kp.hover,
-                &mut kp.imgs, &mut kp.sheet, false,
+                &mut kp.imgs, &mut kp.sheet,
+                &mut kp.styles, dirty_nodes.as_deref(), false,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -4936,6 +4947,7 @@ fn process_job(
                     let mut nav = None;
                     let mut dirty = false;
                     let mut form_nav: Option<runtime::FormNav> = None;
+                    let mut dirty_nodes: Option<Vec<(u32, bool)>> = None;
                     {
                         let KeptPage { dom, scripts, .. } = kp;
                         if let Some(scripts) = scripts.as_mut() {
@@ -4967,10 +4979,12 @@ fn process_job(
                             // result (keeps the generation gate untouched)
                             return (None, None, false, false, false);
                         }
+                        dirty_nodes = scripts.as_mut().and_then(|s| s.take_dirty());
                     }
                 let (page, fnames) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
-                    kp.hover, &mut kp.imgs, &mut kp.sheet, false,
+                    kp.hover, &mut kp.imgs, &mut kp.sheet,
+                    &mut kp.styles, dirty_nodes.as_deref(), false,
                 );
                 (page, fnames)
             };
@@ -5309,8 +5323,12 @@ fn settle_load(
         hover: None,
         imgs: ImgCache::default(),
         sheet: None,
+        styles: layout::StyleCache::default(),
         failed: false,
     };
+    // a new page starts with no mutation report (one left by the previous
+    // page would name nodes of a different DOM)
+    runtime::take_dirty_report();
     #[cfg(feature = "count-alloc")]
     let heap_mb = || crate::live_alloc_bytes() as f64 / (1024.0 * 1024.0);
     #[cfg(feature = "count-alloc")]
@@ -5327,7 +5345,8 @@ fn settle_load(
         let mut scratch = ImgCache::default();
         let (page, form_names) = layout_page(
             &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
-            &layout::FormState::default(), None, &mut scratch, &mut kp.sheet, true,
+            &layout::FormState::default(), None, &mut scratch, &mut kp.sheet,
+            &mut kp.styles, Some(&[]), true,
         );
         fonts.set_choice(saved);
         let stacks = fonts.stacks.borrow().clone();
@@ -5384,6 +5403,7 @@ fn settle_load(
         });
     }    #[cfg(feature = "count-alloc")]
     let h1 = heap_mb();
+    let dirty_nodes = scripts.take_dirty();
     kp.scripts = Some(scripts);
     let (page, form_names) = layout_page(
         &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
@@ -5392,6 +5412,7 @@ fn settle_load(
         None,
         &mut kp.imgs,
         &mut kp.sheet,
+        &mut kp.styles, dirty_nodes.as_deref(),
         false,
     );
     #[cfg(feature = "count-alloc")]
@@ -6151,6 +6172,13 @@ fn layout_page(
     // so that is the key. `Sheet::begin_pass` drops the per-node memos that
     // described the DOM of the previous pass. None = nothing parsed yet.
     sheet_cache: &mut Option<(f32, css::Sheet)>,
+    // Per-node cascade results from the previous pass, plus what this pass's
+    // script turn reported as touched, as `(node, child_list_moved)` (see
+    // `layout::StyleCache`). `Some([])` = nothing changed since, so every
+    // element keeps its style; `None` = the engine cannot say, so nothing is
+    // reused.
+    styles: &mut layout::StyleCache,
+    dirty: Option<&[(u32, bool)]>,
     // first_paint: the caller is going to lay this page out again once the
     // scripts have run, so skip everything that only the final pass needs
     // (image + media probing, i.e. network round trips). The early frame
@@ -6187,10 +6215,18 @@ fn layout_page(
     sheet.set_viewport(viewport, vh);
     // the hover cell (shell hit test) — `:hover` rules match against it
     sheet.set_hovered(hover);
+    // drop the cached styles the last turn's mutations invalidated. A new
+    // sheet (first pass, or a width change) parses different rules, so no
+    // cached style is valid — the same "cannot say" case as a missing report.
+    let dirty = dirty.filter(|_| reused);
+    styles.begin_pass(dom, &sheet, viewport, hover, dirty);
     if reused {
         eprintln!("[css] sheet reused ({} rules)", sheet.rule_count());
     } else {
         eprintln!("[css] {} rules", sheet.rule_count());
+    }
+    if timing {
+        eprintln!("[css] {} :has rules", sheet.has_rule_count());
     }
     // cascade writes font-family stack ids into the font picker's own table
     sheet.set_stacks(fonts.stacks.clone());
@@ -6216,7 +6252,7 @@ fn layout_page(
         .unwrap_or(0);
     sheet.scope_vars(dom, html_el);
     stage!("scope vars");
-    fonts.begin_page(owned_faces);
+    fonts.begin_page(owned_faces, !styles.warm());
 
     // cascade <html> FIRST: its computed font-size is the root of `rem` (see
     // css::ROOT_PX), so it must be known before the body's subtree resolves
@@ -6238,7 +6274,7 @@ fn layout_page(
         body.bx.cursor = html_st.bx.cursor;
     }
 
-    let mut root_box = layout::build_scoped(dom, root, body.style, body.bx, &sheet, body.vars.as_ref());
+    let mut root_box = layout::build_cached(dom, root, body.style, body.bx, &sheet, body.vars.as_ref(), styles);
     stage!("cascade + box tree");
     if timing {
         let (tested, matched, decls) = css::cascade_stats_take();
@@ -6254,6 +6290,14 @@ fn layout_page(
         eprintln!(
             "[time] cascade rules: {:.0} ms of that",
             layout::cascade_ns_take() as f64 / 1e6
+        );
+        eprintln!(
+            "[time] restyle: {} nodes reused, {} re-cascaded ({} reported dirty, {} wide, hover {:?})",
+            styles.hits,
+            styles.misses,
+            dirty.map_or(0, |d| d.len()),
+            viewport,
+            hover
         );
     }
     eprintln!(
@@ -8462,7 +8506,10 @@ impl Fonts {
     /// Page-scoped font state: drop the previous page's webfonts and stack
     /// ids (RAM freed on navigation), register the new page's `@font-face`
     /// defs — each font itself still loads lazily on first use.
-    fn begin_page(&mut self, faces: Vec<css::FontFace>) {
+    /// `reset_stacks`: drop the `font-family` stack table too. False for a
+    /// RE-layout of the same page — cached styles hold stack ids from the
+    /// last pass (`layout::StyleCache`), so the ids must not move.
+    fn begin_page(&mut self, faces: Vec<css::FontFace>, reset_stacks: bool) {
         self.faces.clear();
         self.webfont_bytes.set(0);
         self.webfont_clock.set(0);
@@ -8472,7 +8519,7 @@ impl Fonts {
         // reset the shared stack table BEFORE any early return: the cascade
         // (running later in `layout_page`) pushes this page's stacks into it,
         // so stale names/id slots must never survive a navigation
-        {
+        if reset_stacks {
             let mut t = self.stacks.borrow_mut();
             t.clear();
             t.push(Vec::new()); // id 0 = "no stack"
@@ -9942,6 +9989,7 @@ mod tests {
             hover: None,
             imgs: ImgCache::default(),
             sheet: None,
+            styles: layout::StyleCache::default(),
             failed: false,
         }
     }
@@ -10834,7 +10882,7 @@ mod tests {
             wmin: 400,
             wmax: 700,
             italic: false,
-        }]);
+        }], true);
         assert!(fonts.faces.is_empty(), "B keeps no @font-face defs");
         // stack table reset before the early return (no stale leak)
         assert_eq!(fonts.stacks.borrow().len(), 1, "only the id-0 slot");
@@ -10853,7 +10901,7 @@ mod tests {
             wmin: 400,
             wmax: 700,
             italic: false,
-        }]);
+        }], true);
         #[cfg(feature = "woff2")]
         assert_eq!(fonts.faces.len(), 1);
         #[cfg(not(feature = "woff2"))]
@@ -11879,6 +11927,7 @@ mod tests {
             hover: None,
             imgs: ImgCache::default(),
             sheet: None,
+            styles: layout::StyleCache::default(),
             failed: false,
         });
         let mut fonts = Fonts::load();
@@ -11931,6 +11980,7 @@ mod tests {
                 hover: None,
                 imgs: ImgCache::default(),
                 sheet: None,
+                styles: layout::StyleCache::default(),
                 failed: false,
             })
         };

@@ -5597,3 +5597,75 @@ parse and kept for the page's life.
 
 Tests **1062 -> 1063** green: a pseudo rule is found through the tag, class,
 id, attribute, universal and `:is()` bucket, and misses a stranger.
+
+## A restyle only re-cascades what a script touched (P98, 2026-11-13)
+
+Every layout pass on an already-loaded page re-matched the whole sheet: the
+pre-script frame, the post-script frame, every animation frame, every tab
+restore. github needs 608 340 selector tests, 21 924 matches and 36 800
+declarations for a pass (P96/P97), repeated for every one of them, although a
+script turn touches a handful of nodes.
+
+`layout::StyleCache` now keeps each element's cascade result (`StyleOutcome`)
+between passes, and a pass starts by dropping only what the last script turn
+can have changed. The script engine reports the mutations from the same host
+writes that already set its dirty flag - `(node, child_list_moved)` pairs in a
+thread-local list, taken once per layout (`ScriptRuntime::take_dirty`), with
+`None` from an engine that cannot say, which drops everything. Clearing the
+list at the start of a load keeps a previous page's node ids from naming nodes
+in a new DOM.
+
+What a mutation invalidates:
+
+- an attribute or text write on `n`: `n`'s subtree (its own style and its
+  descendants' inherited inputs) plus the siblings AFTER it, because `+` and
+  `~` read `n` from their side;
+- a child list moving at `n`: `n`'s subtree only - the moved children and
+  their new `:nth-child`/`:empty` answers are inside it;
+- `:has()`: an element's answer depends on its descendants and following
+  siblings, so a mutation can restyle an ancestor and, through inheritance,
+  that ancestor's whole subtree. Rather than giving up on any sheet with a
+  `:has` rule (github has 74 of 32 073), each dirty node walks its ancestors
+  and preceding siblings and asks `Sheet::has_subject` - a `RuleIndex` over
+  just the 74 rules, then the normal matcher - and only matching subjects are
+  dropped. A sheet with no `:has` rule costs one bool per pass;
+- a new viewport width, or a newly parsed sheet: nothing is valid, and
+  `dirty` is treated as `None`. The first cut of this smuggled "sheet is new"
+  through a `width = None` key and stored it, so the next pass at the real
+  width looked like a width change and cleared the whole cache - the counters
+  said `0 reused` on every pass until the width key was made a plain `f32`.
+
+Measured on github.com, 1000 px wide, release, `MAZDA_TIME=1`:
+
+| pass | reused / re-cascaded | reported dirty | candidates | matched | declarations | cascade rules |
+|---|---|---|---|---|---|---|
+| cold load, pre-script | 0 / 1157 | 0 | 608 340 | 21 924 | 36 800 | 243 ms |
+| cold load, post-script | **246 / 911** | 37 | **480 720** | **16 566** | **26 753** | 179 ms |
+| later relayout (timer) | **1149 / 8** | 29 | **4 316** | **186** | **259** | **12 ms** |
+
+Before this change the post-script pass was 0 / 1157 with 608 343 candidates
+and the relayout 608 353 / 21 929 / 36 805 with 251 ms of cascade. The box
+count and the matched rules of the reused nodes are identical; the cascade
+counter is the honest metric because stage times on this host vary 2x.
+
+The post-script pass only reuses 246 of 1157 because github's boot scripts
+write to `<head>` and to body-level containers (`react-app`, the top `div`s
+around node 969/983), and invalidating one of those is most of the body. The
+full effect is on passes nothing mutated: a timer/animation relayout drops
+21 924 matches to 186, and a tab restore at the same width on a local 901-node
+page reuses **901 / 0** with 1 ms of cascade. A tab restore after the window
+width changed (github 1000 -> 1120) correctly re-parses the sheet and
+re-cascades all 1191 nodes.
+
+`Fonts::begin_page` grew a `reset_stacks` flag: a re-layout of the same page
+must keep the `font-family` stack ids that the cached styles point into.
+
+Cost: one `StyleOutcome` clone per element per pass (a pass that reuses
+everything still allocates the cache's slots), and the dirty-node walk over
+ancestors when the sheet has `:has` rules.
+
+Tests **1063 -> 1067** green: a restyle reuses what the report does not name
+(and re-cascades the sibling after a written node and a moved child list), a
+`:has()` rule makes its subject depend on a descendant, a mutation report
+names exactly the nodes a turn touched, and a child-list change names the
+parent that owns the list.
