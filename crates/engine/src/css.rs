@@ -1705,10 +1705,25 @@ pub struct Sheet {
     /// re-cascade); None = nothing is hovered, so no `:hover` matches.
     /// Cell (not mut): `resolve` runs on `&Sheet` throughout layout.
     hovered: std::cell::Cell<Option<u32>>,
-    /// cascade-ordered `(selector, value)` pairs for `color-scheme` only.
-    /// The property is consulted for every element but declared on very few
-    /// rules, so `resolve` walks this tiny slice instead of the full rule list.
-    schemes: Vec<(Vec<Seg>, String)>,
+    /// cascade-ordered rules that declare `color-scheme`, each with that
+    /// declaration as its only entry in `decls`. The property is consulted for
+    /// every element but declared on a handful of rules, so `own_scheme` tests
+    /// only the indexed candidates instead of the whole sheet.
+    scheme_rules: Vec<Rule>,
+    /// rightmost-compound buckets over `scheme_rules`
+    scheme_index: RuleIndex,
+    /// Memoized [`Self::declared_dark`] per node: 0 = not computed, 1 = no
+    /// ancestor declares `color-scheme`, 2 = light, 3 = dark. The property
+    /// inherits, so a node's answer is its own declaration else its parent's
+    /// cached answer; a fresh lookup per element used to walk the whole
+    /// ancestor chain (57k hops on github.com) and re-sweep every scheme
+    /// selector at each hop.
+    scheme_memo: std::cell::RefCell<Vec<u8>>,
+    /// `MAZDA_TIME` diagnostics for that lookup: selector tests run, and
+    /// ancestor hops walked (a hop re-sweeps the scheme rules for the parent,
+    /// so the product is the real cost). Taken and reset per layout.
+    scheme_probes: std::cell::Cell<usize>,
+    scheme_hops: std::cell::Cell<usize>,
     /// effective custom properties (--name → value) consumed by `resolve`.
     /// Starts as the flat last-definition-wins map (parse time); `scope_vars`
     /// rewrites it once the real <html> element is known.
@@ -1836,6 +1851,9 @@ impl Sheet {
     /// `None` clears it — no `:hover` matches then.
     pub fn set_hovered(&self, node: Option<u32>) {
         self.hovered.set(node);
+        // `:hover` can ride an ancestor compound, so a cached color-scheme
+        // answer is no longer trustworthy
+        self.scheme_memo.borrow_mut().clear();
     }
 
     /// Wire the loader's shared stack table so `Style::fam_stack` ids resolved
@@ -1914,6 +1932,8 @@ impl Sheet {
     pub fn scope_vars(&mut self, dom: &Dom, html: u32) {
         let root_pol = dom.attr(html, "class").and_then(theme_polarity);
         self.root_pol = root_pol; // fallback theme for light-dark() below
+        // cached color-scheme answers were resolved against the old fallback
+        self.scheme_memo.borrow_mut().clear();
         self.vars.clear();
         let hover = self.hovered.get();
         for (name, defs) in &self.var_defs {
@@ -2512,25 +2532,36 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     let index = RuleIndex::build(&rules);
     let var_index = RuleIndex::build(&var_rules);
     // color-scheme decides light-dark() for every element but is declared on
-    // very few rules — keep the (already cascade-ordered) slice so resolve can
-    // find a winning value without re-walking the full rule list. Last
-    // declaration within a rule wins (source order), like every property.
-    let schemes: Vec<(Vec<Seg>, String)> = rules
+    // very few rules — keep those rules (and their index) apart so the lookup
+    // tests a couple of candidates per element instead of sweeping the sheet.
+    // Last declaration within a rule wins (source order), like every property.
+    let scheme_rules: Vec<Rule> = rules
         .iter()
         .filter_map(|r| {
             r.decls
                 .iter()
                 .rev()
                 .find(|d| d.0 == "color-scheme")
-                .map(|d| (r.segs.clone(), d.1.clone()))
+                .map(|d| Rule {
+                    segs: r.segs.clone(),
+                    decls: vec![d.clone()],
+                    vars: Vec::new(),
+                    spec: r.spec,
+                    order: r.order,
+                })
         })
         .collect();
+    let scheme_index = RuleIndex::build(&scheme_rules);
     Sheet {
         rules,
         index,
         var_rules,
         var_index,
-        schemes,
+        scheme_rules,
+        scheme_index,
+        scheme_memo: std::cell::RefCell::new(Vec::new()),
+        scheme_probes: std::cell::Cell::new(0),
+        scheme_hops: std::cell::Cell::new(0),
         pseudo,
         hover,
         hovered: std::cell::Cell::new(None),
@@ -2803,13 +2834,14 @@ impl Sheet {
         if dark && scheme.is_some() && !color_declared && style.color == 0x00_00_00 {
             style.color = 0xff_ff_ff;
         }
-        StyleOutcome {
+        let out = StyleOutcome {
             style,
             bg,
             display_none,
             bx,
             vars,
-        }
+        };
+        out
     }
 
     /// Cascade the `kind` pseudo-element rules over `base` — the origin
@@ -2954,15 +2986,25 @@ impl Sheet {
     /// order (last wins), then the inline `style` (applied last → wins).
     fn own_scheme(&self, dom: &Dom, node: u32, inline: Option<&str>) -> Option<String> {
         let mut val: Option<String> = None;
-        for (segs, v) in &self.schemes {
-            if matches(dom, node, segs, self.hovered.get()) {
-                // same var() substitution resolve applies to every declaration
-                val = Some(if v.contains("var(") {
-                    subst_vars(v, &|name| self.vars.get(name).cloned(), 0)
-                } else {
-                    v.clone()
-                });
-            }
+        if !self.scheme_rules.is_empty() {
+            RULE_SCRATCH.with(|scratch| {
+                let mut cand = scratch.borrow_mut();
+                self.scheme_index.candidates(dom, node, &mut cand);
+                for &ri in cand.iter() {
+                    let r = &self.scheme_rules[ri as usize];
+                    self.scheme_probes.set(self.scheme_probes.get() + 1);
+                    if matches(dom, node, &r.segs, self.hovered.get()) {
+                        let raw = &r.decls[0].1;
+                        // same var() substitution resolve applies to every
+                        // declaration
+                        val = Some(if raw.contains("var(") {
+                            subst_vars(raw, &|name| self.vars.get(name).cloned(), 0)
+                        } else {
+                            raw.clone()
+                        });
+                    }
+                }
+            });
         }
         if let Some(inline) = inline {
             for d in &parse_decls(inline) {
@@ -2988,17 +3030,41 @@ impl Sheet {
     /// the bare preference fallback (the default text color only follows a
     /// scheme the page opted into) need the distinction.
     fn declared_dark(&self, dom: &Dom, node: u32, inline: Option<&str>) -> Option<bool> {
+        let mut memo = self.scheme_memo.borrow_mut();
+        if memo.len() < dom.nodes.len() {
+            memo.resize(dom.nodes.len(), 0);
+        }
+        // walk up until a cached ancestor answers, then cache the whole chain
+        let mut chain: Vec<u32> = Vec::new();
         let mut n = node;
-        loop {
+        let val = loop {
+            let c = memo[n as usize];
+            if c != 0 {
+                break c;
+            }
+            self.scheme_hops.set(self.scheme_hops.get() + 1);
             let here = if n == node { inline } else { dom.attr(n, "style") };
+            chain.push(n);
             if let Some(v) = self.own_scheme(dom, n, here) {
-                return Some(used_scheme(Some(&v), self.root_pol, PREFERS_DARK));
+                break if used_scheme(Some(&v), self.root_pol, PREFERS_DARK) {
+                    3
+                } else {
+                    2
+                };
             }
             let parent = dom.nodes[n as usize].parent;
             if parent == n {
-                return None; // document root (its parent is itself)
+                break 1; // document root: nothing declared up the chain
             }
             n = parent;
+        };
+        for m in chain {
+            memo[m as usize] = val;
+        }
+        match val {
+            2 => Some(false),
+            3 => Some(true),
+            _ => None,
         }
     }
 
@@ -3007,6 +3073,15 @@ impl Sheet {
     /// injector picks the same branch the text cascade does.
     pub fn is_dark(&self, dom: &Dom, node: u32) -> bool {
         self.used_dark(dom, node, dom.attr(node, "style"))
+    }
+
+    /// Take (and reset) the `color-scheme` lookup counters (selector tests,
+    /// ancestor hops) for the `MAZDA_TIME` layout summary.
+    pub fn scheme_stats_take(&self) -> (usize, usize) {
+        let r = (self.scheme_probes.get(), self.scheme_hops.get());
+        self.scheme_probes.set(0);
+        self.scheme_hops.set(0);
+        r
     }
 
     /// Tags an inline SVG's markup contains, for [`Sheet::svg_candidates`].
@@ -11538,6 +11613,35 @@ mod tests {
         // an author color always wins over the scheme default
         let author = parse("html { color-scheme: dark } p { color: #123456 }");
         assert_eq!(style_for_tag(&author, &dom, "p").color, 0x12_34_56);
+    }
+
+    #[test]
+    fn color_scheme_memo_answers_each_element_once_and_hover_invalidates_it() {
+        // `color-scheme` inherits: an element's answer is its nearest
+        // declaring ancestor's. The memo answers each chain once per element
+        // (the old code re-walked it and re-swept every scheme selector at
+        // every hop), so a child resolved BEFORE its ancestor must still see
+        // the ancestor's value, and a hover-dependent declaration must drop
+        // the cache.
+        let dom = dom_of(
+            r#"<html><body><div class="d"><p id="inner">x</p></div>
+            <p id="outer">y</p></body></html>"#,
+        );
+        let sheet = parse("html { color-scheme: light } .d { color-scheme: dark }");
+        let inner = find(&dom, |d, i| d.attr(i, "id") == Some("inner"));
+        let outer = find(&dom, |d, i| d.attr(i, "id") == Some("outer"));
+        assert!(sheet.is_dark(&dom, inner), "inherits .d's dark");
+        assert!(!sheet.is_dark(&dom, outer), "html's light");
+        assert!(sheet.is_dark(&dom, inner), "repeat answers from the memo");
+
+        // an ancestor-compound `:hover` declaration flips the used scheme
+        let hovered = parse("html { color-scheme: light } html:hover .d { color-scheme: dark }");
+        assert!(!hovered.is_dark(&dom, inner));
+        hovered.set_hovered(Some(by_tag(&dom, "html")));
+        assert!(
+            hovered.is_dark(&dom, inner),
+            "hover flips the scheme; the memo must not keep the stale answer"
+        );
     }
 
     #[test]

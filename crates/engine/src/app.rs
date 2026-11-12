@@ -6019,9 +6019,11 @@ fn layout_page(
     stage!("cascade + box tree");
     if timing {
         let (tested, matched, decls) = css::cascade_stats_take();
+        let (probes, hops) = sheet.scheme_stats_take();
         eprintln!(
             "[css] {tested} candidates tested, {matched} matched, {decls} declarations applied"
         );
+        eprintln!("[css] color-scheme: {probes} selector tests, {hops} ancestor hops");
     }
     eprintln!(
         "[mem] after box tree: {:.1} MB ({} boxes)",

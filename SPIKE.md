@@ -4747,3 +4747,37 @@ Tests **1032 -> 1033** green (new
 `first_paint_shows_the_markup_before_scripts_add_to_it`: a page whose script
 rewrites its heading; the sink sees the markup, the final wire sees the
 script's text).
+
+## The `color-scheme` lookup swept the sheet once per ancestor (P75, 2026-11-12)
+
+`color-scheme` inherits, so `declared_dark` walked the parent chain until a
+node declared it, and at every hop it re-tested *every* rule that declares the
+property. `MAZDA_TIME` on github.com: **1 431 175 selector tests and 57 247
+ancestor hops per cascade pass**, against 491 563 candidates for the whole
+actual cascade - the lookup was doing three times the matcher work of the
+cascade it was supporting.
+
+Change (`css.rs`):
+
+- the `color-scheme` rules get their own `RuleIndex` (rightmost-compound
+  buckets, like `rules` and `var_rules`), so `own_scheme` tests only the
+  buckets the element falls into;
+- `declared_dark` memoizes per node (`2` light / `3` dark / `1` "nothing up
+  the chain"): the answer is the node's own declaration, else its parent's
+  cached answer, so a whole subtree costs one declaration test each. The memo
+  is dropped when the pointer moves (`set_hovered`: an ancestor compound can
+  carry `:hover`) and when `scope_vars` changes the root polarity.
+
+Same load, same binary, A/B via a temporary `MAZDA_SCHEME_OLD` switch: **1 431
+175 -> 1 424 selector tests, 57 247 -> 1 124 hops**, three interleaved pairs.
+`cascade + box tree` did **not** move measurably (844 vs 874 ms median,
++-100 ms noise), which is the honest headline: the removed work was ~35 ms of
+~740 ms, i.e. below what this machine can resolve. The counters are the proof;
+the wall clock is not. It still matters for the paths that re-cascade the
+whole sheet on every event (hover, scroll relayout), where the same ~35 ms was
+spent per pass.
+
+Tests **1033 -> 1034** green (new
+`color_scheme_memo_answers_each_element_once_and_hover_invalidates_it`: a
+child resolved before its ancestor still inherits, and an ancestor `:hover`
+declaration flips the answer after the cache is dropped).
