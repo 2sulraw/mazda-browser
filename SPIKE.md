@@ -5430,3 +5430,44 @@ Bounds and rules:
   stale id would style whatever node carries it now.
 
 Tests **1057 -> 1061** green.
+
+## A tab switch shows the page before the renderer has laid it out (P93, 2026-11-12)
+
+P92 made a switch cheap in the renderer (bind the parked live page, one
+cascade). The shell still made it look slow: on every switch it dropped the
+texture it had and waited for the renderer's restore frame - 0 ms for a local
+page, ~1 s for github. The window went blank for exactly the interval the
+renderer was working, which is the one thing Chrome never does: the old tab's
+pixels stay on screen until the new tab has pixels of its own.
+
+Each tab now owns the last frame it painted: the `TextureHandle` the shell
+uploaded, plus the renderer `seq` it came from. A switch parks the frame on
+screen under the tab being left and takes the target tab's frame, so the
+texture is in hand before `Command::Restore` is even written. The same handover
+happens when a tab is opened (`open`, Ctrl+T) and when the active tab is
+closed. A new frame from the renderer replaces the parked one as usual.
+
+Measured by driving the shell's stdin verbs (`open <url>`, `tab N`), two local
+pages:
+
+```
+[tabs] active=1 n=2 url=http://127.0.0.1:8765/tab-b.html
+[tabs] active=0 n=2 url=http://127.0.0.1:8765/tab-a.html frame=kept
+[tabs] active=1 n=2 url=http://127.0.0.1:8765/tab-b.html frame=kept
+```
+
+Both switches report `frame=kept`; the frame is drawn in the same frame as the
+switch, not after the restore.
+
+Cost: one texture per background tab, 2.7 MB at 1000x670 (GPU), dropped when
+the tab closes. A renderer restart zeroes every tab's `seq` - the frame numbers
+start over and a stored one could collide - but keeps the parked texture, which
+still holds the last pixels the old renderer produced.
+
+Known gap: a frame event carries no URL. A load that finishes after the user
+switched away paints the old page on the active tab until the next paint
+replaces it (this predates P93; the parked frame makes it visible as the wrong
+tab's page for one restore). Frames should carry their page's URL.
+
+Verified end to end with the release shell + release renderer; the renderer-side
+parking rules are covered by the four `park_page`/`bind_parked` tests.

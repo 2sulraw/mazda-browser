@@ -200,6 +200,14 @@ struct Tab {
     url: String,
     label: String,
     scroll: f32,
+    /// The last frame this tab painted: the GPU texture the shell uploaded
+    /// from the renderer's buffer. Kept while the tab is in the background so
+    /// a switch shows the page immediately - the renderer still has to
+    /// re-lay the bound page out, and a blank window for that second is the
+    /// one thing Chrome never shows.
+    tex: Option<egui::TextureHandle>,
+    /// `seq` of `tex` in the renderer's frame buffer (0 = no frame yet).
+    seq: u32,
 }
 
 impl Tab {
@@ -209,6 +217,8 @@ impl Tab {
             label: short_title(&url),
             url,
             scroll: 0.0,
+            tex: None,
+            seq: 0,
         }
     }
 }
@@ -862,7 +872,13 @@ impl Shell {
             self.pending_scroll = None;
             self.loading = true;
             self.err = None;
+            // a navigation replaces the page: the frame on screen is not this
+            // tab's any more (a tab SWITCH parks it instead, see select_tab)
             self.tex = None;
+            if let Some(t) = self.tabs.get_mut(tab) {
+                t.tex = None;
+                t.seq = 0;
+            }
             self.r.url = url.clone();
             self.title.clear();
             println!("[nav] {url}");
@@ -877,6 +893,11 @@ impl Shell {
             return;
         }
         self.save_scroll();
+        // the frame on screen belongs to the tab we are leaving: park it
+        // there, and take the frame the tab we switch to left behind, so the
+        // window shows that page while the renderer re-lays it out
+        self.tabs[self.active].tex = self.tex.take();
+        self.tabs[self.active].seq = self.seq;
         self.active = i;
         let (url, scroll) = {
             let t = &self.tabs[i];
@@ -887,7 +908,8 @@ impl Shell {
         self.pending_scroll = None;
         self.loading = false;
         self.err = None;
-        self.tex = None;
+        self.tex = self.tabs[i].tex.take();
+        self.seq = self.tabs[i].seq;
         self.title.clear();
         self.r.url = url.clone();
         if url.is_empty() {
@@ -899,15 +921,20 @@ impl Shell {
             self.pending_scroll = Some(scroll);
         }
         println!(
-            "[tabs] active={} n={} url={}",
+            "[tabs] active={} n={} url={} frame={}",
             self.active,
             self.tabs.len(),
-            url
+            url,
+            if self.tex.is_some() { "kept" } else { "none" }
         );
     }
 
     fn new_tab(&mut self) {
         self.save_scroll();
+        // the page the user is looking at keeps its frame for when they come
+        // back to that tab
+        self.tabs[self.active].tex = self.tex.take();
+        self.tabs[self.active].seq = self.seq;
         self.tabs.push(Tab::new(""));
         let i = self.tabs.len() - 1;
         self.active = i;
@@ -915,6 +942,7 @@ impl Shell {
         self.pending_scroll = None;
         self.loading = false;
         self.tex = None;
+        self.seq = 0;
         self.url_edit.clear();
         self.focus_url = true;
         println!("[tabs] active={} n={} url=", self.active, self.tabs.len());
@@ -924,11 +952,17 @@ impl Shell {
         if i >= self.tabs.len() {
             return;
         }
+        let was_active = i == self.active;
+        // the closed tab's parked frame goes with it
         self.tabs.remove(i);
+        if was_active {
+            // ... and the frame on screen is that tab's too
+            self.tex = None;
+            self.seq = 0;
+        }
         if self.tabs.is_empty() {
             self.tabs.push(Tab::new(""));
         }
-        let was_active = i == self.active;
         if i < self.active {
             self.active -= 1;
         }
@@ -940,7 +974,9 @@ impl Shell {
             };
             self.url_edit = url.clone();
             self.scroll = scroll;
-            self.tex = None;
+            // the newly active tab shows its own last frame right away
+            self.tex = self.tabs[self.active].tex.take();
+            self.seq = self.tabs[self.active].seq;
             self.r.url = url.clone();
             if url.is_empty() {
                 self.loading = false;
@@ -1200,6 +1236,11 @@ impl Shell {
                         self.map_path.clear();
                         self.tex = None;
                         self.seq = 0;
+                        // frame seqs restart with the new renderer: a stored
+                        // one could collide, so let every tab re-upload
+                        for t in &mut self.tabs {
+                            t.seq = 0;
+                        }
                         // the restarted renderer is back at 100% zoom
                         self.r.send(Command::Zoom(self.zoom));
                         // a print in flight died with the old renderer
@@ -1240,9 +1281,14 @@ impl Shell {
                 Ctl::Tab(i) => self.select_tab(i),
                 Ctl::Open(url) => {
                     self.save_scroll();
+                    // the current page keeps its frame for when the user
+                    // comes back to its tab
+                    self.tabs[self.active].tex = self.tex.take();
+                    self.tabs[self.active].seq = self.seq;
                     self.tabs.push(Tab::new(&url));
                     self.active = self.tabs.len() - 1;
                     self.tex = None;
+                    self.seq = 0;
                     self.scroll = 0.0;
                     self.pending_scroll = None;
                     self.loading = true;
