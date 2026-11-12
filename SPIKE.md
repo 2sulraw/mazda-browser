@@ -4781,3 +4781,43 @@ Tests **1033 -> 1034** green (new
 `color_scheme_memo_answers_each_element_once_and_hover_invalidates_it`: a
 child resolved before its ancestor still inherits, and an ancestor `:hover`
 declaration flips the answer after the cache is dropped).
+
+## The page's images were fetched after the scripts, not during (P76, 2026-11-12)
+
+The comment above the script phase claimed the markup's images start
+downloading before the scripts run, but the only image preload lives inside
+`layout_page`, i.e. *after* the whole script phase. Cold, github.com's 21
+markup images were therefore 2.5-4.3 s of round trips serialized behind
+~6 s of script execution, and the probe that followed them paid another
+1.6-2.5 s, because by then the URLs are new asset hashes with no cache entry.
+
+Change (`app.rs`): `image_urls` resolves every `<img src>` in the parsed DOM
+(skipping inline SVG and `data:`), and `settle_load` hands that list to a
+side thread that runs the same `preload_accept(..., IMAGE_ACCEPT)` the layout
+pass uses - same Accept header, so the entry the probe later asks for is the
+entry that was fetched. The thread is detached: the script phase starts
+immediately and the downloads overlap it. CSS `background-image` URLs still
+start at box-tree time, when they are known.
+
+Cold github.com, fresh profile each run, alternating modes, wall clock:
+
+| pair | off (images after exec) | on (images during exec) |
+|---|---|---|
+| 1 | 31 639 ms | 29 169 ms |
+| 2 | 23 599 ms | 22 381 ms |
+| 3 | 25 491 ms | 23 265 ms |
+| median | 25 491 ms | 23 265 ms |
+
+Every pair favoured the overlap, median **-2.2 s (-8.7%)** on a link that was
+running 23-32 s per load that afternoon. The stage print is the direct
+evidence: `[time] image probe` after layout fell from 1 560/1 825/2 008 ms to
+360/392/409 ms, and `preload (images)` from 2.5-4.3 s to 0.33-0.43 s. An
+earlier session with the preload on the script phase's own thread showed the
+same shape (-2.8 s median of three pairs) but paid the 1.8-2.0 s inline; the
+side thread is why the current change keeps the whole overlap.
+
+Still serialized after execution, and the next candidates: `media probe`
+1.1-1.8 s (one 64 KB MP4 prefix fetch, pure TTFB) and `image decode` ~0.3 s.
+
+Tests **1034 -> 1035** green (new
+`image_urls_resolve_markup_sources_and_skip_inline_ones`).

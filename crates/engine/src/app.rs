@@ -5211,6 +5211,15 @@ fn settle_load(
     // the script bodies are about to be asked for one by one: overlap their
     // round trips now that the first frame is out (see `preload`)
     preload(&script_urls(&kp.dom, url));
+    // the markup's own `<img>` bytes: fetch them on a side thread so they
+    // overlap the script phase instead of blocking it, and so the probes
+    // after layout are cache hits rather than ~2-4 s of round trips
+    // serialized behind script execution (CSS background images still start
+    // at box-tree time, when their URLs are known).
+    let early_imgs = image_urls(&kp.dom, url);
+    std::thread::spawn(move || {
+        preload_accept(&early_imgs, Some(IMAGE_ACCEPT), "preload (images, early)");
+    });
     // run every <script> (inline + src) BEFORE layout so the DOM is settled
     let mut scripts = runtime::make_runtime(engine, &mut kp.dom, url);
     let turn = if no_js() {
@@ -5918,6 +5927,27 @@ fn script_urls(dom: &html::Dom, url: &str) -> Vec<String> {
 fn subresource_urls(dom: &html::Dom, url: &str) -> Vec<String> {
     let mut out = stylesheet_urls(dom, url);
     out.extend(script_urls(dom, url));
+    out
+}
+
+/// `<img src>` URLs the markup names, resolved against the page. The box-tree
+/// pass asks for the same URLs (`pending_image_urls`); fetching them up front
+/// overlaps their round trips with script execution instead of paying them
+/// after it.
+fn image_urls(dom: &html::Dom, url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 1..dom.nodes.len() as u32 {
+        if !dom.tag(i).eq_ignore_ascii_case("img") {
+            continue;
+        }
+        let Some(src) = dom.attr(i, "src") else { continue };
+        if src.starts_with('<') || src.starts_with("data:") {
+            continue; // inline SVG / data: URIs need no round trip
+        }
+        if let Some(abs) = resolve_img(url, src) {
+            out.push(abs);
+        }
+    }
     out
 }
 
@@ -11434,6 +11464,27 @@ mod tests {
             }, &mut last_geom, &mut last_forms, None);
         assert!(nav2.is_none() && !nav_done2 && !panicked2 && wire2.is_some(),
             "formless activation = plain relayout");
+    }
+
+    /// The markup's own `<img>` sources are fetched on a side thread while the
+    /// scripts run, so they must be the URLs layout will ask for: resolved
+    /// against the page, and no round trip for inline `data:`/SVG sources.
+    #[test]
+    fn image_urls_resolve_markup_sources_and_skip_inline_ones() {
+        let dom = html::parse(
+            r#"<html><body>
+            <img src="a.png"><img src="/b.png">
+            <img src="data:image/png;base64,AA"><img>
+            <svg><image href="c.png"/></svg>
+            </body></html>"#,
+        );
+        assert_eq!(
+            image_urls(&dom, "https://e.com/x/y"),
+            vec![
+                "https://e.com/x/a.png".to_string(),
+                "https://e.com/b.png".to_string()
+            ]
+        );
     }
 
     /// Progressive first paint: the frame the worker pushes before the scripts
