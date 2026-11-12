@@ -4334,6 +4334,9 @@ struct KeptPage {
     hover: Option<u32>,
     /// decoded-image memo shared by this page's relayouts (see `ImgCache`)
     imgs: ImgCache,
+    /// The parsed stylesheet, keyed by the viewport width it was parsed for
+    /// (media queries are decided at parse time). See `layout_page`.
+    sheet: Option<(f32, css::Sheet)>,
     /// This page is `fetch_and_parse`'s "Failed to load" error page. It is
     /// kept like any page (a resize re-lays it out without refetching), but a
     /// Restore must never REUSE it: the site may be back, and reusing would
@@ -4578,7 +4581,8 @@ fn fire_due(
     // engine of the kept page (form-submission loads fired from timer/rAF
     // turns re-run the full pipeline and must use the same runtime choice)
     let engine = kept.as_ref().map(|k| k.engine).unwrap_or(EngineChoice::A);
-    let KeptPage { dom, scripts, css_text, faces, url, hover, imgs, .. } = kept.as_mut().unwrap();
+    let KeptPage { dom, scripts, css_text, faces, url, hover, imgs, sheet, .. } =
+        kept.as_mut().unwrap();
     let (mw, vh) = *last_geom;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scripts
@@ -4658,7 +4662,8 @@ fn fire_due(
     }
     if dirty {
         let (page, form_names) = layout_page(
-            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover, imgs, false,
+            &*dom, css_text, faces, url, fonts, mw, vh, last_forms, *hover, imgs, sheet,
+            false,
         );
         let stacks = fonts.stacks.borrow().clone();
         let out_faces = collect_out_faces(fonts);
@@ -4718,7 +4723,7 @@ fn process_job(
                 kp.hover = None;
                 let (page, form_names) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh,
-                    last_forms, None, &mut kp.imgs, false,
+                    last_forms, None, &mut kp.imgs, &mut kp.sheet, false,
                 );
                 let stacks = fonts.stacks.borrow().clone();
                 let out_faces = collect_out_faces(fonts);
@@ -4740,7 +4745,7 @@ fn process_job(
             kp.hover = *hover;
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, *hover,
-                &mut kp.imgs, false,
+                &mut kp.imgs, &mut kp.sheet, false,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -4911,7 +4916,7 @@ fn process_job(
             // always re-layout: the event likely changed the DOM
             let (page, form_names) = layout_page(
                 &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh, forms, kp.hover,
-                &mut kp.imgs, false,
+                &mut kp.imgs, &mut kp.sheet, false,
             );
             let stacks = fonts.stacks.borrow().clone();
             let out_faces = collect_out_faces(fonts);
@@ -4965,7 +4970,7 @@ fn process_job(
                     }
                 let (page, fnames) = layout_page(
                     &kp.dom, &kp.css_text, &kp.faces, url, fonts, last_geom.0, last_geom.1, last_forms,
-                    kp.hover, &mut kp.imgs, false,
+                    kp.hover, &mut kp.imgs, &mut kp.sheet, false,
                 );
                 (page, fnames)
             };
@@ -5303,6 +5308,7 @@ fn settle_load(
         engine,
         hover: None,
         imgs: ImgCache::default(),
+        sheet: None,
         failed: false,
     };
     #[cfg(feature = "count-alloc")]
@@ -5321,7 +5327,7 @@ fn settle_load(
         let mut scratch = ImgCache::default();
         let (page, form_names) = layout_page(
             &kp.dom, &kp.css_text, &kp.faces, url, fonts, max_w, vh,
-            &layout::FormState::default(), None, &mut scratch, true,
+            &layout::FormState::default(), None, &mut scratch, &mut kp.sheet, true,
         );
         fonts.set_choice(saved);
         let stacks = fonts.stacks.borrow().clone();
@@ -5385,6 +5391,7 @@ fn settle_load(
         // fresh page: the shell clears its hover cell on navigation too
         None,
         &mut kp.imgs,
+        &mut kp.sheet,
         false,
     );
     #[cfg(feature = "count-alloc")]
@@ -6137,6 +6144,13 @@ fn layout_page(
     state: &layout::FormState,
     hover: Option<u32>,
     imgs: &mut ImgCache,
+    // The page's parsed stylesheet, kept between passes: a page is laid out
+    // again after its scripts run, on a resize, on a form keystroke, on a tab
+    // switch - and parsing github's 6.5 MB of CSS costs 144 ms each time.
+    // Only the viewport width changes what parsing decides (media queries),
+    // so that is the key. `Sheet::begin_pass` drops the per-node memos that
+    // described the DOM of the previous pass. None = nothing parsed yet.
+    sheet_cache: &mut Option<(f32, css::Sheet)>,
     // first_paint: the caller is going to lay this page out again once the
     // scripts have run, so skip everything that only the final pass needs
     // (image + media probing, i.e. network round trips). The early frame
@@ -6163,13 +6177,21 @@ fn layout_page(
     }
     // media queries evaluate against the window's CSS pixel width
     let viewport = max_w + 2.0 * PADDING as f32;
-    let mut sheet = css::parse_for(css_text, viewport);
+    let (mut sheet, reused) = match sheet_cache.take() {
+        Some((w, s)) if w == viewport => (s, true),
+        _ => (css::parse_for(css_text, viewport), false),
+    };
+    sheet.begin_pass();
     stage!("css parse");
     // viewport units (vh/vw/vmin/vmax) resolve against the real window size
     sheet.set_viewport(viewport, vh);
     // the hover cell (shell hit test) — `:hover` rules match against it
     sheet.set_hovered(hover);
-    eprintln!("[css] {} rules", sheet.rule_count());
+    if reused {
+        eprintln!("[css] sheet reused ({} rules)", sheet.rule_count());
+    } else {
+        eprintln!("[css] {} rules", sheet.rule_count());
+    }
     // cascade writes font-family stack ids into the font picker's own table
     sheet.set_stacks(fonts.stacks.clone());
     // FontFace isn't Clone (all fields are) — copy for begin_page, which
@@ -6235,6 +6257,9 @@ fn layout_page(
         working_set_mb(),
         layout::count_boxes(&root_box)
     );
+    // nothing below touches the sheet: park it for this page's next pass (the
+    // post-script layout of a cold load, a resize, a keystroke, a switch)
+    *sheet_cache = Some((viewport, sheet));
 
     // fetch + probe every <img> header (disk-cached; no pixel decode yet —
     // layout only needs the intrinsic size to size the box)
@@ -9912,6 +9937,7 @@ mod tests {
             engine: EngineChoice::A,
             hover: None,
             imgs: ImgCache::default(),
+            sheet: None,
             failed: false,
         }
     }
@@ -11848,6 +11874,7 @@ mod tests {
             engine: EngineChoice::A,
             hover: None,
             imgs: ImgCache::default(),
+            sheet: None,
             failed: false,
         });
         let mut fonts = Fonts::load();
@@ -11899,6 +11926,7 @@ mod tests {
                 engine: EngineChoice::A,
                 hover: None,
                 imgs: ImgCache::default(),
+                sheet: None,
                 failed: false,
             })
         };

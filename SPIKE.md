@@ -5505,3 +5505,39 @@ found by looking at the screenshots.
 
 Tests: the ipc round-trip covers the new field (5 green), engine unchanged at
 **1061**.
+## A page parses its stylesheet once (P95, 2026-11-12)
+
+`layout_page` parsed the CSS at the top of every pass. github's 6.5 MB sheet
+costs 144-201 ms to parse, and a page is laid out more than once: the pre-script
+frame of a cold load, the post-script frame, every resize, every form keystroke,
+every tab switch. The parse was repeated for each one.
+
+The parsed `Sheet` now lives in the page (`KeptPage`), keyed by the viewport
+width it was parsed for - media queries are decided at parse time, so a new
+width is the only thing that makes the old sheet wrong. `Sheet::begin_pass`
+clears the per-node memos (ancestor bloom, color-scheme answer) that described
+the previous tree; a script may have changed any of it since, and one new test
+shows a stale bloom hiding a class an earlier pass had not seen.
+
+Measured on github.com, `MAZDA_TIME=1`:
+
+| pass | css parse | cascade + box | selectors |
+|---|---|---|---|
+| cold load, pre-script | 158 ms | 913 ms | 608341 / 21924 / 36800 |
+| cold load, post-script | **0 ms** (reused) | 961 ms | 608344 / 21925 / 36801 |
+| restore (parked page) | **0 ms** (reused) | 933 ms | 608356 / 21929 / 36805 |
+| resize to 900x600 | 201 ms (new width) | 916 ms | 608356 / 21929 / 36805 |
+
+Every github pass reports the same candidates / matches / declarations it did at
+that stage before (the pre-script pass 608341 / 21924 / 36800, the post-script
+608344 / 21925 / 36801), and the reuse pass matches the fresh load exactly
+(608356 / 21929 / 36805), so the reuse changes no selector result - it only
+stops re-reading the CSS. The resize re-parses and finds **32075 rules instead
+of 32073**, which is exactly why the width is part of the key. The restore's
+worker time went 1000 -> 981 ms, which is inside this host's noise; the honest
+number is the 144 ms of parse that is now 0.
+
+Cost: the parsed sheet lives as long as the page (rules + index + the text it
+was parsed from), and a new viewport width drops the old one.
+
+Tests **1061 -> 1062** green.

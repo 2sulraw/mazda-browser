@@ -1876,9 +1876,9 @@ pub struct Sheet {
     /// rightmost-compound buckets over `scheme_rules`
     scheme_index: RuleIndex,
     /// Per-node ancestor filters (see [`Bloom`]): `None` = not computed yet.
-    /// Filled lazily while the cascade descends the tree, and dropped with the
-    /// sheet - a page load builds a fresh sheet for each pass, so a stale
-    /// filter can never outlive the DOM it describes.
+    /// Filled lazily while the cascade descends the tree, and cleared at the
+    /// start of every pass ([`Self::begin_pass`]): the sheet outlives a pass
+    /// now, so a filter must never outlive the DOM it describes.
     ancestors: std::cell::RefCell<Vec<Option<Bloom>>>,
     /// Memoized [`Self::declared_dark`] per node: 0 = not computed, 1 = no
     /// ancestor declares `color-scheme`, 2 = light, 3 = dark. The property
@@ -2022,6 +2022,21 @@ impl Sheet {
         // `:hover` can ride an ancestor compound, so a cached color-scheme
         // answer is no longer trustworthy
         self.scheme_memo.borrow_mut().clear();
+    }
+
+    /// Start another layout pass on a sheet that has been used before.
+    ///
+    /// The loader keeps a page's parsed sheet (re-parsing github's 6.5 MB of
+    /// CSS cost 144 ms on every pass: the post-script layout, a resize, a
+    /// keystroke, a tab switch). The rules and the rule index depend only on
+    /// the CSS text and the viewport width, but the per-node memos below
+    /// describe the DOM of the *previous* pass, and a script may have changed
+    /// any of it since. Clearing them is what makes the reuse safe.
+    pub fn begin_pass(&mut self) {
+        self.ancestors.borrow_mut().clear();
+        self.scheme_memo.borrow_mut().clear();
+        self.scheme_probes.set(0);
+        self.scheme_hops.set(0);
     }
 
     /// Wire the loader's shared stack table so `Style::fam_stack` ids resolved
@@ -12217,6 +12232,35 @@ mod tests {
         assert!(
             hovered.is_dark(&dom, inner),
             "hover flips the scheme; the memo must not keep the stale answer"
+        );
+    }
+
+    #[test]
+    fn a_reused_sheet_forgets_the_previous_pass() {
+        // The loader keeps a page's parsed sheet and lays the page out again
+        // after its scripts run (see `Sheet::begin_pass`). The ancestor filter
+        // and the color-scheme memo describe ONE tree: a pass over a tree a
+        // script has changed since must not answer from them.
+        let before = dom_of(r#"<html><body><div><p id="x">x</p></div></body></html>"#);
+        let after =
+            dom_of(r#"<html><body><div class="wrap"><p id="x">x</p></div></body></html>"#);
+        let mut sheet = parse(".wrap p { color: #123456 }");
+        let x = by_attr(&before, "id", "x");
+        let y = by_attr(&after, "id", "x");
+        let stale = sheet.resolve(&before, x, Style::new(), None).style.color;
+        assert_ne!(stale, 0x123456, "no .wrap ancestor in `before`");
+        // the filter built for `before` says "no .wrap on any ancestor", and
+        // it is memoized per node id: the same id in `after` inherits the lie
+        assert_eq!(
+            sheet.resolve(&after, y, Style::new(), None).style.color,
+            stale,
+            "a memo from the previous pass would hide the new class"
+        );
+        sheet.begin_pass();
+        assert_eq!(
+            sheet.resolve(&after, y, Style::new(), None).style.color,
+            0x123456,
+            "a new pass sees the tree as it is now"
         );
     }
 
