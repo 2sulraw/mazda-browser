@@ -6251,6 +6251,10 @@ fn layout_page(
             css::sel_hops_take()
         );
         eprintln!("[css] color-scheme: {probes} selector tests, {hops} ancestor hops");
+        eprintln!(
+            "[time] cascade rules: {:.0} ms of that",
+            layout::cascade_ns_take() as f64 / 1e6
+        );
     }
     eprintln!(
         "[mem] after box tree: {:.1} MB ({} boxes)",

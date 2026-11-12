@@ -5541,3 +5541,26 @@ Cost: the parsed sheet lives as long as the page (rules + index + the text it
 was parsed from), and a new viewport width drops the old one.
 
 Tests **1061 -> 1062** green.
+## How much of the box tree is the cascade (P96, 2026-11-12)
+
+`MAZDA_TIME` printed one number for two very different jobs: building boxes and
+cascading styles onto them. A restyle pass can only ever remove the second one,
+so the number that justifies one is the split, not the sum.
+
+`build_into` now times its `resolve_scoped` call and its two `pseudo_box` calls
+and reports them as `cascade rules` inside the existing `cascade + box tree`
+line. Measured on github.com:
+
+| pass | cascade + box tree | of that, cascade rules |
+|---|---|---|
+| cold load, pre-script | 781 ms | 483 ms |
+| cold load, post-script | 793 ms | 479 ms |
+| later relayout | 1216 ms | 665 ms |
+| fresh load (no cache) | 686 ms | 397 ms |
+
+So roughly 60 % of the walk is selector matching + declaration application and
+the other 40 % is box construction. The absolute numbers move 2x between runs
+on this host; the split is the signal.
+
+Cost: one `Instant::now()` pair per element and per pseudo pair, unconditionally
+(about 40 ns each). Tests unchanged at **1062**.

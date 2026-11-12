@@ -12,6 +12,19 @@ use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
 use std::collections::HashMap;
 
+// How much of the box-tree walk was the cascade itself (selector matching +
+// declaration application) rather than box construction. `MAZDA_TIME` prints
+// it: "cascade + box tree" is one number for two very different costs, and a
+// restyle pass (see `Sheet::begin_pass`) only ever removes the first one.
+thread_local! {
+    static CASCADE_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Take the cascade time accumulated since the last call (ns).
+pub fn cascade_ns_take() -> u64 {
+    CASCADE_NS.with(|c| c.replace(0))
+}
+
 /// Resolved generic font family (CSS `font-family` stack → first known
 /// generic; unknown names are skipped, default = Sans).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1414,7 +1427,9 @@ fn build_into(
                 // author CSS (rules + inline style) cascades over UA defaults;
                 // relative font-sizes compute against the TRUE parent (style),
                 // not the UA-bumped child_style (headings would compound 2x)
+                let t0 = std::time::Instant::now();
                 let outcome = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, style.color, vars);
+                CASCADE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
                 // the element's own counter operations happen before its
                 // ::before and its content; they stay in scope for its
                 // following siblings (unwound at the end of this child list)
@@ -1446,6 +1461,7 @@ fn build_into(
                 // counter would therefore not be seen by ::after's content;
                 // real pages put counter increments on ::before or on the
                 // element itself, which this order handles correctly.
+                let t1 = std::time::Instant::now();
                 let before = pseudo_box(
                     sheet,
                     dom,
@@ -1466,6 +1482,7 @@ fn build_into(
                     PseudoEl::After,
                     counters,
                 );
+                CASCADE_NS.with(|c| c.set(c.get() + t1.elapsed().as_nanos() as u64));
                 if tag == "img" {
                     // replaced element: box now, pixels when main fetches the src.
                     // width/height attributes are presentational hints (CSS wins:
