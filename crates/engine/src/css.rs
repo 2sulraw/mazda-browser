@@ -893,6 +893,11 @@ pub struct BoxStyle {
     pub margin: [Len; 4],
     /// per-box background-color
     pub bg: Option<u32>,
+    /// that colour's alpha (255 = opaque). `#RRGGBBAA` and `rgba()` keep their
+    /// alpha here instead of in the packed colour, so every existing user of
+    /// `bg` still sees a plain RGB value; layout multiplies it into the
+    /// rect's opacity (see SPIKE P85).
+    pub bg_alpha: u8,
     /// `background-image: url(…)` — the raw target (unresolved; layout
     /// hands it to the shared `<img>` pipeline, which resolves/fetches it
     /// against the page URL)
@@ -1212,6 +1217,7 @@ impl Default for BoxStyle {
             pad: [Len::Px(0.0); 4],
             margin: [Len::Px(0.0); 4],
             bg: None,
+            bg_alpha: 255,
             bg_image: None,
             bg_size: BgSize::Auto,
             bg_pos: [BgPos::Pct(0.0); 2], // top-left
@@ -3593,9 +3599,17 @@ fn apply_decl(
             // even when it carries a url; the image longhand does not)
             if d.0 != "background-image" {
                 bx.declared |= decl::BG;
-                if let Some(c) = parse_color(pick_light_dark(&d.1, dark)) {
-                    *bg = Some(c);
-                    bx.bg = Some(c); // per-box fill (cards, nav bars)
+                // `#RRGGBBAA` / `rgba()` keep their alpha: a 6 %-black pill
+                // is not a black pill (github's secondary CTA). Alpha 0 is
+                // plain `transparent` - no fill at all, so an unparseable or
+                // fully transparent value leaves an earlier fill in place.
+                match parse_color_alpha(pick_light_dark(&d.1, dark)) {
+                    Some((c, a)) if a > 0 => {
+                        *bg = Some(c); // page canvas (body/html), always opaque
+                        bx.bg = Some(c); // per-box fill (cards, nav bars)
+                        bx.bg_alpha = a;
+                    }
+                    _ => {}
                 }
             }
             // the image half: url(…) rides the shared <img> pipeline
@@ -11278,6 +11292,35 @@ mod tests {
         // the `background` shorthand resets background-* longhands it omits
         assert_eq!(bx("f").bg_clip, BgClip::Border, "shorthand reset");
         assert_eq!(BoxStyle::default().bg_clip, BgClip::Border, "initial value");
+    }
+
+    #[test]
+    fn translucent_backgrounds_keep_their_alpha() {
+        // github's secondary CTA: `--brand-button-secondary-bgColor-rest:
+        // #0000000f` in light mode. Dropping the alpha painted it solid black
+        // with its black label invisible on top.
+        let sheet = parse(
+            ".a { background-color: #0000000f } \
+             .b { background: rgba(0, 0, 0, 0.5) } \
+             .c { background: #123456 } \
+             .d { background-color: transparent } \
+             .e { background: #ffffff1f; background-color: #00ff00 }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div>\
+             <div class=d></div><div class=e></div>",
+        );
+        let bx = |cls: &str| sheet.resolve(&dom, by_attr(&dom, "class", cls), Style::new(), None).bx;
+        let a = bx("a");
+        assert_eq!((a.bg, a.bg_alpha), (Some(0x000000), 15));
+        let b = bx("b");
+        assert_eq!((b.bg, b.bg_alpha), (Some(0x000000), 128));
+        let c = bx("c");
+        assert_eq!((c.bg, c.bg_alpha), (Some(0x123456), 255), "opaque stays 255");
+        let d = bx("d");
+        assert_eq!((d.bg, d.bg_alpha), (None, 255), "transparent is no fill");
+        let e = bx("e");
+        assert_eq!((e.bg, e.bg_alpha), (Some(0x00ff00), 255), "a later opaque fill resets it");
     }
 
     #[test]

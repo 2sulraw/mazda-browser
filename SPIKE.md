@@ -5134,6 +5134,52 @@ is real dark content (the secondary CTA painted opaque black - next rule).
 Tests **1041 -> 1042** green
 (`scope_vars_picks_the_palette_whose_selector_matches_the_root`).
 
+## A background colour's alpha is a blend, not a suggestion (P85, 2026-11-12)
+
+The first frame was light and readable, and one element was still wrong: the
+secondary CTA ("Download GitHub Copilot app") painted as a solid black bar with
+its black label invisible on it. Its background is
+`--brand-button-secondary-bgColor-rest: #0000000f` - 6 % black, i.e. a light
+grey pill. `parse_color` dropped the alpha byte (`8 => Some(digits >> 8) //
+drop alpha, lenient`), so the pill was painted `#000000` and the label
+disappeared into it. The 4 px bands at y 322-325 and 412-415 had the same
+cause: 6 %-alpha fills painted as `#000000`.
+
+Change: `BoxStyle::bg_alpha` (255 = opaque) keeps the alpha beside the RGB
+value, so every existing reader of `bg` still sees a plain colour; `apply_decl`
+reads `#RRGGBBAA` / `rgba()` / `hsla()` through the already-existing
+`parse_color_alpha`, and layout folds the alpha into the rect's packed opacity
+(`bg_alpha_of`, multiplied by the box's `opacity`). `alpha == 0` stays "no
+fill", so `background: transparent` still leaves an earlier declaration in
+place.
+
+That exposed a second, older shortcut: a rounded border was painted by filling
+the whole border box with the border colour and laying the background on top,
+which is invisible while the background is opaque but shows the border colour
+through a translucent one - the pill came out `#C5CCC7` (6 % black over
+`#D2D9D4`) instead of `#F0F0F0` (6 % black over the page). So a rounded border
+now paints as a **ring**: `Layout::rect_ring` is a channel parallel to
+`rects` (`Some(t)` = "paint the band inside the outer radius"), the ring is
+pushed *after* its background, and `paint_ring_rect` paints two spans per row
+(outer span minus inner span) - no per-pixel distance test, no work in the
+interior. Opaque pages are byte-identical: the same border colour ends up on
+the same pixels.
+
+Measured, cold github.com, fresh profile, `tools/paint-timeline.ps1`:
+
+| | secondary CTA area | 4 px band at y=322 | first frame |
+|---|---|---|---|
+| before | 83.9 % solid `#000000`, label invisible | `#000000` | 7.0 s, 7.54 % ink, 261 colours |
+| after | `#F0F0F0` interior, `#D2D9D4` 1 px ring, label readable | `#F0F0F0` | 8.4 s, 7.55 % ink, 237 colours |
+
+(The timings are two different runs on a noisy link; only the pixels are
+comparable.) Local check page (`%TEMP%\mazda-local\alpha.html`) reads
+`#F0F0F0` for `#0000000f`, `#C3C3C3` for `#0000003c`, `#7F7F7F` for
+`rgba(0,0,0,.5)` and `#000000` for opaque black. Tests **1042 -> 1045** green
+(`translucent_backgrounds_keep_their_alpha`,
+`translucent_backgrounds_blend_instead_of_covering`,
+`a_border_ring_leaves_the_translucent_fill_visible`).
+
 
 
 

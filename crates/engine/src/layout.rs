@@ -1095,6 +1095,22 @@ fn with_alpha(color: u32, op: f32) -> u32 {
     }
 }
 
+/// Fold a background colour's own alpha (`#RRGGBBAA`, `rgba()`) into the
+/// packed opacity byte. Opaque backgrounds are returned untouched, so a page
+/// without a translucent `background-color` keeps byte-identical paint output.
+fn bg_alpha_of(color: u32, a: u8) -> u32 {
+    if a >= 255 {
+        return color;
+    }
+    // 0 in the packed byte means "not packed" = opaque to the painter
+    let cur = match (color >> 24) as u8 {
+        0 => 255u32,
+        c => c as u32,
+    };
+    let out = ((cur * a as u32 + 127) / 255).max(1);
+    (out << 24) | (color & 0x00ff_ffff)
+}
+
 /// Apply a box's effective filter to a solid colour (no-op without one).
 fn filt_color(color: u32, f: Option<&Filter>) -> u32 {
     match f {
@@ -2279,6 +2295,11 @@ pub struct Layout {
     /// gradient instead of its (sentinel) color. Sharing the rect channel
     /// keeps z-order, sticky spans and transforms exact for free.
     pub rect_grad: Vec<Option<std::sync::Arc<Gradient>>>,
+    /// parallel to [`Layout::rects`]: `Some(t)` = the entry is a border RING
+    /// of thickness `t` (outer radius from the rect), not a solid fill. A
+    /// rounded border has to be a ring: filling the whole border box with the
+    /// border colour shows through a translucent background (see SPIKE P85).
+    pub rect_ring: Vec<Option<f32>>,
     /// decoded `<img>` boxes (x, y, w, h, pixels, fixed, alpha, filter) — drawn under text
     pub images: Vec<(
         f32,
@@ -2488,6 +2509,7 @@ pub fn layout_in_forms(
     );
     let mut rects = Vec::new();
     let mut rect_grad = Vec::new();
+    let mut rect_ring = Vec::new();
     let mut rect_z = Vec::new();
     let mut images = Vec::new();
     let mut img_z = Vec::new();
@@ -2505,6 +2527,7 @@ pub fn layout_in_forms(
         (0.0, viewport_h),
         &mut rects,
         &mut rect_grad,
+        &mut rect_ring,
         &mut rect_z,
         &mut images,
         &mut img_z,
@@ -2521,6 +2544,7 @@ pub fn layout_in_forms(
     // permutation), so slot `i` still describes `rects[i]`
     if rm.is_some() {
         let _ = zsort(&mut rect_grad, &rect_z);
+        let _ = zsort(&mut rect_ring, &rect_z);
     }
     let im = zsort(&mut images, &img_z);
     // text channel: move runs/underlines through their boxes' transforms
@@ -2570,6 +2594,7 @@ pub fn layout_in_forms(
         underline_rects: uls,
         rects,
         rect_grad,
+        rect_ring,
         images,
         shadows,
         open_line: root.open,
@@ -3107,6 +3132,7 @@ fn collect_paint(
     container: (f32, f32),
     out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     out_g: &mut Vec<Option<std::sync::Arc<Gradient>>>,
+    out_r: &mut Vec<Option<f32>>,
     out_z: &mut Vec<i32>,
     imgs: &mut Vec<(
         f32,
@@ -3211,23 +3237,21 @@ fn collect_paint(
                 )
             }
         };
-        // a rounded ring still fills the border box with the border colour;
-        // the colour layer then paints INSIDE the ring — at the padding box
-        // (the border area belongs to the ring, pre-existing shortcut) or at
-        // the content box when `background-clip: content-box` asks for more
+        // a rounded border paints as a ring whose inner radius is what the
+        // background is inset by; the background itself keeps its own clip box
         let border_max = bt.max(br).max(bb).max(bl);
-        let (inner_bg, inner_r) = match n.bx.bg_clip {
+        let inner_r = match n.bx.bg_clip {
             BgClip::Content => {
                 let pad_max = resolve_len(n.bx.pad[0], n.w)
                     .max(resolve_len(n.bx.pad[1], n.w))
                     .max(resolve_len(n.bx.pad[2], n.w))
                     .max(resolve_len(n.bx.pad[3], n.w));
-                (bg_box, (r - border_max - pad_max).max(0.0))
+                (r - border_max - pad_max).max(0.0)
             }
-            BgClip::Border | BgClip::Padding => (
-                (n.x + bl, n.y + bt, (n.w - bl - br).max(0.0), (n.h - bt - bb).max(0.0)),
-                (r - border_max).max(0.0),
-            ),
+            BgClip::Padding => (r - border_max).max(0.0),
+            // the colour layer paints up to the border box; its radius is the
+            // border radius (the border ring sits on top of it)
+            BgClip::Border => r,
         };
         // this box's effective filter (own + ancestors) — applied to every
         // primitive it emits; text reads it through the already-filtered
@@ -3323,18 +3347,27 @@ fn collect_paint(
             });
         }
         if let Some(c) = n.bx.bg.filter(|_| !masked) {
-            let mut rects = vec![(bg_box.0, bg_box.1, bg_box.2, bg_box.3, c, r)];
+            // a translucent `background-color` (`#0000000f`, `rgba()`) paints
+            // over what is behind it instead of covering it, and a rounded
+            // border paints as a RING over it - filling the border box with
+            // the border colour and laying the background on top would show
+            // the border colour through a translucent fill (P85)
+            let bgc = bg_alpha_of(with_alpha(filt_color(c, f), n.eff), n.bx.bg_alpha);
+            let mut rects = vec![(bg_box.0, bg_box.1, bg_box.2, bg_box.3, bgc, inner_r, None)];
             if ring {
-                // rounded ring: fill the border-box with the border color,
-                // then the background inset over it (inner radius ≈ r − border)
-                rects[0] = (n.x, n.y, n.w, n.h, bc, r);
-                rects.push((inner_bg.0, inner_bg.1, inner_bg.2, inner_bg.3, c, inner_r));
+                // the ring rides the same channel; `rect_ring` says "paint
+                // only the band inside the outer radius"
+                let rc = with_alpha(filt_color(bc, f), n.eff);
+                rects.push((n.x, n.y, n.w, n.h, rc, r, Some(border_max)));
             }
-            for (x, y, w, h, color, rad) in rects {
+            for (x, y, w, h, color, rad, ring_t) in rects {
                 let (x, y, w, h) = m.map_rect((x, y, w, h));
                 if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
-                    out.push((x, y, w, h, with_alpha(filt_color(color, f), n.eff), rad * m.sx.abs(), fixed));
+                    out.push((x, y, w, h, color, rad * m.sx.abs(), fixed));
                     out_g.push(None);
+                    // the thickness is vertical-ish: scale by the mean axis so
+                    // a rotated box's ring stays as thick as its edges
+                    out_r.push(ring_t.map(|t| t * m.sx.abs().max(m.sy.abs())));
                     out_z.push(z);
                 }
             }
@@ -3354,6 +3387,7 @@ fn collect_paint(
                 };
                 out.push((x, y, w, h, with_alpha(u32::MAX, n.eff), r * m.sx.abs(), fixed));
                 out_g.push(Some(g));
+                out_r.push(None);
                 out_z.push(z);
             }
         }
@@ -3374,6 +3408,7 @@ fn collect_paint(
                 if let Some(q) = cull_rect(q, clip) {
                     out.push((q.0, q.1, q.2, q.3, with_alpha(bc, n.eff), 0.0, fixed));
                     out_g.push(None);
+                    out_r.push(None);
                     out_z.push(z);
                 }
             }
@@ -3405,6 +3440,7 @@ fn collect_paint(
                     if let Some(q) = cull_rect(q, clip) {
                         out.push((q.0, q.1, q.2, q.3, with_alpha(oc, n.eff), 0.0, fixed));
                         out_g.push(None);
+                        out_r.push(None);
                         out_z.push(z);
                     }
                 }
@@ -3529,6 +3565,7 @@ fn collect_paint(
                 (n.y, n.y + n.h),
                 out,
                 out_g,
+                out_r,
                 out_z,
                 imgs,
                 img_z,
@@ -8287,6 +8324,7 @@ fn layout_from(
             underline_rects,
             rects: Vec::new(),
             rect_grad: Vec::new(),
+            rect_ring: Vec::new(),
             images: Vec::new(),
             shadows: Vec::new(),
             open_line: x > line_x0,
@@ -8681,6 +8719,26 @@ mod tests {
         // text runs carry the owning box's effective opacity
         assert_eq!(l.runs.iter().find(|r| r.text == "hi").unwrap().alpha, 128);
         assert_eq!(l.runs.iter().find(|r| r.text == "x").unwrap().alpha, 64);
+    }
+
+    #[test]
+    fn translucent_backgrounds_blend_instead_of_covering() {
+        // `#0000000f` is 6 % black: over the white page it must read as a
+        // near-white pill, not a black one (github's secondary CTA).
+        let mut root = boxes_of(
+            r#"<div style="width:100px;min-height:20px;background-color:#0000000f">x</div>
+               <div style="width:100px;min-height:20px;background-color:#0000000f;opacity:.5">y</div>"#,
+            "",
+        );
+        let l = layout_tree(&mut root, 300.0, &m4);
+        let alphas: Vec<u8> = l
+            .rects
+            .iter()
+            .filter(|r| r.4 & 0x00ff_ffff == 0x000000)
+            .map(|r| (r.4 >> 24) as u8)
+            .collect();
+        // the box's own 6 % and opacity's 50 % multiply to 3 %
+        assert_eq!(alphas, vec![15, 8], "background alpha × opacity");
     }
 
     #[test]
@@ -11818,6 +11876,7 @@ mod tests {
         let mut root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
         let l = layout_tree(&mut root, 300.0, &m4);
         assert_eq!(l.rect_grad.len(), l.rects.len(), "parallel channels");
+        assert_eq!(l.rect_ring.len(), l.rects.len(), "parallel ring channel");
         let (i, g) = l
             .rect_grad
             .iter()
@@ -12026,7 +12085,7 @@ mod tests {
         let l = layout_tree(&mut n, 50.0, &m4);
         assert_eq!(l.rects.len(), 5, "bg + 4 strips: {:?}", l.rects);
         assert_eq!(l.rects[1].4, 0x000000, "unspecified border = currentcolor");
-        // rounded box with bg: ring = border-box fill + background inset over it
+        // rounded box with bg: background over the border box + a border ring
         let mut m2 = BoxNode::group(
             Style::new(),
             BoxStyle {
@@ -12038,10 +12097,13 @@ mod tests {
         );
         m2.children = vec![leaf("a")];
         let l2 = layout_tree(&mut m2, 50.0, &m4);
-        assert_eq!(l2.rects.len(), 2, "ring = outer + inner: {:?}", l2.rects);
-        assert_eq!(l2.rects[0].4, 0x000000, "outer ring = currentcolor (text color)");
-        assert!((l2.rects[1].2 - 46.0).abs() < 0.01, "inner w={}", l2.rects[1].2);
-        assert!((l2.rects[1].5 - 4.0).abs() < 0.01, "inner radius={}", l2.rects[1].5);
+        assert_eq!(l2.rects.len(), 2, "bg + ring: {:?}", l2.rects);
+        assert_eq!(l2.rects[0].4, 0x123456, "the background paints first");
+        assert_eq!(l2.rect_ring[0], None, "the background is a solid fill");
+        assert_eq!(l2.rects[1].4, 0x000000, "ring = currentcolor (text color)");
+        assert!((l2.rects[1].2 - 50.0).abs() < 0.01, "ring covers the border box");
+        assert!((l2.rects[1].5 - 6.0).abs() < 0.01, "outer radius={}", l2.rects[1].5);
+        assert_eq!(l2.rect_ring[1], Some(2.0), "2px border = ring thickness");
         // transparent border: width still lays out (space reserved) but only
         // the background paints - no strips, no ring
         let mut t = BoxNode::group(

@@ -1956,6 +1956,7 @@ impl App {
                 underline_rects: Vec::new(),
                 rects: Vec::new(),
                 rect_grad: Vec::new(),
+                rect_ring: Vec::new(),
                 images: Vec::new(),
                 shadows: Vec::new(),
                 open_line: false,
@@ -4090,6 +4091,9 @@ struct PageWire {
     rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
     /// parallel to `rects`: Some = paint that rect as a gradient
     rect_grad: Vec<Option<std::sync::Arc<css::Gradient>>>,
+    /// parallel to `rects`: Some(t) = paint that rect as a border ring of
+    /// thickness t instead of a solid fill
+    rect_ring: Vec<Option<f32>>,
     /// x, y, w, h, pixels (owned), fixed, effective opacity, filter
     images: Vec<(
         f32,
@@ -4205,6 +4209,7 @@ fn page_to_wire(
         underline_rects: p.laid.underline_rects,
         rects: p.laid.rects,
         rect_grad: p.laid.rect_grad,
+        rect_ring: p.laid.rect_ring,
         images: p
             .laid
             .images
@@ -4270,6 +4275,7 @@ fn wire_to_page(w: PageWire) -> Page {
             underline_rects: w.underline_rects,
             rects: w.rects,
             rect_grad: w.rect_grad,
+            rect_ring: w.rect_ring,
             images: w
                 .images
                 .into_iter()
@@ -8733,6 +8739,12 @@ fn render(
                 paint_gradient(buf, width, height, sx, sy, w, h, r, g, alpha);
                 continue;
             }
+            // a border RING paints only the band inside the outer radius, so a
+            // translucent background behind it stays visible (P85)
+            if let Some(t) = laid.rect_ring.get(i).copied().flatten() {
+                paint_ring_rect(buf, width, height, sx, sy, w, h, r, t, rgb, alpha);
+                continue;
+            }
             paint_solid_rect(buf, width, height, sx, sy, w, h, r, rgb, alpha);
         }
         // decoded <img> boxes next (nearest-neighbour scale, alpha-blended)
@@ -9442,6 +9454,90 @@ fn paint_solid_rect(
     }
 }
 
+/// Horizontal extent `(x0, x1)` of a rounded rect at row `ly`, in rect-local
+/// coordinates (`0..w` by `ly` within `0..h`).
+fn round_span(ly: f32, w: f32, h: f32, r: f32) -> (f32, f32) {
+    let r = r.min(w * 0.5).min(h * 0.5);
+    if r <= 0.0 {
+        return (0.0, w);
+    }
+    let d = if ly < r {
+        let dy = r - ly;
+        r - (r * r - dy * dy).max(0.0).sqrt()
+    } else if ly > h - r {
+        let dy = ly - (h - r);
+        r - (r * r - dy * dy).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    (d, w - d)
+}
+
+/// Paint a rounded-rect BORDER RING: the band between the outer rounded rect
+/// and the same rect inset by `t` (its radius shrunk by `t`). A border must be
+/// a ring, not a fill of the whole border box, or the border colour shows
+/// through a translucent background painted on top of it (see SPIKE P85).
+/// Two spans per row: the ring's left and right parts, never the interior.
+#[allow(clippy::too_many_arguments)]
+fn paint_ring_rect(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    sx: f32,
+    sy: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    t: f32,
+    rgb: u32,
+    alpha: u8,
+) {
+    if w <= 0.0 || h <= 0.0 || t <= 0.0 {
+        return;
+    }
+    let t = t.min(w * 0.5).min(h * 0.5);
+    let (iw, ih) = (w - t * 2.0, h - t * 2.0);
+    let ri = (r - t).max(0.0);
+    let (ox, oy) = (sx as i32, sy as i32);
+    let fill = |buf: &mut [u32], py: i32, x0: f32, x1: f32| {
+        if py < 0 || py as usize >= height {
+            return;
+        }
+        let xa = (ox as f32 + x0).round().max(0.0).min(width as f32) as usize;
+        let xb = (ox as f32 + x1).round().max(0.0).min(width as f32) as usize;
+        if xa >= xb {
+            return;
+        }
+        let row = &mut buf[py as usize * width + xa..py as usize * width + xb];
+        if alpha == 255 {
+            row.fill(rgb);
+        } else {
+            for idx in row {
+                blend(idx, rgb, alpha);
+            }
+        }
+    };
+    for dy in 0..h as i32 {
+        let py = oy + dy;
+        if py < 0 {
+            continue;
+        }
+        if py as usize >= height {
+            break;
+        }
+        let ly = dy as f32 + 0.5;
+        let (o0, o1) = round_span(ly, w, h, r);
+        // rows above/below the inner rect are ring from edge to edge
+        if ly < t || ly > t + ih {
+            fill(buf, py, o0, o1);
+            continue;
+        }
+        let (i0, i1) = round_span(ly - t, iw, ih, ri);
+        fill(buf, py, o0, (t + i0).min(o1));
+        fill(buf, py, (t + i1).max(o0), o1);
+    }
+}
+
 fn paint_gradient(
     buf: &mut [u32],
     width: usize,
@@ -9870,6 +9966,7 @@ mod tests {
                 (6.0, 4.0, 4.0, 4.0, 0x0000_ff00, 0.0, false),
             ],
             rect_grad: vec![None, None],
+            rect_ring: vec![None, None],
             images: Vec::new(),
             shadows: Vec::new(),
             open_line: false,
@@ -9934,6 +10031,52 @@ mod tests {
         assert_eq!(plain[30 * w + 16], 0x00ff_0000, "no snapshot either");
     }
 
+
+    /// Paint-only layout: one box whose background is 6 % black and whose
+    /// border is a 2px ring, both rounded — the translucent-pill case.
+    fn ring_page() -> Layout {
+        Layout {
+            runs: Vec::new(),
+            height: 64.0,
+            underline_rects: Vec::new(),
+            rects: vec![
+                // the background: 6 % black over the white page
+                (0.0, 0.0, 40.0, 40.0, 0x0f00_0000, 6.0, false),
+                // its border ring, 2px of #d2d9d4
+                (0.0, 0.0, 40.0, 40.0, 0x00d2_d9d4, 6.0, false),
+            ],
+            rect_grad: vec![None, None],
+            rect_ring: vec![None, Some(2.0)],
+            images: Vec::new(),
+            shadows: Vec::new(),
+            open_line: false,
+            forms: Vec::new(),
+            focused: None,
+            form_values: Default::default(),
+            sticky: Vec::new(),
+            backdrops: Vec::new(),
+            hover_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_border_ring_leaves_the_translucent_fill_visible() {
+        let (w, h) = (64usize, 64usize);
+        let fonts = Fonts::load();
+        let mut buf = vec![0x00ff_ffffu32; w * h];
+        render(&mut buf, w, h, &ring_page(), &fonts, 0.0, 64.0, 0.0);
+        let at = |x: usize, y: usize| buf[y * w + x];
+        // interior: 6 % black over white, NOT over the border colour
+        assert_eq!(at(32, 32), 0x00f0_f0f0, "interior keeps the page behind");
+        // the ring itself paints the border colour
+        assert_eq!(at(12, 32), 0x00d2_d9d4, "left ring edge");
+        assert_eq!(at(51, 32), 0x00d2_d9d4, "right ring edge");
+        assert_eq!(at(32, 12), 0x00d2_d9d4, "top ring edge");
+        // a rounded corner: outside the outer radius the page shows, just
+        // inside it the ring paints
+        assert_eq!(at(12, 12), 0x00ff_ffff, "corner stays page-coloured");
+        assert_eq!(at(14, 14), 0x00d2_d9d4, "ring follows the corner arc");
+    }
 
     #[test]
     fn svg_text_paints_ink_over_the_vector_pass() {
@@ -10584,6 +10727,7 @@ mod tests {
             underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
             rects: vec![(1.0, 2.0, 3.0, 4.0, 0x00ff00, 2.0, true)],
             rect_grad: vec![None],
+            rect_ring: vec![None],
             images: vec![(
                 5.0,
                 6.0,
