@@ -4301,9 +4301,9 @@ fn wire_to_page(w: PageWire) -> Page {
 }
 
 /// The parsed page the worker keeps between jobs so a re-layout or a script
-/// event doesn't refetch/reparse. One live page per worker (the tabs reload
-/// on switch). Holds the non-`Send` script engine, so it never leaves this
-/// thread.
+/// event doesn't refetch/reparse. One page is active; the pages of the other
+/// tabs stay parked (see [`bind_parked`]) and come back on a switch. Holds the
+/// non-`Send` script engine, so it never leaves this thread.
 struct KeptPage {
     url: String,
     dom: html::Dom,
@@ -4330,6 +4330,12 @@ struct KeptPage {
     hover: Option<u32>,
     /// decoded-image memo shared by this page's relayouts (see `ImgCache`)
     imgs: ImgCache,
+    /// This page is `fetch_and_parse`'s "Failed to load" error page. It is
+    /// kept like any page (a resize re-lays it out without refetching), but a
+    /// Restore must never REUSE it: the site may be back, and reusing would
+    /// pin the error forever. The snapshot path has the same rule (an error
+    /// page is never snapshotted).
+    failed: bool,
 }
 
 /// The single long-lived loader thread. Owns its own `Fonts` (font types
@@ -4349,6 +4355,9 @@ struct KeptPage {
 fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>) {
     let mut fonts = Fonts::load();
     let mut kept: Option<KeptPage> = None;
+    // pages of the background tabs, frozen: nothing advances their timers
+    // until one is bound again (see `bind_parked`). Bounded by count.
+    let mut parked: Vec<KeptPage> = Vec::new();
     // geometry + form state of the last layout (timers re-layout with them)
     let mut last_geom = (0.0f32, 0.0f32);
     let mut last_forms = layout::FormState::default();
@@ -4380,6 +4389,24 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
             let id = job.id();
             let url = job.url().to_string();
             let scroll_like = matches!(job, LoadReq::Scroll { .. });
+            // The page this job is about. A restore (tab switch / back) binds
+            // the live page the worker parked for that URL, so the job runs
+            // against a live DOM instead of a rebuild.
+            let keep_live = match &job {
+                LoadReq::Load { restore, .. } => *restore,
+                _ => true,
+            };
+            if !(keep_live && bind_parked(&mut kept, &mut parked, &url)) {
+                // the job rebuilds its target (`do_load`): keep the page we
+                // are leaving, so a switch back to it is a bind, not a rebuild
+                if let Some(old) = kept.take() {
+                    if old.url == url {
+                        kept = Some(old); // a reload of the same page: nothing to park
+                    } else {
+                        park_page(&mut parked, old);
+                    }
+                }
+            }
             // first paint goes out mid-job: markup + stylesheets, laid out,
             // before the scripts run. A load can take 10+ s on this link and
             // a blank window for all of it is the worst part of it.
@@ -4414,6 +4441,11 @@ fn loader_thread(jobs: mpsc::Receiver<LoadReq>, results: mpsc::Sender<LoadDone>)
                     (None, None, false, true, false)
                 }
             };
+            // a fresh load replaces the page for its URL: a parked page from
+            // an older visit of the same URL is stale now
+            if matches!(job, LoadReq::Load { restore: false, .. }) && kept_matches(&kept, &url) {
+                parked.retain(|p| p.url != url);
+            }
             css::dump_misses(); // no-op unless MAZDA_MISS=1
             js::dump_misses(); // no-op unless MAZDA_MISS=1
             eprintln!(
@@ -4666,6 +4698,28 @@ fn process_job(
         LoadReq::Load { url, max_w, vh, restore, .. } => {
             *last_geom = (*max_w, *vh);
             *last_forms = layout::FormState::default();
+            // The live page for this URL was bound by the caller (the page
+            // already showing, or a parked tab): re-lay it out instead of
+            // rebuilding it from the snapshot. Scripts do NOT run again - the
+            // DOM is the one the user left, which is also more correct than
+            // the pre-script snapshot a rebuild starts from.
+            if *restore
+                && kept_matches(kept, url)
+                && !kept.as_ref().map(|k| k.failed).unwrap_or(false)
+            {
+                eprintln!("[tabs] reusing the live page for {url} (no fetch, no scripts)");
+                let kp = kept.as_mut().unwrap();
+                // the hover cell is a node id from the OLD page: a stale one
+                // would style whatever node happens to carry that id now
+                kp.hover = None;
+                let (page, form_names) = layout_page(
+                    &kp.dom, &kp.css_text, &kp.faces, url, fonts, *max_w, *vh,
+                    last_forms, None, &mut kp.imgs, false,
+                );
+                let stacks = fonts.stacks.borrow().clone();
+                let out_faces = collect_out_faces(fonts);
+                return (Some(page_to_wire(page, stacks, out_faces, form_names)), None, false, false, false);
+            }
             let r = do_load(kept, fonts, url, *max_w, *vh, job.engine(), *restore, early);
             (r.0, r.1, false, r.2, r.3)
         }
@@ -4995,6 +5049,53 @@ fn kept_matches(kept: &Option<KeptPage>, url: &str) -> bool {
     kept.as_ref().map(|k| k.url == url).unwrap_or(false)
 }
 
+/// Background pages the worker keeps alive. Bounded by COUNT, never by memory
+/// (the engine has no memory budget): the page parked longest ago is dropped
+/// and its tab falls back to the snapshot restore every switch used to take.
+const PARKED_MAX: usize = 8;
+
+/// Bind the parked page for `url` as the active one, parking the page it
+/// replaces. Returns true when the active page already is `url` or a parked
+/// page was bound for it.
+///
+/// This is what makes a tab switch cheap: a parked page keeps its live DOM,
+/// its script heap and its decoded images, so switching back costs one
+/// re-layout instead of a snapshot read + script replay + two cascades. A
+/// parked page is frozen: `fire_due` only advances the ACTIVE page's timers.
+fn bind_parked(kept: &mut Option<KeptPage>, parked: &mut Vec<KeptPage>, url: &str) -> bool {
+    if kept_matches(kept, url) {
+        return true;
+    }
+    let Some(i) = parked.iter().position(|p| p.url == url) else {
+        return false;
+    };
+    let page = parked.remove(i);
+    eprintln!("[tabs] bound the live page for {url}");
+    if let Some(old) = kept.replace(page) {
+        park_page(parked, old);
+    }
+    true
+}
+
+/// Park a page for a later switch back. A page parked earlier for the same URL
+/// (an older visit) is dropped, so a switch back always binds the newest one.
+fn park_page(parked: &mut Vec<KeptPage>, page: KeptPage) {
+    // an error page is not worth a slot: one fetch rebuilds it
+    if page.failed {
+        return;
+    }
+    parked.retain(|p| p.url != page.url);
+    parked.push(page);
+    if parked.len() > PARKED_MAX {
+        let dropped = parked.remove(0);
+        eprintln!(
+            "[tabs] dropped the parked page for {} ({} kept)",
+            dropped.url,
+            parked.len()
+        );
+    }
+}
+
 /// Full load: fetch + parse + run `<script>` + layout. Seeds/ replaces the
 /// kept page. `settle_load` is the shared back half — submission-driven
 /// loads arrive with bytes already fetched (POST) and skip `fetch_and_parse`.
@@ -5011,9 +5112,16 @@ fn do_load(
     // a snapshot restore (tab switch / back) replays scripts from the disk
     // cache and is already fast: a pre-script frame there only pays a cascade
     let early = if restore { None } else { early };
-    let (dom, css_text, faces) = fetch_and_parse(url, restore);
+    let (dom, css_text, faces, failed) = fetch_and_parse(url, restore);
     let (wire, nav, form_nav) =
         settle_load(kept, fonts, url, max_w, vh, engine, dom, css_text, faces, early);
+    // mark the error page so a Restore refetches instead of reusing it (the
+    // next successful load clears the mark with the page it replaces)
+    if failed {
+        if let Some(k) = kept.as_mut() {
+            k.failed = true;
+        }
+    }
     if let Some(f) = form_nav {
         // an inline script form.submit()ed a POST during the load — the
         // worker executes it now (the first page's wire is replaced). Same
@@ -5191,6 +5299,7 @@ fn settle_load(
         engine,
         hover: None,
         imgs: ImgCache::default(),
+        failed: false,
     };
     #[cfg(feature = "count-alloc")]
     let heap_mb = || crate::live_alloc_bytes() as f64 / (1024.0 * 1024.0);
@@ -5866,7 +5975,7 @@ fn collect_form_names(dom: &html::Dom) -> HashMap<u32, String> {
 
 /// Fetch + parse one page's HTML and every stylesheet (network + parse —
 /// the expensive half of the pipeline, done once per navigation).
-fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::FontFace>) {
+fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::FontFace>, bool) {
     // Phase 3: a tab switch / back restores the snapshot instead of
     // re-fetching + re-tokenizing. The tree is the PRE-SCRIPT one, so
     // `settle_load` still replays the page's scripts (listeners intact).
@@ -5877,9 +5986,9 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
                 dom.nodes.len()
             );
             let (css_text, faces) = styles_for(&dom, url);
-            return (dom, css_text, faces);
+            return (dom, css_text, faces, false);
         }
-        eprintln!("[dom] no snapshot for {url} — fetching");
+        eprintln!("[dom] no snapshot for {url} - fetching");
     }
     let source = match fetch(url) {
         Ok((bytes, ct)) => {
@@ -5895,10 +6004,11 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
         Err(e) => {
             eprintln!("[nav] fetch failed for {url}: {e}");
             // never snapshot an error page: a later restore would show it
-            // forever even after the site came back
+            // forever even after the site came back (the live page is marked
+            // `failed` for the same reason)
             let (dom, css_text, faces) =
                 parse_source_with_styles(url, format!("<p>Failed to load: {e}</p>"));
-            return (dom, css_text, faces);
+            return (dom, css_text, faces, true);
         }
     };
     let dom = html::parse(&source);
@@ -5910,7 +6020,7 @@ fn fetch_and_parse(url: &str, restore: bool) -> (html::Dom, String, Vec<css::Fon
     // bodies once that frame is out.
     preload(&stylesheet_urls(&dom, url));
     let (css_text, faces) = styles_for(&dom, url);
-    (dom, css_text, faces)
+    (dom, css_text, faces, false)
 }
 
 /// The markup's own subresources: external stylesheets and `<script src>`
@@ -9786,6 +9896,69 @@ mod tests {
         assert_eq!(startxref, xref);
     }
 
+    /// A minimal live page for the parking tests: no scripts were run, an
+    /// empty stylesheet, no font faces.
+    fn fake_page(url: &str) -> KeptPage {
+        KeptPage {
+            url: url.to_string(),
+            dom: html::parse("<!doctype html><p>x</p>"),
+            css_text: String::new(),
+            faces: Vec::new(),
+            scripts: None,
+            engine: EngineChoice::A,
+            hover: None,
+            imgs: ImgCache::default(),
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn a_parked_page_is_bound_by_url() {
+        let mut kept = Some(fake_page("https://a/"));
+        let mut parked = Vec::new();
+        assert!(!bind_parked(&mut kept, &mut parked, "https://b/"), "not parked");
+        let old = kept.take().unwrap();
+        park_page(&mut parked, old);
+        assert!(bind_parked(&mut kept, &mut parked, "https://a/"));
+        assert_eq!(kept.as_ref().unwrap().url, "https://a/");
+        assert!(parked.is_empty(), "the bound page left the lot");
+    }
+
+    #[test]
+    fn switching_between_two_live_pages_only_moves_them() {
+        let mut kept = Some(fake_page("https://a/"));
+        let mut parked = vec![fake_page("https://b/")];
+        assert!(bind_parked(&mut kept, &mut parked, "https://b/"));
+        assert_eq!(kept.as_ref().unwrap().url, "https://b/");
+        assert_eq!(parked.len(), 1, "the page we left took its place");
+        assert_eq!(parked[0].url, "https://a/");
+        assert!(bind_parked(&mut kept, &mut parked, "https://a/"));
+        assert_eq!(kept.as_ref().unwrap().url, "https://a/");
+        assert_eq!(parked[0].url, "https://b/");
+    }
+
+    #[test]
+    fn parking_the_same_url_twice_keeps_the_newest_page() {
+        let mut parked = Vec::new();
+        let mut old = fake_page("https://a/");
+        old.hover = Some(7); // a marker for "this is the old one"
+        park_page(&mut parked, old);
+        park_page(&mut parked, fake_page("https://a/"));
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].hover, None, "the newest visit wins");
+    }
+
+    #[test]
+    fn the_parking_lot_drops_the_oldest_page_past_its_bound() {
+        let mut parked = Vec::new();
+        for i in 0..=PARKED_MAX {
+            park_page(&mut parked, fake_page(&format!("https://{i}/")));
+        }
+        assert_eq!(parked.len(), PARKED_MAX);
+        assert_eq!(parked[0].url, "https://1/");
+        assert_eq!(parked[PARKED_MAX - 1].url, format!("https://{}/", PARKED_MAX));
+    }
+
     #[test]
     fn blend_rect_mixes_only_inside_the_rect() {
         let mut buf = vec![0x00_ff_ff_ffu32; 4 * 4];
@@ -11671,6 +11844,7 @@ mod tests {
             engine: EngineChoice::A,
             hover: None,
             imgs: ImgCache::default(),
+            failed: false,
         });
         let mut fonts = Fonts::load();
         let mut last_geom = (0.0_f32, 0.0_f32);
@@ -11721,6 +11895,7 @@ mod tests {
                 engine: EngineChoice::A,
                 hover: None,
                 imgs: ImgCache::default(),
+                failed: false,
             })
         };
         let mut fonts2 = Fonts::load();

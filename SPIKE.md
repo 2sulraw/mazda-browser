@@ -5378,3 +5378,55 @@ lazily and dropped with the sheet at the end of the pass. Tests
 
 
 
+
+## A tab switch binds a live page instead of rebuilding it (P92, 2026-11-12)
+
+The renderer kept exactly one page. Switching tabs replayed that tab's snapshot:
+re-read the DOM from disk, re-run every script (1.7 s on github), re-parse the
+CSS, cascade twice and re-decode the images - ~3.5 s of work to show a page the
+process had *already rendered a minute earlier*.
+
+The worker now keeps the pages of background tabs alive ("parked"). A job whose
+URL differs from the active page binds the parked page for that URL, and the page
+left behind takes its slot; a fresh load parks its predecessor too, so a
+navigation does not throw the old page away. A bound page is used as it stands:
+same DOM, same script heap, same decoded images, same listeners. Only the layout
+is rebuilt, because the viewport may have changed.
+
+Measured on github.com, `MAZDA_TIME=1`, load then `restore` (exactly what
+clicking the tab does):
+
+| | snapshot rebuild (P91) | bound live page (P92) |
+|---|---|---|
+| snapshot read | 2663 nodes | none |
+| scripts | 1735 ms | **not run** |
+| css parse | 158 ms | 144 ms |
+| cascade + box | 894 + 960 ms (two passes) | 793 ms (one pass) |
+| image decode | 120 ms | 0 ms (cache warm) |
+| **worker job** | **~3.9 s** | **1.00 s** (1.43 s on a noisier run) |
+
+The fresh load and the reuse pass report identical selectors and boxes
+(608355 candidates / 21929 matches / 36805 declarations), which is the honest
+proof the bound page lays out exactly like the loaded one; stage timings on this
+host vary by 2x, the counts do not.
+
+Two pages, 0 ms: `load tab-a`, `load tab-b`, `restore tab-a`, `restore tab-b`,
+`restore tab-a` all finish in 0 ms with no fetch, no snapshot read and no script
+run (logged as `[tabs] bound the live page for ...`).
+
+Bounds and rules:
+
+- The lot is bounded by COUNT (8 parked pages, the oldest dropped), never by
+  memory - the engine has no memory budget. A dropped page falls back to the
+  snapshot restore every switch used to take.
+- A parked page is frozen: `fire_due` only advances the ACTIVE page's timers, so
+  a background tab runs no script until it is bound. Overdue timers then fire on
+  the bind, which is what a paused page does anyway.
+- A failed load is marked `failed` and never reused by a Restore: it refetches,
+  so a site that comes back is not pinned behind a stale error page (the
+  snapshot path has always refused to snapshot error pages). Verified with an
+  unreachable port: two `fetch failed` lines, no `reusing`.
+- The hover cell is cleared when a page is reused: node ids are per page, and a
+  stale id would style whatever node carries it now.
+
+Tests **1057 -> 1061** green.
