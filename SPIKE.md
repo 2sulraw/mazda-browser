@@ -5180,6 +5180,49 @@ comparable.) Local check page (`%TEMP%\mazda-local\alpha.html`) reads
 `translucent_backgrounds_blend_instead_of_covering`,
 `a_border_ring_leaves_the_translucent_fill_visible`).
 
+## The input hint has its own style, and `:placeholder-shown` is static (P86, 2026-11-12)
+
+The sign-up field on github's front page painted its label and its hint on top
+of each other - "Enter youemail". Two separate causes, both fixed here.
+
+First, the hint was unconditional: `<input placeholder="you@domain.com">` drew
+that text whenever the `value` attribute was missing, ignoring
+`.SignUpForm__input__JlFC3S::placeholder{opacity:0}`, which is how a
+floating-label field hides its hint at rest. `::placeholder` is now a real
+pseudo-element bucket (`PseudoEl::Placeholder`, `Sheet::pseudo[3]`), the
+parser keeps it instead of dropping the selector, and layout resolves it while
+building the control: `opacity: 0` builds no hint text at all, otherwise the
+pseudo's `color` and `opacity` go on that text run only. An empty `value=""`
+now also shows the hint (it fills an empty control in Chrome too).
+
+Second - the actual overlap - the label was *scaled*. Primer floats the label
+with
+`.SignUpForm__field:has(.SignUpForm__input:not(:placeholder-shown)) .SignUpForm__label{transform:translateY(calc(-50% - 8px)) scale(.8)}`.
+`:placeholder-shown` was on the "dynamic, can never hold" list, so
+`:not(:placeholder-shown)` was *vacuously true* and `:has()` matched a field
+whose hint is visibly showing. The rule then applied `scale(.8)`, and the
+documented transform shortcut only maps a run's anchor, not its glyphs, so the
+three words moved 3 px closer to each other while their ink stayed full size -
+exactly the overlap. `:placeholder-shown` is statically decidable (a text
+control with a `placeholder` attribute and an empty value), so it is now a real
+`Pseudo::PlaceholderShown`; `:not()` keeps it as a member instead of dropping
+it.
+
+Measured on the sign-up field (local repro with github's own CSS,
+`%TEMP%\mazda-local\ghform.html`), before -> after:
+
+| | label runs | hint | label scale |
+|---|---|---|---|
+| before | x = 21, 51, 77 with widths 33, 29, 34 (gaps -3 px) | hidden | .8 |
+| after | x = 21, 58, 91 with widths 33, 29, 34 (gaps +4, +3.6) | hidden | 1 |
+
+Cold github.com, fresh profile, `tools/paint-timeline.ps1`: first frame 6.4 s,
+7.82 % ink, 229 colours (previous run 7.2 s / 7.78 % / 231); the field now
+reads "Enter your email". The 8 px float offset and the scaled glyphs stay
+unimplemented - a genuinely scaled run still overlaps, because text scaling
+needs an affine glyph raster path this engine doesn't have (documented at
+`transform_runs`). Tests **1045 -> 1048** green.
+
 
 
 

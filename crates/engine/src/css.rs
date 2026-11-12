@@ -1405,6 +1405,12 @@ enum Pseudo {
     /// sibling, an element matching one of the alternates. Each alternate
     /// keeps the relation its leading combinator picked (see [`Rel`]).
     Has(Vec<(Rel, Vec<Seg>)>),
+    /// `:placeholder-shown` — a text control showing its placeholder hint:
+    /// the `placeholder` attribute is present and the control's value is
+    /// empty. The cascade has no live field values, so this is the initial
+    /// state (`value` absent or empty; a `<textarea>`'s default text isn't
+    /// consulted — shortcut).
+    PlaceholderShown,
 }
 
 /// How a `:has()` argument anchors to the subject element: `:has(.x)` (any
@@ -1434,15 +1440,17 @@ enum AttrOp {
 /// A generated pseudo-element: `::before`/`::after`, plus the legacy
 /// single-colon `:before`/`:after` spelling, and `::marker` (the list-item
 /// marker; only its `content`/`color` are honored — see layout's
-/// `list_marker`). Recorded on the selector's LAST segment — the rule
+/// `list_marker`), and `::placeholder` (the input hint's color/opacity — see
+/// layout's input branch). Recorded on the selector's LAST segment — the rule
 /// styles that pseudo of the matched origin element (`li::before` targets
 /// the `<li>`'s generated box, matched by the segment itself). Out of scope,
-/// dropped at parse: `::placeholder`, `::backdrop`.
+/// dropped at parse: `::backdrop` and every other pseudo-element.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PseudoEl {
     Before,
     After,
     Marker,
+    Placeholder,
 }
 
 impl PseudoEl {
@@ -1452,6 +1460,7 @@ impl PseudoEl {
             PseudoEl::Before => 0,
             PseudoEl::After => 1,
             PseudoEl::Marker => 2,
+            PseudoEl::Placeholder => 3,
         }
     }
 }
@@ -1705,7 +1714,7 @@ pub struct Sheet {
     /// the origin element's cascade, the SVG paint injector and the `color-scheme`
     /// slice never see them — a `p::before` rule must not style the `p` —
     /// and so pages without pseudo rules pay nothing extra.
-    pseudo: [Vec<Rule>; 3],
+    pseudo: [Vec<Rule>; 4],
     /// `:hover` rules whose LAST segment carries the flag (and no
     /// pseudo-element), cascade-sorted like `rules`. Kept apart so a page
     /// with no pointer on it skips them entirely; `cascade_rules` merges
@@ -2548,7 +2557,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     // via `resolve_pseudo`), and `a:hover span` keeps its hover on a middle
     // segment where it stays in `rules` (it can never match with no cell
     // set anyway — the split only spares pointer-free pages the walk).
-    let mut pseudo: [Vec<Rule>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut pseudo: [Vec<Rule>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut hover = Vec::new();
     let mut plain = Vec::with_capacity(rules.len());
     for r in rules {
@@ -7480,7 +7489,11 @@ fn flush<'a>(tokens: &mut Vec<&'a str>, s: &'a str, start: usize, end: usize) {
 /// real (negated) match too.
 ///
 /// Note: `:enabled`/`:disabled` are NOT here — they are markup state (the
-/// `disabled` attribute), which the static cascade evaluates directly.
+/// `disabled` attribute), which the static cascade evaluates directly, and
+/// neither is `:placeholder-shown` (empty value + a `placeholder` attribute,
+/// the initial state of every text field — github's floating label flips on
+/// `:not(:placeholder-shown)`, so misreading it as "never holds" scaled the
+/// label's text on top of itself).
 fn is_dynamic_pseudo(s: &str) -> bool {
     let Some(name) = s.strip_prefix(':') else {
         return false;
@@ -7493,7 +7506,7 @@ fn is_dynamic_pseudo(s: &str) -> bool {
         "focus" | "focus-within" | "focus-visible" | "active" | "checked"
             | "target" | "default" | "required" | "optional"
             | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
-            | "read-only" | "read-write" | "placeholder-shown"
+            | "read-only" | "read-write"
     )
 }
 
@@ -7742,7 +7755,7 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     i += 1;
                 }
                 let name: String = b[st..i].iter().collect::<String>().to_ascii_lowercase();
-                if name == "before" || name == "after" || name == "marker" {
+                if name == "before" || name == "after" || name == "marker" || name == "placeholder" {
                     // the pseudo-element must CLOSE the compound and a
                     // compound carries at most one (`li::before.foo`,
                     // `li::before::after`, `li::before(x)` are invalid).
@@ -7754,6 +7767,9 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     seg.pseudo_el = Some(match name.as_str() {
                         "before" => PseudoEl::Before,
                         "after" => PseudoEl::After,
+                        // the input hint's own style (`::placeholder { opacity: 0 }`
+                        // is how a floating-label field hides it at rest)
+                        "placeholder" => PseudoEl::Placeholder,
                         _ => PseudoEl::Marker,
                     });
                     break; // compound closed
@@ -7798,6 +7814,13 @@ fn parse_compound(s: &str) -> Option<Seg> {
                     // attribute), not interaction state — statically evaluable.
                     ("enabled", None) => seg.pseudos.push(Pseudo::Enabled),
                     ("disabled", None) => seg.pseudos.push(Pseudo::Disabled),
+                    // the input hint is showing: an empty value + a
+                    // `placeholder` attribute. Static (the cascade keeps no
+                    // live values); `:not(:placeholder-shown)` is how a
+                    // floating label stays put while the hint is visible.
+                    ("placeholder-shown", None) => {
+                        seg.pseudos.push(Pseudo::PlaceholderShown)
+                    }
                     // interaction state — evaluated against the sheet's
                     // hover cell at cascade time (nothing matches while
                     // the cell is None)
@@ -8275,6 +8298,15 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
         // parse-time note.)
         Pseudo::Disabled => is_form_control(dom, node) && dom.attr(node, "disabled").is_some(),
         Pseudo::Enabled => is_form_control(dom, node) && dom.attr(node, "disabled").is_none(),
+        // the hint is showing: a text control with a non-empty `placeholder`
+        // and no current value (the `value` attribute absent or empty).
+        // Shortcut: a `<textarea>`'s element content isn't read, so a
+        // textarea with default text still counts as hint-only.
+        Pseudo::PlaceholderShown => {
+            matches!(dom.tag(node), "input" | "textarea")
+                && dom.attr(node, "placeholder").is_some_and(|p| !p.is_empty())
+                && dom.attr(node, "value").map_or(true, |v| v.is_empty())
+        }
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
@@ -10025,6 +10057,71 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_shown_matches_only_an_empty_field_with_a_hint() {
+        let sheet = parse(":placeholder-shown { color: #123456 }");
+        let dom = dom_of(
+            r#"<input id=a placeholder="hint">
+               <input id=b placeholder="hint" value="x">
+               <input id=c value="">
+               <textarea id=d placeholder="hint"></textarea>"#,
+        );
+        let c = |id: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        assert_eq!(c("a"), 0x00_12_34_56, "empty value + hint = hint shown");
+        assert_ne!(c("b"), 0x00_12_34_56, "a filled field shows no hint");
+        assert_ne!(c("c"), 0x00_12_34_56, "no placeholder attribute = none shown");
+        assert_eq!(c("d"), 0x00_12_34_56, "textarea with a hint and no text");
+        // the floating-label flip github's sign-up form relies on: the label
+        // stays put while the hint is visible, and only `:not(...)` (typed
+        // value) removes the negation. Reading `:placeholder-shown` as
+        // dynamic made the `:not()` vacuous and floated the label at rest.
+        let sheet = parse(".f:has(input:not(:placeholder-shown)) .lbl { color: #ff0000 }");
+        let dom = dom_of(
+            r#"<div class=f><input placeholder=h><span class=lbl id=le>x</span></div>
+               <div class=f><input placeholder=h value=v><span class=lbl id=lf>x</span></div>"#,
+        );
+        let lc = |id: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        assert_ne!(lc("le"), 0x00_ff_00_00, "hint visible: label has not floated");
+        assert_eq!(lc("lf"), 0x00_ff_00_00, "typed value floats the label");
+    }
+
+    #[test]
+    fn placeholder_pseudo_resolves_colour_and_opacity() {
+        // the input hint's own style: colour + opacity, default invisible
+        // only when a rule says so
+        let dom = dom_of(r#"<input placeholder="you@domain.com">"#);
+        let inp = by_tag(&dom, "input");
+        let sheet = parse(
+            "input::placeholder { color: #ff0000; opacity: .5 }",
+        );
+        let out = sheet
+            .resolve_pseudo(&dom, inp, Style::new(), PseudoEl::Placeholder)
+            .expect("placeholder rules exist");
+        assert!(!out.display_none, "half opacity still shows");
+        assert_eq!(out.style.color, 0x00_ff_00_00);
+        assert!((out.bx.opacity - 0.5).abs() < 1e-6);
+        // opacity:0 = terminal (a floating-label field at rest)
+        let sheet = parse("input::placeholder { opacity: 0 }");
+        let out = sheet
+            .resolve_pseudo(&dom, inp, Style::new(), PseudoEl::Placeholder)
+            .expect("placeholder rule");
+        assert!(out.display_none, "opacity:0 hides the hint");
+        // a sheet without placeholder rules costs nothing at layout
+        assert!(parse("input { color: red }")
+            .resolve_pseudo(&dom, inp, Style::new(), PseudoEl::Placeholder)
+            .is_none());
+    }
+
+    #[test]
     fn pseudo_element_selectors() {
         // double-colon (modern) and legacy single-colon spellings both parse
         assert!(parse_selector("li::before").is_some());
@@ -10040,8 +10137,10 @@ mod tests {
         // ::marker is supported (content/color only — see list_marker)
         assert!(parse_selector("li::marker").is_some());
         assert!(parse_selector("li:marker").is_some());
-        // other pseudo-elements are out of scope and still drop
-        assert!(parse_selector("li::placeholder").is_none());
+        // ::placeholder styles the input hint (colour/opacity, see layout's
+        // input branch); ::backdrop is still out of scope
+        assert!(parse_selector("li::placeholder").is_some());
+        assert!(parse_selector("input::placeholder").is_some());
         assert!(parse_selector("li::backdrop").is_none());
         // the pseudo-element must close the compound and the selector
         assert!(parse_selector("li::before:hover").is_none());

@@ -1684,6 +1684,9 @@ fn build_into(
                     // value attr / textarea content / option label / button
                     // label — seeded into Layout::form_values at collect
                     let mut raw = String::new();
+                    // the hint's own `::placeholder` style (colour + opacity),
+                    // when the visible text IS the hint
+                    let mut hint_style: Option<(u32, f32)> = None;
                     let (text, min_h, def_w, centered): (
                         Option<String>,
                         f32,
@@ -1738,11 +1741,31 @@ fn build_into(
                             // raw stored value = the value attribute only
                             // (placeholder is display fallback, never a value)
                             raw = dom.attr(child, "value").unwrap_or("").to_string();
-                            let val = dom
-                                .attr(child, "value")
-                                // no value → the placeholder shows as static text
-                                .or_else(|| dom.attr(child, "placeholder"))
-                                .unwrap_or("");
+                            let val = match dom.attr(child, "value").filter(|v| !v.is_empty()) {
+                                Some(v) => v,
+                                // no value (or an empty one) → the hint shows as
+                                // static text, styled by `::placeholder`.
+                                // `opacity: 0` there (a floating-label field at
+                                // rest, like github's sign-up form) means no
+                                // text at all.
+                                None => {
+                                    let hint = dom.attr(child, "placeholder").unwrap_or("");
+                                    match sheet.resolve_pseudo(
+                                        dom,
+                                        child,
+                                        outcome.style,
+                                        PseudoEl::Placeholder,
+                                    ) {
+                                        _ if hint.is_empty() => hint,
+                                        Some(o) if o.display_none || o.bx.opacity <= 0.0 => "",
+                                        Some(o) => {
+                                            hint_style = Some((o.style.color, o.bx.opacity));
+                                            hint
+                                        }
+                                        None => hint,
+                                    }
+                                }
+                            };
                             // shortcut: checkbox/radio/range/color/image
                             // render as a generic chrome box — no widget art
                             let body = match kind {
@@ -1804,6 +1827,12 @@ fn build_into(
                         let mut l = BoxNode::leaf(st, t, false, child_link.clone());
                         l.node = Some(child);
                         l.bx.cursor = cur;
+                        // the hint is the input's own `::placeholder` rendering:
+                        // its colour and opacity apply to this text run only
+                        if let Some((c, op)) = hint_style {
+                            l.style.color = c;
+                            l.bx.opacity = op;
+                        }
                         g.children.push(l);
                     }
                     out.push(g);
@@ -13650,6 +13679,35 @@ mod tests {
         let inp = controls(&root)[0];
         assert_eq!(inp.bx.bcolor, Some(0x00_ff_00_00), "author border-color wins");
         assert!(inp.bx.border == [Len::Px(1.0); 4], "UA width survives a color-only decl");
+    }
+
+    #[test]
+    fn placeholder_style_styles_or_hides_the_empty_hint() {
+        // a floating-label field hides the hint with `::placeholder{opacity:0}`
+        // (github's sign-up form does exactly this); when shown, the pseudo's
+        // colour and opacity apply to the hint text alone
+        let dom = crate::html::parse(
+            r#"<div><input id="a" placeholder="hidden@x.com"><input id="b" placeholder="you@domain.com"></div>"#,
+        );
+        let sheet = crate::css::parse(
+            "#a::placeholder { opacity: 0 }\
+             #b::placeholder { opacity: .5; color: #ff0000 }",
+        );
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        let cs = controls(&root);
+        assert!(
+            cs[0].children.is_empty(),
+            "an opacity:0 hint builds no text: {:?}",
+            cs[0].children.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let t = &cs[1].children[0];
+        assert_eq!(t.text, "you@domain.com");
+        assert_eq!(t.style.color, 0x00_ff_00_00, "the hint's own colour");
+        assert!((t.bx.opacity - 0.5).abs() < 0.001, "opacity={}", t.bx.opacity);
+        // an empty value attribute still shows the hint (the hint fills an
+        // empty control in real engines too)
+        let root = tree_of(r#"<div><input value="" placeholder="hi"></div>"#);
+        assert_eq!(controls(&root)[0].children[0].text, "hi");
     }
 
     #[test]
