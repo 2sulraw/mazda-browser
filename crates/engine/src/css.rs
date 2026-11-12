@@ -1937,7 +1937,15 @@ impl Sheet {
     /// activated theme (nextjs `.dark`, absent from server HTML) is NOT a
     /// contradiction, so its dark values are kept — matching a system-dark render.
     pub fn scope_vars(&mut self, dom: &Dom, html: u32) {
-        let root_pol = dom.attr(html, "class").and_then(theme_polarity);
+        // the root's declared theme: a `data-color-mode` / `data-theme`
+        // attribute first (github.com ships `data-color-mode="light"` with no
+        // theme CLASS, so a class-only read left it unpolarised and let the
+        // last var definition win - the dark theme sheet, painting #010409
+        // under a light declaration), then the usual theme class
+        let root_pol = ["data-color-mode", "data-theme"]
+            .iter()
+            .find_map(|a| dom.attr(html, a).and_then(theme_polarity))
+            .or_else(|| dom.attr(html, "class").and_then(theme_polarity));
         self.root_pol = root_pol; // fallback theme for light-dark() below
         // cached color-scheme answers were resolved against the old fallback
         self.scheme_memo.borrow_mut().clear();
@@ -9835,6 +9843,45 @@ mod tests {
             sheet.resolve(&dom, body, Style::new(), None).bg,
             Some(0x202122),
             "non-root theme scopes still supply names the root doesn't define"
+        );
+    }
+
+    #[test]
+    fn scope_vars_picks_the_palette_whose_selector_matches_the_root() {
+        // github.com shape: `<html data-color-mode="light" data-dark-theme="dark">`
+        // (an ATTRIBUTE, not a theme class) plus three palettes - `:root` /
+        // `[data-color-mode=light]`, `[data-color-mode=dark]`, and the dark
+        // theme sheet. With no polarity token the last definition used to win,
+        // so the dark sheet painted the canvas #010409 under the light
+        // declaration (and the brand tokens stayed light: a mixed page).
+        let mut sheet = parse(
+            ":root, [data-color-mode=light] { --bg: #ffffff } \
+             [data-color-mode=dark][data-dark-theme=dark] { --bg: #0d1117 } \
+             body { background-color: var(--bg, #f0f0f0) }",
+        );
+        let light =
+            dom_of(r#"<html data-color-mode="light" data-dark-theme="dark"><body><p>x</p></body></html>"#);
+        let html = by_tag(&light, "html");
+        sheet.scope_vars(&light, html);
+        assert_eq!(
+            sheet.resolve(&light, by_tag(&light, "body"), Style::new(), None).bg,
+            Some(0xffffff),
+            "a light root declaration beats a later dark-theme sheet"
+        );
+        // the same page in dark mode picks the dark sheet
+        let mut sheet = parse(
+            ":root, [data-color-mode=light] { --bg: #ffffff } \
+             [data-color-mode=dark][data-dark-theme=dark] { --bg: #0d1117 } \
+             body { background-color: var(--bg, #f0f0f0) }",
+        );
+        let dark =
+            dom_of(r#"<html data-color-mode="dark" data-dark-theme="dark"><body><p>x</p></body></html>"#);
+        let html = by_tag(&dark, "html");
+        sheet.scope_vars(&dark, html);
+        assert_eq!(
+            sheet.resolve(&dark, by_tag(&dark, "body"), Style::new(), None).bg,
+            Some(0x0d1117),
+            "a dark root declaration picks the dark sheet"
         );
     }
 

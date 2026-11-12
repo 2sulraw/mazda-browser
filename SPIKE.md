@@ -5078,6 +5078,62 @@ white page; it is read together with `Colours`, never alone (P79). Frames
 **1039 -> 1041** green (`grid_column_span_parses_from_shorthand_and_longhand`,
 `grid_column_span_covers_its_tracks`).
 
+## A theme is chosen by what matches `<html>`, not by a token in a class (P84, 2026-11-12)
+
+With the layout right, github.com was still a mixed page: white body, dark
+bands. At x=500 the frame read `#010409` for y 0-11, y 615-669, and a dark
+strip down the right edge (`#000308` at x=990), while the body read white.
+The banner, the headline and the CTAs were painted light - the *canvas* was
+dark. That is the html element's background surviving from a palette the page
+never selected.
+
+github ships `<html lang="en" data-color-mode="light" data-light-theme="light"
+data-dark-theme="dark">` - a data ATTRIBUTE, not a theme class - and Primer
+Brand then declares one palette three times:
+
+```css
+:root, [data-color-mode=light], [data-color-mode=auto] { --brand-color-canvas-default: white }
+[data-color-mode=dark]                                  { --brand-color-canvas-default: black }
+@media (prefers-color-scheme: dark) { [data-color-mode=auto] { ... black } }
+```
+
+`scope_vars` picked the root's polarity with `theme_polarity(class)`. There is
+no class on that `<html>`, so `root_pol` was `None`, no definition could be
+marked as contradicting the root, and the fallback branch ("last definition
+wins") took the **dark** sheet - `#010409` - under a page that says light. The
+brand tokens in the same sheet are `:root`/`[data-color-mode=light]`, so the
+rest of the page stayed light: exactly the mixed render in the frame.
+
+Two changes, one rule:
+
+* `root_pol` reads `data-color-mode` / `data-theme` first, then `class` - the
+  theme can be declared as an attribute, and github declares it that way.
+* a definition whose selector **matches the real `<html>`** counts as on-root
+  regardless of `root_pol`: matching the element that owns the custom
+  properties is the truth, the polarity tokens are a heuristic. (This is why
+  `root_pol.is_some() &&` had to go from the `applies` guard - an unpolarised
+  root still has a real root.)
+
+Reproduced locally before fixing, with the smallest page that has the same
+shape (`%TEMP%\mazda-local\theme.html`: `data-color-mode="light"` plus the dark
+sheet last) - it rendered the dark palette. After: white canvas, black text,
+`2.22 %` ink in `68` colours.
+
+Cold github.com, fresh profile, `tools/paint-timeline.ps1 -Seconds 50 -Every 5`
+(this run's document fetch alone was 18.2 s - the link was bad, so only the
+pixels are comparable, not the timestamps):
+
+| | canvas pixels (`#010409`-ish) | white pixels |
+|---|---|---|
+| before | 14.9 % | 80.9 % |
+| after | 2.9 % | 92.0 % |
+
+No dark band at the top or the bottom, no dark strip at the right edge; the
+first frame at 38.1 s reads `7.54 %` ink in `220` colours. The remaining 2.9 %
+is real dark content (the secondary CTA painted opaque black - next rule).
+Tests **1041 -> 1042** green
+(`scope_vars_picks_the_palette_whose_selector_matches_the_root`).
+
 
 
 
