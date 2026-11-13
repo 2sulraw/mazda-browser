@@ -1548,9 +1548,9 @@ struct Seg {
     /// pseudo-classes that must ALL hold for this segment (`:hover` reads
     /// the sheet's hover cell, the others are static state)
     pseudos: Vec<Pseudo>,
-    /// `:not(...)` exclusions — the element must match NONE of these simple
-    /// selectors (each parsed by `parse_compound`)
-    nots: Vec<Seg>,
+    /// `:not(...)` exclusions — the element must match NONE of these
+    /// selectors (each a full complex chain, like `:is()`)
+    nots: Vec<Vec<Seg>>,
     /// `::before`/`::after` (or the legacy `:before`/`:after`) this
     /// compound closes. Matched against the ORIGIN element (ignored by
     /// `seg_matches`); only the last segment of a selector may carry one,
@@ -1590,7 +1590,7 @@ fn seg_tests_has(s: &Seg) -> bool {
         Pseudo::Is(alts, _) => alts.iter().any(|chain| chain.iter().any(seg_tests_has)),
         Pseudo::Host(inner, _) => seg_tests_has(inner),
         _ => false,
-    }) || s.nots.iter().any(seg_tests_has)
+    }) || s.nots.iter().any(|chain| chain.iter().any(seg_tests_has))
 }
 
 thread_local! {
@@ -8763,10 +8763,10 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     }
                     ("not", Some(a)) => {
                         // the argument may be a selector LIST — `:not(A, B)`
-                        // excludes a match against any member, so each member
-                        // becomes its own `nots` entry
-                        let a = a.trim();
-                        for m in split_all_top_level(a, ",").unwrap_or_else(|| vec![a]) {
+                        // excludes a match against any member, and each member
+                        // is a FULL selector (`:not(dialog h1)` is a
+                        // descendant chain, not a class named "dialog h1")
+                        for m in split_selectors(&a) {
                             let m = m.trim();
                             if m.is_empty() {
                                 continue; // stray comma — nothing to exclude
@@ -8777,22 +8777,14 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                                 // is vacuously true: drop it, keep the rest
                                 continue;
                             }
-                            // simple-selector members only; anything more
-                            // complex (combinators, nested :is()) drops the
-                            // rule (shortcut: no complex :not() args)
-                            // shortcut: a space inside the argument is taken
-                            // as part of the class name (`:not(.a .b)` becomes
-                            // class "a .b", which matches nothing) instead of
-                            // dropping — same silent misparse as Selectors 4
-                            // complex arguments, rare in practice
-                            let m_seg = parse_compound_why(m)
+                            let chain = parse_selector_why(m)
                                 .map_err(|_| format!("complex :not({m}) argument"))?;
                             // a pseudo-element can't appear inside :not()
                             // (invalid — the whole selector drops)
-                            if m_seg.pseudo_el.is_some() {
+                            if chain.iter().any(|s| s.pseudo_el.is_some()) {
                                 return Err("pseudo-element in :not()".into());
                             }
-                            seg.nots.push(m_seg);
+                            seg.nots.push(chain);
                         }
                     }
                     // `:host(arg)` — matches the element that declared the
@@ -8933,8 +8925,9 @@ fn spec_of(segs: &[Seg]) -> (u16, u16, u16) {
                 _ => cls += 1,
             }
         }
-        for n in &s.nots {
-            let (i, c, t) = spec_of(std::slice::from_ref(n));
+        // `:not()` takes its most specific argument's specificity, like `:is()`
+        let best = s.nots.iter().map(|a| spec_of(a)).max();
+        if let Some((i, c, t)) = best {
             ids += i;
             cls += c;
             tags += t;
@@ -9254,7 +9247,7 @@ fn seg_matches(dom: &Dom, node: u32, seg: &Seg, hover: Option<u32>) -> bool {
     }
     // `:not(X)` — the element must match NONE of the excluded selectors
     for n in &seg.nots {
-        if seg_matches(dom, node, n, hover) {
+        if matches(dom, node, n, hover) {
             return false;
         }
     }
@@ -10609,6 +10602,53 @@ mod tests {
         let ex = by_attr(&dom, "id", "ex");
         assert_eq!(sheet.resolve(&dom, plain, Style::new(), None).style.color, 0x123456);
         assert_ne!(sheet.resolve(&dom, ex, Style::new(), None).style.color, 0x123456);
+    }
+
+    #[test]
+    fn not_pseudo_accepts_complex_arguments() {
+        // `:not(dialog h1)` is a descendant chain: the h1 inside the dialog
+        // is excluded, the h1 outside is not
+        let sheet = parse("h1:not(dialog h1) { color: #123456 }");
+        let dom = dom_of("<h1 id=out>o</h1><dialog><h1 id=in>i</h1></dialog>");
+        let out = by_attr(&dom, "id", "out");
+        let inside = by_attr(&dom, "id", "in");
+        assert_eq!(sheet.resolve(&dom, out, Style::new(), None).style.color, 0x123456);
+        assert_ne!(
+            sheet.resolve(&dom, inside, Style::new(), None).style.color,
+            0x123456
+        );
+        // the space is a combinator now, not part of a class name
+        let sheet2 = parse(".x:not(.p .y) { color: #223344 }");
+        let dom2 = dom_of(
+            "<div class=p><span id=a class=\"x y\"></span></div>\
+             <span id=b class=x></span>",
+        );
+        assert_ne!(
+            sheet2
+                .resolve(&dom2, by_attr(&dom2, "id", "a"), Style::new(), None)
+                .style
+                .color,
+            0x223344,
+            "inside .p, the .x.y is excluded"
+        );
+        assert_eq!(
+            sheet2
+                .resolve(&dom2, by_attr(&dom2, "id", "b"), Style::new(), None)
+                .style
+                .color,
+            0x223344
+        );
+        // specificity is the most specific argument (like :is), not the sum
+        let sheet3 = parse(".x:not(.a, #b){color:#111111} .x#z{color:#222222}");
+        let dom3 = dom_of("<div id=z class=x></div>");
+        assert_eq!(
+            sheet3
+                .resolve(&dom3, by_attr(&dom3, "id", "z"), Style::new(), None)
+                .style
+                .color,
+            0x222222,
+            "the later, equal-specificity rule wins"
+        );
     }
 
     #[test]

@@ -6074,3 +6074,24 @@ unchanged. The restored rules only target checkboxes, which are never
 indeterminate from markup here, so no layout change is claimed.
 
 Tests: `indeterminate_reads_radio_groups_and_progress`. 1087 green.
+
+## accept complex selectors inside :not() (P112, 2026-11-13)
+
+`:not()` took simple compounds only, and a space was silently read as part of
+a class name (`.a:not(.p .y)` became "class `p .y`", which never matched
+anything). Six github rules dropped outright for `:not(dialog h1)` ..
+`:not(dialog h6)` - the `.business-content` heading sizes.
+
+Members are now parsed as full selectors with `parse_selector_why`, the same
+way `:is()`/`:where()` already were, and matched with the chain matcher, so
+the descendant combinator inside `:not()` means what it says. Specificity is
+the most specific argument, like `:is()`, instead of the sum over a list.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32 938 -> 32 944
+rules (+6), 42 -> 36 distinct dropped selector reasons (the six `complex
+:not(dialog hN) argument` entries gone; `complex :not(:defined) argument`
+stays because `:defined` itself is unsupported), 38 dropped properties, 1
+at-rule and 1110 boxes unchanged. No layout change is claimed on this page.
+
+Tests: `not_pseudo_accepts_complex_arguments` (descendant exclusion, the
+former class-name misparse, and max-vs-sum specificity). 1088 green.
