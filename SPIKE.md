@@ -6051,3 +6051,26 @@ claimed on this page. A local `data:` page confirms the behavior:
 plain `.p` box remains.
 
 Tests: `popover_open_matches_nothing_so_closed_overlays_hide`. 1086 green.
+
+## read :indeterminate from radio groups and progress bars (P111, 2026-11-13)
+
+37 github selectors used `:indeterminate` and dropped their rules (all cached
+ones style checkboxes: `.FormControl-checkbox:indeterminate:before`,
+`.prc-Checkbox:indeterminate`). A checkbox's indeterminate flag is an IDL
+property set by script, so markup never expresses it - but the other cases
+are static: an unchecked radio whose radio button group has nothing checked,
+and a `<progress>` without a `value`. Those now match, so
+`:not(:indeterminate)` is evaluated instead of being skipped as a dynamic
+pseudo-class.
+
+Radio groups use the same form owner (nearest ancestor form, or the `form`
+attribute) and the same non-empty `name`; an unnamed radio is its own group.
+The checkbox case stays false until the property itself is modeled.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32 901 -> 32 938
+rules (+37), 43 -> 42 distinct dropped selector reasons (`pseudo-class
+:indeterminate` gone), 38 dropped properties, 1 at-rule and 1110 boxes
+unchanged. The restored rules only target checkboxes, which are never
+indeterminate from markup here, so no layout change is claimed.
+
+Tests: `indeterminate_reads_radio_groups_and_progress`. 1087 green.

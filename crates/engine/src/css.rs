@@ -1437,6 +1437,12 @@ enum Pseudo {
     /// `:not(:popover-open)` matches closed popovers (and every other
     /// element), which is how pages hide their overlays.
     PopoverOpen,
+    /// `:indeterminate` — markup state where there is one: an unchecked
+    /// radio whose group has no checked radio, and a `<progress>` without a
+    /// `value`. A checkbox's indeterminate flag is an IDL property (set by
+    /// script, never by markup), so it stays false; a script setting it is
+    /// not seen until the engine models the property.
+    Indeterminate,
     /// `:root` — a direct child of the document root (the `<html>` element).
     Root,
     /// `:first-child` — first ELEMENT child of its parent (text nodes don't
@@ -8339,9 +8345,10 @@ fn flush<'a>(tokens: &mut Vec<&'a str>, s: &'a str, start: usize, end: usize) {
 /// against the sheet's hover cell at cascade time, so `:not(:hover)` is a
 /// real (negated) match too.
 ///
-/// Note: `:enabled`/`:disabled`/`:checked` are NOT here — they are markup
-/// state (the `disabled`/`checked`/`selected` attribute), which the static
-/// cascade evaluates directly, and neither is `:placeholder-shown` (empty
+/// Note: `:enabled`/`:disabled`/`:checked`/`:indeterminate` are NOT here —
+/// they are markup state (the `disabled`/`checked`/`selected` attribute, a
+/// radio group with nothing checked, a valueless `<progress>`), which the
+/// static cascade evaluates directly, and neither is `:placeholder-shown` (empty
 /// value + a `placeholder` attribute, the initial state of every text field —
 /// github's floating label flips on `:not(:placeholder-shown)`, so misreading
 /// it as "never holds" scaled the label's text on top of itself).
@@ -8356,7 +8363,7 @@ fn is_dynamic_pseudo(s: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "focus" | "focus-within" | "focus-visible" | "active"
             | "default" | "required" | "optional"
-            | "indeterminate" | "valid" | "invalid" | "in-range" | "out-of-range"
+            | "valid" | "invalid" | "in-range" | "out-of-range"
             | "read-only" | "read-write"
     )
 }
@@ -8713,6 +8720,9 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     // no popover is ever open here (no API, no top layer),
                     // so `:not(:popover-open)` can hide closed overlays
                     ("popover-open", None) => seg.pseudos.push(Pseudo::PopoverOpen),
+                    // radio groups and valueless progress bars are markup
+                    // state; a checkbox's flag is IDL-only
+                    ("indeterminate", None) => seg.pseudos.push(Pseudo::Indeterminate),
                     // the input hint is showing: an empty value + a
                     // `placeholder` attribute. Static (the cascade keeps no
                     // live values); `:not(:placeholder-shown)` is how a
@@ -9306,6 +9316,27 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
             .is_some_and(|t| dom.attr(node, "id") == Some(t)),
         // nothing is open: the popover API and top layer aren't modeled
         Pseudo::PopoverOpen => false,
+        // statically knowable form state: an unchecked radio with no checked
+        // radio in its group, or a progress bar with no `value`. A checkbox's
+        // indeterminate flag is set only through the IDL property (script),
+        // so markup can never express it.
+        Pseudo::Indeterminate => match dom.tag(node) {
+            "input" => {
+                let ty = dom.attr(node, "type").unwrap_or("text").to_ascii_lowercase();
+                if ty != "radio" || dom.attr(node, "checked").is_some() {
+                    false
+                } else {
+                    let name = dom.attr(node, "name").unwrap_or("");
+                    if name.is_empty() {
+                        true // not part of a group: nothing can be checked
+                    } else {
+                        !radio_group_has_checked(dom, node, name)
+                    }
+                }
+            }
+            "progress" => dom.attr(node, "value").is_none(),
+            _ => false,
+        },
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
@@ -9396,6 +9427,49 @@ fn is_form_control(dom: &Dom, node: u32) -> bool {
         dom.tag(node),
         "input" | "button" | "select" | "textarea" | "fieldset" | "optgroup" | "option"
     )
+}
+
+/// The `<form>` that owns `node`: the one named by its `form` attribute, else
+/// the nearest ancestor form. `None` for a control outside any form.
+fn form_owner(dom: &Dom, node: u32) -> Option<u32> {
+    if let Some(id) = dom.attr(node, "form") {
+        for i in 1..dom.nodes.len() as u32 {
+            if dom.tag(i) == "form" && dom.attr(i, "id") == Some(id) {
+                return Some(i);
+            }
+        }
+    }
+    let mut cur = dom.nodes[node as usize].parent;
+    loop {
+        if cur == 0 || cur == node {
+            return None;
+        }
+        if dom.tag(cur) == "form" {
+            return Some(cur);
+        }
+        let parent = dom.nodes[cur as usize].parent;
+        if parent == cur {
+            return None;
+        }
+        cur = parent;
+    }
+}
+
+/// Does the radio button group of `node` (same form owner, same non-empty
+/// `name`) contain a checked radio? `node` itself is unchecked when this is
+/// asked, so it is skipped.
+fn radio_group_has_checked(dom: &Dom, node: u32, name: &str) -> bool {
+    let owner = form_owner(dom, node);
+    (1..dom.nodes.len() as u32).any(|n| {
+        n != node
+            && dom.tag(n) == "input"
+            && dom
+                .attr(n, "type")
+                .is_some_and(|t| t.eq_ignore_ascii_case("radio"))
+            && dom.attr(n, "name") == Some(name)
+            && form_owner(dom, n) == owner
+            && dom.attr(n, "checked").is_some()
+    })
 }
 
 /// Element children of `node`'s parent: `(node's 1-based index, total count)`
@@ -11908,6 +11982,43 @@ mod tests {
         assert_eq!(color("o1"), 0x0011_1111, "selected option");
         assert_eq!(color("o2"), 0x0022_2222, "unselected option");
         assert_eq!(color("dv"), 0x0022_2222, "a div never matches :checked");
+    }
+
+    #[test]
+    fn indeterminate_reads_radio_groups_and_progress() {
+        // static form state: an unchecked radio whose group has nothing
+        // checked, or a progress bar with no `value`
+        assert!(parse_selector_why(":indeterminate").is_ok());
+        assert!(parse_selector_why(":not(:indeterminate)").is_ok());
+        let sheet = parse(":indeterminate{color:#111111} :not(:indeterminate){color:#222222}");
+        let dom = dom_of(
+            "<form>\
+               <input id=r1 type=radio name=g>\
+               <input id=r2 type=radio name=g>\
+               <input id=r3 type=radio name=h checked>\
+               <input id=r4 type=radio name=h>\
+               <input id=solo type=radio>\
+               <input id=cb type=checkbox>\
+               <progress id=p1></progress>\
+               <progress id=p2 value=3></progress>\
+             </form>\
+             <form><input id=r5 type=radio name=g checked></form>",
+        );
+        let color = |id: &str| {
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", id), Style::new(), None)
+                .style
+                .color
+        };
+        assert_eq!(color("r1"), 0x0011_1111, "no radio in group g is checked");
+        assert_eq!(color("r2"), 0x0011_1111);
+        assert_eq!(color("r3"), 0x0022_2222, "this radio is checked");
+        assert_eq!(color("r4"), 0x0022_2222, "group h has a checked radio");
+        assert_eq!(color("solo"), 0x0011_1111, "unnamed radio: its own group");
+        assert_eq!(color("r5"), 0x0022_2222);
+        assert_eq!(color("cb"), 0x0022_2222, "checkbox flag is IDL-only");
+        assert_eq!(color("p1"), 0x0011_1111, "progress without value");
+        assert_eq!(color("p2"), 0x0022_2222, "progress with value");
     }
 
     #[test]
