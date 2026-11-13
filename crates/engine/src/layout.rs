@@ -446,7 +446,7 @@ fn control_chrome(bx: &mut BoxStyle, min_h: f32, default_w: Option<f32>) {
         bx.pad = [Len::Px(0.0), Len::Px(3.0), Len::Px(0.0), Len::Px(3.0)];
     }
     if bx.declared & decl::RADIUS == 0 {
-        bx.radius = Len::Px(2.0);
+        bx.radii = [Len::Px(2.0); 4];
     }
     if bx.declared & decl::MIN_HEIGHT == 0 {
         bx.min_height = Some(Len::Px(min_h));
@@ -2565,8 +2565,9 @@ pub struct Layout {
     pub height: f32,
     /// x, y, w, h, color (matches the run's text color), fixed
     pub underline_rects: Vec<(f32, f32, f32, f32, u32, bool)>,
-    /// filled box backgrounds (x, y, w, h, color, radius, fixed) - drawn under text
-    pub rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    /// filled box backgrounds (x, y, w, h, color, per-corner radius, fixed) -
+    /// drawn under text
+    pub rects: Vec<(f32, f32, f32, f32, u32, [f32; 4], bool)>,
     /// parallel to [`Layout::rects`]: `Some(g)` = fill that rect with the
     /// gradient instead of its (sentinel) color. Sharing the rect channel
     /// keeps z-order, sticky spans and transforms exact for free.
@@ -3406,7 +3407,7 @@ fn collect_paint(
     // groups (shortcut: parent border box, not the spec's scrollport
     // containing block; the root's parent is the viewport)
     container: (f32, f32),
-    out: &mut Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    out: &mut Vec<(f32, f32, f32, f32, u32, [f32; 4], bool)>,
     out_g: &mut Vec<Option<std::sync::Arc<Gradient>>>,
     out_r: &mut Vec<Option<f32>>,
     out_z: &mut Vec<i32>,
@@ -3483,7 +3484,26 @@ fn collect_paint(
             Some(c) => filt_color(c, n.bx.filter.as_deref()),
             None => n.style.color,
         };
-        let r = resolve_len(n.bx.radius, n.w).min(n.w * 0.5).min(n.h * 0.5);
+        // per-corner radii [tl, tr, br, bl]; CSS reduces all four by one
+        // factor when opposite corners would overlap on either axis
+        let mut corners = [0.0f32; 4];
+        for (c, l) in corners.iter_mut().zip(n.bx.radii) {
+            *c = resolve_len(l, n.w).max(0.0);
+        }
+        let scale = |a: f32, b: f32, len: f32| {
+            if a + b > 1e-6 {
+                (len / (a + b)).min(1.0)
+            } else {
+                1.0
+            }
+        };
+        let k = scale(corners[0], corners[1], n.w)
+            .min(scale(corners[3], corners[2], n.w))
+            .min(scale(corners[0], corners[3], n.h))
+            .min(scale(corners[1], corners[2], n.h));
+        for c in &mut corners {
+            *c *= k;
+        }
         // `background-clip` box in layout coords: the colour and gradient
         // layers paint up to this rect instead of the border box (the image
         // layer has its own padding-box geometry and crops further at line
@@ -3516,18 +3536,25 @@ fn collect_paint(
         // a rounded border paints as a ring whose inner radius is what the
         // background is inset by; the background itself keeps its own clip box
         let border_max = bt.max(br).max(bb).max(bl);
+        let inset_r = |d: f32| {
+            let mut o = [0.0f32; 4];
+            for (c, r) in o.iter_mut().zip(corners) {
+                *c = (r - d).max(0.0);
+            }
+            o
+        };
         let inner_r = match n.bx.bg_clip {
             BgClip::Content => {
                 let pad_max = resolve_len(n.bx.pad[0], n.w)
                     .max(resolve_len(n.bx.pad[1], n.w))
                     .max(resolve_len(n.bx.pad[2], n.w))
                     .max(resolve_len(n.bx.pad[3], n.w));
-                (r - border_max - pad_max).max(0.0)
+                inset_r(border_max + pad_max)
             }
-            BgClip::Padding => (r - border_max).max(0.0),
+            BgClip::Padding => inset_r(border_max),
             // the colour layer paints up to the border box; its radius is the
             // border radius (the border ring sits on top of it)
-            BgClip::Border => r,
+            BgClip::Border => corners,
         };
         // this box's effective filter (own + ancestors) — applied to every
         // primitive it emits; text reads it through the already-filtered
@@ -3543,7 +3570,7 @@ fn collect_paint(
         // (rounded or not) still paints over the mask, as the border is
         // chrome, not background.
         let masked = n.children.iter().any(|c| c.is_mask && c.img.is_some());
-        let ring = has_b && r > 0.0 && n.bx.bg.is_some() && !masked;
+        let ring = has_b && corners.iter().any(|&r| r > 0.0) && n.bx.bg.is_some() && !masked;
         // own `clip: rect()` (positioned boxes) clips this box's WHOLE
         // rendering incl. its own background — composed with the inherited
         // one; the window is recorded in layout coords, so it is mapped
@@ -3591,7 +3618,8 @@ fn collect_paint(
                     runs: (n.run_range.0 as usize, n.run_range.1 as usize),
                     uls: (n.ul_range.0 as usize, n.ul_range.1 as usize),
                     rect,
-                    radius: r * m.sx.abs(),
+                    // shortcut: blur masks a backdrop group with one radius
+                    radius: corners.iter().fold(0.0f32, |a, &b| a.max(b)) * m.sx.abs(),
                     blur: n.bx.backdrop,
                     fixed,
                 });
@@ -3626,7 +3654,8 @@ fn collect_paint(
                 y: sy,
                 w: sw,
                 h: sh,
-                radius: r * m.sx.abs(),
+                // shortcut: a shadow takes the largest corner radius
+                radius: corners.iter().fold(0.0f32, |a, &b| a.max(b)) * m.sx.abs(),
                 blur: s.blur,
                 color: ((alpha as f32 * n.eff).round().min(255.0) as u32) << 24 | c,
                 fixed,
@@ -3644,13 +3673,19 @@ fn collect_paint(
             if ring {
                 // the ring rides the same channel; `rect_ring` says "paint
                 // only the band inside the outer radius"
-                let rc = with_alpha(filt_color(bc, f), n.eff);
-                rects.push((n.x, n.y, n.w, n.h, rc, r, Some(border_max)));
+                let bcol = with_alpha(filt_color(bc, f), n.eff);
+                rects.push((n.x, n.y, n.w, n.h, bcol, corners, Some(border_max)));
             }
             for (x, y, w, h, color, rad, ring_t) in rects {
                 let (x, y, w, h) = m.map_rect((x, y, w, h));
                 if let Some((x, y, w, h)) = cull_rect((x, y, w, h), clip) {
-                    out.push((x, y, w, h, color, rad * m.sx.abs(), fixed));
+                    // shortcut: a transform scales every corner by the same
+                    // horizontal factor (non-uniform scales are rare)
+                    let mut rad = rad;
+                    for c in &mut rad {
+                        *c *= m.sx.abs();
+                    }
+                    out.push((x, y, w, h, color, rad, fixed));
                     out_g.push(None);
                     // the thickness is vertical-ish: scale by the mean axis so
                     // a rotated box's ring stays as thick as its edges
@@ -3672,7 +3707,11 @@ fn collect_paint(
                     Some(f) => filter_gradient(&g, f),
                     None => g,
                 };
-                out.push((x, y, w, h, with_alpha(u32::MAX, n.eff), r * m.sx.abs(), fixed));
+                let mut rad = corners;
+                for c in &mut rad {
+                    *c *= m.sx.abs();
+                }
+                out.push((x, y, w, h, with_alpha(u32::MAX, n.eff), rad, fixed));
                 out_g.push(Some(g));
                 out_r.push(None);
                 out_z.push(z);
@@ -3693,7 +3732,7 @@ fn collect_paint(
                 }
                 let q = m.map_rect(q);
                 if let Some(q) = cull_rect(q, clip) {
-                    out.push((q.0, q.1, q.2, q.3, with_alpha(bc, n.eff), 0.0, fixed));
+                    out.push((q.0, q.1, q.2, q.3, with_alpha(bc, n.eff), [0.0; 4], fixed));
                     out_g.push(None);
                     out_r.push(None);
                     out_z.push(z);
@@ -3725,7 +3764,7 @@ fn collect_paint(
                 for q in strips {
                     let q = m.map_rect(q);
                     if let Some(q) = cull_rect(q, clip) {
-                        out.push((q.0, q.1, q.2, q.3, with_alpha(oc, n.eff), 0.0, fixed));
+                        out.push((q.0, q.1, q.2, q.3, with_alpha(oc, n.eff), [0.0; 4], fixed));
                         out_g.push(None);
                         out_r.push(None);
                         out_z.push(z);
@@ -11386,7 +11425,7 @@ mod tests {
         assert_eq!(
             l.rects
                 .iter()
-                .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5, r.6))
+                .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5[0], r.6))
                 .collect::<Vec<_>>(),
             // `.b` is a <p>: one line down plus its UA 1em (16px) top margin
             vec![
@@ -12672,7 +12711,7 @@ mod tests {
             Style::new(),
             BoxStyle {
                 border: [Len::Px(2.0); 4],
-                radius: Len::Px(6.0),
+                radii: [Len::Px(6.0); 4],
                 bg: Some(0x123456),
                 ..BoxStyle::default()
             },
@@ -12684,7 +12723,11 @@ mod tests {
         assert_eq!(l2.rect_ring[0], None, "the background is a solid fill");
         assert_eq!(l2.rects[1].4, 0x000000, "ring = currentcolor (text color)");
         assert!((l2.rects[1].2 - 50.0).abs() < 0.01, "ring covers the border box");
-        assert!((l2.rects[1].5 - 6.0).abs() < 0.01, "outer radius={}", l2.rects[1].5);
+        assert!(
+            l2.rects[1].5.iter().all(|r| (r - 6.0).abs() < 0.01),
+            "outer radius={:?}",
+            l2.rects[1].5
+        );
         assert_eq!(l2.rect_ring[1], Some(2.0), "2px border = ring thickness");
         // transparent border: width still lays out (space reserved) but only
         // the background paints - no strips, no ring
@@ -12822,7 +12865,7 @@ mod tests {
             BoxStyle {
                 display: Display::Block,
                 bg: Some(0x112233),
-                radius: Len::Px(8.0),
+                radii: [Len::Px(8.0); 4],
                 pad: [Len::Px(5.0), Len::Px(5.0), Len::Px(5.0), Len::Px(5.0)],
                 ..BoxStyle::default()
             },
@@ -12836,7 +12879,56 @@ mod tests {
         assert!((x - 0.0).abs() < 0.01 && (y - 0.0).abs() < 0.01);
         assert!((w - 100.0).abs() < 0.01, "w={}", w);
         assert!((h - (16.0 * 1.35 + 10.0)).abs() < 0.01, "h={}", h);
-        assert!((rad - 8.0).abs() < 0.01, "radius={}", rad);
+        assert!(
+            rad.iter().all(|r| (r - 8.0).abs() < 0.01),
+            "radius={:?}",
+            rad
+        );
+    }
+
+    #[test]
+    fn per_corner_radii_reach_the_bg_rect_and_scale_on_overlap() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                bg: Some(0x112233),
+                radii: [
+                    Len::Px(10.0),
+                    Len::Px(20.0),
+                    Len::Px(30.0),
+                    Len::Px(40.0),
+                ],
+                width: Some(Len::Px(100.0)),
+                height: Some(Len::Px(100.0)),
+                ..BoxStyle::default()
+            },
+        );
+        n.children = vec![leaf("hi")];
+        let l = layout_tree(&mut n, 100.0, &m4);
+        let got = l.rects[0].5;
+        for (g, want) in got.iter().zip([10.0, 20.0, 30.0, 40.0]) {
+            assert!((g - want).abs() < 0.01, "radii={:?}", got);
+        }
+        // opposite corners 60+60 on a 100x50 box overlap on BOTH axes; CSS
+        // scales all four by the smaller factor (50/60)
+        let mut o = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Block,
+                bg: Some(0x112233),
+                radii: [Len::Px(60.0), Len::Px(60.0), Len::Px(0.0), Len::Px(0.0)],
+                width: Some(Len::Px(100.0)),
+                height: Some(Len::Px(50.0)),
+                ..BoxStyle::default()
+            },
+        );
+        o.children = vec![leaf("hi")];
+        let lo = layout_tree(&mut o, 100.0, &m4);
+        let got = lo.rects[0].5;
+        for g in &got[..2] {
+            assert!((g - 50.0).abs() < 0.01, "scaled radii={:?}", got);
+        }
     }
 
     // ---- replaced elements (<img>) ----
@@ -14289,7 +14381,7 @@ mod tests {
         assert_eq!(sel.bx.bcolor, Some(0x00_44_55_66), "author border color");
         assert!(sel.bx.pad == [Len::Px(5.0); 4], "author padding wins");
         // undeclared properties keep the UA defaults
-        assert!(sel.bx.radius == Len::Px(2.0), "UA radius survives");
+        assert!(sel.bx.radii == [Len::Px(2.0); 4], "UA radius survives");
         assert!(sel.inline, "still inline");
     }
 
@@ -14307,7 +14399,7 @@ mod tests {
         let b = find_form(&root).expect("button box");
         assert!(b.bx.border == [Len::Px(0.0); 4], "no UA border");
         assert_eq!(b.bx.bg, None, "no UA fill");
-        assert!(b.bx.radius == Len::Px(0.0), "no UA radius");
+        assert!(b.bx.radii == [Len::Px(0.0); 4], "no UA radius");
         assert!(b.bx.pad == [Len::Px(4.0); 4], "the rule's own padding applies");
         assert_eq!(b.style.text_align, 0, "UA button centering cleared");
     }
@@ -16094,7 +16186,7 @@ line</textarea></div>"#,
         assert_eq!(
             l.rects
                 .iter()
-                .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5, r.6))
+                .map(|r| (r.0, r.1, r.2, (r.3 * 100.0).round() / 100.0, r.4, r.5[0], r.6))
                 .collect::<Vec<_>>(),
             // `.b` is a <p>: one line down plus its UA 1em (16px) top margin
             vec![

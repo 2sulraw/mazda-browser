@@ -4091,8 +4091,8 @@ struct PageWire {
     runs: Vec<RunWire>,
     /// x, y, w, h, color, fixed
     underline_rects: Vec<(f32, f32, f32, f32, u32, bool)>,
-    /// x, y, w, h, color, radius, fixed
-    rects: Vec<(f32, f32, f32, f32, u32, f32, bool)>,
+    /// x, y, w, h, color, per-corner radius [tl, tr, br, bl], fixed
+    rects: Vec<(f32, f32, f32, f32, u32, [f32; 4], bool)>,
     /// parallel to `rects`: Some = paint that rect as a gradient
     rect_grad: Vec<Option<std::sync::Arc<css::Gradient>>>,
     /// parallel to `rects`: Some(t) = paint that rect as a border ring of
@@ -6539,7 +6539,7 @@ fn layout_page(
                 // background/border rects in paint order (z is the stacking key)
                 for (i, r) in laid.rects.iter().enumerate() {
                     eprintln!(
-                        "[rect {i}] x={:.0} y={:.0} w={:.0} h={:.0} c={:06x} z={:.0}",
+                        "[rect {i}] x={:.0} y={:.0} w={:.0} h={:.0} c={:06x} rad={:?}",
                         r.0, r.1, r.2, r.3, r.4, r.5
                     );
                 }
@@ -9006,7 +9006,7 @@ fn render(
                 continue;
             }
             let (sx, sy) = (PADDING as f32 + x, PADDING as f32 + top + y);
-            let r = rad.min(w * 0.5).min(h * 0.5);
+            let r = rad;
             // high byte = effective opacity (0 = un-packed colour, treat as
             // opaque so every pre-opacity caller keeps painting solid)
             let alpha = match (color >> 24) as u8 {
@@ -9140,7 +9140,7 @@ fn render(
                 a => a,
             };
             let rgb = color & 0x00ff_ffff;
-            paint_solid_rect(buf, width, height, sx, sy, w, h.max(1.0), 0.0, rgb, alpha);
+            paint_solid_rect(buf, width, height, sx, sy, w, h.max(1.0), [0.0; 4], rgb, alpha);
         }
     };
     // two passes: normal content (scrolled) first, then fixed overlays on
@@ -9655,6 +9655,20 @@ fn radial_radii(g: &css::Radial, w: f32, h: f32) -> (f32, f32, f32, f32) {
 /// put a box left of / above the page): the span is intersected with the
 /// buffer instead of only clamping the origin, which would smear the box's
 /// full width/height from pixel 0.
+/// Whether rect-local point `(lx, ly)` lies inside the rounded rect. Each
+/// corner cuts away its own quadrant, so the radii need not meet at the
+/// half-way lines (CSS scales them only when opposite corners overlap).
+fn inside_rounded(lx: f32, ly: f32, w: f32, h: f32, r: [f32; 4]) -> bool {
+    let in_circle = |x: f32, y: f32, cx: f32, cy: f32, rr: f32| {
+        let (dx, dy) = (x - cx, y - cy);
+        dx * dx + dy * dy <= rr * rr
+    };
+    (lx >= r[0] || ly >= r[0] || in_circle(lx, ly, r[0], r[0], r[0]))
+        && (lx <= w - r[1] || ly >= r[1] || in_circle(lx, ly, w - r[1], r[1], r[1]))
+        && (lx <= w - r[2] || ly <= h - r[2] || in_circle(lx, ly, w - r[2], h - r[2], r[2]))
+        && (lx >= r[3] || ly <= h - r[3] || in_circle(lx, ly, r[3], h - r[3], r[3]))
+}
+
 fn paint_solid_rect(
     buf: &mut [u32],
     width: usize,
@@ -9663,7 +9677,7 @@ fn paint_solid_rect(
     sy: f32,
     w: f32,
     h: f32,
-    r: f32,
+    r: [f32; 4],
     rgb: u32,
     alpha: u8,
 ) {
@@ -9679,7 +9693,7 @@ fn paint_solid_rect(
         return;
     }
     // square corners: one row fill per line instead of per-pixel math
-    if r <= 0.5 {
+    if r.iter().all(|&r| r <= 0.5) {
         for dy in 0..h as i32 {
             let py = oy + dy;
             if py < 0 {
@@ -9720,10 +9734,7 @@ fn paint_solid_rect(
             let px = px as usize;
             // rounded corners: cull pixels outside the corner circles
             let lx = dx as f32;
-            let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
-            let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
-            let (ex, ey) = (lx - cx, ly - cy);
-            if ex * ex + ey * ey > r * r {
+            if !inside_rounded(lx, ly, w, h, r) {
                 continue;
             }
             if alpha == 255 {
@@ -9737,21 +9748,25 @@ fn paint_solid_rect(
 
 /// Horizontal extent `(x0, x1)` of a rounded rect at row `ly`, in rect-local
 /// coordinates (`0..w` by `ly` within `0..h`).
-fn round_span(ly: f32, w: f32, h: f32, r: f32) -> (f32, f32) {
-    let r = r.min(w * 0.5).min(h * 0.5);
-    if r <= 0.0 {
-        return (0.0, w);
+fn round_span(ly: f32, w: f32, h: f32, r: [f32; 4]) -> (f32, f32) {
+    let inset = |rr: f32, d: f32| rr - (rr * rr - d * d).max(0.0).sqrt();
+    // a row can be cut by both a top and a bottom corner when the radii are
+    // larger than half the box; the deeper cut wins on each side
+    let mut left: f32 = 0.0;
+    let mut right: f32 = 0.0;
+    if ly < r[0] {
+        left = left.max(inset(r[0], r[0] - ly));
     }
-    let d = if ly < r {
-        let dy = r - ly;
-        r - (r * r - dy * dy).max(0.0).sqrt()
-    } else if ly > h - r {
-        let dy = ly - (h - r);
-        r - (r * r - dy * dy).max(0.0).sqrt()
-    } else {
-        0.0
-    };
-    (d, w - d)
+    if ly > h - r[3] {
+        left = left.max(inset(r[3], ly - (h - r[3])));
+    }
+    if ly < r[1] {
+        right = right.max(inset(r[1], r[1] - ly));
+    }
+    if ly > h - r[2] {
+        right = right.max(inset(r[2], ly - (h - r[2])));
+    }
+    (left, w - right)
 }
 
 /// Paint a rounded-rect BORDER RING: the band between the outer rounded rect
@@ -9768,7 +9783,7 @@ fn paint_ring_rect(
     sy: f32,
     w: f32,
     h: f32,
-    r: f32,
+    r: [f32; 4],
     t: f32,
     rgb: u32,
     alpha: u8,
@@ -9778,7 +9793,10 @@ fn paint_ring_rect(
     }
     let t = t.min(w * 0.5).min(h * 0.5);
     let (iw, ih) = (w - t * 2.0, h - t * 2.0);
-    let ri = (r - t).max(0.0);
+    let mut ri = [0.0f32; 4];
+    for (i, c) in ri.iter_mut().enumerate() {
+        *c = (r[i] - t).max(0.0);
+    }
     let (ox, oy) = (sx as i32, sy as i32);
     let fill = |buf: &mut [u32], py: i32, x0: f32, x1: f32| {
         if py < 0 || py as usize >= height {
@@ -9827,7 +9845,7 @@ fn paint_gradient(
     sy: f32,
     w: f32,
     h: f32,
-    r: f32,
+    r: [f32; 4],
     g: &css::Gradient,
     // effective opacity byte of the box that owns this gradient
     opacity: u8,
@@ -9857,12 +9875,9 @@ fn paint_gradient(
             if px >= width as i32 {
                 break;
             }
-            if r > 0.5 {
+            if r.iter().any(|&r| r > 0.5) {
                 let lx = dx as f32;
-                let cx = if lx < r { r } else if lx > w - r { w - r } else { lx };
-                let cy = if ly < r { r } else if ly > h - r { h - r } else { ly };
-                let (ex, ey) = (lx - cx, ly - cy);
-                if ex * ex + ey * ey > r * r {
+                if !inside_rounded(lx, ly, w, h, r) {
                     continue;
                 }
             }
@@ -10307,9 +10322,9 @@ mod tests {
             underline_rects: Vec::new(),
             rects: vec![
                 // red left half: layout x 0..20 → buffer 12..32 (PADDING)
-                (0.0, 0.0, 20.0, 64.0, 0x00ff_0000, 0.0, false),
+                (0.0, 0.0, 20.0, 64.0, 0x00ff_0000, [0.0; 4], false),
                 // the backdrop box's own opaque rect (buffer 18..22 × 16..20)
-                (6.0, 4.0, 4.0, 4.0, 0x0000_ff00, 0.0, false),
+                (6.0, 4.0, 4.0, 4.0, 0x0000_ff00, [0.0; 4], false),
             ],
             rect_grad: vec![None, None],
             rect_ring: vec![None, None],
@@ -10387,9 +10402,9 @@ mod tests {
             underline_rects: Vec::new(),
             rects: vec![
                 // the background: 6 % black over the white page
-                (0.0, 0.0, 40.0, 40.0, 0x0f00_0000, 6.0, false),
+                (0.0, 0.0, 40.0, 40.0, 0x0f00_0000, [6.0; 4], false),
                 // its border ring, 2px of #d2d9d4
-                (0.0, 0.0, 40.0, 40.0, 0x00d2_d9d4, 6.0, false),
+                (0.0, 0.0, 40.0, 40.0, 0x00d2_d9d4, [6.0; 4], false),
             ],
             rect_grad: vec![None, None],
             rect_ring: vec![None, Some(2.0)],
@@ -11071,7 +11086,7 @@ mod tests {
             }],
             height: 123.0,
             underline_rects: vec![(1.0, 2.0, 3.0, 4.0, 0xff0000, false)],
-            rects: vec![(1.0, 2.0, 3.0, 4.0, 0x00ff00, 2.0, true)],
+            rects: vec![(1.0, 2.0, 3.0, 4.0, 0x00ff00, [2.0; 4], true)],
             rect_grad: vec![None],
             rect_ring: vec![None],
             images: vec![(
@@ -12727,7 +12742,7 @@ mod tests {
         // visible span must be the INTERSECTION, not the full width drawn
         // from pixel 0 (the old clamp smeared negative origins)
         let mut buf = vec![0u32; 20 * 10];
-        paint_solid_rect(&mut buf, 20, 10, -5.0, -3.0, 10.0, 8.0, 0.0, 0xff0000, 255);
+        paint_solid_rect(&mut buf, 20, 10, -5.0, -3.0, 10.0, 8.0, [0.0; 4], 0xff0000, 255);
         assert_eq!(buf[0], 0xff0000);
         assert_eq!(buf[4], 0xff0000, "last visible column of the 10px rect");
         assert_eq!(buf[5], 0, "rect ends at x=5");
@@ -12736,12 +12751,12 @@ mod tests {
 
         // fully off-buffer: nothing is painted (no panic, no smear)
         let mut buf = vec![0u32; 20 * 10];
-        paint_solid_rect(&mut buf, 20, 10, -30.0, 0.0, 10.0, 4.0, 0.0, 0xff0000, 255);
+        paint_solid_rect(&mut buf, 20, 10, -30.0, 0.0, 10.0, 4.0, [0.0; 4], 0xff0000, 255);
         assert!(buf.iter().all(|&p| p == 0));
 
         // the rounded path clips the same way
         let mut buf = vec![0u32; 20 * 10];
-        paint_solid_rect(&mut buf, 20, 10, -5.0, -3.0, 10.0, 8.0, 3.0, 0x0000ff, 255);
+        paint_solid_rect(&mut buf, 20, 10, -5.0, -3.0, 10.0, 8.0, [3.0; 4], 0x0000ff, 255);
         assert_eq!(buf[3 * 20 + 5], 0, "outside the corner radius");
         assert_eq!(buf[3 * 20 + 3], 0x0000ff, "inside the rounded rect");
     }
@@ -12757,7 +12772,7 @@ mod tests {
             ],
         };
         let mut buf = vec![0u32; 100];
-        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 1.0, 0.0, &g, 255);
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 1.0, [0.0; 4], &g, 255);
         assert_eq!(buf[0], 0xff0000, "left edge = first stop");
         let (r0, _, b0) = ((buf[0] >> 16) & 0xff, (buf[0] >> 8) & 0xff, buf[0] & 0xff);
         let (r9, _, b9) = ((buf[9] >> 16) & 0xff, (buf[9] >> 8) & 0xff, buf[9] & 0xff);
@@ -12767,7 +12782,7 @@ mod tests {
         // a vertical direction changes only the y axis: every row differs
         let v = css::Gradient { dir: (0.0, 1.0), ..g };
         let mut buf = vec![0u32; 100];
-        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 1.0, 10.0, 0.0, &v, 255);
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 1.0, 10.0, [0.0; 4], &v, 255);
         assert_eq!(buf[0], 0xff0000);
         assert!(buf[9 * 10] & 0xff > 200, "bottom row near blue");
     }
@@ -12792,7 +12807,7 @@ mod tests {
             ],
         };
         let mut buf = vec![0u32; 100];
-        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, 0.0, &g, 255);
+        paint_gradient(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, [0.0; 4], &g, 255);
         assert_eq!(buf[5 * 10 + 5], 0xff0000, "center = first stop");
         assert_eq!(buf[0], 0x0000ff, "corner past the radius = last stop");
         assert!(buf[6 * 10 + 6] != 0xff0000, "off-center pixel blended");

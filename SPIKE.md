@@ -6350,3 +6350,23 @@ distinct dropped properties (`grid-auto-columns` gone), 32982 rules,
 
 Tests: `grid_auto_columns_parses_a_track_list`,
 `grid_auto_columns_size_implicit_columns`. 1107 green.
+## per-corner border radii (P127, 2026-11-13)
+
+order-radius collapsed every form to one value: the shorthand kept its
+first token and each order-*-radius longhand overwrote the whole box.
+BoxStyle.radii is now [Len; 4] (clockwise from the top-left), the
+shorthand distributes 1-4 values like margins, the four longhands move one
+corner each, and the logical spellings map onto their physical corners
+(horizontal-tb, ltr). Layout resolves each corner and applies CSS's overlap
+reduction (one factor for all four when opposite corners exceed a side).
+The rect channel, wire format and painters carry the array; the solid fill
+tests the four corner circles independently, and the border ring insets each
+corner by the border thickness.
+
+Measured on github.com (release, MAZDA_MISS=1, 1000 wide): 24 -> 20
+distinct dropped properties (all four logical order-*-radius longhands
+gone, 86 declarations), 33008 rules, 35 selector reasons, 1110 boxes
+unchanged.
+
+Tests: order_radius_shorthand_and_logical_corners,
+per_corner_radii_reach_the_bg_rect_and_scale_on_overlap. 1109 green.

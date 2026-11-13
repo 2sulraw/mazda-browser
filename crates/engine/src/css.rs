@@ -1000,8 +1000,10 @@ pub struct BoxStyle {
     /// `mask-repeat` — same model as [`bg_repeat`]: None = undeclared
     /// (single draw), Some(...) tiles at paint
     pub mask_repeat: Option<BgRepeat>,
-    /// border-radius (all corners; % resolves against box width at layout)
-    pub radius: Len,
+    /// border-radius per corner, clockwise from the top-left
+    /// (`[tl, tr, br, bl]`; % resolves against box width at layout). The
+    /// shorthand fills all four; each `border-*-radius` longhand moves one.
+    pub radii: [Len; 4],
     /// border widths, top/right/bottom/left (% resolves against box width)
     pub border: [Len; 4],
     /// border color; None = currentcolor (the element's own text color,
@@ -1294,7 +1296,7 @@ impl Default for BoxStyle {
             mask_size: BgSize::Auto,
             mask_pos: [BgPos::Pct(0.0); 2], // top-left
             mask_repeat: None,
-            radius: Len::Px(0.0),
+            radii: [Len::Px(0.0); 4],
             border: [Len::Px(0.0); 4],
             bcolor: None, // currentcolor
             btransparent: false,
@@ -4162,6 +4164,11 @@ fn logical_physical(p: &str) -> Option<&'static str> {
         "border-after-style" | "border-block-end-style" => "border-bottom-style",
         "border-start-style" | "border-inline-start-style" => "border-left-style",
         "border-end-style" | "border-inline-end-style" => "border-right-style",
+        // logical corners (horizontal-tb, ltr: start-start = top-left)
+        "border-start-start-radius" => "border-top-left-radius",
+        "border-start-end-radius" => "border-top-right-radius",
+        "border-end-start-radius" => "border-bottom-left-radius",
+        "border-end-end-radius" => "border-bottom-right-radius",
         // scroll-margin/scroll-padding are accepted no-ops (no scroll
         // anchoring yet), but their logical spellings should not show up as
         // unknown properties
@@ -5552,15 +5559,36 @@ fn apply_decl(
             bx.pad[3] = parse_len(&d.1, vp).unwrap_or(Len::Px(0.0));
             bx.declared |= decl::PAD;
         }
-        // one radius for all corners (shortcut: per-corner radii and the
-        // elliptical `h v` form collapse to the first value)
-        "border-radius"
-        | "border-top-left-radius"
-        | "border-top-right-radius"
-        | "border-bottom-right-radius"
-        | "border-bottom-left-radius" => {
-            if let Some(v) = joined_tokens(&d.1).first().and_then(|t| parse_len(t, vp)) {
-                bx.radius = v;
+        // corner order is clockwise from the top-left, matching `parse_sides`.
+        // shortcut: the elliptical `h / v` form keeps only the horizontal half.
+        "border-radius" => {
+            let first = d.1.split('/').next().unwrap_or(&d.1);
+            if joined_tokens(first).iter().any(|t| parse_len(t, vp).is_some()) {
+                bx.radii = parse_sides(first, vp);
+                bx.declared |= decl::RADIUS;
+            }
+        }
+        "border-top-left-radius" => {
+            if let Some(v) = parse_len(&d.1, vp) {
+                bx.radii[0] = v;
+                bx.declared |= decl::RADIUS;
+            }
+        }
+        "border-top-right-radius" => {
+            if let Some(v) = parse_len(&d.1, vp) {
+                bx.radii[1] = v;
+                bx.declared |= decl::RADIUS;
+            }
+        }
+        "border-bottom-right-radius" => {
+            if let Some(v) = parse_len(&d.1, vp) {
+                bx.radii[2] = v;
+                bx.declared |= decl::RADIUS;
+            }
+        }
+        "border-bottom-left-radius" => {
+            if let Some(v) = parse_len(&d.1, vp) {
+                bx.radii[3] = v;
                 bx.declared |= decl::RADIUS;
             }
         }
@@ -13396,7 +13424,7 @@ mod tests {
                            .t { background: rgba(0, 0, 0, 0) }");
         let dom = dom_of(r#"<div class=c></div><div class=t></div>"#);
         let c = sheet.resolve(&dom, by_attr(&dom, "class", "c"), Style::new(), None);
-        assert_eq!(c.bx.radius, Len::Px(12.0));
+        assert_eq!(c.bx.radii, [Len::Px(12.0); 4]);
         assert_eq!(c.bx.bg, Some(0xff0000), "rgba alpha>0 renders opaque");
         let t = sheet.resolve(&dom, by_attr(&dom, "class", "t"), Style::new(), None);
         assert_eq!(t.bx.bg, None, "rgba(…,0) = transparent = no fill");
@@ -13419,7 +13447,11 @@ mod tests {
             "per-side width longhands"
         );
         assert_eq!(a.bx.bcolor, Some(0xff0000), "per-side colour longhand");
-        assert_eq!(a.bx.radius, Len::Px(7.0), "corner radius longhand");
+        assert_eq!(
+            a.bx.radii,
+            [Len::Px(0.0), Len::Px(0.0), Len::Px(7.0), Len::Px(0.0)],
+            "corner radius longhand"
+        );
         // a longhand and a shorthand compose in cascade order
         let b = get("b");
         assert_eq!(
@@ -13430,6 +13462,48 @@ mod tests {
         // style longhands are accepted no-ops (all borders render solid)
         let c = get("c");
         assert_eq!(c.bx.bcolor, Some(0xff0000));
+    }
+
+    #[test]
+    fn border_radius_shorthand_and_logical_corners() {
+        let sheet = parse(
+            ".a { border-radius: 1px 2px 3px 4px }\n\
+             .b { border-radius: 1px 2px 3px }\n\
+             .c { border-radius: 1px 2px }\n\
+             .d { border-top-left-radius: 5px; border-end-end-radius: 6px }\n\
+             .e { border-start-start-radius: 7px; border-start-end-radius: 8px }\n\
+             .f { border-radius: 1px / 2px }",
+        );
+        let dom = dom_of(
+            r#"<div class=a></div><div class=b></div><div class=c></div>
+               <div class=d></div><div class=e></div><div class=f></div>"#,
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let z = Len::Px(0.0);
+        assert_eq!(
+            get("a").bx.radii,
+            [Len::Px(1.0), Len::Px(2.0), Len::Px(3.0), Len::Px(4.0)]
+        );
+        assert_eq!(
+            get("b").bx.radii,
+            [Len::Px(1.0), Len::Px(2.0), Len::Px(3.0), Len::Px(2.0)]
+        );
+        assert_eq!(
+            get("c").bx.radii,
+            [Len::Px(1.0), Len::Px(2.0), Len::Px(1.0), Len::Px(2.0)]
+        );
+        // physical TL then logical end-end (bottom-right, ltr)
+        assert_eq!(
+            get("d").bx.radii,
+            [Len::Px(5.0), z, Len::Px(6.0), z]
+        );
+        assert_eq!(
+            get("e").bx.radii,
+            [Len::Px(7.0), Len::Px(8.0), z, z],
+            "start-start = TL, start-end = TR"
+        );
+        // the elliptical half is dropped: the horizontal radii survive
+        assert_eq!(get("f").bx.radii, [Len::Px(1.0); 4]);
     }
 
     #[test]
