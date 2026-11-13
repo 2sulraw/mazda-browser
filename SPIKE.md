@@ -6095,3 +6095,27 @@ at-rule and 1110 boxes unchanged. No layout change is claimed on this page.
 
 Tests: `not_pseudo_accepts_complex_arguments` (descendant exclusion, the
 former class-name misparse, and max-vs-sum specificity). 1088 green.
+
+## read the grid-template shorthand (P113, 2026-11-13)
+
+`grid-template` was unknown, so 25 github declarations never reached the grid
+layout. They use the shorthand form with quoted area rows, optional row sizes
+and a `/ <columns>` half (`grid-template:"label action"min-content/
+min-content 1fr`), which left control groups and banners on an implicit
+single-column template.
+
+The shorthand now writes all three longhands: quoted strings become
+`grid-template-areas`, the tokens between them become the row track list (a
+shared `parse_area_rows` helper returns the rows and the leftover sizes), and
+the part after the top-level `/` goes through the existing track parser. It
+resets every longhand it shadows, and `none` clears them all.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32 944 -> 32 945
+rules, 38 -> 37 distinct dropped properties (`grid-template` gone), 36
+selector reasons and 1110 boxes unchanged. The affected components may not be
+mounted on this page, so no page-level layout change is claimed; a local
+`data:` page proves the result: `grid-template:"a b" 40px "c d" 60px /
+100px 1fr` places `.a` at x=0 (w=100) and `.b` at x=100 (w=200).
+
+Tests: `grid_template_shorthand_sets_areas_rows_and_columns` (areas, rows,
+columns, the no-slash form, and the `none` reset). 1089 green.

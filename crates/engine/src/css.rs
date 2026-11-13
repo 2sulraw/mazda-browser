@@ -2474,6 +2474,7 @@ const KNOWN: &[&str] = &[
     "column-gap",
     "column-width",
     "column-count",
+    "grid-template",
     "grid-template-columns",
     "grid-template-rows",
     "grid-template-areas",
@@ -5016,26 +5017,34 @@ fn apply_decl(
         // whole quoted rows are read; an unquoted value (or `none`) clears.
         "grid-template-areas" => {
             bx.areas.clear();
-            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-            let mut rest = d.1.as_str();
-            while let Some(open) = rest.find('"') {
-                let Some(close) = rest[open + 1..].find('"') else { break };
-                let row = &rest[open + 1..open + 1 + close];
-                rows.push(
-                    row.split_whitespace()
-                        .map(|t| {
-                            if !t.is_empty() && t.bytes().all(|b| b == b'.') {
-                                None
-                            } else {
-                                Some(t.to_string())
-                            }
-                        })
-                        .collect(),
-                );
-                rest = &rest[open + 1 + close + 1..];
-            }
+            let (rows, _) = parse_area_rows(&d.1);
             if !rows.is_empty() {
                 bx.areas = rows;
+            }
+        }
+        // `grid-template` — the shorthand: quoted area rows with optional row
+        // sizes, then `/ <columns>`. github writes
+        // `"label action" min-content / min-content 1fr` for control groups.
+        // It resets all three longhands, like `grid-template-areas: none`.
+        "grid-template" => {
+            bx.areas.clear();
+            bx.rows.clear();
+            bx.row_lines.clear();
+            bx.cols.clear();
+            bx.col_lines.clear();
+            let v = d.1.trim();
+            if !v.eq_ignore_ascii_case("none") {
+                let (rows_part, cols_part) = split_top_level(v, "/").unwrap_or((v, ""));
+                let (areas, rest) = parse_area_rows(rows_part);
+                if !areas.is_empty() {
+                    bx.areas = areas;
+                }
+                let (rows, row_lines) = parse_tracks(&rest, vp);
+                bx.rows = rows;
+                bx.row_lines = row_lines;
+                let (cols, col_lines) = parse_tracks(cols_part, vp);
+                bx.cols = cols;
+                bx.col_lines = col_lines;
             }
         }
         // `grid-area: <name>` — a plain custom ident places the item into the
@@ -7565,6 +7574,38 @@ fn tracking(v: &str, vp: (f32, f32), size: f32, inherited: f32) -> f32 {
             }
         }
     }
+}
+
+/// Read the quoted area rows of `grid-template-areas` (or the rows half of the
+/// `grid-template` shorthand). Returns the rows plus the input with the quoted
+/// strings replaced by spaces - the shorthand's row track sizes live there.
+fn parse_area_rows(v: &str) -> (Vec<Vec<Option<String>>>, String) {
+    let mut rows = Vec::new();
+    let mut rest = String::new();
+    let mut s = v;
+    while let Some(open) = s.find('"') {
+        rest.push_str(&s[..open]);
+        let Some(close) = s[open + 1..].find('"') else {
+            rest.push_str(&s[open..]);
+            break;
+        };
+        let row = &s[open + 1..open + 1 + close];
+        rows.push(
+            row.split_whitespace()
+                .map(|t| {
+                    if !t.is_empty() && t.bytes().all(|b| b == b'.') {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    }
+                })
+                .collect(),
+        );
+        rest.push(' '); // keep the row sizes as separate tokens
+        s = &s[open + 1 + close + 1..];
+    }
+    rest.push_str(s);
+    (rows, rest)
 }
 
 /// `grid-template-columns` / `grid-template-rows`: `1fr 1fr`, `repeat(3, 1fr)`,
@@ -12564,6 +12605,39 @@ mod tests {
         let sheet = parse(".s { grid-area: 1 / 2 / 3 / 4 }");
         let s = sheet.resolve(&dom, by_attr(&dom, "class", "s"), Style::new(), None).bx;
         assert_eq!(s.grid_area, None);
+    }
+
+    #[test]
+    fn grid_template_shorthand_sets_areas_rows_and_columns() {
+        // github: `grid-template:"label action"min-content/ min-content 1fr`
+        let sheet = parse(
+            ".g { grid-template: \"label action\" min-content \
+                                \"desc desc\" 1fr / min-content 1fr }",
+        );
+        let dom = dom_of("<div class=g></div>");
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert_eq!(
+            g.areas,
+            vec![
+                vec![Some("label".to_string()), Some("action".to_string())],
+                vec![Some("desc".to_string()), Some("desc".to_string())],
+            ]
+        );
+        assert_eq!(g.rows, vec![Track::MinContent, Track::Fr(1.0)]);
+        assert_eq!(g.cols, vec![Track::MinContent, Track::Fr(1.0)]);
+        // no slash: rows only, columns reset to none
+        let sheet = parse(".g { grid-template: \"a\" 1fr \"b\" 2fr }");
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert_eq!(g.rows, vec![Track::Fr(1.0), Track::Fr(2.0)]);
+        assert!(g.cols.is_empty());
+        assert_eq!(g.areas.len(), 2);
+        // `none` resets the longhands it shadows
+        let sheet = parse(
+            ".g { grid-template-columns: 1fr 1fr; grid-template-rows: 20px; \
+                  grid-template-areas: \"a b\"; grid-template: none }",
+        );
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert!(g.cols.is_empty() && g.rows.is_empty() && g.areas.is_empty());
     }
 
     #[test]
