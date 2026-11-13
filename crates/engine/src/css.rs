@@ -1431,6 +1431,12 @@ enum Pseudo {
     /// `:target` — the element named by the document URL's fragment. The
     /// loader stores the decoded fragment on the DOM; no fragment = no match.
     Target,
+    /// `:popover-open` — a popover in the open state. No popover API is
+    /// implemented and no top layer is modeled, so nothing is ever open:
+    /// this matches nothing. That makes the useful half work statically —
+    /// `:not(:popover-open)` matches closed popovers (and every other
+    /// element), which is how pages hide their overlays.
+    PopoverOpen,
     /// `:root` — a direct child of the document root (the `<html>` element).
     Root,
     /// `:first-child` — first ELEMENT child of its parent (text nodes don't
@@ -8704,6 +8710,9 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     ("empty", None) => seg.pseudos.push(Pseudo::Empty),
                     // the URL fragment names this element (static per load)
                     ("target", None) => seg.pseudos.push(Pseudo::Target),
+                    // no popover is ever open here (no API, no top layer),
+                    // so `:not(:popover-open)` can hide closed overlays
+                    ("popover-open", None) => seg.pseudos.push(Pseudo::PopoverOpen),
                     // the input hint is showing: an empty value + a
                     // `placeholder` attribute. Static (the cascade keeps no
                     // live values); `:not(:placeholder-shown)` is how a
@@ -9295,6 +9304,8 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
         Pseudo::Target => dom
             .target()
             .is_some_and(|t| dom.attr(node, "id") == Some(t)),
+        // nothing is open: the popover API and top layer aren't modeled
+        Pseudo::PopoverOpen => false,
         // a direct child of the document root (the `<html>` element)
         Pseudo::Root => node != 0 && dom.nodes[node as usize].parent == 0,
         Pseudo::FirstChild => element_sibling_index(dom, node) == Some(1),
@@ -14486,6 +14497,31 @@ mod tests {
         // a `::marker` rule must NOT style the origin element
         assert_eq!(
             sheet.resolve(&dom, li, Style::new(), None).style.color,
+            Style::new().color
+        );
+    }
+
+    #[test]
+    fn popover_open_matches_nothing_so_closed_overlays_hide() {
+        // github ships `.Overlay[popover]:not(:popover-open){display:none}`;
+        // with no popover ever open, the negation must match
+        let dom = dom_of(r#"<div popover class="o">x</div><p class="p">y</p>"#);
+        let o = by_attr(&dom, "class", "o");
+        let p = by_attr(&dom, "class", "p");
+        let sheet = parse(
+            ".o:not(:popover-open) { display: none } \
+             .p:not(:popover-open) { color: #112233 }",
+        );
+        assert!(sheet.resolve(&dom, o, Style::new(), None).display_none);
+        assert_eq!(
+            sheet.resolve(&dom, p, Style::new(), None).style.color,
+            0x112233,
+            "a non-popover is not popover-open either"
+        );
+        // the positive form never matches
+        let open = parse("div:popover-open { color: #445566 }");
+        assert_eq!(
+            open.resolve(&dom, o, Style::new(), None).style.color,
             Style::new().color
         );
     }

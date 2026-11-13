@@ -6026,3 +6026,28 @@ count stays at 32 884 because `Sheet::len()` counts `rules`, `hover` and the
 that total (a separate accounting quirk, not a layout claim).
 
 Tests: `webkit_details_marker_is_the_marker_pseudo`. 1085 green.
+
+## read :popover-open as closed instead of dropping the rule (P110, 2026-11-13)
+
+github ships `.Overlay[popover]:not(:popover-open){display:none}` to hide its
+closed overlays, but `:popover-open` was rejected at parse time, so the whole
+negation dropped - the one rule that keeps those panels out of the static
+frame. No popover API or top layer is modeled here, so nothing is ever open:
+`:popover-open` is statically false, and `:not(:popover-open)` matches closed
+popovers (and every non-popover), which is exactly the initial state.
+
+The positive form still matches nothing, which is correct for a fresh load.
+Caveat: a script calling `showPopover()` is not tracked, so Chrome would show
+that popover while this engine keeps it closed; and the UA `[popover]` default
+hiding is still not implemented, so pages relying only on that default are
+unaffected by this change.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32 884 -> 32 901
+rules (+17), 45 -> 43 distinct dropped selector reasons (`pseudo-class
+:popover-open`, 16, and `complex :not(:popover-open) argument`, 1, gone), 38
+dropped properties, 1 at-rule and 1110 boxes unchanged, so no layout change is
+claimed on this page. A local `data:` page confirms the behavior:
+`.o[popover]:not(:popover-open){display:none}` drops the `.o` box while the
+plain `.p` box remains.
+
+Tests: `popover_open_matches_nothing_so_closed_overlays_hide`. 1086 green.
