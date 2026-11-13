@@ -8024,17 +8024,28 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
     // explicit columns, else one auto (content-sized) track per area column,
     // else one per column-flow implicit column, else the single full-width
     // implicit track
+    // implicit columns repeat `grid-auto-columns` cyclically (auto when it
+    // is not declared)
+    let implicit_cols = |count: usize| -> Vec<Track> {
+        if n.bx.auto_cols.is_empty() {
+            vec![Track::Auto; count]
+        } else {
+            (0..count)
+                .map(|i| n.bx.auto_cols[i % n.bx.auto_cols.len()].clone())
+                .collect()
+        }
+    };
     let mut tracks: Vec<Track> = if !n.bx.cols.is_empty() {
         n.bx.cols.clone()
-    } else if area_cols > 0 || nc > 1 {
-        vec![Track::Auto; nc]
+    } else if area_cols > 0 || nc > 1 || (!n.bx.auto_cols.is_empty() && nc > 0) {
+        implicit_cols(nc.max(1))
     } else {
         Vec::new()
     };
     // implicit columns past an explicit template (`grid-template-columns:
-    // 1fr` + column flow) size as auto too
+    // 1fr` + column flow) follow `grid-auto-columns` too
     if !tracks.is_empty() && tracks.len() < nc {
-        tracks.resize(nc, Track::Auto);
+        tracks.extend(implicit_cols(nc - tracks.len()));
     }
     // Per-column measured widths for `auto`/`min-content`/`max-content`/
     // `minmax(…)`: min-content = widest unbreakable word, max-content = the
@@ -10783,6 +10794,38 @@ mod tests {
         layout_tree(&mut n, 300.0, &m4);
         assert_eq!(n.children[0].y, 0.0);
         assert_eq!(n.children[1].y, 100.0, "second row starts after 100px");
+    }
+
+    #[test]
+    fn grid_auto_columns_size_implicit_columns() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                grid_flow: GridFlow::Column,
+                cols: vec![Track::Px(50.0)],
+                auto_cols: vec![Track::Px(80.0)],
+                ..BoxStyle::default()
+            },
+        );
+        for t in ["a", "b"] {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            n.children.push(g);
+        }
+        layout_tree(&mut n, 300.0, &m4);
+        assert_eq!(n.children[0].x, 0.0);
+        assert_eq!(n.children[1].x, 50.0, "implicit column after the 50px one");
+        assert_eq!(
+            n.children[1].w, 80.0,
+            "implicit column uses grid-auto-columns"
+        );
     }
 
     #[test]

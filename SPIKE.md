@@ -6335,3 +6335,18 @@ distinct dropped properties (`overflow-anchor` and `caret-color` gone),
 
 Test: `scroll_anchor_and_caret_colour_are_inert_in_a_static_frame`.
 1105 green.
+## size implicit grid columns from grid-auto-columns (P126, 2026-11-13)
+
+`grid-auto-rows` already repeated its track list past the explicit
+template, but the column-axis twin was dropped. Add `auto_cols` to
+`BoxStyle`: implicit columns (column flow, or placement past an explicit
+`grid-template-columns`) now repeat `grid-auto-columns` cyclically, and a
+grid with no template columns but a declared auto-columns list gets its
+single implicit column sized by it. `auto` remains the fallback.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 25 -> 24
+distinct dropped properties (`grid-auto-columns` gone), 32982 rules,
+35 selector reasons, 1110 boxes unchanged.
+
+Tests: `grid_auto_columns_parses_a_track_list`,
+`grid_auto_columns_size_implicit_columns`. 1107 green.

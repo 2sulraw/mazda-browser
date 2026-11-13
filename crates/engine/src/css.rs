@@ -820,6 +820,9 @@ pub struct BoxStyle {
     /// `grid-auto-rows` — track sizes for implicit rows, repeated cyclically
     /// past the explicit `grid-template-rows` list.
     pub auto_rows: Vec<Track>,
+    /// `grid-auto-columns` — the column-axis twin of [`Self::auto_rows`],
+    /// repeated cyclically past the explicit `grid-template-columns` list.
+    pub auto_cols: Vec<Track>,
     /// `[line-name]` boundaries from `grid-template-columns`
     /// (name → track index it precedes)
     pub col_lines: Vec<(String, usize)>,
@@ -1243,6 +1246,7 @@ impl Default for BoxStyle {
             cols: Vec::new(),
             rows: Vec::new(),
             auto_rows: Vec::new(),
+            auto_cols: Vec::new(),
             col_lines: Vec::new(),
             row_lines: Vec::new(),
             grid_col: None,
@@ -2495,6 +2499,7 @@ const KNOWN: &[&str] = &[
     "grid-template",
     "grid-template-columns",
     "grid-auto-rows",
+    "grid-auto-columns",
     "grid-template-rows",
     "grid-template-areas",
     "grid-area",
@@ -5095,6 +5100,9 @@ fn apply_decl(
         // `grid-template-rows` list (a height floor, like explicit rows)
         "grid-auto-rows" => {
             bx.auto_rows = parse_tracks(&d.1, vp).0;
+        }
+        "grid-auto-columns" => {
+            bx.auto_cols = parse_tracks(&d.1, vp).0;
         }
         // `grid-template-areas: "a b" "c d"` — one quoted string per row,
         // whitespace-separated names, a run of dots is an empty cell. Only
@@ -12916,6 +12924,14 @@ mod tests {
         let dom = dom_of("<div class=g></div>");
         let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
         assert_eq!(g.auto_rows, vec![Track::MinContent, Track::Fr(1.0)]);
+    }
+
+    #[test]
+    fn grid_auto_columns_parses_a_track_list() {
+        let sheet = parse(".g { grid-auto-columns: max-content }");
+        let dom = dom_of("<div class=g></div>");
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert_eq!(g.auto_cols, vec![Track::MaxContent]);
     }
 
     #[test]
