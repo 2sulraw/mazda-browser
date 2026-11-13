@@ -6308,3 +6308,16 @@ distinct dropped properties (`contain-intrinsic-size` gone), 32982
 rules, 35 selector reasons, 1110 boxes unchanged.
 
 Test: `contain_intrinsic_size_is_an_accepted_noop`. 1103 green.
+## route CSS text-anchor into inline SVG (P124, 2026-11-13)
+
+The rasterizer already implements `text-anchor` (start/middle/end), but
+the CSS gate dropped the property and the inline-SVG paint injector did
+not forward it, so a page rule targeting an SVG `<text>` was lost and the
+text always started at its x. Keep the property and add it to the SVG
+paint property list, like fill/stroke.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 28 -> 27
+distinct dropped properties (`text-anchor` gone), 32982 rules, 35
+selector reasons, 1110 boxes unchanged.
+
+Test: `svg_class_text_anchor_is_injected_as_inline_style`. 1104 green.

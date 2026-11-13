@@ -5881,7 +5881,7 @@ fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 
 /// Paint/font properties an SVG rasterizer understands; only these are merged
 /// from the page cascade.
-const SVG_PROPS: [&str; 11] = [
+const SVG_PROPS: [&str; 12] = [
     "fill",
     "stroke",
     "fill-opacity",
@@ -5891,6 +5891,7 @@ const SVG_PROPS: [&str; 11] = [
     "stroke-linejoin",
     "stroke-dasharray",
     "stroke-dashoffset",
+    "text-anchor",
     "opacity",
     "font-size",
 ];
@@ -13058,6 +13059,28 @@ mod tests {
         );
         layout_tree(&mut e, 600.0, &m4);
         assert!((e.h - 240.0).abs() < 0.01, "e.h={}", e.h);
+    }
+
+    #[test]
+    fn svg_class_text_anchor_is_injected_as_inline_style() {
+        let dom = crate::html::parse(
+            r#"<body><svg viewBox="0 0 40 20"><text class="end" x="30" y="15">Hi</text></svg></body>"#,
+        );
+        let sheet = crate::css::parse(r#".end { text-anchor: end }"#);
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        fn find_svg(n: &BoxNode) -> Option<&ImgSlot> {
+            if n.img.is_some() {
+                return n.img.as_ref();
+            }
+            n.children.iter().find_map(find_svg)
+        }
+        let Some(ImgSlot::Pending(src)) = find_svg(&root) else {
+            panic!("svg should produce a pending img slot");
+        };
+        assert!(
+            src.contains("text-anchor:end"),
+            "class text-anchor injected as inline style: {src:?}"
+        );
     }
 
     #[test]
