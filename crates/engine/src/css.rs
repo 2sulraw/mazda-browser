@@ -1019,6 +1019,13 @@ pub struct BoxStyle {
     /// the two axes collapse into this one flag, so `overflow-x:hidden;
     /// overflow-y:visible` clips both axes.
     pub clip: bool,
+    /// the clipping came from `overflow: clip` (not `hidden`/`scroll`/`auto`),
+    /// so `overflow-clip-margin` expands the window
+    pub overflow_clip: bool,
+    /// `overflow-clip-margin` — how far content may bleed past the padding
+    /// box when `overflow: clip`; the box keyword (`content-box` etc.) is
+    /// ignored (we always clip at the padding box)
+    pub clip_margin: Len,
     /// `text-overflow: ellipsis` — an overflowing line of this box ends with
     /// "…" instead of a cut glyph (`apply_run_clips` trims the run text).
     /// Only takes effect together with `clip` (`overflow` not `visible`),
@@ -1289,6 +1296,8 @@ impl Default for BoxStyle {
             btransparent: false,
             outline: Outline::NONE,
             clip: false,
+            overflow_clip: false,
+            clip_margin: Len::Px(0.0),
             ellipsis: false,
             clip_rect: None,
             clip_path: None,
@@ -2578,6 +2587,7 @@ const KNOWN: &[&str] = &[
     "left",
     "inset",
     "overflow",
+    "overflow-clip-margin",
     "text-overflow",
     "overflow-x",
     "overflow-y",
@@ -5200,10 +5210,16 @@ fn apply_decl(
         // `overflow-y` set it too), so a mixed visible/hidden pair clips
         // both axes. `visible` (and the default) → false.
         "overflow" | "overflow-x" | "overflow-y" => {
-            bx.clip = matches!(
-                d.1.split_whitespace().next().unwrap_or(""),
-                "hidden" | "clip" | "scroll" | "auto"
-            );
+            let v = d.1.split_whitespace().next().unwrap_or("");
+            bx.clip = matches!(v, "hidden" | "clip" | "scroll" | "auto");
+            bx.overflow_clip = v == "clip";
+        }
+        // `overflow-clip-margin: [content-box|padding-box|border-box] <length>`
+        // — only meaningful with `overflow: clip`; the box keyword is ignored
+        // (clipping stays at the padding box)
+        "overflow-clip-margin" => {
+            let v = d.1.split_whitespace().last().unwrap_or("");
+            bx.clip_margin = parse_len(v, vp).unwrap_or(Len::Px(0.0));
         }
         // `text-overflow` — the ellipsis marker; only the keyword matters
         // (the second `clip`/`fade` value has no visual difference here)
@@ -10854,6 +10870,25 @@ mod tests {
         assert!(get("x").clip, "overflow-x: hidden clips");
         assert!(!get("y").clip, "overflow-y: visible alone leaves the flag off");
         assert!(!get("d").clip, "default is visible");
+    }
+
+    #[test]
+    fn overflow_clip_margin_parses_and_marks_clip_overflow() {
+        let sheet = parse(
+            ".c { overflow: clip; overflow-clip-margin: .5rem } \
+             .h { overflow: hidden; overflow-clip-margin: 8px } \
+             .b { overflow: clip; overflow-clip-margin: content-box 4px }",
+        );
+        let dom = dom_of(
+            "<div class=c></div><div class=h></div><div class=b></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None).bx;
+        let c = get("c");
+        assert!(c.clip && c.overflow_clip);
+        assert_eq!(c.clip_margin, Len::Px(8.0), ".5rem = 8px");
+        let h = get("h");
+        assert!(h.clip && !h.overflow_clip, "hidden is not clip");
+        assert_eq!(get("b").clip_margin, Len::Px(4.0), "box keyword ignored");
     }
 
     #[test]

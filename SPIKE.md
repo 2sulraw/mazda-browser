@@ -6157,3 +6157,23 @@ rules (+4), 36 -> 35 dropped selector reasons (`:dir` gone), 36 properties and
 
 Test: `dir_pseudo_reads_the_nearest_dir_attribute` (inherits rtl from an
 ancestor, stops at a nearer dir=ltr, defaults ltr). 1092 green.
+
+## let overflow:clip content bleed by overflow-clip-margin (P116, 2026-11-13)
+
+Six github rules pair `overflow: clip` with
+`overflow-clip-margin: var(--base-size-8, .5rem)` (8px); both were unknown,
+so clipped content stopped dead at the padding box.
+
+The margin now parses into `BoxStyle::clip_margin` (a `Len`, resolved against
+the box width), and a new `overflow_clip` flag records that the clip came from
+`overflow: clip` rather than `hidden`/`scroll`/`auto`. Layout inflates the
+content clip window by the margin only in that case (the box keyword ?
+`content-box` etc. ? is ignored; clipping stays at the padding box).
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 36 -> 35 distinct
+dropped properties (`overflow-clip-margin` gone), 32949 rules, 35 selector
+reasons and 1110 boxes unchanged.
+
+Tests: `overflow_clip_margin_parses_and_marks_clip_overflow`,
+`overflow_clip_margin_lets_content_bleed_past_the_padding_box` (100px window,
+108px with an 8px margin, margin ignored under `overflow: hidden`). 1094 green.

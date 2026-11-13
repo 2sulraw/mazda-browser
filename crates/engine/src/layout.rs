@@ -3555,7 +3555,18 @@ fn collect_paint(
         };
         // own overflow clips CONTENT (children + own image), not own chrome
         let content_clip = if n.bx.clip {
-            let pad = (n.x + bl, n.y + bt, n.x + n.w - br, n.y + n.h - bb);
+            // `overflow-clip-margin` only widens an `overflow: clip` window
+            let cm = if n.bx.overflow_clip {
+                resolve_len(n.bx.clip_margin, n.w)
+            } else {
+                0.0
+            };
+            let pad = (
+                n.x + bl - cm,
+                n.y + bt - cm,
+                n.x + n.w - br + cm,
+                n.y + n.h - bb + cm,
+            );
             Some(match clip {
                 Some(c) => clip_intersect(c, m.map_win(pad)),
                 None => m.map_win(pad),
@@ -13664,6 +13675,57 @@ mod tests {
         assert!(
             l.runs.iter().all(|r| r.clip.is_none()),
             "visible: no run carries a clip window"
+        );
+    }
+
+    #[test]
+    fn overflow_clip_margin_lets_content_bleed_past_the_padding_box() {
+        let mk = |clip: bool, overflow_clip: bool, margin: f32| {
+            let mut clipper = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(100.0)),
+                    bg: Some(0x112233),
+                    clip,
+                    overflow_clip,
+                    clip_margin: Len::Px(margin),
+                    ..BoxStyle::default()
+                },
+            );
+            let mut straddle = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    width: Some(Len::Px(300.0)),
+                    bg: Some(0x00ff00),
+                    ..BoxStyle::default()
+                },
+            );
+            straddle.children = vec![leaf("over")];
+            clipper.children = vec![straddle];
+            let mut root = BoxNode::group(Style::new(), BoxStyle::default());
+            root.children = vec![clipper];
+            root
+        };
+        let width = |mut root: BoxNode| {
+            let l = layout_tree(&mut root, 300.0, &m4);
+            l.rects
+                .iter()
+                .find(|r| r.4 == 0x00ff00)
+                .expect("straddle rect")
+                .2
+        };
+        assert_eq!(width(mk(true, true, 0.0)), 100.0, "no margin: padding box");
+        assert_eq!(
+            width(mk(true, true, 8.0)),
+            108.0,
+            "clip margin bleeds 8px past the right edge"
+        );
+        assert_eq!(
+            width(mk(true, false, 8.0)),
+            100.0,
+            "overflow: hidden ignores the margin"
         );
     }
 
