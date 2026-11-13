@@ -6119,3 +6119,23 @@ mounted on this page, so no page-level layout change is claimed; a local
 
 Tests: `grid_template_shorthand_sets_areas_rows_and_columns` (areas, rows,
 columns, the no-slash form, and the `none` reset). 1089 green.
+
+## floor implicit grid rows from grid-auto-rows (P114, 2026-11-13)
+
+19 github declarations set `grid-auto-rows` (`min-content`, `max-content`,
+`auto 1fr`, `minmax(80px, max-content)`) for cards, bento grids and river
+sections; unknown, so implicit rows stayed purely content-sized.
+
+The property now parses through the existing track-list parser into a new
+`BoxStyle::auto_rows`, and the grid row pass uses it as the height floor for
+rows past the explicit `grid-template-rows`, repeating the list cyclically,
+the same `row_track_floor` the template tracks use.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 37 -> 36 distinct
+dropped properties (`grid-auto-rows` gone), 36 selector reasons and 1110 boxes
+unchanged, so no page-level layout change is claimed. The layout test proves
+the mechanism: with one 30px explicit row and a 70px auto row, the third item
+starts at y=100 instead of y?52 (content height).
+
+Tests: `grid_auto_rows_parses_a_track_list`,
+`grid_auto_rows_floor_implicit_rows`. 1091 green.

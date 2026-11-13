@@ -817,6 +817,9 @@ pub struct BoxStyle {
     /// and `fr` rows are content-sized (see layout's `grid()`). shortcut:
     /// `fr` rows don't fill a declared container height.
     pub rows: Vec<Track>,
+    /// `grid-auto-rows` — track sizes for implicit rows, repeated cyclically
+    /// past the explicit `grid-template-rows` list.
+    pub auto_rows: Vec<Track>,
     /// `[line-name]` boundaries from `grid-template-columns`
     /// (name → track index it precedes)
     pub col_lines: Vec<(String, usize)>,
@@ -1232,6 +1235,7 @@ impl Default for BoxStyle {
             column_gap: None,
             cols: Vec::new(),
             rows: Vec::new(),
+            auto_rows: Vec::new(),
             col_lines: Vec::new(),
             row_lines: Vec::new(),
             grid_col: None,
@@ -2476,6 +2480,7 @@ const KNOWN: &[&str] = &[
     "column-count",
     "grid-template",
     "grid-template-columns",
+    "grid-auto-rows",
     "grid-template-rows",
     "grid-template-areas",
     "grid-area",
@@ -5011,6 +5016,11 @@ fn apply_decl(
             let (rows, lines) = parse_tracks(&d.1, vp);
             bx.rows = rows;
             bx.row_lines = lines;
+        }
+        // implicit rows repeat these track sizes cyclically past the explicit
+        // `grid-template-rows` list (a height floor, like explicit rows)
+        "grid-auto-rows" => {
+            bx.auto_rows = parse_tracks(&d.1, vp).0;
         }
         // `grid-template-areas: "a b" "c d"` — one quoted string per row,
         // whitespace-separated names, a run of dots is an empty cell. Only
@@ -12638,6 +12648,14 @@ mod tests {
         );
         let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
         assert!(g.cols.is_empty() && g.rows.is_empty() && g.areas.is_empty());
+    }
+
+    #[test]
+    fn grid_auto_rows_parses_a_track_list() {
+        let sheet = parse(".g { grid-auto-rows: min-content 1fr }");
+        let dom = dom_of("<div class=g></div>");
+        let g = sheet.resolve(&dom, by_attr(&dom, "class", "g"), Style::new(), None).bx;
+        assert_eq!(g.auto_rows, vec![Track::MinContent, Track::Fr(1.0)]);
     }
 
     #[test]

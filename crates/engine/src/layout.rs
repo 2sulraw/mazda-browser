@@ -8164,8 +8164,15 @@ fn grid(n: &mut BoxNode, measure: &dyn Fn(&str, &Style) -> f32, runs: &mut Vec<P
                 span_h[idx] = ih; // remember it for the row it ends in
             }
         }
-        // a declared row track is a height floor (the tallest cell still wins)
-        if let Some(t) = n.bx.rows.get(r) {
+        // a declared row track is a height floor (the tallest cell still
+        // wins); past the explicit template, `grid-auto-rows` repeats its
+        // cyclically
+        let explicit_rows = n.bx.rows.len();
+        let track = n.bx.rows.get(r).or_else(|| {
+            let auto = &n.bx.auto_rows;
+            (!auto.is_empty()).then(|| &auto[(r - explicit_rows) % auto.len()])
+        });
+        if let Some(t) = track {
             row_h = row_h.max(row_track_floor(t, row_avail_h));
         }
         // Row-spanning items laid out above (in their start row): whatever the
@@ -10762,6 +10769,35 @@ mod tests {
         layout_tree(&mut n, 300.0, &m4);
         assert_eq!(n.children[0].y, 0.0);
         assert_eq!(n.children[1].y, 100.0, "second row starts after 100px");
+    }
+
+    #[test]
+    fn grid_auto_rows_floor_implicit_rows() {
+        let mut n = BoxNode::group(
+            Style::new(),
+            BoxStyle {
+                display: Display::Grid,
+                cols: vec![Track::Fr(1.0)],
+                rows: vec![Track::Px(30.0)],
+                auto_rows: vec![Track::Px(70.0)],
+                ..BoxStyle::default()
+            },
+        );
+        for t in ["a", "b", "c"] {
+            let mut g = BoxNode::group(
+                Style::new(),
+                BoxStyle {
+                    display: Display::Block,
+                    ..BoxStyle::default()
+                },
+            );
+            g.children = vec![leaf(t)];
+            n.children.push(g);
+        }
+        layout_tree(&mut n, 300.0, &m4);
+        assert_eq!(n.children[0].y, 0.0);
+        assert_eq!(n.children[1].y, 30.0, "explicit row");
+        assert_eq!(n.children[2].y, 100.0, "implicit row gets the 70px floor");
     }
 
     #[test]
