@@ -7,7 +7,8 @@
 //! colors; linearGradient/radialGradient collapsed to the flat midpoint of
 //! their stop colors.
 //! shortcut: no text, clip/mask/filter/pattern, no `use`/`image`, no CSS
-//! <style> blocks, no dash/miter/linecap variants, gradients render flat.
+//! <style> blocks, no miter/linecap variants (dashes are butt-capped),
+//! gradients render flat.
 
 use crate::image::ImageData;
 
@@ -883,7 +884,11 @@ fn paint_geometry(
         // matrix already maps to supersampled space → hypot gives super px
         let sw = st.sw * (m.a.hypot(m.b) + m.c.hypot(m.d)) / 2.0;
         if sw > 0.0 {
-            let polys = stroke_polys(subs, m, sw);
+            // dash lengths are user units: scale them into the supersampled
+            // space the same way the width was
+            let k = (m.a.hypot(m.b) + m.c.hypot(m.d)) / 2.0;
+            let dash: Vec<f64> = st.dash.iter().map(|d| d * k).collect();
+            let polys = stroke_polys(subs, m, sw, &dash, st.dash_off * k);
             if !polys.is_empty() {
                 mask.fill(0);
                 fill_scan(&mut mask, ctx.w2, ctx.h2, &polys, false);
@@ -2141,6 +2146,10 @@ struct Style {
     opacity: f64,
     fill_opacity: f64,
     stroke_opacity: f64,
+    /// `stroke-dasharray` (user units, alternating on/off; empty = solid)
+    dash: Vec<f64>,
+    /// `stroke-dashoffset` (user units)
+    dash_off: f64,
     evenodd: bool,
     /// `font-size` in user units (SVG's initial value is 16)
     fs: f64,
@@ -2157,6 +2166,8 @@ impl Default for Style {
             opacity: 1.0,
             fill_opacity: 1.0,
             stroke_opacity: 1.0,
+            dash: Vec::new(),
+            dash_off: 0.0,
             evenodd: false,
             fs: 16.0,
             anchor: 0,
@@ -2172,6 +2183,8 @@ impl Style {
             "fill",
             "stroke",
             "stroke-width",
+            "stroke-dasharray",
+            "stroke-dashoffset",
             "fill-rule",
             "fill-opacity",
             "stroke-opacity",
@@ -2192,6 +2205,31 @@ impl Style {
             "fill" => self.fill = self.paint(v),
             "stroke" => self.stroke = self.paint(v),
             "stroke-width" => self.sw = parse_px(v).unwrap_or(self.sw).max(0.0),
+            "stroke-dasharray" => {
+                if v.eq_ignore_ascii_case("none") {
+                    self.dash.clear();
+                } else {
+                    let mut d: Vec<f64> = v
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|t| !t.is_empty())
+                        .filter_map(parse_px)
+                        .filter(|n| *n >= 0.0)
+                        .collect();
+                    if d.is_empty() || d.iter().all(|n| *n == 0.0) {
+                        // the initial value / an all-zero pattern is solid
+                        d.clear();
+                    } else if d.len() % 2 == 1 {
+                        let dup = d.clone();
+                        d.extend(dup);
+                    }
+                    self.dash = d;
+                }
+            }
+            "stroke-dashoffset" => {
+                if let Some(n) = parse_px(v) {
+                    self.dash_off = n;
+                }
+            }
             "fill-rule" => self.evenodd = v.eq_ignore_ascii_case("evenodd"),
             "fill-opacity" => self.fill_opacity = v.parse::<f64>().unwrap_or(self.fill_opacity).clamp(0.0, 1.0),
             "stroke-opacity" => self.stroke_opacity = v.parse::<f64>().unwrap_or(self.stroke_opacity).clamp(0.0, 1.0),
@@ -2600,7 +2638,17 @@ fn ellipse_poly(cx: f64, cy: f64, rx: f64, ry: f64) -> Vec<(f64, f64)> {
 }
 
 /// Stroke outline polygons: one quad per segment + round joins (octagons).
-fn stroke_polys(subs: &[Sub], m: M, sw: f64) -> Vec<Vec<(f64, f64)>> {
+/// A non-empty `dash` (on/off lengths, alternating from an "on" slot, scaled
+/// to supersampled units) keeps only the "on" intervals; `dash_off` shifts
+/// the pattern start like `stroke-dashoffset`. Dashes are butt-capped (the
+/// quads end flat), which is SVG's default linecap.
+fn stroke_polys(
+    subs: &[Sub],
+    m: M,
+    sw: f64,
+    dash: &[f64],
+    dash_off: f64,
+) -> Vec<Vec<(f64, f64)>> {
     let r = sw / 2.0;
     let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
     for sub in subs {
@@ -2608,37 +2656,118 @@ fn stroke_polys(subs: &[Sub], m: M, sw: f64) -> Vec<Vec<(f64, f64)>> {
         if pts.len() < 2 {
             continue;
         }
-        let nseg = if sub.closed { pts.len() } else { pts.len() - 1 };
-        for s in 0..nseg {
-            let (x0, y0) = pts[s];
-            let (x1, y1) = pts[(s + 1) % pts.len()];
-            let (dx, dy) = (x1 - x0, y1 - y0);
-            let len = dx.hypot(dy);
-            if len < 1e-9 {
-                continue;
-            }
-            let (nx, ny) = (-dy / len * r, dx / len * r);
-            out.push(vec![
-                (x0 + nx, y0 + ny),
-                (x1 + nx, y1 + ny),
-                (x1 - nx, y1 - ny),
-                (x0 - nx, y0 - ny),
-            ]);
-        }
-        // round joins: every vertex (closed) or interior vertices (open)
-        if r >= 0.75 {
-            let jrange: Vec<usize> = if sub.closed {
-                (0..pts.len()).collect()
-            } else {
-                (1..pts.len().saturating_sub(1)).collect()
-            };
-            for j in jrange {
-                let (cx, cy) = pts[j];
-                out.push(ellipse_poly(cx, cy, r, r));
-            }
+        if dash.is_empty() {
+            solid_stroke(&pts, sub.closed, r, &mut out);
+        } else {
+            dashed_stroke(&pts, sub.closed, r, dash, dash_off, &mut out);
         }
     }
     out
+}
+
+/// Solid subpath: one quad per segment plus round joins at every vertex
+/// (closed) or interior vertices (open).
+fn solid_stroke(pts: &[(f64, f64)], closed: bool, r: f64, out: &mut Vec<Vec<(f64, f64)>>) {
+    let nseg = if closed { pts.len() } else { pts.len() - 1 };
+    for s in 0..nseg {
+        let (x0, y0) = pts[s];
+        let (x1, y1) = pts[(s + 1) % pts.len()];
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = dx.hypot(dy);
+        if len < 1e-9 {
+            continue;
+        }
+        let (nx, ny) = (-dy / len * r, dx / len * r);
+        out.push(vec![
+            (x0 + nx, y0 + ny),
+            (x1 + nx, y1 + ny),
+            (x1 - nx, y1 - ny),
+            (x0 - nx, y0 - ny),
+        ]);
+    }
+    // round joins: every vertex (closed) or interior vertices (open)
+    if r >= 0.75 {
+        let jrange: Vec<usize> = if closed {
+            (0..pts.len()).collect()
+        } else {
+            (1..pts.len().saturating_sub(1)).collect()
+        };
+        for j in jrange {
+            let (cx, cy) = pts[j];
+            out.push(ellipse_poly(cx, cy, r, r));
+        }
+    }
+}
+
+/// Dashed subpath: walk the polyline in path order, alternating `on`/`off`
+/// spans. The dash state carries across vertices; a round join is emitted at
+/// a vertex only when the dash continues through it.
+fn dashed_stroke(
+    pts: &[(f64, f64)],
+    closed: bool,
+    r: f64,
+    dash: &[f64],
+    dash_off: f64,
+    out: &mut Vec<Vec<(f64, f64)>>,
+) {
+    let total: f64 = dash.iter().sum();
+    if total <= 1e-9 {
+        return;
+    }
+    // start `dash_off` into the pattern (positive offset shortens the first
+    // dash, as in CSS)
+    let mut phase = dash_off.rem_euclid(total);
+    let mut di = 0usize;
+    let mut left;
+    loop {
+        let d = dash[di];
+        if phase < d {
+            left = d - phase;
+            break;
+        }
+        phase -= d;
+        di = (di + 1) % dash.len();
+    }
+    let mut on = di % 2 == 0;
+    let nseg = if closed { pts.len() } else { pts.len() - 1 };
+    for s in 0..nseg {
+        let (x0, y0) = pts[s];
+        let (x1, y1) = pts[(s + 1) % pts.len()];
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = dx.hypot(dy);
+        if len < 1e-9 {
+            continue;
+        }
+        let (ux, uy) = (dx / len, dy / len);
+        let (nx, ny) = (-uy * r, ux * r);
+        let mut t = 0.0;
+        while t < len - 1e-9 {
+            let seg = (len - t).min(left);
+            if on {
+                let (ax, ay) = (x0 + ux * t, y0 + uy * t);
+                let (bx, by) = (x0 + ux * (t + seg), y0 + uy * (t + seg));
+                out.push(vec![
+                    (ax + nx, ay + ny),
+                    (bx + nx, by + ny),
+                    (bx - nx, by - ny),
+                    (ax - nx, ay - ny),
+                ]);
+            }
+            t += seg;
+            left -= seg;
+            if left <= 1e-9 {
+                di = (di + 1) % dash.len();
+                left = dash[di];
+                on = !on;
+            }
+        }
+        // a dash that runs through the vertex needs the round join; an open
+        // path's final endpoint has nothing to join
+        if r >= 0.75 && on && (closed || s + 1 < pts.len() - 1) {
+            let (cx, cy) = pts[(s + 1) % pts.len()];
+            out.push(ellipse_poly(cx, cy, r, r));
+        }
+    }
 }
 
 // ---------- raster core ----------
@@ -2861,6 +2990,22 @@ mod tests {
         assert_eq!(img.px[5 * 10 + 5], 0); // hollow center
         assert_ne!(img.px[2 * 10 + 5], 0); // ring top
         assert_eq!(img.px[0], 0); // outside
+    }
+
+    #[test]
+    fn dasharray_breaks_the_stroke_into_dashes() {
+        let s = br#"<svg width="40" height="6"><line x1="1" y1="3" x2="39" y2="3" stroke="black" stroke-width="2" stroke-dasharray="6 6"/></svg>"#;
+        let img = render(s, 40, 6).unwrap();
+        // pattern starts at x=1: dashes at 1..7, 13..19, 25..31, 37..39
+        assert_ne!(img.px[3 * 40 + 3], 0, "first dash");
+        assert_eq!(img.px[3 * 40 + 10], 0, "first gap");
+        assert_ne!(img.px[3 * 40 + 15], 0, "second dash");
+        assert_eq!(img.px[3 * 40 + 22], 0, "second gap");
+        // the dash pattern shifts with stroke-dashoffset
+        let s2 = br#"<svg width="40" height="6"><line x1="1" y1="3" x2="39" y2="3" stroke="black" stroke-width="2" stroke-dasharray="6 6" stroke-dashoffset="6"/></svg>"#;
+        let img2 = render(s2, 40, 6).unwrap();
+        assert_eq!(img2.px[3 * 40 + 3], 0, "offset starts in a gap");
+        assert_ne!(img2.px[3 * 40 + 10], 0, "and lands a dash there");
     }
 
     #[test]

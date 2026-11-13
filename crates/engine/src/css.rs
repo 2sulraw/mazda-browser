@@ -2624,6 +2624,9 @@ const KNOWN: &[&str] = &[
     "stroke-width",
     "stroke-linejoin",
     "stroke-linecap",
+    // rasterizer walks the dash pattern itself (butt caps)
+    "stroke-dasharray",
+    "stroke-dashoffset",
     // logical-axis shorthands (writing-mode is assumed horizontal-tb and
     // direction ltr). The single-sided logical names never reach this table:
     // [`logical_physical`] renames them before the gate.

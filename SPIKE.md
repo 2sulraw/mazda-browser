@@ -6224,3 +6224,27 @@ rules, 35 selector reasons, 1110 boxes unchanged).
 Test: `solid_border_image_gradient_becomes_the_border_colour` (uniform
 gradient supplies the colour; different stops, conic slices and
 `initial` do not). 1097 green.
+## render dashed SVG strokes (P119, 2026-11-13)
+
+`stroke-dasharray` (10 dropped declarations) and `stroke-dashoffset` (20)
+were kept out at the CSS property gate, and the rasterizer had no dash
+support at all: every inline-SVG path stroked solid. The rasterizer now
+walks each subpath with a continuous on/off pattern (odd-length lists
+duplicated, all-zero lists treated as solid, `none` clearing), scaling
+dash lengths and the offset from user units into the supersampled space by
+the same mean-transform factor as `stroke-width`. Only "on" intervals emit
+stroke quads, a round join appears at a vertex only when a dash runs
+through it, and open-path endpoints stay unjoined. Butt caps are exact
+(the quads end flat); miter/round caps remain unsupported.
+
+The CSS gate keeps both properties and the inline-SVG paint injector
+forwards them to the markup, so page rules like `.x { stroke-dasharray: ? }`
+now reach the rasterizer.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 34 -> 32
+distinct dropped properties (`stroke-dasharray` and `stroke-dashoffset`
+gone), 32949 -> 32958 rules, 35 selector reasons, 1110 boxes unchanged.
+
+Tests: `dasharray_breaks_the_stroke_into_dashes` (dash/gap pixels plus the
+offset shift), `svg_class_stroke_dasharray_is_injected_as_inline_style`.
+1099 green (one pre-existing network-timing flake reran clean).

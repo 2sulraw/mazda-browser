@@ -5881,7 +5881,7 @@ fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 
 /// Paint/font properties an SVG rasterizer understands; only these are merged
 /// from the page cascade.
-const SVG_PROPS: [&str; 9] = [
+const SVG_PROPS: [&str; 11] = [
     "fill",
     "stroke",
     "fill-opacity",
@@ -5889,6 +5889,8 @@ const SVG_PROPS: [&str; 9] = [
     "fill-rule",
     "stroke-width",
     "stroke-linejoin",
+    "stroke-dasharray",
+    "stroke-dashoffset",
     "opacity",
     "font-size",
 ];
@@ -13056,6 +13058,28 @@ mod tests {
         );
         layout_tree(&mut e, 600.0, &m4);
         assert!((e.h - 240.0).abs() < 0.01, "e.h={}", e.h);
+    }
+
+    #[test]
+    fn svg_class_stroke_dasharray_is_injected_as_inline_style() {
+        let dom = crate::html::parse(
+            r#"<body><svg viewBox="0 0 10 10"><path class="dashed" d="M0 0h10"/></svg></body>"#,
+        );
+        let sheet = crate::css::parse(r#".dashed { stroke: #111111; stroke-dasharray: 4 2 }"#);
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        fn find_svg(n: &BoxNode) -> Option<&ImgSlot> {
+            if n.img.is_some() {
+                return n.img.as_ref();
+            }
+            n.children.iter().find_map(find_svg)
+        }
+        let Some(ImgSlot::Pending(src)) = find_svg(&root) else {
+            panic!("svg should produce a pending img slot");
+        };
+        assert!(
+            src.contains("stroke-dasharray:4 2"),
+            "class dasharray injected as inline style: {src:?}"
+        );
     }
 
     #[test]
