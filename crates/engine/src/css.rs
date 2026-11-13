@@ -2681,6 +2681,8 @@ const KNOWN: &[&str] = &[
     "will-change",
     "contain",
     "contain-intrinsic-size",
+    "overflow-anchor",
+    "caret-color",
     "backface-visibility",
     "tap-highlight-color",
     "text-size-adjust",
@@ -4827,6 +4829,7 @@ fn apply_decl(
         // a static box in this engine
         "pointer-events" | "user-select" | "will-change" | "contain"
         | "contain-intrinsic-size"
+        | "overflow-anchor" | "caret-color"
         | "backface-visibility" | "tap-highlight-color" | "text-size-adjust"
         | "font-smoothing" | "osx-font-smoothing" | "scroll-behavior"
         | "scroll-snap-type" | "scroll-snap-align" | "scrollbar-width"
@@ -13451,6 +13454,15 @@ mod tests {
         let d = parse_decls("animation-timeline: scroll(); animation-range: entry 0% cover 50%");
         assert_eq!(d.len(), 1, "timeline kept, range still unknown");
         assert_eq!(d[0].0, "animation-timeline");
+    }
+
+    #[test]
+    fn scroll_anchor_and_caret_colour_are_inert_in_a_static_frame() {
+        // overflow-anchor only picks which element holds the scroll position
+        // when content changes; caret-color only paints the insertion caret.
+        // Neither changes a laid-out, painted frame.
+        let d = parse_decls("overflow-anchor: none; caret-color: #ff0000");
+        assert_eq!(d.len(), 2, "both kept: {d:?}");
     }
 
     #[test]

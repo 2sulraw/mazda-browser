@@ -6321,3 +6321,17 @@ distinct dropped properties (`text-anchor` gone), 32982 rules, 35
 selector reasons, 1110 boxes unchanged.
 
 Test: `svg_class_text_anchor_is_injected_as_inline_style`. 1104 green.
+## accept scroll-anchor and caret colour as inert (P125, 2026-11-13)
+
+Two lone declarations can never change a laid-out, painted frame:
+`overflow-anchor` only picks which element holds the scroll position when
+content changes (the cached value is `none`), and `caret-color` paints
+only the insertion caret, which a static frame does not draw. Both are
+accepted no-ops beside the other interaction/scroll properties.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 27 -> 25
+distinct dropped properties (`overflow-anchor` and `caret-color` gone),
+32982 rules, 35 selector reasons, 1110 boxes unchanged.
+
+Test: `scroll_anchor_and_caret_colour_are_inert_in_a_static_frame`.
+1105 green.
