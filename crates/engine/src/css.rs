@@ -1549,6 +1549,9 @@ struct Seg {
     /// joined to the left segment by `+` (immediately preceding element
     /// sibling). Takes precedence over `child` — `+` implies the same parent.
     adj: bool,
+    /// joined to the left segment by `~` (any preceding element sibling).
+    /// Takes precedence over `child`; `~` implies the same parent.
+    gen_sib: bool,
 }
 
 #[derive(Clone)]
@@ -3731,7 +3734,13 @@ impl Sheet {
             if rule
                 .segs
                 .iter()
-                .any(|s| !s.pseudos.is_empty() || !s.nots.is_empty() || s.pseudo_el.is_some() || s.adj)
+                .any(|s| {
+                    !s.pseudos.is_empty()
+                        || !s.nots.is_empty()
+                        || s.pseudo_el.is_some()
+                        || s.adj
+                        || s.gen_sib
+                })
                 || rule.cond.is_some()
             {
                 continue;
@@ -8392,9 +8401,9 @@ fn parse_selector_why(s: &str) -> Result<Vec<Seg>, String> {
     if s.is_empty() {
         return Err("empty selector".into());
     }
-    // Tokenize on whitespace, '>' and '+' — but NOT inside `(...)` (pseudo-
-    // class args like `:is(h1, h2)` or `:nth-child(2n + 1)` may contain
-    // them) or `[...]` (attribute values like `[title="a b"]`).
+    // Tokenize on whitespace, '>', '+' and '~' — but NOT inside `(...)`
+    // (pseudo-class args like `:is(h1, h2)` or `:nth-child(2n + 1)` may
+    // contain them) or `[...]` (attribute values like `[title="a b"]`).
     // shortcut: paren/bracket depth isn't quote-aware — a `]` inside a
     // quoted attribute value unbalances the count (real selectors rarely do
     // this; split_selectors has the same shortcut).
@@ -8416,13 +8425,18 @@ fn parse_selector_why(s: &str) -> Result<Vec<Seg>, String> {
             _ => {}
         }
         if depth == 0
-            && (bytes[i].is_ascii_whitespace() || bytes[i] == b'>' || bytes[i] == b'+')
+            && (bytes[i].is_ascii_whitespace()
+                || bytes[i] == b'>'
+                || bytes[i] == b'+'
+                || bytes[i] == b'~')
         {
             flush(&mut tokens, s, start, i);
             if bytes[i] == b'>' {
                 tokens.push(">");
             } else if bytes[i] == b'+' {
                 tokens.push("+");
+            } else if bytes[i] == b'~' {
+                tokens.push("~");
             }
             i += 1;
             start = i;
@@ -8435,6 +8449,7 @@ fn parse_selector_why(s: &str) -> Result<Vec<Seg>, String> {
     let mut segs: Vec<Seg> = Vec::new();
     let mut pending_child = false;
     let mut pending_adj = false;
+    let mut pending_gen_sib = false;
     for t in tokens {
         if t == ">" {
             if segs.is_empty() {
@@ -8450,9 +8465,12 @@ fn parse_selector_why(s: &str) -> Result<Vec<Seg>, String> {
             pending_adj = true;
             continue;
         }
-        if t.starts_with('~') {
-            // `a ~ b`: no general-sibling relation in `Seg` (only `>`/`+`)
-            return Err("general sibling ~".into());
+        if t == "~" {
+            if segs.is_empty() {
+                return Err("stray combinator".into());
+            }
+            pending_gen_sib = true;
+            continue;
         }
         if t.starts_with("||") {
             return Err("column combinator ||".into());
@@ -8460,8 +8478,10 @@ fn parse_selector_why(s: &str) -> Result<Vec<Seg>, String> {
         let mut seg = parse_compound_why(t)?;
         seg.child = pending_child;
         seg.adj = pending_adj;
+        seg.gen_sib = pending_gen_sib;
         pending_child = false;
         pending_adj = false;
+        pending_gen_sib = false;
         segs.push(seg);
     }
     if segs.is_empty() {
@@ -8488,6 +8508,7 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
         pseudo_el: None,
         child: false,
         adj: false,
+        gen_sib: false,
     };
     let b: Vec<char> = s.chars().collect();
     let mut i = 0usize;
@@ -8825,8 +8846,6 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     _ => return Err(format!("pseudo-class :{name}")),
                 }
             }
-            // `a~b` (no spaces) never reached the tokenizer's split point
-            '~' => return Err("general sibling ~".into()),
             '|' => return Err("column combinator ||".into()),
             // unexpected char (space/combinator inside a compound)
             c => return Err(format!("unexpected '{c}' in a compound")),
@@ -8939,64 +8958,97 @@ fn leftmost_match(
     hover: Option<u32>,
     filter: Option<&Bloom>,
 ) -> Option<u32> {
-    let mut idx = segs.len() - 1;
-    let mut cur = node;
-    if !seg_matches(dom, cur, &segs[idx], hover) {
+    leftmost_from(dom, node, segs, segs.len() - 1, hover, filter)
+}
+
+/// [`leftmost_match`] anchored at `segs[idx]`: `node` must satisfy that
+/// compound, and everything left of it must match through the combinator
+/// that joins the two. Returns the node that matched `segs[0]` (`:has()`
+/// needs it to test its leading relation).
+fn leftmost_from(
+    dom: &Dom,
+    node: u32,
+    segs: &[Seg],
+    idx: usize,
+    hover: Option<u32>,
+    filter: Option<&Bloom>,
+) -> Option<u32> {
+    if !seg_matches(dom, node, &segs[idx], hover) {
         return None;
     }
-    while idx > 0 {
-        let need_child = segs[idx].child;
-        let need_adj = segs[idx].adj;
-        idx -= 1;
-        if need_adj {
-            // `a + b`: the left compound must match b's immediately
-            // PRECEDING element sibling (text nodes skipped)
-            let parent = dom.nodes[cur as usize].parent;
-            if parent == cur {
-                return None;
-            }
-            let mut prev = None;
-            for &c in &dom.nodes[parent as usize].children {
-                if c == cur {
-                    break;
-                }
-                if is_element(dom, c) {
-                    prev = Some(c);
-                }
-            }
-            let sib = prev?;
-            if !seg_matches(dom, sib, &segs[idx], hover) {
-                return None;
-            }
-            cur = sib;
-            continue;
+    if idx == 0 {
+        return Some(node);
+    }
+    let seg = &segs[idx];
+    if seg.gen_sib {
+        // `a ~ b`: the left compound may match ANY preceding element
+        // sibling. Try each from nearest to farthest, because a farther one
+        // can be the only path for the rest of the chain (`a.x ~ b ~ c`).
+        let parent = dom.nodes[node as usize].parent;
+        if parent == node {
+            return None;
         }
-        // not a sibling: the left compound has to be an ancestor, so the
-        // filter can reject it without walking. A `>` compound is the direct
-        // parent, which is an ancestor too (a weaker but valid test).
-        if let Some(f) = filter {
-            if !ancestor_could_match(&segs[idx], f) {
-                return None;
-            }
-        }
-        loop {
-            let parent = dom.nodes[cur as usize].parent;
-            if parent == 0 {
-                return None; // reached document root
-            }
-            cur = parent;
-            if hop_stats_on() {
-                SEL_HOPS.with(|c| c.set(c.get() + 1));
-            }
-            if seg_matches(dom, cur, &segs[idx], hover) {
+        let mut prev = Vec::new();
+        for &c in &dom.nodes[parent as usize].children {
+            if c == node {
                 break;
             }
-            if need_child {
-                return None; // direct parent didn't match
+            if is_element(dom, c) {
+                prev.push(c);
             }
         }
+        for sib in prev.into_iter().rev() {
+            if let Some(m) = leftmost_from(dom, sib, segs, idx - 1, hover, filter) {
+                return Some(m);
+            }
+        }
+        return None;
     }
-    Some(cur)
+    if seg.adj {
+        // `a + b`: the left compound must match b's immediately PRECEDING
+        // element sibling (text nodes skipped)
+        let parent = dom.nodes[node as usize].parent;
+        if parent == node {
+            return None;
+        }
+        let mut prev = None;
+        for &c in &dom.nodes[parent as usize].children {
+            if c == node {
+                break;
+            }
+            if is_element(dom, c) {
+                prev = Some(c);
+            }
+        }
+        return leftmost_from(dom, prev?, segs, idx - 1, hover, filter);
+    }
+    // not a sibling: the left compound has to be an ancestor, so the
+    // filter can reject it without walking. A `>` compound is the direct
+    // parent, which is an ancestor too (a weaker but valid test).
+    if let Some(f) = filter {
+        if !ancestor_could_match(&segs[idx - 1], f) {
+            return None;
+        }
+    }
+    let mut cur = node;
+    loop {
+        let parent = dom.nodes[cur as usize].parent;
+        if parent == 0 {
+            return None; // reached document root
+        }
+        cur = parent;
+        if hop_stats_on() {
+            SEL_HOPS.with(|c| c.set(c.get() + 1));
+        }
+        if seg_matches(dom, cur, &segs[idx - 1], hover) {
+            // nearest matching ancestor: the same anchor the iterative
+            // matcher used, and the only one a descendant chain needs
+            return leftmost_from(dom, cur, segs, idx - 1, hover, filter);
+        }
+        if seg.child {
+            return None; // direct parent didn't match
+        }
+    }
 }
 
 /// Does `node` satisfy `:has(rel segs…)`? Walks the candidate elements the
@@ -10078,6 +10130,42 @@ mod tests {
             sheet.resolve(&dom, d, Style::new(), None).style.color,
             0x999999,
             "a + b only matches the immediately preceding sibling"
+        );
+    }
+
+    #[test]
+    fn general_sibling_combinator() {
+        // `h1 ~ p` matches every p AFTER an h1, not only the adjacent one,
+        // and not a p before it; text/other elements in between don't matter
+        let sheet = parse("h1 ~ p { color: #111111 } p { color: #999999 }");
+        let dom = dom_of(
+            "<p id=before></p><h1></h1><i></i>text<p id=after></p>\
+             <div><span class=a></span><span></span><span class=b id=b></span></div>",
+        );
+        assert_eq!(
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", "before"), Style::new(), None)
+                .style
+                .color,
+            0x999999,
+            "a p before the h1 does not match"
+        );
+        assert_eq!(
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", "after"), Style::new(), None)
+                .style
+                .color,
+            0x111111,
+            "a p after the h1 matches across the <i>"
+        );
+        // the left compound need not be the immediately preceding sibling
+        let sheet = parse(".a ~ .b { color: #222222 }");
+        assert_eq!(
+            sheet
+                .resolve(&dom, by_attr(&dom, "id", "b"), Style::new(), None)
+                .style
+                .color,
+            0x222222
         );
     }
 
@@ -11753,8 +11841,8 @@ mod tests {
             "pseudo-class :focus-visible"
         );
         assert_eq!(
-            parse_selector_why(".x ~ .y").err().unwrap(),
-            "general sibling ~"
+            parse_selector_why(".x || .y").err().unwrap(),
+            "column combinator ||"
         );
         assert_eq!(
             parse_selector_why("li::selection").err().unwrap(),

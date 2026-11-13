@@ -5981,3 +5981,30 @@ Tests: `container_size_query_follows_the_nearest_measured_container`,
 `container_boxes_capture_the_used_content_width`,
 `container_width_generation_invalidates_the_style_cache`,
 `container_keywords_are_ascii_case_insensitive`. 1083 green.
+
+## match the general sibling combinator instead of dropping it (P108, 2026-11-13)
+
+`a ~ b` was rejected at parse time, so all 18 selectors on github.com dropped
+their rules - even though the engine already walked preceding element siblings
+for `:has(~ ...)` and `+`. The relation is static DOM structure, like `+`, so
+there was nothing to wait for.
+
+`Seg` carries a third combinator flag; the matcher walks every preceding
+element sibling (text nodes skipped) and tries each from nearest to farthest,
+so a farther sibling can still anchor the rest of the chain. The recursive
+matcher keeps `:has()`'s leftmost-node return contract, and the SVG scope
+filter skips `~` rules like it already skipped `+`.
+
+A local `data:` page proves the final frame: `.a ~ .b{display:none}` hides the
+`.b` after `.a` (across an intervening `<p>`), while `.b ~ .a` does not hide
+the earlier `.a`; the box dump holds `.a` and `.c` but no `.b`.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32 866 -> 32 884
+rules (+18 parsed), 47 -> 46 distinct dropped selector reasons (`general
+sibling ~` gone), 38 dropped properties and 1 at-rule unchanged, box tree
+unchanged at 1110 boxes. The restored rules match nothing on this page at this
+width (the first pass still matches 22 524 rules and applies 37 911
+declarations, exactly the pre-change numbers), so no layout change is claimed.
+
+Tests: `general_sibling_combinator`; `a_dropped_selector_names_why` now uses
+the still-unsupported column combinator `||`. 1084 green.
