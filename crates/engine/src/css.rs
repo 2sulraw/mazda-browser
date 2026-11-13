@@ -1435,6 +1435,11 @@ enum Pseudo {
     /// `:target` — the element named by the document URL's fragment. The
     /// loader stores the decoded fragment on the DOM; no fragment = no match.
     Target,
+    /// `:dir(rtl)` / `:dir(ltr)` — the element's directionality from the
+    /// nearest `dir` attribute. `dir=auto` is read as ltr (shortcut: no
+    /// first-strong-character scan), and the `direction` property is not
+    /// modeled.
+    Dir(bool),
     /// `:popover-open` — a popover in the open state. No popover API is
     /// implemented and no top layer is modeled, so nothing is ever open:
     /// this matches nothing. That makes the useful half work statically —
@@ -8768,6 +8773,15 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     ("empty", None) => seg.pseudos.push(Pseudo::Empty),
                     // the URL fragment names this element (static per load)
                     ("target", None) => seg.pseudos.push(Pseudo::Target),
+                    // directionality from the nearest `dir` attribute
+                    ("dir", Some(a)) => {
+                        let rtl = match a.trim().to_ascii_lowercase().as_str() {
+                            "rtl" => true,
+                            "ltr" => false,
+                            _ => return Err(format!("bad :dir({a})")),
+                        };
+                        seg.pseudos.push(Pseudo::Dir(rtl));
+                    }
                     // no popover is ever open here (no API, no top layer),
                     // so `:not(:popover-open)` can hide closed overlays
                     ("popover-open", None) => seg.pseudos.push(Pseudo::PopoverOpen),
@@ -9358,6 +9372,8 @@ fn pseudo_matches(dom: &Dom, node: u32, p: &Pseudo, hover: Option<u32>) -> bool 
         Pseudo::Target => dom
             .target()
             .is_some_and(|t| dom.attr(node, "id") == Some(t)),
+        // nearest ancestor-or-self `dir` attribute decides
+        Pseudo::Dir(rtl) => dir_is_rtl(dom, node) == *rtl,
         // nothing is open: the popover API and top layer aren't modeled
         Pseudo::PopoverOpen => false,
         // statically knowable form state: an unchecked radio with no checked
@@ -9471,6 +9487,23 @@ fn is_form_control(dom: &Dom, node: u32) -> bool {
         dom.tag(node),
         "input" | "button" | "select" | "textarea" | "fieldset" | "optgroup" | "option"
     )
+}
+
+/// The element's directionality: the nearest ancestor-or-self `dir`
+/// attribute. `dir=auto` reads as ltr (shortcut: no first-strong-character
+/// scan), and the `direction` property is not modeled.
+fn dir_is_rtl(dom: &Dom, node: u32) -> bool {
+    let mut cur = node;
+    loop {
+        if let Some(d) = dom.attr(cur, "dir") {
+            return d.eq_ignore_ascii_case("rtl");
+        }
+        let parent = dom.nodes[cur as usize].parent;
+        if parent == 0 || parent == cur {
+            return false;
+        }
+        cur = parent;
+    }
 }
 
 /// The `<form>` that owns `node`: the one named by its `form` attribute, else
@@ -14767,6 +14800,38 @@ mod tests {
             open.resolve(&dom, o, Style::new(), None).style.color,
             Style::new().color
         );
+    }
+
+    #[test]
+    fn dir_pseudo_reads_the_nearest_dir_attribute() {
+        // github's task-list margins are `ul:dir(rtl) ...`, so the selector
+        // must follow `dir` down the ancestor chain (and stop at the nearest
+        // override)
+        let dom = dom_of(
+            r#"<div dir=rtl><ul><li class="b" id="a">x</li></ul>
+               <ul dir=ltr><li class="b" id="d">w</li></ul></div>
+               <ul dir=ltr><li class="b" id="b">y</li></ul>
+               <ul><li class="b" id="c">z</li></ul>"#,
+        );
+        let sheet = parse(
+            "ul:dir(rtl) .b { color: #112233 } \
+             .b:dir(ltr) { background-color: #445566 }",
+        );
+        let get = |id: &str| {
+            let n = by_attr(&dom, "id", id);
+            sheet.resolve(&dom, n, Style::new(), None)
+        };
+        let a = get("a");
+        assert_eq!(a.style.color, 0x112233, "inherits rtl from the div");
+        assert_eq!(a.bx.bg, None);
+        let d = get("d");
+        assert_eq!(d.style.color, Style::new().color, "nearest dir=ltr wins");
+        assert_eq!(d.bx.bg, Some(0x445566));
+        for id in ["b", "c"] {
+            let out = get(id);
+            assert_eq!(out.style.color, Style::new().color, "{id} is ltr");
+            assert_eq!(out.bx.bg, Some(0x445566));
+        }
     }
 
     #[test]

@@ -6139,3 +6139,21 @@ starts at y=100 instead of y?52 (content height).
 
 Tests: `grid_auto_rows_parses_a_track_list`,
 `grid_auto_rows_floor_implicit_rows`. 1091 green.
+
+## match :dir() from the nearest dir attribute (P115, 2026-11-13)
+
+Four github rules key task-list margins on `ul:dir(rtl)` / `ol:dir(rtl)`
+(and a decorative `:dir(rtl){scale:-1 1}`); the selector was dropped, so the
+rules never entered the sheet.
+
+`:dir(ltr|rtl)` now parses into `Pseudo::Dir(rtl)` and matches by walking
+ancestor-or-self for the nearest `dir` attribute (`rtl` true, `ltr` false,
+`dir=auto` read as ltr ? shortcut: no first-strong-character scan; the
+`direction` property stays unmodeled). `:not(:dir(...))` composes for free.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32945 -> 32949
+rules (+4), 36 -> 35 dropped selector reasons (`:dir` gone), 36 properties and
+1110 boxes unchanged ? the page is LTR, so nothing visually moves.
+
+Test: `dir_pseudo_reads_the_nearest_dir_attribute` (inherits rtl from an
+ancestor, stops at a nearer dir=ltr, defaults ltr). 1092 green.
