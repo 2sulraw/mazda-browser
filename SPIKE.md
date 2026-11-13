@@ -6280,3 +6280,18 @@ distinct dropped properties (`animation-timeline` gone), 32976 -> 32982
 rules, 35 selector reasons, 1110 boxes unchanged.
 
 Test: `animation_timeline_is_an_accepted_noop`. 1101 green.
+## accept text-underline-position: under (P122, 2026-11-13)
+
+All 16 cached `text-underline-position` declarations are `under`. This
+engine already paints underlines at the line-box bottom (`y + lh - 2`,
+below the descender), which is what `under` asks for, so the matching
+values (`under`, `auto`, `initial`) are accepted as matching the existing
+placement. `from-font` would need per-font underline metrics and stays
+counted.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 30 -> 29
+distinct dropped properties (`text-underline-position` gone), 32982
+rules, 35 selector reasons, 1110 boxes unchanged.
+
+Test: `text_underline_position_under_matches_the_existing_underline_placement`.
+1102 green.

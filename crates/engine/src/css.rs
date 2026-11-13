@@ -4217,10 +4217,17 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
             // rendering: skipping off-screen content is an optimization, so
             // painting it is always the correct (if slower) result. `hidden`
             // really hides content and stays a miss.
-            let cv_first = v.split_whitespace().next().unwrap_or("");
+            let first = v.split_whitespace().next().unwrap_or("");
+            let first = first.to_ascii_lowercase();
             let cv_visible =
-                p == "content-visibility" && matches!(cv_first.to_ascii_lowercase().as_str(), "auto" | "visible");
-            if !(p == "border-image" && solid_border_image_shape(v)) && !cv_visible {
+                p == "content-visibility" && matches!(first.as_str(), "auto" | "visible");
+            // `under` asks for the line below the text; this engine already
+            // paints the underline at the line-box bottom (`y + lh - 2`), so
+            // the cached `under` declarations match the existing placement.
+            // `from-font` needs new metrics and stays counted.
+            let ul_under = p == "text-underline-position"
+                && matches!(first.as_str(), "under" | "auto" | "initial");
+            if !(p == "border-image" && solid_border_image_shape(v)) && !cv_visible && !ul_under {
                 note_unknown_prop(&p);
                 continue;
             }
@@ -13441,6 +13448,18 @@ mod tests {
         let d = parse_decls("animation-timeline: scroll(); animation-range: entry 0% cover 50%");
         assert_eq!(d.len(), 1, "timeline kept, range still unknown");
         assert_eq!(d[0].0, "animation-timeline");
+    }
+
+    #[test]
+    fn text_underline_position_under_matches_the_existing_underline_placement() {
+        let d = parse_decls(
+            "text-underline-position: under; text-underline-position: auto; \
+             text-underline-position: from-font",
+        );
+        let vals: Vec<&str> = d.iter().map(|d| d.1.as_str()).collect();
+        assert!(vals.contains(&"under"), "under kept: {vals:?}");
+        assert!(vals.contains(&"auto"), "auto kept: {vals:?}");
+        assert!(!vals.contains(&"from-font"), "from-font dropped: {vals:?}");
     }
 
     #[test]
