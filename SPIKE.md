@@ -6370,3 +6370,15 @@ unchanged.
 
 Tests: order_radius_shorthand_and_logical_corners,
 per_corner_radii_reach_the_bg_rect_and_scale_on_overlap. 1109 green.
+## accept mask compositing and alpha mask mode (P128, 2026-11-13)
+
+The mask model keeps a single layer (documented in BoxStyle::mask_image),
+so mask-composite never composes anything and is inert. mask-mode:
+alpha | match-source is also how this engine already reads a mask (alpha +
+tint); luminance would change the shape and stays a miss.
+
+Measured on github.com (release, MAZDA_MISS=1, 1000 wide): 20 -> 18
+distinct dropped properties (mask-composite and mask-mode gone), 33008
+rules, 35 selector reasons, 1110 boxes unchanged.
+
+Test: mask_composite_and_alpha_mode_are_inert_with_one_layer. 1110 green.

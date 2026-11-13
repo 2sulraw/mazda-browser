@@ -4243,7 +4243,23 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
             // `from-font` needs new metrics and stays counted.
             let ul_under = p == "text-underline-position"
                 && matches!(first.as_str(), "under" | "auto" | "initial");
-            if !(p == "border-image" && solid_border_image_shape(v)) && !cv_visible && !ul_under {
+            // the mask model keeps ONE layer (see `BoxStyle::mask_image`), so
+            // inter-layer compositing never applies and `mask-composite` is
+            // inert. `mask-mode: alpha | match-source` also matches how this
+            // engine already reads a mask (its alpha); `luminance` does not.
+            let mask_composite = p == "mask-composite";
+            let mask_val = v.split("!important").next().unwrap_or(v);
+            let mask_mode_alpha = p == "mask-mode"
+                && mask_val
+                    .to_ascii_lowercase()
+                    .split(',')
+                    .all(|t| matches!(t.trim(), "alpha" | "match-source"));
+            if !(p == "border-image" && solid_border_image_shape(v))
+                && !cv_visible
+                && !ul_under
+                && !mask_composite
+                && !mask_mode_alpha
+            {
                 note_unknown_prop(&p);
                 continue;
             }
@@ -4863,7 +4879,7 @@ fn apply_decl(
         | "animation-iteration-count" | "animation-direction"
         | "animation-fill-mode" | "animation-play-state" | "animation-timeline"
         | "overflow-scrolling" | "touch-callout" | "user-drag"
-        | "scroll-chaining"
+        | "scroll-chaining" | "mask-composite" | "mask-mode"
         | "font-feature-settings" | "font-variation-settings"
         | "font-optical-sizing" | "font-synthesis" | "font-kerning"
         | "font-variant" | "font-variant-numeric" | "font-variant-ligatures"
@@ -13590,6 +13606,33 @@ mod tests {
         assert!(vals.contains(&"visible"), "visible kept: {vals:?}");
         assert!(vals.iter().any(|v| v.starts_with("auto")), "important kept: {vals:?}");
         assert!(!vals.contains(&"hidden"), "hidden dropped: {vals:?}");
+    }
+
+    #[test]
+    fn mask_composite_and_alpha_mode_are_inert_with_one_layer() {
+        // the mask model keeps one layer, so inter-layer compositing cannot
+        // change what is painted; alpha/match-source is how masks already read
+        let decls = parse_decls(
+            "mask-composite: exclude; mask-composite: source-in, xor; \
+             mask-mode: alpha; mask-mode: match-source, match-source; \
+             mask-mode: luminance; mask-mode: alpha !important",
+        );
+        let vals: Vec<&str> = decls.iter().map(|d| d.1.as_str()).collect();
+        assert!(vals.contains(&"exclude"), "composite kept: {vals:?}");
+        assert!(
+            vals.contains(&"source-in, xor"),
+            "composite list kept: {vals:?}"
+        );
+        assert!(vals.contains(&"alpha"), "alpha kept: {vals:?}");
+        assert!(
+            vals.contains(&"match-source, match-source"),
+            "match-source kept: {vals:?}"
+        );
+        assert!(!vals.contains(&"luminance"), "luminance dropped: {vals:?}");
+        assert!(
+            vals.iter().any(|v| v.starts_with("alpha")),
+            "important alpha kept: {vals:?}"
+        );
     }
 
     #[test]
