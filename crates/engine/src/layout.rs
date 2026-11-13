@@ -14204,6 +14204,25 @@ mod tests {
     }
 
     #[test]
+    fn all_unset_suppresses_ua_control_chrome() {
+        let dom = crate::html::parse(r#"<div><button id="b">x</button></div>"#);
+        let sheet = crate::css::parse("button { all: unset; padding: 4px }");
+        let root = build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet);
+        fn find_form(n: &BoxNode) -> Option<&BoxNode> {
+            if n.form.is_some() {
+                return Some(n);
+            }
+            n.children.iter().find_map(find_form)
+        }
+        let b = find_form(&root).expect("button box");
+        assert!(b.bx.border == [Len::Px(0.0); 4], "no UA border");
+        assert_eq!(b.bx.bg, None, "no UA fill");
+        assert!(b.bx.radius == Len::Px(0.0), "no UA radius");
+        assert!(b.bx.pad == [Len::Px(4.0); 4], "the rule's own padding applies");
+        assert_eq!(b.style.text_align, 0, "UA button centering cleared");
+    }
+
+    #[test]
     fn author_border_none_suppresses_ua_chrome() {
         // a RESET to initial must suppress the UA chrome (previously
         // indistinguishable from "not declared")

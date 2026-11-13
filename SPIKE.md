@@ -6177,3 +6177,27 @@ reasons and 1110 boxes unchanged.
 Tests: `overflow_clip_margin_parses_and_marks_clip_overflow`,
 `overflow_clip_margin_lets_content_bleed_past_the_padding_box` (100px window,
 108px with an 8px margin, margin ignored under `overflow: hidden`). 1094 green.
+
+## implement all: unset / initial (P117, 2026-11-13)
+
+Eight github declarations use `all` ? notably the mobile AnchorNav menu
+button (`all:unset;cursor:pointer;padding:...`), which kept the UA control
+chrome (gray fill, border, 2px radius, min-height) instead of becoming a
+plain icon button.
+
+`all: unset | initial` now performs a cascade reset at its place in the
+order: box style back to initial values (`display:inline`), every chrome
+property marked declared so the UA control fill and UA margins cannot
+refill it, and the hide verdicts (display/opacity/visibility) cleared.
+`unset` restores inherited text properties from the true parent
+(size/colour) and clears decoration/weight/alignment; `initial` installs
+the full initial style. Shortcut: `unset` keeps the tag's UA font family,
+white-space and list type (the cascade has no parent-style snapshot).
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 35 -> 34
+distinct dropped properties (`all` gone), 32949 rules, 35 selector reasons
+and 1110 boxes unchanged.
+
+Tests: `all_unset_resets_inherited_text_and_box_style`,
+`all_unset_suppresses_ua_control_chrome` (no UA border/fill/radius, the
+rule's own padding still applies, UA centering cleared). 1096 green.

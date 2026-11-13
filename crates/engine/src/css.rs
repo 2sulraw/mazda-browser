@@ -2588,6 +2588,7 @@ const KNOWN: &[&str] = &[
     "inset",
     "overflow",
     "overflow-clip-margin",
+    "all",
     "text-overflow",
     "overflow-x",
     "overflow-y",
@@ -3402,7 +3403,22 @@ impl Sheet {
                 stats.1 += 1;
                 stats.2 += rule.decls.len();
                 for d in &rule.decls {
-                    color_declared |= d.0 == "color";
+                    // `all` rewrites every property at its place in the
+                    // order, so an earlier display/opacity/visibility
+                    // verdict is wiped too
+                    let all = d.0 == "all"
+                        && matches!(
+                            d.1.trim().to_ascii_lowercase().as_str(),
+                            "unset" | "initial"
+                        );
+                    if all {
+                        display_hidden = false;
+                        opacity_zero = false;
+                        visibility_hidden = false;
+                        color_declared = d.1.trim().eq_ignore_ascii_case("initial");
+                    } else {
+                        color_declared |= d.0 == "color";
+                    }
                     let sd = self.subst_scoped(d, vars.as_deref());
                     let fs = self.fam_stack_of(&sd, parent_size, self.vp);
                     let hides = apply_decl(
@@ -3429,7 +3445,19 @@ impl Sheet {
             let mut inline_opacity_zero = false;
             let mut inline_display_none = false;
             for d in &parse_decls(inline) {
-                color_declared |= d.0 == "color";
+                let all = d.0 == "all"
+                    && matches!(
+                        d.1.trim().to_ascii_lowercase().as_str(),
+                        "unset" | "initial"
+                    );
+                if all {
+                    display_hidden = false;
+                    opacity_zero = false;
+                    visibility_hidden = false;
+                    color_declared = d.1.trim().eq_ignore_ascii_case("initial");
+                } else {
+                    color_declared |= d.0 == "color";
+                }
                 let sd = self.subst_scoped(d, vars.as_deref());
                 let fs = self.fam_stack_of(&sd, parent_size, self.vp);
                 let hides = apply_decl(
@@ -5880,6 +5908,48 @@ fn apply_decl(
                 // `url(...)` and anything else -> ignored (see shortcut)
             }
         }
+        // `all: unset | initial` — a whole-element cascade reset at this
+        // point in the order. `unset` restores inherited text properties
+        // (size/color from the true parent; decoration, weight and alignment
+        // cleared) and initial box values; `initial` is the full initial
+        // style. Both mark every chrome property declared so the UA control
+        // fill and UA margins cannot refill them.
+        // shortcut: `unset` keeps the tag's UA font family/white-space and
+        // list type (the cascade has no parent-style snapshot here).
+        "all" => match d.1.trim().to_ascii_lowercase().as_str() {
+            "unset" | "initial" => {
+                *bx = BoxStyle::default();
+                bx.display = Display::Inline;
+                bx.declared = decl::BORDER
+                    | decl::BCOLOR
+                    | decl::BG
+                    | decl::PAD
+                    | decl::RADIUS
+                    | decl::MIN_HEIGHT
+                    | decl::WIDTH
+                    | decl::VALIGN
+                    | decl::MARGIN;
+                if d.1.trim().eq_ignore_ascii_case("initial") {
+                    *style = Style::new();
+                } else {
+                    style.underline = false;
+                    style.strike = false;
+                    style.overline = false;
+                    style.deco_color = None;
+                    style.deco_style = DecoStyle::Solid;
+                    style.deco_thickness = 0.0;
+                    style.deco_offset = 0.0;
+                    style.text_shadow = [None, None];
+                    style.bold = false;
+                    style.italic = false;
+                    style.size = parent;
+                    style.color = parent_color;
+                    style.text_align = 0;
+                    style.list_type = ListStyleType::Disc;
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
     None
@@ -10889,6 +10959,34 @@ mod tests {
         let h = get("h");
         assert!(h.clip && !h.overflow_clip, "hidden is not clip");
         assert_eq!(get("b").clip_margin, Len::Px(4.0), "box keyword ignored");
+    }
+
+    #[test]
+    fn all_unset_resets_inherited_text_and_box_style() {
+        let sheet = parse(
+            ".a { all: unset } .b { all: initial } \
+             .c { all: unset; color: #112233 }",
+        );
+        let dom = dom_of(
+            r#"<a class=a href=#>x</a><a class=b href=#>y</a><a class=c href=#>z</a>"#,
+        );
+        let parent = Style {
+            color: 0x445566,
+            size: 20.0,
+            ..Style::new()
+        };
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), parent, None);
+        let a = get("a");
+        assert_eq!(a.style.color, 0x445566, "unset inherits the parent colour");
+        assert_eq!(a.style.size, 20.0, "unset inherits the parent size");
+        assert!(!a.style.underline, "the UA link underline is cleared");
+        assert_eq!(a.bx.display, Display::Inline, "display goes back to inline");
+        assert_eq!(a.bx.border, [Len::Px(0.0); 4]);
+        assert_eq!(a.bx.declared & decl::BG, decl::BG, "UA chrome suppressed");
+        let b = get("b");
+        assert_eq!(b.style.color, 0x000000, "initial colour");
+        assert_eq!(b.style.size, 16.0, "initial size");
+        assert_eq!(get("c").style.color, 0x112233, "a later declaration wins");
     }
 
     #[test]
