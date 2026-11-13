@@ -1014,17 +1014,42 @@ impl StyleCache {
     ) {
         self.hits = 0;
         self.misses = 0;
-        let same = Some(width) == self.width
-            && hover == self.hover
-            && sheet.container_gen() == self.container_gen;
-        let Some(dirty) = dirty.filter(|_| same) else {
+        let same = Some(width) == self.width && sheet.container_gen() == self.container_gen;
+        if !same {
             self.slots.clear();
             self.width = Some(width);
             self.hover = hover;
             self.container_gen = sheet.container_gen();
             return;
+        }
+        let Some(dirty) = dirty else {
+            self.slots.clear();
+            self.hover = hover;
+            return;
         };
-        for &(n, child_list) in dirty {
+        // A hover move changes the `:hover` answer only for the two pointer
+        // paths: everything shared by the old and new cell (the body, the
+        // page wrapper) stays hovered. Invalidate just the symmetric
+        // difference instead of the whole page -- pointer moves are the
+        // most frequent re-cascade and used to cost a full pass.
+        let mut affected: Vec<(u32, bool)> = dirty.to_vec();
+        if hover != self.hover {
+            let mut changed = std::collections::HashSet::new();
+            for h in [self.hover, hover].into_iter().flatten() {
+                let mut cur = Some(h);
+                while let Some(m) = cur {
+                    if !changed.remove(&m) {
+                        changed.insert(m);
+                    }
+                    let parent = dom.nodes.get(m as usize).map(|x| x.parent).unwrap_or(0);
+                    let up = parent != 0 && parent != m;
+                    cur = up.then_some(parent);
+                }
+            }
+            affected.extend(changed.into_iter().map(|n| (n, false)));
+        }
+        self.hover = hover;
+        for &(n, child_list) in &affected {
             self.invalidate_subtree(dom, n);
             // an attribute/text change also flips the `+`/`~` rules that read
             // this node from a FOLLOWING sibling. A moved child list only
@@ -1052,7 +1077,7 @@ impl StyleCache {
         // follows (the descendants inherit). `asked` keeps the ancestors the
         // dirty nodes share from being re-asked.
         let mut asked = std::collections::HashSet::new();
-        for &(n, _) in dirty {
+        for &(n, _) in &affected {
             let mut cur = Some(n);
             while let Some(m) = cur {
                 let parent = dom.nodes.get(m as usize).map(|x| x.parent).unwrap_or(0);
@@ -15242,6 +15267,44 @@ line</textarea></div>"#,
         let dom = crate::html::parse(markup);
         let sheet = crate::css::parse(css);
         build(&dom, dom.body_root(), Style::new(), BoxStyle::default(), &sheet)
+    }
+
+    #[test]
+    fn a_hover_move_reuses_the_branches_it_does_not_touch() {
+        // `:hover` matches the cell and its ancestor/descendant chain, so a
+        // pointer move only changes the two paths through the tree. The
+        // earlier section keeps its styles (a following sibling could read
+        // the moved cell with `+`/`~`, so those still re-cascade).
+        let dom = crate::html::parse(
+            "<section id=three><p class=c>z</p></section>\
+             <section id=one><p class=a>x</p></section>\
+             <section id=two><p class=b>y</p></section>",
+        );
+        let sheet = crate::css::parse("p:hover { color: #111111 }");
+        let body = dom.body_root();
+        let by_class = |want: &str| {
+            (0..dom.nodes.len() as u32)
+                .find(|&i| dom.attr(i, "class") == Some(want))
+                .unwrap_or_else(|| panic!("the .{want} paragraph"))
+        };
+        let (a, b) = (by_class("a"), by_class("b"));
+        let mut cache = StyleCache::default();
+        let mut pass = |cache: &mut StyleCache, hover| {
+            cache.begin_pass(&dom, &sheet, 800.0, hover, Some(&[]));
+            build_cached(
+                &dom,
+                body,
+                Style::new(),
+                BoxStyle::default(),
+                &sheet,
+                None,
+                cache,
+            );
+            (cache.hits, cache.misses)
+        };
+        assert_eq!(pass(&mut cache, Some(a)), (0, 6), "cold pass");
+        // the two pointer paths re-cascade; #three and .c are reused
+        assert_eq!(pass(&mut cache, Some(b)), (2, 4), "hover moved");
     }
 
     #[test]

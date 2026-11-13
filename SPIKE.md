@@ -6382,3 +6382,17 @@ distinct dropped properties (mask-composite and mask-mode gone), 33008
 rules, 35 selector reasons, 1110 boxes unchanged.
 
 Test: mask_composite_and_alpha_mode_are_inert_with_one_layer. 1110 green.
+## keep the style cache warm across hover moves (P129, 2026-11-13)
+
+:hover matches the pointer cell and its ancestor/descendant chain, so a
+move changes only the symmetric difference of the two paths. StyleCache::begin_pass
+required hover == self.hover and dropped every slot otherwise, so every
+pointer move re-cascaded all 1172 github elements. It now invalidates just
+the changed paths (plus following siblings for +/~ and :has subjects)
+and reuses the rest.
+
+Test: _hover_move_reuses_the_branches_it_does_not_touch (2 reused / 4
+re-cascaded on a 6-node tree; before, 0 / 6). 1111 green.
+
+Github load unchanged: 18 dropped properties, 33008 rules, 1110 boxes.
+Total memory 444 MB (renderer 371, shell 73).
