@@ -2674,6 +2674,7 @@ const KNOWN: &[&str] = &[
     "animation-direction",
     "animation-fill-mode",
     "animation-play-state",
+    "animation-timeline",
     "pointer-events",
     "user-select",
     "will-change",
@@ -4835,7 +4836,7 @@ fn apply_decl(
         | "animation" | "animation-name" | "animation-duration"
         | "animation-delay" | "animation-timing-function"
         | "animation-iteration-count" | "animation-direction"
-        | "animation-fill-mode" | "animation-play-state"
+        | "animation-fill-mode" | "animation-play-state" | "animation-timeline"
         | "overflow-scrolling" | "touch-callout" | "user-drag"
         | "scroll-chaining"
         | "font-feature-settings" | "font-variation-settings"
@@ -13430,6 +13431,16 @@ mod tests {
         assert_eq!(get("b").bx.bcolor, None, "two different stops are not solid");
         assert_eq!(get("c").bx.bcolor, None, "conic slices stay unsupported");
         assert_eq!(get("d").bx.bcolor, None, "border-image: initial is none");
+    }
+
+    #[test]
+    fn animation_timeline_is_an_accepted_noop() {
+        // the engine has no animation clock at all (`animation`,
+        // `animation-name`, `animation-duration` are already accepted
+        // no-ops), so a scroll/view timeline is inert too
+        let d = parse_decls("animation-timeline: scroll(); animation-range: entry 0% cover 50%");
+        assert_eq!(d.len(), 1, "timeline kept, range still unknown");
+        assert_eq!(d[0].0, "animation-timeline");
     }
 
     #[test]

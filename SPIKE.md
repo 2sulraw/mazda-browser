@@ -6265,3 +6265,18 @@ rules (the 18 declarations' rules now survive the empty-decl gate),
 
 Test: `content_visibility_auto_and_visible_are_kept_hidden_is_dropped`.
 1100 green.
+## accept animation-timeline as inert (P121, 2026-11-13)
+
+The engine has no animation clock: `animation`, `animation-name`,
+`animation-duration`, delay/timing/iteration/direction/fill/play-state are
+already accepted no-ops. A scroll- or view-driven `animation-timeline`
+(18 dropped declarations) can therefore have no effect either, so it is
+now accepted alongside the rest of the animation family. `animation-range`
+and other timeline sub-properties stay dropped until they appear in the
+census.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 31 -> 30
+distinct dropped properties (`animation-timeline` gone), 32976 -> 32982
+rules, 35 selector reasons, 1110 boxes unchanged.
+
+Test: `animation_timeline_is_an_accepted_noop`. 1101 green.
