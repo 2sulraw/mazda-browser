@@ -6396,3 +6396,11 @@ re-cascaded on a 6-node tree; before, 0 / 6). 1111 green.
 
 Github load unchanged: 18 dropped properties, 33008 rules, 1110 boxes.
 Total memory 444 MB (renderer 371, shell 73).
+
+## full-page settings with engine and font switches (P130, 2026-11-14)
+
+The shell now owns a separate settings.conf and a full-page settings view: a left sidebar with General, Script engines, Content, Privacy and About, opened by the gear or Ctrl+, and closed by Esc/Close. Remember-history is enforced at the history write, Privacy can clear history and bookmarks, About shows the active engine and renderer memory, and the overlay suppresses page scrolling/clicks while open.
+
+The script-engine and webfont choices persist as engine=a|b and fonts=a|b. The shell passes them to the renderer on spawn as MAZDA_ENGINE/MAZDA_FONTS, and SetEngine/SetFonts update the running renderer for the next load. Capabilities gates the Boa row so a renderer built without engine-b cannot select it; a saved engine=b is reset to A when the renderer reports no Boa support.
+
+Verified with the engine-b debug renderer: capabilities 1, Boa row enabled, selecting Boa wrote engine=b, selecting A restored engine=a, and scrolling over the settings page did not move the page underneath. Release workspace build passes; tests are 1111 engine, 9 shell, 5 ipc.

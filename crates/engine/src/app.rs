@@ -1214,11 +1214,27 @@ pub fn run_headless() {
     let mut fonts = Fonts::load();
     // the settings page can turn site webfonts off; the headless harness uses
     // the same switch (`MAZDA_FONTS=b`) for the reload-soak bisection.
-    let fonts_choice = if std::env::var("MAZDA_FONTS").ok().as_deref() == Some("b") {
+    let mut fonts_choice = if std::env::var("MAZDA_FONTS").ok().as_deref() == Some("b") {
         FontsChoice::B
     } else {
         FontsChoice::A
     };
+    // the shell passes the persisted choice on spawn; the env is the
+    // pre-IPC value, before the shell has had a chance to send `SetEngine`.
+    let mut engine_choice = if std::env::var("MAZDA_ENGINE").ok().as_deref() == Some("b")
+        && EngineChoice::B.available()
+    {
+        EngineChoice::B
+    } else {
+        EngineChoice::A
+    };
+    println!(
+        "{}",
+        mazda_ipc::Event::Capabilities {
+            engine_b: EngineChoice::B.available(),
+        }
+        .encode()
+    );
 
     // the same loader thread the shell uses: fetch → DOM → script → layout
     let (jobs_tx, jobs_rx) = mpsc::channel();
@@ -1281,7 +1297,7 @@ pub fn run_headless() {
             url,
             max_w: zoomed_w(pw, zoom),
             vh: zoomed_h(ph, zoom),
-            engine: EngineChoice::A,
+            engine: engine_choice,
             fonts: fonts_choice,
             restore: false,
         });
@@ -1435,7 +1451,7 @@ pub fn run_headless() {
                             url,
                             max_w: zoomed_w(pw, zoom),
                             vh: zoomed_h(ph, zoom),
-                            engine: EngineChoice::A,
+                            engine: engine_choice,
                             fonts: fonts_choice,
                             restore: false,
                         });
@@ -1450,7 +1466,7 @@ pub fn run_headless() {
                             url,
                             max_w: zoomed_w(pw, zoom),
                             vh: zoomed_h(ph, zoom),
-                            engine: EngineChoice::A,
+                            engine: engine_choice,
                             fonts: fonts_choice,
                             restore: true,
                         });
@@ -1468,7 +1484,7 @@ pub fn run_headless() {
                                 vh: zoomed_h(ph, zoom),
                                 forms: forms.clone(),
                                 hover: None,
-                                engine: EngineChoice::A,
+                                engine: engine_choice,
                             });
                             scroll = scroll.min((p.laid.height - zoomed_h(ph, zoom)).max(0.0));
                             headless_paint(
@@ -1493,7 +1509,7 @@ pub fn run_headless() {
                                 vh: zoomed_h(ph, zoom),
                                 forms: forms.clone(),
                                 hover: None,
-                                engine: EngineChoice::A,
+                                engine: engine_choice,
                             });
                         }
                     }
@@ -1600,7 +1616,7 @@ pub fn run_headless() {
                                     vh: zoomed_h(ph, zoom),
                                     forms: forms.clone(),
                                     hover: None,
-                                    engine: EngineChoice::A,
+                                    engine: engine_choice,
                                 });
                                 scroll = scroll
                                     .min((p.laid.height - zoomed_h(ph, zoom)).max(0.0));
@@ -1610,6 +1626,25 @@ pub fn run_headless() {
                                 );
                             }
                         }
+                    }
+                    mazda_ipc::Command::SetEngine(kind) => {
+                        let next = match kind {
+                            mazda_ipc::EngineKind::A => EngineChoice::A,
+                            mazda_ipc::EngineKind::B => EngineChoice::B,
+                        };
+                        if next.available() {
+                            engine_choice = next;
+                            eprintln!("[settings] engine {} for the next load", next.as_conf());
+                        } else {
+                            eprintln!("[settings] engine B unavailable in this build");
+                        }
+                    }
+                    mazda_ipc::Command::SetFonts(kind) => {
+                        fonts_choice = match kind {
+                            mazda_ipc::FontsKind::Site => FontsChoice::A,
+                            mazda_ipc::FontsKind::System => FontsChoice::B,
+                        };
+                        eprintln!("[settings] fonts {} for the next load", fonts_choice.as_conf());
                     }
                     mazda_ipc::Command::Print => match page.as_ref() {
                         Some(p) => match write_print_pdf(p, &fonts, pw) {

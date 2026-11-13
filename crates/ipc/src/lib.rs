@@ -195,6 +195,54 @@ impl FrameMap {
     }
 }
 
+/// Script engine selected in the shell settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineKind {
+    A,
+    B,
+}
+
+impl EngineKind {
+    fn as_conf(self) -> &'static str {
+        match self {
+            EngineKind::A => "a",
+            EngineKind::B => "b",
+        }
+    }
+
+    fn from_conf(s: &str) -> Option<Self> {
+        match s {
+            "a" => Some(EngineKind::A),
+            "b" => Some(EngineKind::B),
+            _ => None,
+        }
+    }
+}
+
+/// Font policy selected in the shell settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontsKind {
+    Site,
+    System,
+}
+
+impl FontsKind {
+    fn as_conf(self) -> &'static str {
+        match self {
+            FontsKind::Site => "a",
+            FontsKind::System => "b",
+        }
+    }
+
+    fn from_conf(s: &str) -> Option<Self> {
+        match s {
+            "a" => Some(FontsKind::Site),
+            "b" => Some(FontsKind::System),
+            _ => None,
+        }
+    }
+}
+
 /// Shell → renderer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -216,6 +264,10 @@ pub enum Command {
     FindClose,
     /// page zoom factor (1.0 = 100%)
     Zoom(f32),
+    /// change the script engine; applies from the next load on
+    SetEngine(EngineKind),
+    /// change the webfont policy; applies from the next load on
+    SetFonts(FontsKind),
     /// render the whole document to a PDF in the sandbox temp dir
     Print,
     Quit,
@@ -242,6 +294,8 @@ impl Command {
             Command::FindStep(d) => format!("find-step {d}"),
             Command::FindClose => "find-close".to_string(),
             Command::Zoom(z) => format!("zoom {z}"),
+            Command::SetEngine(e) => format!("engine {}", e.as_conf()),
+            Command::SetFonts(f) => format!("fonts {}", f.as_conf()),
             Command::Print => "print".to_string(),
             Command::Quit => "quit".to_string(),
         }
@@ -276,6 +330,8 @@ impl Command {
             "find-step" => rest.trim().parse().ok().map(Command::FindStep),
             "find-close" => Some(Command::FindClose),
             "zoom" => rest.trim().parse().ok().map(Command::Zoom),
+            "engine" => EngineKind::from_conf(rest.trim()).map(Command::SetEngine),
+            "fonts" => FontsKind::from_conf(rest.trim()).map(Command::SetFonts),
             "print" => Some(Command::Print),
             "file-chosen" => {
                 let (node, rest) = rest.split_once(' ')?;
@@ -324,6 +380,8 @@ pub enum Event {
     /// the file is complete in the renderer's temp dir; the shell moves it out
     DownloadDone { path: PathBuf },
     DownloadFailed { name: String, err: String },
+    /// renderer build capabilities (sent once at startup)
+    Capabilities { engine_b: bool },
     /// not on the wire: the reader thread's EOF signal
     Exited,
 }
@@ -354,6 +412,9 @@ impl Event {
             }
             Event::DownloadDone { path } => format!("download-done {}", path.display()),
             Event::DownloadFailed { name, err } => format!("download-failed {name}\t{err}"),
+            Event::Capabilities { engine_b } => {
+                format!("capabilities {}", u8::from(*engine_b))
+            }
             Event::Exited => "exited".to_string(),
         }
     }
@@ -420,6 +481,9 @@ impl Event {
                     err: err.to_string(),
                 })
             }
+            "capabilities" => Some(Event::Capabilities {
+                engine_b: rest.trim() == "1",
+            }),
             "exited" => Some(Event::Exited),
             _ => None,
         }
@@ -497,6 +561,10 @@ mod tests {
             Command::FindClose,
             Command::Zoom(1.25),
             Command::Zoom(0.25),
+            Command::SetEngine(EngineKind::A),
+            Command::SetEngine(EngineKind::B),
+            Command::SetFonts(FontsKind::Site),
+            Command::SetFonts(FontsKind::System),
             Command::Print,
             Command::Quit,
         ];
@@ -543,6 +611,8 @@ mod tests {
                 path: PathBuf::from("C:/Temp/mazda-print/page.pdf"),
             },
             Event::PrintFailed("disk full: no space left".into()),
+            Event::Capabilities { engine_b: true },
+            Event::Capabilities { engine_b: false },
             Event::Exited,
         ];
         for e in cases {

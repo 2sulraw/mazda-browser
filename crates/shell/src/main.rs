@@ -58,6 +58,153 @@ const MUTED: Color32 = Color32::from_rgb(0x5F, 0x63, 0x68);
 const ACCENT: Color32 = Color32::from_rgb(0x1A, 0x73, 0xE8);
 
 // ---------------------------------------------------------------------------
+// Settings
+//
+// The shell owns these (the renderer is sandboxed and never sees the profile).
+// `settings.conf` is a separate file from the old app's `mazda.conf`, so the
+// tabbed browser and the old single-window app do not overwrite each other.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EngineSetting {
+    A,
+    B,
+}
+
+impl EngineSetting {
+    fn as_conf(self) -> &'static str {
+        match self {
+            EngineSetting::A => "a",
+            EngineSetting::B => "b",
+        }
+    }
+
+    fn from_conf(s: &str) -> Option<Self> {
+        match s {
+            "a" => Some(EngineSetting::A),
+            "b" => Some(EngineSetting::B),
+            _ => None,
+        }
+    }
+
+    fn kind(self) -> mazda_ipc::EngineKind {
+        match self {
+            EngineSetting::A => mazda_ipc::EngineKind::A,
+            EngineSetting::B => mazda_ipc::EngineKind::B,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FontsSetting {
+    Site,
+    System,
+}
+
+impl FontsSetting {
+    fn as_conf(self) -> &'static str {
+        match self {
+            FontsSetting::Site => "a",
+            FontsSetting::System => "b",
+        }
+    }
+
+    fn from_conf(s: &str) -> Option<Self> {
+        match s {
+            "a" => Some(FontsSetting::Site),
+            "b" => Some(FontsSetting::System),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Settings {
+    engine: EngineSetting,
+    fonts: FontsSetting,
+    remember_history: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            engine: EngineSetting::A,
+            fonts: FontsSetting::Site,
+            remember_history: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Engines,
+    Content,
+    Privacy,
+    About,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 5] = [
+        SettingsSection::General,
+        SettingsSection::Engines,
+        SettingsSection::Content,
+        SettingsSection::Privacy,
+        SettingsSection::About,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsSection::General => "General",
+            SettingsSection::Engines => "Script engines",
+            SettingsSection::Content => "Content",
+            SettingsSection::Privacy => "Privacy",
+            SettingsSection::About => "About",
+        }
+    }
+}
+
+fn parse_settings(text: &str) -> Settings {
+    let mut out = Settings::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "engine" => {
+                if let Some(e) = EngineSetting::from_conf(value) {
+                    out.engine = e;
+                }
+            }
+            "fonts" => {
+                if let Some(f) = FontsSetting::from_conf(value) {
+                    out.fonts = f;
+                }
+            }
+            "remember_history" => {
+                out.remember_history =
+                    !matches!(value, "0" | "false" | "no" | "off");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn settings_text(s: &Settings) -> String {
+    format!(
+        "engine={}\nfonts={}\nremember_history={}\n",
+        s.engine.as_conf(),
+        s.fonts.as_conf(),
+        u8::from(s.remember_history)
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Renderer supervisor
 
 struct Renderer {
@@ -71,10 +218,18 @@ struct Renderer {
     /// page the supervisor replays after a crash
     url: String,
     restarts: u32,
+    /// persisted choices; re-applied to a restarted renderer
+    engine: EngineSetting,
+    fonts: FontsSetting,
 }
 
 impl Renderer {
-    fn spawn(exe: PathBuf, initial: Option<&str>) -> Option<Self> {
+    fn spawn(
+        exe: PathBuf,
+        initial: Option<&str>,
+        engine: EngineSetting,
+        fonts: FontsSetting,
+    ) -> Option<Self> {
         // the renderer never sees the real profile: its frame file and cache
         // live in this directory, which the sandbox grants it access to
         let dir = std::env::temp_dir().join(format!("mazda-sandbox-{}", std::process::id()));
@@ -95,6 +250,8 @@ impl Renderer {
             ("TMP", tmp.as_os_str().to_owned()),
             ("TEMP", tmp.as_os_str().to_owned()),
             ("LOCALAPPDATA", local.as_os_str().to_owned()),
+            ("MAZDA_ENGINE", OsString::from(engine.as_conf())),
+            ("MAZDA_FONTS", OsString::from(fonts.as_conf())),
         ];
         // no memory cap: the renderer must stay lean by what it allocates
         let limits = mazda_sandbox::Limits {
@@ -155,6 +312,8 @@ impl Renderer {
             sandbox: dir,
             url: initial.unwrap_or("").to_string(),
             restarts: 0,
+            engine,
+            fonts,
         })
     }
 
@@ -175,7 +334,7 @@ impl Renderer {
         }
         self.proc.kill();
         self.proc.wait();
-        let Some(mut fresh) = Self::spawn(self.exe.clone(), None) else {
+        let Some(mut fresh) = Self::spawn(self.exe.clone(), None, self.engine, self.fonts) else {
             return false;
         };
         fresh.url = self.url.clone();
@@ -354,6 +513,24 @@ fn history_path() -> PathBuf {
 
 fn bookmarks_path() -> PathBuf {
     data_dir().join("bookmarks.tsv")
+}
+
+fn settings_path() -> PathBuf {
+    data_dir().join("settings.conf")
+}
+
+fn load_settings() -> Settings {
+    std::fs::read_to_string(settings_path())
+        .map(|t| parse_settings(&t))
+        .unwrap_or_default()
+}
+
+fn save_settings(s: &Settings) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(settings_path(), settings_text(s));
 }
 
 /// Tabs and newlines would break the one-record-per-line format.
@@ -670,6 +847,12 @@ struct Shell {
     bookmarks: Vec<Bookmark>,
     /// the History/Bookmarks panel (toolbar clock or Ctrl+H)
     library_open: bool,
+    /// full-page settings (gear or Ctrl+,)
+    settings: Settings,
+    settings_open: bool,
+    settings_section: SettingsSection,
+    /// renderer build capability, reported once on startup
+    engine_b_available: bool,
     title: String,
     err: Option<String>,
     /// content size last sent to the renderer
@@ -705,7 +888,13 @@ impl Shell {
         }
         let active = active.min(tabs.len() - 1);
         let start = tabs[active].url.clone();
-        let r = Renderer::spawn(exe, (!start.is_empty()).then_some(start.as_str()))?;
+        let settings = load_settings();
+        let r = Renderer::spawn(
+            exe,
+            (!start.is_empty()).then_some(start.as_str()),
+            settings.engine,
+            settings.fonts,
+        )?;
         let url_edit = tabs[active].url.clone();
         let mut inflight = VecDeque::new();
         if !start.is_empty() {
@@ -737,6 +926,10 @@ impl Shell {
             history: load_history(),
             bookmarks: load_bookmarks(),
             library_open: false,
+            settings,
+            settings_open: false,
+            settings_section: SettingsSection::General,
+            engine_b_available: false,
             title: String::new(),
             err: None,
             size: (0, 0),
@@ -797,7 +990,7 @@ impl Shell {
     /// Append a committed load to the visit log (memory + disk). Reloading a
     /// URL updates its timestamp instead of adding a second row.
     fn record_visit(&mut self, url: &str) {
-        if url.is_empty() {
+        if url.is_empty() || !self.settings.remember_history {
             return;
         }
         let secs = now_secs();
@@ -842,6 +1035,48 @@ impl Shell {
     fn clear_history(&mut self) {
         self.history.clear();
         clear_history_file();
+    }
+
+    fn clear_bookmarks(&mut self) {
+        self.bookmarks.clear();
+        write_bookmarks(&self.bookmarks);
+    }
+
+    fn toggle_settings(&mut self) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.library_open = false;
+            self.downloads_open = false;
+            self.close_find();
+        }
+    }
+
+    fn set_engine(&mut self, engine: EngineSetting) {
+        if engine == EngineSetting::B && !self.engine_b_available {
+            return;
+        }
+        if engine == self.settings.engine {
+            return;
+        }
+        self.settings.engine = engine;
+        self.r.engine = engine;
+        save_settings(&self.settings);
+        self.r.send(Command::SetEngine(engine.kind()));
+        self.reload();
+    }
+
+    fn set_fonts(&mut self, fonts: FontsSetting) {
+        if fonts == self.settings.fonts {
+            return;
+        }
+        self.settings.fonts = fonts;
+        self.r.fonts = fonts;
+        save_settings(&self.settings);
+        self.r.send(Command::SetFonts(match fonts {
+            FontsSetting::Site => mazda_ipc::FontsKind::Site,
+            FontsSetting::System => mazda_ipc::FontsKind::System,
+        }));
+        self.reload();
     }
 
     /// Load `url` in the active tab (fresh fetch).
@@ -1236,6 +1471,17 @@ impl Shell {
                     println!("[print] failed: {e}");
                     self.err = Some(format!("print failed: {e}"));
                 }
+                Event::Capabilities { engine_b } => {
+                    self.engine_b_available = engine_b;
+                    if !engine_b && self.settings.engine == EngineSetting::B {
+                        // the conf may have been copied from an engine-b build
+                        self.settings.engine = EngineSetting::A;
+                        self.r.engine = EngineSetting::A;
+                        self.r.send(Command::SetEngine(EngineSetting::A.kind()));
+                        save_settings(&self.settings);
+                    }
+                    println!("[capabilities] engine_b={}", u8::from(engine_b));
+                }
                 Event::Exited => {
                     if self.r.restart() {
                         self.err = Some(format!(
@@ -1348,6 +1594,280 @@ impl Shell {
                 }
             }
             ctx.request_repaint();
+        }
+    }
+
+    /// Full-page settings: a sidebar on the left, the selected section on the
+    /// right. Drawn after the page, so it also hides the page and its input.
+    fn settings_ui(&mut self, ctx: &egui::Context, rect: Rect) {
+        let mut section = self.settings_section;
+        let mut engine = self.settings.engine;
+        let mut fonts = self.settings.fonts;
+        let mut remember = self.settings.remember_history;
+        let available = self.engine_b_available;
+        let history_len = self.history.len();
+        let bookmarks_len = self.bookmarks.len();
+        let mut close = false;
+        let mut clear_history = false;
+        let mut clear_bookmarks = false;
+
+        let bg = Color32::from_rgb(0xFB, 0xFC, 0xFD);
+        egui::Area::new(egui::Id::new("settings-page"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(rect.size());
+                egui::Frame::NONE.fill(bg).show(ui, |ui| {
+                    ui.set_min_size(rect.size());
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(220.0, rect.height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.add_space(28.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(22.0);
+                                    ui.label(
+                                        egui::RichText::new("Settings")
+                                            .size(22.0)
+                                            .strong(),
+                                    );
+                                });
+                                ui.add_space(18.0);
+                                for s in SettingsSection::ALL {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(12.0);
+                                        ui.selectable_value(
+                                            &mut section,
+                                            s,
+                                            format!("  {}", s.label()),
+                                        );
+                                    });
+                                }
+                                ui.add_space(18.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(22.0);
+                                    if ui.button("Close").clicked() {
+                                        close = true;
+                                    }
+                                });
+                            },
+                        );
+                        ui.separator();
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(
+                                (rect.width() - 220.0).max(1.0),
+                                rect.height(),
+                            ),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add_space(28.0);
+                                ui.set_max_width((rect.width() - 280.0).max(320.0));
+                                match section {
+                                    SettingsSection::General => {
+                                        ui.label(
+                                            egui::RichText::new("General")
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.checkbox(
+                                            &mut remember,
+                                            "Remember browsing history",
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Visited pages appear in History and are written to disk.",
+                                            )
+                                            .color(MUTED)
+                                            .size(12.0),
+                                        );
+                                    }
+                                    SettingsSection::Engines => {
+                                        ui.label(
+                                            egui::RichText::new("Script engines")
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Choose the interpreter that runs page JavaScript. A change applies after the page reloads.",
+                                            )
+                                            .color(MUTED)
+                                            .size(12.0),
+                                        );
+                                        ui.add_space(12.0);
+                                        ui.radio_value(
+                                            &mut engine,
+                                            EngineSetting::A,
+                                            "1. Mazda Engine (current)",
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Pure-Rust tree-walking runtime. The default, and the one page tests cover.",
+                                            )
+                                            .color(MUTED)
+                                            .size(12.0),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.add_enabled_ui(available, |ui| {
+                                            ui.radio_value(
+                                                &mut engine,
+                                                EngineSetting::B,
+                                                "2. Boa (experimental)",
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Full ECMAScript engine core. Slower and not yet feature-complete; memory results are not measured.",
+                                            )
+                                            .color(MUTED)
+                                            .size(12.0),
+                                        );
+                                        if !available {
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Not available in this build: the renderer was built without engine-b.",
+                                                )
+                                                .color(MUTED)
+                                                .size(12.0),
+                                            );
+                                        }
+                                    }
+                                    SettingsSection::Content => {
+                                        ui.label(
+                                            egui::RichText::new("Content")
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new("Fonts")
+                                                .strong(),
+                                        );
+                                        ui.radio_value(
+                                            &mut fonts,
+                                            FontsSetting::Site,
+                                            "Site fonts (webfonts)",
+                                        );
+                                        ui.radio_value(
+                                            &mut fonts,
+                                            FontsSetting::System,
+                                            "System fonts only",
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "System fonts skip @font-face downloads and decoding.",
+                                            )
+                                            .color(MUTED)
+                                            .size(12.0),
+                                        );
+                                    }
+                                    SettingsSection::Privacy => {
+                                        ui.label(
+                                            egui::RichText::new("Privacy")
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(10.0);
+                                        if ui
+                                            .add_enabled(
+                                                history_len > 0,
+                                                egui::Button::new("Clear history"),
+                                            )
+                                            .clicked()
+                                        {
+                                            clear_history = true;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                bookmarks_len > 0,
+                                                egui::Button::new("Clear bookmarks"),
+                                            )
+                                            .clicked()
+                                        {
+                                            clear_bookmarks = true;
+                                        }
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Clearing removes the in-memory list and its file under the profile.",
+                                            )
+                                            .color(MUTED)
+                                            .size(12.0),
+                                        );
+                                    }
+                                    SettingsSection::About => {
+                                        ui.label(
+                                            egui::RichText::new("About")
+                                                .size(20.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.label(format!(
+                                            "Mazda {}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ));
+                                        ui.add_space(6.0);
+                                        ui.label(format!(
+                                            "Script engine: {}",
+                                            match self.settings.engine {
+                                                EngineSetting::A => "Mazda Engine",
+                                                EngineSetting::B => "Boa",
+                                            }
+                                        ));
+                                        ui.label(format!(
+                                            "Boa build support: {}",
+                                            if available { "yes" } else { "no" }
+                                        ));
+                                        ui.label(format!(
+                                            "Renderer memory: {}",
+                                            if self.last_mb > 0.0 {
+                                                format!("{:.1} MB", self.last_mb)
+                                            } else {
+                                                "measuring".to_string()
+                                            }
+                                        ));
+                                        ui.label(format!(
+                                            "Tabs: {}   History: {}   Bookmarks: {}",
+                                            self.tabs.len(),
+                                            history_len,
+                                            bookmarks_len
+                                        ));
+                                    }
+                                }
+                                ui.add_space(28.0);
+                            });
+                            },
+                        );
+                    });
+                });
+            });
+
+        self.settings_section = section;
+        if remember != self.settings.remember_history {
+            self.settings.remember_history = remember;
+            save_settings(&self.settings);
+        }
+        if engine != self.settings.engine {
+            self.set_engine(engine);
+        }
+        if fonts != self.settings.fonts {
+            self.set_fonts(fonts);
+        }
+        if clear_history {
+            self.clear_history();
+        }
+        if clear_bookmarks {
+            self.clear_bookmarks();
+        }
+        if close {
+            self.settings_open = false;
         }
     }
 
@@ -1627,6 +2147,10 @@ impl eframe::App for Shell {
             egui::pos2(toolbar_rect.right() - 135.0, toolbar_rect.center().y),
             egui::vec2(34.0, 34.0),
         );
+        let gear_rect = Rect::from_center_size(
+            egui::pos2(toolbar_rect.right() - 171.0, toolbar_rect.center().y),
+            egui::vec2(34.0, 34.0),
+        );
         let pill = Rect::from_min_max(
             egui::pos2(reload_rect.right() + 10.0, toolbar_rect.top() + 7.0),
             egui::pos2(lib_rect.left() - 8.0, toolbar_rect.bottom() - 7.0),
@@ -1805,6 +2329,21 @@ impl eframe::App for Shell {
             self.library_open = !self.library_open;
         }
 
+        // settings gear
+        let gear_resp = ui.interact(gear_rect, ui.id().with("settings"), Sense::click());
+        if gear_resp.hovered() {
+            painter.circle_filled(gear_rect.center(), 16.0, PILL_HOVER);
+        }
+        let ge_col = if gear_resp.hovered() || self.settings_open {
+            ACCENT
+        } else {
+            MUTED
+        };
+        draw_gear(&painter, gear_rect.center(), 7.5, ge_col);
+        if gear_resp.clicked() {
+            self.toggle_settings();
+        }
+
         // ---- keyboard: the usual browser chords ------------------------
         let mut k_new = false;
         let mut k_close = false;
@@ -1816,6 +2355,7 @@ impl eframe::App for Shell {
         let mut k_print = false;
         let mut k_bookmark = false;
         let mut k_library = false;
+        let mut k_settings = false;
         let mut k_next = 0i32;
         let mut k_select = None;
         ui.input(|i| {
@@ -1854,6 +2394,9 @@ impl eframe::App for Shell {
             }
             if i.key_pressed(egui::Key::H) {
                 k_library = true;
+            }
+            if i.key_pressed(egui::Key::Comma) {
+                k_settings = true;
             }
             if i.key_pressed(egui::Key::Tab) {
                 k_next = if i.modifiers.shift { -1 } else { 1 };
@@ -1897,6 +2440,12 @@ impl eframe::App for Shell {
         }
         if k_library {
             self.library_open = !self.library_open;
+        }
+        if k_settings {
+            self.toggle_settings();
+        }
+        if self.settings_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.settings_open = false;
         }
         if let Some(url) = go {
             self.navigate(url);
@@ -2058,7 +2607,8 @@ impl eframe::App for Shell {
 
         // input -> renderer (only over the page, never over the chrome)
         let hover = ui.input(|i| i.pointer.hover_pos());
-        let over_page = hover.map(|p| page_rect.contains(p)).unwrap_or(false);
+        let over_page = !self.settings_open
+            && hover.map(|p| page_rect.contains(p)).unwrap_or(false);
         let wheel = if over_page {
             ui.input(|i| i.smooth_scroll_delta().y)
         } else {
@@ -2070,6 +2620,7 @@ impl eframe::App for Shell {
                 .then(|| i.pointer.interact_pos())
                 .flatten()
                 .filter(|p| page_rect.contains(*p))
+                .filter(|_| !self.settings_open)
         });
         if wheel != 0.0 && page {
             // the renderer scrolls in CSS pixels; the wheel arrives in
@@ -2307,6 +2858,13 @@ impl eframe::App for Shell {
             }
         }
 
+        if self.settings_open {
+            // cover the page on the main layer first; the settings `Area` is
+            // foreground, so its own frame does not have to hide the canvas
+            painter.rect_filled(page_rect, 0.0, Color32::from_rgb(0xFB, 0xFC, 0xFD));
+            self.settings_ui(ui.ctx(), page_rect);
+        }
+
         ui.ctx().request_repaint_after(Duration::from_millis(8));
     }
 }
@@ -2440,6 +2998,23 @@ fn draw_reload(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
         [tip, egui::pos2(back.x - 2.5 * nx, back.y - 2.5 * ny)],
         Stroke::new(1.6, color),
     );
+}
+
+fn draw_gear(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
+    let stroke = Stroke::new(1.5, color);
+    p.circle_stroke(c, r * 0.58, stroke);
+    p.circle_filled(c, r * 0.16, color);
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::FRAC_PI_4;
+        let (s, c_a) = a.sin_cos();
+        p.line_segment(
+            [
+                egui::pos2(c.x + s * r * 0.62, c.y - c_a * r * 0.62),
+                egui::pos2(c.x + s * r, c.y - c_a * r),
+            ],
+            stroke,
+        );
+    }
 }
 
 fn draw_star(p: &egui::Painter, c: egui::Pos2, r: f32, filled: bool, color: Color32) {
@@ -2658,6 +3233,32 @@ mod tests {
         let line = history_line(1, "u\tv\nw", "t\tx");
         assert!(line.ends_with("u v w\tt x\n"));
         assert_eq!(parse_history("bad\nx\ty\n").len(), 0);
+    }
+
+    #[test]
+    fn settings_parse_tolerantly_and_round_trip() {
+        let d = parse_settings("");
+        assert_eq!(d, Settings::default());
+        assert_eq!(d.engine, EngineSetting::A);
+        assert_eq!(d.fonts, FontsSetting::Site);
+        assert!(d.remember_history);
+
+        let s = parse_settings(
+            "# comment\nengine=b\nfonts=system\nremember_history=0\nunknown=x\nengine=nope\n",
+        );
+        assert_eq!(s.engine, EngineSetting::B);
+        assert_eq!(s.fonts, FontsSetting::Site, "unknown spelling keeps the default");
+        assert!(!s.remember_history);
+        assert_eq!(parse_settings(&settings_text(&s)), s);
+    }
+
+    #[test]
+    fn settings_engine_maps_to_the_wire() {
+        assert_eq!(EngineSetting::A.kind(), mazda_ipc::EngineKind::A);
+        assert_eq!(EngineSetting::B.kind(), mazda_ipc::EngineKind::B);
+        assert_eq!(EngineSetting::A.as_conf(), "a");
+        assert_eq!(EngineSetting::B.as_conf(), "b");
+        assert_eq!(FontsSetting::System.as_conf(), "b");
     }
 
     #[test]
