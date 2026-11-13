@@ -747,11 +747,40 @@ impl Outline {
     };
 }
 
+/// `container-type`: which axis (if any) an element establishes a query
+/// container for. `InlineSize`/`Size` make it a query container whose used
+/// content-box inline size answers `@container` size queries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ContainerType {
+    #[default]
+    Normal,
+    InlineSize,
+    Size,
+}
+
+/// A query container measured by a layout pass: the element's used
+/// content-box inline size plus what it answers queries by (`container-name`
+/// list, empty = unnamed). Indexed by DOM node id in
+/// [`Sheet::set_container_boxes`].
+#[derive(Clone, PartialEq, Debug)]
+pub struct ContainerBox {
+    pub kind: ContainerType,
+    pub names: Vec<String>,
+    pub width: f32,
+}
+
 /// Per-element box layout properties — the non-inherited half of CSS.
 /// Default = plain block flow (matches pre-flex rendering).
 #[derive(Clone, PartialEq, Debug)]
 pub struct BoxStyle {
     pub display: Display,
+    /// `container-type` — which axis makes this element a query container
+    /// (`normal` = not one). Queries are evaluated against the measured
+    /// content-box inline size, see [`ContainerBox`].
+    pub container_type: ContainerType,
+    /// `container-name` — the query names this container answers to (empty =
+    /// unnamed, which still answers unnamed `@container` queries).
+    pub container_name: Vec<String>,
     /// true for `display: inline-flex` / `inline-grid`: the box keeps its
     /// Flex/Grid inner layout but is inline-LEVEL — it shrinks to fit and
     /// sits on the surrounding text line instead of filling the parent.
@@ -1188,6 +1217,8 @@ impl Default for BoxStyle {
     fn default() -> Self {
         BoxStyle {
             display: Display::Auto,
+            container_type: ContainerType::Normal,
+            container_name: Vec::new(),
             inline_box: false,
             dir: Dir::Row,
             justify: Justify::Normal,
@@ -1531,6 +1562,8 @@ struct Rule {
     /// (ids, classes+attrs, tags) — cascade order key
     spec: (u16, u16, u16),
     order: u32,
+    /// `@container` condition this rule sits under (None = unconditional)
+    cond: Option<ContainerCond>,
 }
 
 /// Does this compound (or anything it nests) test `:has()`? A `:has()`
@@ -1977,6 +2010,20 @@ pub struct Sheet {
     /// height defaults to 700 (= the fixed window in main.rs) until
     /// `set_viewport` passes the real one.
     vp: (f32, f32),
+    /// Query containers measured by the last layout pass, indexed by DOM node
+    /// id. Filled by `layout::container_boxes` via [`Self::set_container_boxes`]
+    /// and read by [`Self::container_matches`]. Persists across passes (a
+    /// resize re-parses the sheet and starts empty again).
+    containers: std::cell::RefCell<Vec<Option<ContainerBox>>>,
+    /// Bumped whenever [`Self::set_container_boxes`] changes the measured
+    /// widths. `layout::StyleCache` keys on it: a cached style resolved under
+    /// old container widths must not survive into a pass that can answer
+    /// `@container` differently.
+    container_gen: std::cell::Cell<u32>,
+    /// Parsed rules carrying an `@container` condition. Only a page with at
+    /// least one pays the corrective layout pass that re-cascades with the
+    /// measured container widths.
+    container_rules: usize,
 }
 
 /// Interned `font-family` comma stacks: the cascade assigns each distinct
@@ -2147,6 +2194,69 @@ impl Sheet {
         self.scheme_memo.borrow_mut().clear();
         self.scheme_probes.set(0);
         self.scheme_hops.set(0);
+    }
+
+    /// Record the query containers measured by a layout pass. Returns true
+    /// when they differ from what the previous cascade used — the caller then
+    /// re-cascades and lays out once more so rules gated by a container width
+    /// see the real size. The map persists across passes so a resize/hover
+    /// restart begins from the last measured widths.
+    pub fn set_container_boxes(&self, boxes: Vec<Option<ContainerBox>>) -> bool {
+        let mut cur = self.containers.borrow_mut();
+        if *cur == boxes {
+            return false;
+        }
+        *cur = boxes;
+        self.container_gen.set(self.container_gen.get().wrapping_add(1));
+        true
+    }
+
+    /// Generation of the measured container widths (see [`Self::set_container_boxes`]).
+    pub fn container_gen(&self) -> u32 {
+        self.container_gen.get()
+    }
+
+    /// Does any rule sit under an `@container` condition?
+    pub fn uses_containers(&self) -> bool {
+        self.container_rules > 0
+    }
+
+    /// The condition holds when the nearest ancestor query container (with
+    /// `cond.name`, when named) has a measured content-box inline size that
+    /// passes the comparison. No such ancestor = false (a query with no
+    /// container never matches).
+    fn container_matches(&self, dom: &Dom, node: u32, cond: &ContainerCond) -> bool {
+        let Some(w) = self.container_width(dom, node, cond.name.as_deref()) else {
+            return false;
+        };
+        cond.op.holds(w, cond.px)
+    }
+
+    /// Used content-box inline size of the nearest ancestor query container
+    /// (optionally filtered by name). The element itself is never its own
+    /// query container, so the walk starts at its parent.
+    fn container_width(&self, dom: &Dom, node: u32, name: Option<&str>) -> Option<f32> {
+        let map = self.containers.borrow();
+        let mut n = dom.nodes.get(node as usize)?.parent;
+        let mut hops = 0usize;
+        while hops <= dom.nodes.len() {
+            if let Some(b) = map.get(n as usize).and_then(|x| x.as_ref()) {
+                let hit = match name {
+                    None => true,
+                    Some(q) => b.names.iter().any(|x| x == q),
+                };
+                if hit {
+                    return Some(b.width);
+                }
+            }
+            let p = dom.nodes.get(n as usize)?.parent;
+            if p == n {
+                break;
+            }
+            n = p;
+            hops += 1;
+        }
+        None
     }
 
     /// Wire the loader's shared stack table so `Style::fam_stack` ids resolved
@@ -2360,6 +2470,9 @@ const KNOWN: &[&str] = &[
     "grid-row-start",
     "grid-row-end",
     "grid-auto-flow",
+    "container-type",
+    "container-name",
+    "container",
     "width",
     "max-width",
     "min-width",
@@ -2744,6 +2857,14 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         std::collections::HashMap::new();
     let mut order = 0u32;
     let mut i = 0usize;
+    // transparent at-rule blocks currently open (`@media`/`@layer`/`@supports`
+    // and supported `@container`). Rule blocks consume their own braces, so a
+    // stray `}` here closes one of these. `conds` stacks the active
+    // `@container` conditions with the depth they opened at; rules take the
+    // innermost one (nested `@container` blocks are not observed on real
+    // pages, so the outer condition is not conjoined).
+    let mut depth = 0usize;
+    let mut conds: Vec<(usize, ContainerCond)> = Vec::new();
 
     while i < b.len() {
         let c = b[i];
@@ -2752,15 +2873,27 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
             continue;
         }
         if c == b'}' {
-            // stray closer (end of a media/layer block we parsed into) —
-            // never glue it onto the next selector
+            // stray closer (end of a media/layer/container block we parsed
+            // into) — never glue it onto the next selector
+            depth = depth.saturating_sub(1);
+            while conds.last().is_some_and(|(d, _)| depth < *d) {
+                conds.pop();
+            }
             i += 1;
             continue;
         }
         if c == b'@' {
-            i = handle_at_rule(&s, b, i, vw);
+            let step = handle_at_rule(&s, b, i, vw);
+            i = step.next;
+            if step.entered {
+                depth += 1;
+                if let Some(cond) = step.cond {
+                    conds.push((depth, cond));
+                }
+            }
             continue;
         }
+        let cond = conds.last().map(|(_, c)| c.clone());
         let Some(ob) = s[i..].find('{') else { break };
         let Some(cb) = match_brace(b, i + ob) else { break };
         let sel_text = &s[i..i + ob];
@@ -2815,6 +2948,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                                 vars: own_vars.clone(),
                                 spec,
                                 order: var_order,
+                                cond: cond.clone(),
                             });
                             var_order += 1;
                         }
@@ -2840,6 +2974,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                             vars: Vec::new(),
                             spec,
                             order,
+                            cond: cond.clone(),
                         });
                         order += 1;
                     }
@@ -2901,6 +3036,7 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
                     vars: Vec::new(),
                     spec: r.spec,
                     order: r.order,
+                    cond: r.cond.clone(),
                 })
         })
         .collect();
@@ -2920,6 +3056,12 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
     const PSEUDO_NAMES: [&str; 4] = [" ::before", " ::after", " ::marker", " ::placeholder"];
     let pseudo_index: [RuleIndex; 4] =
         std::array::from_fn(|i| RuleIndex::build_named(&pseudo[i], PSEUDO_NAMES[i]));
+    let container_rules = rules
+        .iter()
+        .chain(hover.iter())
+        .chain(pseudo.iter().flatten())
+        .filter(|r| r.cond.is_some())
+        .count();
     Sheet {
         rules,
         index,
@@ -2942,14 +3084,26 @@ pub fn parse_for(text: &str, vw: f32) -> Sheet {
         root_pol: None,
         stacks: None,
         vp: (vw, 700.0),
+        containers: std::cell::RefCell::new(Vec::new()),
+        container_gen: std::cell::Cell::new(0),
+        container_rules,
     }
+}
+
+/// One parsed at-rule step: where parsing resumes, whether a transparent block
+/// was entered, and (for a supported `@container`) its condition.
+struct AtStep {
+    next: usize,
+    entered: bool,
+    cond: Option<ContainerCond>,
 }
 
 /// Position just past an at-rule. `@media`/`@layer` blocks whose condition
 /// matches are entered (their inner rules parse normally); everything else
 /// (`@keyframes`, `@supports`, `@font-face`, unmatched `@media`, statements
-/// like `@import`) is skipped whole.
-fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
+/// like `@import`) is skipped whole. A supported `@container` block is entered
+/// too, and its condition is attached to every rule parsed inside it.
+fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> AtStep {
     let mut ne = at + 1;
     while ne < b.len() && (b[ne].is_ascii_alphabetic() || b[ne] == b'-') {
         ne += 1;
@@ -2961,22 +3115,36 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
         pe += 1;
     }
     if pe >= b.len() {
-        return b.len();
+        return AtStep {
+            next: b.len(),
+            entered: false,
+            cond: None,
+        };
     }
     if b[pe] == b';' {
-        return pe + 1; // @import …;  /  @layer a, b;
+        return AtStep {
+            next: pe + 1, // @import ·;  /  @layer a, b;
+            entered: false,
+            cond: None,
+        };
     }
-    let transparent = match name {
-        "media" => media_matches(&s[ne..pe], vw),
+    // `@container` is entered only when its prelude names a size query we can
+    // evaluate; otherwise the block is skipped whole, like before.
+    let (transparent, cond) = match name {
+        "media" => (media_matches(&s[ne..pe], vw), None),
         // feature queries: enter a branch only if we actually support what it
         // tests for. Modern sites ship a native form and an `@supports not`
         // polyfill of the same custom property; evaluating the query for real
         // keeps the polyfill (whose logic we can't run) from shadowing the
         // native values (MDN's `light-dark()` colours).
-        "supports" => supports_matches(&s[ne..pe]),
-        // shortcut: layer order ≈ source order (cross-layer specificity off)
-        "layer" => true,
-        _ => false,
+        "supports" => (supports_matches(&s[ne..pe]), None),
+        // shortcut: layer order ~ source order (cross-layer specificity off)
+        "layer" => (true, None),
+        "container" => match parse_container_cond(&s[ne..pe], (vw, 700.0)) {
+            Some(c) => (true, Some(c)),
+            None => (false, None),
+        },
+        _ => (false, None),
     };
     // observed-miss instrumentation: only names this parser never implements
     // (media/supports/layer are handled above; import/font-face/keyframes are
@@ -3001,13 +3169,25 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
             // font-feature-settings are accepted no-ops (one fixed face), so
             // the definitions select nothing
             | "font-feature-values"
-    ) {
+    ) && !(name == "container" && cond.is_some())
+    {
+        // an `@container` prelude this parser supports is not a miss; an
+        // unsupported form (height, style query, and/or) still is, so it
+        // stays visible in MAZDA_MISS
         note_unknown_at_rule(name);
     }
     if transparent {
-        pe + 1 // parse inside; the closing '}' is consumed as a stray
+        AtStep {
+            next: pe + 1, // parse inside; the closing '}' is consumed as a stray
+            entered: true,
+            cond,
+        }
     } else {
-        skip_at_rule(s, at)
+        AtStep {
+            next: skip_at_rule(s, at),
+            entered: false,
+            cond: None,
+        }
     }
 }
 
@@ -3178,6 +3358,11 @@ impl Sheet {
                 if !matches_filtered(dom, node, &rule.segs, self.hovered.get(), filter) {
                     continue;
                 }
+                if let Some(c) = &rule.cond {
+                    if !self.container_matches(dom, node, c) {
+                        continue;
+                    }
+                }
                 stats.1 += 1;
                 stats.2 += rule.decls.len();
                 for d in &rule.decls {
@@ -3308,6 +3493,11 @@ impl Sheet {
                 if !matches(dom, node, &rule.segs, self.hovered.get()) {
                     continue;
                 }
+                if let Some(c) = &rule.cond {
+                    if !self.container_matches(dom, node, c) {
+                        continue;
+                    }
+                }
                 for d in &rule.decls {
                     color_declared |= d.0 == "color";
                     let sd = self.subst(d);
@@ -3399,7 +3589,12 @@ impl Sheet {
             self.var_index.candidates(dom, node, &mut cand);
             for &ri in cand.iter() {
                 let rule = &self.var_rules[ri as usize];
-                if matches(dom, node, &rule.segs, self.hovered.get()) {
+                if matches(dom, node, &rule.segs, self.hovered.get())
+                    && rule
+                        .cond
+                        .as_ref()
+                        .map_or(true, |c| self.container_matches(dom, node, c))
+                {
                     own.extend(rule.vars.iter().cloned());
                 }
             }
@@ -3428,7 +3623,11 @@ impl Sheet {
                 for &ri in cand.iter() {
                     let r = &self.scheme_rules[ri as usize];
                     self.scheme_probes.set(self.scheme_probes.get() + 1);
-                    if matches(dom, node, &r.segs, self.hovered.get()) {
+                    if matches(dom, node, &r.segs, self.hovered.get())
+                        && r.cond
+                            .as_ref()
+                            .map_or(true, |c| self.container_matches(dom, node, c))
+                    {
                         let raw = &r.decls[0].1;
                         // same var() substitution resolve applies to every
                         // declaration
@@ -3533,6 +3732,7 @@ impl Sheet {
                 .segs
                 .iter()
                 .any(|s| !s.pseudos.is_empty() || !s.nots.is_empty() || s.pseudo_el.is_some() || s.adj)
+                || rule.cond.is_some()
             {
                 continue;
             }
@@ -3947,7 +4147,12 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         let raw = v.trim();
         let lower = raw.to_ascii_lowercase();
         let imp = lower.find("!important");
-        let mut v = if lower.contains("url(") || p == "content" || p.starts_with("counter-") {
+        let mut v = if lower.contains("url(")
+            || p == "content"
+            || p == "container"
+            || p == "container-name"
+            || p.starts_with("counter-")
+        {
             raw.to_string()
         } else {
             lower
@@ -3961,6 +4166,160 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         }
     }
     out
+}
+
+/// `container-type` value → the axis it makes queryable. Garbage keeps the
+/// initial `normal` (not a query container).
+fn parse_container_type(v: &str) -> ContainerType {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("inline-size") {
+        ContainerType::InlineSize
+    } else if v.eq_ignore_ascii_case("size") {
+        ContainerType::Size
+    } else {
+        ContainerType::Normal
+    }
+}
+
+/// `container-name` / the name half of the `container` shorthand → idents.
+/// `none` (and the CSS-wide keywords) clears the list.
+fn parse_container_names(v: &str) -> Vec<String> {
+    v.split_whitespace()
+        .filter(|n| {
+            !matches!(
+                *n,
+                "none" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            )
+        })
+        .map(|n| n.to_string())
+        .collect()
+}
+
+/// A container size query: the nearest ancestor query container (optionally
+/// filtered by `container-name`) is compared by its measured content-box
+/// inline size. `@container` bodies are parsed into ordinary rules; the
+/// condition rides on each rule and is re-evaluated per element.
+#[derive(Clone, PartialEq, Debug)]
+struct ContainerCond {
+    name: Option<String>,
+    op: Cmp,
+    px: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+impl Cmp {
+    fn holds(self, w: f32, px: f32) -> bool {
+        match self {
+            Cmp::Lt => w < px,
+            Cmp::Le => w <= px,
+            Cmp::Gt => w > px,
+            Cmp::Ge => w >= px,
+            Cmp::Eq => (w - px).abs() < 0.01,
+        }
+    }
+
+    fn flip(self) -> Cmp {
+        match self {
+            Cmp::Lt => Cmp::Gt,
+            Cmp::Le => Cmp::Ge,
+            Cmp::Gt => Cmp::Lt,
+            Cmp::Ge => Cmp::Le,
+            Cmp::Eq => Cmp::Eq,
+        }
+    }
+}
+
+/// Parse an `@container` prelude: `[<name>] (<size-query>)`.
+/// Supports one width/inline-size comparison, in range form
+/// (`width>=30rem`, `20rem<width`) or feature form (`min-width: 400px`,
+/// `max-width: 499.98px`, `width: 400px`). Anything else (height, style
+/// queries, `and`/`or`, nested functions) yields `None`, and the block is
+/// skipped whole — the previous behaviour for this at-rule.
+fn parse_container_cond(pre: &str, vp: (f32, f32)) -> Option<ContainerCond> {
+    let pre = pre.trim();
+    let po = pre.find('(')?;
+    let name = match pre[..po].trim() {
+        "" => None,
+        n if n.split_whitespace().count() == 1 => Some(n.to_string()),
+        _ => return None,
+    };
+    let q = pre[po..].trim();
+    if !q.starts_with('(') || !q.ends_with(')') {
+        return None;
+    }
+    let inner = q[1..q.len() - 1].trim();
+    // one feature only: no logical operators or nested feature functions
+    if inner.contains('(') {
+        return None;
+    }
+    // feature form `name: value`
+    if let Some((k, v)) = inner.split_once(':') {
+        let k = k.trim();
+        let op = if k.eq_ignore_ascii_case("min-width") || k.eq_ignore_ascii_case("min-inline-size") {
+            Cmp::Ge
+        } else if k.eq_ignore_ascii_case("max-width") || k.eq_ignore_ascii_case("max-inline-size") {
+            Cmp::Le
+        } else if k.eq_ignore_ascii_case("width") || k.eq_ignore_ascii_case("inline-size") {
+            Cmp::Eq
+        } else {
+            return None;
+        };
+        return container_cond_px(name, op, v.trim(), vp);
+    }
+    // range form, either `width <op> value` or `value <op> width`
+    let (lo, op, hi) = split_cmp(inner)?;
+    let (op, val) = if is_width_feature(lo.trim()) {
+        (op, hi.trim())
+    } else if is_width_feature(hi.trim()) {
+        (op.flip(), lo.trim())
+    } else {
+        return None;
+    };
+    container_cond_px(name, op, val, vp)
+}
+
+fn is_width_feature(s: &str) -> bool {
+    s.eq_ignore_ascii_case("width") || s.eq_ignore_ascii_case("inline-size")
+}
+
+/// First comparison operator in `s` (`>=`/`<=` before `>`/`<`), with the
+/// text on each side.
+fn split_cmp(s: &str) -> Option<(&str, Cmp, &str)> {
+    for (pat, op) in [
+        (">=", Cmp::Ge),
+        ("<=", Cmp::Le),
+        (">", Cmp::Gt),
+        ("<", Cmp::Lt),
+        ("=", Cmp::Eq),
+    ] {
+        if let Some(i) = s.find(pat) {
+            return Some((&s[..i], op, &s[i + pat.len()..]));
+        }
+    }
+    None
+}
+
+/// Resolve the length half of a container condition. Only absolute lengths
+/// (px/rem/em, all parsed to px) are meaningful here: a percentage is
+/// invalid in a container size query.
+fn container_cond_px(
+    name: Option<String>,
+    op: Cmp,
+    v: &str,
+    vp: (f32, f32),
+) -> Option<ContainerCond> {
+    match parse_len(v, vp)? {
+        Len::Px(px) => Some(ContainerCond { name, op, px }),
+        _ => None,
+    }
 }
 
 /// `span N` → N (0 when the value is not a positive span). Used by
@@ -4009,6 +4368,19 @@ fn apply_decl(
             } else if let Some(c) = parse_color(v) {
                 style.color = c;
             }
+        }
+        // query containers: the element's measured content-box inline size is
+        // recorded by layout and read back by the `@container` condition on
+        // each rule (see `Sheet::container_matches`)
+        "container-type" => bx.container_type = parse_container_type(&d.1),
+        "container-name" => bx.container_name = parse_container_names(&d.1),
+        "container" => {
+            // shorthand: `container: <name> / <type>`; either half may be
+            // omitted. The shorthand resets BOTH longhands (a later
+            // `container: none` clears a name declared earlier)
+            let (names, ty) = d.1.split_once('/').unwrap_or((&d.1, ""));
+            bx.container_name = parse_container_names(names);
+            bx.container_type = parse_container_type(ty);
         }
         "background" | "background-color" | "background-image" => {
             // the color half (the `background` shorthand declares a color
@@ -11298,8 +11670,9 @@ mod tests {
         // `or`: one side true => enter even if the other is unknown
         let orq = "@supports (accent-color: red) or (color: light-dark(#fff, #fff)) { p { color: #222222 } }";
         assert_eq!(style_for_tag(&parse(orq), &dom, "p").color, 0x222222);
-        // neither side supported => skip
-        let none = "@supports (accent-color: red) or (container-type: inline-size) { p { color: #444444 } }";
+        // neither side supported => skip (`container-type` is implemented now,
+        // so use two properties that still are not)
+        let none = "@supports (accent-color: red) or (accent-color: blue) { p { color: #444444 } }";
         assert_eq!(parse(none).rule_count(), 0);
     }
 
@@ -14175,6 +14548,110 @@ mod tests {
             [BgPos::Px(10.0), BgPos::Pct(100.0)],
             "y longhand replaces y only"
         );
+    }
+
+    #[test]
+    fn container_size_query_follows_the_nearest_measured_container() {
+        let dom = dom_of("<div class=box><p class=x>hi</p></div><p class=y>yo</p>");
+        let sheet = parse(
+            ".box{container-type:inline-size}\
+             @container (width>=400px){.x{color:#ff0000}}\
+             @container (width<400px){.x{color:#00ff00}}\
+             .y{color:#0000ff}",
+        );
+        let x = by_attr(&dom, "class", "x");
+        let color = |s: &Sheet| s.resolve(&dom, x, Style::new(), None).style.color;
+        // measured by layout later: no container box yet, so no query matches
+        assert_ne!(color(&sheet), 0x00_ff_0000, "no measured container");
+        let box_node = by_attr(&dom, "class", "box");
+        let mut boxes = vec![None; dom.nodes.len()];
+        boxes[box_node as usize] = Some(ContainerBox {
+            kind: ContainerType::InlineSize,
+            names: Vec::new(),
+            width: 500.0,
+        });
+        sheet.set_container_boxes(boxes);
+        assert_eq!(color(&sheet), 0x00_ff_0000, "500 >= 400");
+        let mut boxes = vec![None; dom.nodes.len()];
+        boxes[box_node as usize] = Some(ContainerBox {
+            kind: ContainerType::InlineSize,
+            names: Vec::new(),
+            width: 300.0,
+        });
+        sheet.set_container_boxes(boxes);
+        assert_eq!(color(&sheet), 0x00_00_ff00, "300 < 400");
+        // the rule after the container block is unconditional (the condition
+        // stack popped at its closing brace)
+        let y = by_attr(&dom, "class", "y");
+        assert_eq!(
+            sheet.resolve(&dom, y, Style::new(), None).style.color,
+            0x00_0000_ff
+        );
+    }
+
+    #[test]
+    fn container_shorthand_names_the_query_container() {
+        let dom = dom_of("<div class=box><p class=x>hi</p></div>");
+        let sheet = parse(
+            ".box{container: banner / inline-size}\
+             @container banner (width<=500px){.x{color:#ff0000}}\
+             @container other (width<=500px){.x{color:#00ff00}}",
+        );
+        let box_node = by_attr(&dom, "class", "box");
+        let bx = sheet.resolve(&dom, box_node, Style::new(), None).bx;
+        assert_eq!(bx.container_type, ContainerType::InlineSize);
+        assert_eq!(bx.container_name, vec!["banner".to_string()]);
+        let mut boxes = vec![None; dom.nodes.len()];
+        boxes[box_node as usize] = Some(ContainerBox {
+            kind: ContainerType::InlineSize,
+            names: vec!["banner".to_string()],
+            width: 400.0,
+        });
+        sheet.set_container_boxes(boxes);
+        let x = by_attr(&dom, "class", "x");
+        assert_eq!(
+            sheet.resolve(&dom, x, Style::new(), None).style.color,
+            0x00_ff_0000,
+            "the named query matches `banner`, not `other`"
+        );
+    }
+
+    #[test]
+    fn container_keywords_are_ascii_case_insensitive() {
+        let dom = dom_of("<div class=box><p class=x>hi</p></div>");
+        let sheet = parse(
+            ".box{container: banner / Inline-Size}\
+             @container banner (WIDTH >= 400px){.x{color:#ff0000}}",
+        );
+        let box_node = by_attr(&dom, "class", "box");
+        let bx = sheet.resolve(&dom, box_node, Style::new(), None).bx;
+        assert_eq!(bx.container_type, ContainerType::InlineSize);
+        let mut boxes = vec![None; dom.nodes.len()];
+        boxes[box_node as usize] = Some(ContainerBox {
+            kind: ContainerType::InlineSize,
+            names: vec!["banner".to_string()],
+            width: 400.0,
+        });
+        sheet.set_container_boxes(boxes);
+        let x = by_attr(&dom, "class", "x");
+        assert_eq!(
+            sheet.resolve(&dom, x, Style::new(), None).style.color,
+            0x00_ff_0000
+        );
+    }
+
+    #[test]
+    fn unsupported_container_features_skip_the_block_and_keep_parsing() {
+        // height queries are not modeled: the block is skipped, and the rule
+        // after it still parses as an unconditional rule
+        let sheet = parse("@container (height>100px){.x{color:#ff0000}} .x{color:#0000ff}");
+        let dom = dom_of("<p class=x>hi</p>");
+        let x = by_attr(&dom, "class", "x");
+        assert_eq!(
+            sheet.resolve(&dom, x, Style::new(), None).style.color,
+            0x00_0000_ff
+        );
+        assert!(!sheet.uses_containers());
     }
 }
 

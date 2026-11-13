@@ -848,7 +848,12 @@ pub struct BoxNode {
     // layout output (absolute CSS px)
     pub x: f32,
     pub y: f32,
+    /// border-box width after `place()` (used CONTENT width during it)
     pub w: f32,
+    /// used CONTENT-box width: what `@container` size queries measure when
+    /// this box declares `container-type` (see `css::ContainerBox`). Captured
+    /// before children are placed, when `w` is still the content width.
+    pub cw: f32,
     pub h: f32,
     /// last line still has content (block flow paragraph-gap bookkeeping)
     pub open: bool,
@@ -888,6 +893,7 @@ impl BoxNode {
             x: 0.0,
             y: 0.0,
             w: 0.0,
+            cw: 0.0,
             h: 0.0,
             open: false,
             run_range: (0, 0),
@@ -920,6 +926,7 @@ impl BoxNode {
             x: 0.0,
             y: 0.0,
             w: 0.0,
+            cw: 0.0,
             h: 0.0,
             open: false,
             run_range: (0, 0),
@@ -984,6 +991,9 @@ pub struct StyleCache {
     width: Option<f32>,
     /// the pointer cell the last pass ran with
     hover: Option<u32>,
+    /// generation of the sheet's measured `@container` widths the slots were
+    /// resolved under; a changed generation invalidates every cached style
+    container_gen: u32,
     /// nodes re-cascaded and reused in the pass that just ran (`MAZDA_TIME`)
     pub misses: usize,
     pub hits: usize,
@@ -1004,10 +1014,14 @@ impl StyleCache {
     ) {
         self.hits = 0;
         self.misses = 0;
-        let Some(dirty) = dirty.filter(|_| Some(width) == self.width && hover == self.hover) else {
+        let same = Some(width) == self.width
+            && hover == self.hover
+            && sheet.container_gen() == self.container_gen;
+        let Some(dirty) = dirty.filter(|_| same) else {
             self.slots.clear();
             self.width = Some(width);
             self.hover = hover;
+            self.container_gen = sheet.container_gen();
             return;
         };
         for &(n, child_list) in dirty {
@@ -1525,6 +1539,42 @@ fn attr_len(v: &str) -> Option<Len> {
 /// Total node count (for the [mem] log).
 pub fn count_boxes(n: &BoxNode) -> usize {
     1 + n.children.iter().map(count_boxes).sum::<usize>()
+}
+
+/// Every query container the laid-out tree establishes, indexed by DOM node
+/// id: its `container-type`, `container-name` list, and the used content-box
+/// inline size captured by `place()`. The loader hands this to
+/// [`Sheet::set_container_boxes`]; when it differs from the widths the cascade
+/// just used, the page is laid out one more time with the real sizes.
+/// shortcut: if one element emits several boxes, the widest content box wins.
+pub fn container_boxes(root: &BoxNode) -> Vec<Option<crate::css::ContainerBox>> {
+    fn walk(n: &BoxNode, out: &mut Vec<Option<crate::css::ContainerBox>>) {
+        if n.bx.container_type != crate::css::ContainerType::Normal {
+            if let Some(id) = n.node {
+                let i = id as usize;
+                if out.len() <= i {
+                    out.resize(i + 1, None);
+                }
+                let wider = match &out[i] {
+                    Some(prev) => n.cw > prev.width,
+                    None => true,
+                };
+                if wider {
+                    out[i] = Some(crate::css::ContainerBox {
+                        kind: n.bx.container_type,
+                        names: n.bx.container_name.clone(),
+                        width: n.cw,
+                    });
+                }
+            }
+        }
+        for c in &n.children {
+            walk(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
 }
 
 fn build_into(
@@ -4915,6 +4965,9 @@ fn place(
     n.x += pl + bl;
     n.y += pt + bt;
     n.w = (w - pl - pr - bl - br).max(0.0);
+    // the content width `@container` queries measure, captured before `w` is
+    // restored to the border box at the end of place()
+    n.cw = n.w;
     // (background-image placeholders are placed at the END of place(),
     // once the used padding box — incl. content height + min-height — is
     // known, so %-sizes/%-positions resolve against the final box)
@@ -16628,5 +16681,65 @@ line</textarea></div>"#,
             "text stays in one full-width flow"
         );
         assert_eq!(m.h, l.runs[0].style.line_height(), "a single line");
+    }
+
+    #[test]
+    fn container_boxes_capture_the_used_content_width() {
+        let mut root = boxes_of(
+            r#"<div class=c><p>x</p></div><div class=plain></div>"#,
+            ".c{container-type:inline-size;padding:0 25px}",
+        );
+        let _l = layout_tree(&mut root, 300.0, &m4);
+        let c = &root.children[0];
+        assert_eq!(c.cw, 250.0, "300 border box - 2*25 padding");
+        let boxes = container_boxes(&root);
+        let b = boxes[c.node.unwrap() as usize]
+            .as_ref()
+            .expect("query container recorded");
+        assert_eq!(b.width, 250.0);
+        assert_eq!(b.kind, crate::css::ContainerType::InlineSize);
+        let plain = root.children[1].node.unwrap() as usize;
+        assert!(
+            boxes.get(plain).and_then(|x| x.as_ref()).is_none(),
+            "a plain element is not a query container"
+        );
+    }
+
+    #[test]
+    fn container_width_generation_invalidates_the_style_cache() {
+        let dom = crate::html::parse("<div id=box class=box><p class=x>x</p></div>");
+        let sheet = crate::css::parse(".box{container-type:inline-size}");
+        let body = dom.body_root();
+        let mut cache = StyleCache::default();
+        let run = |cache: &mut StyleCache, dirty: Option<&[(u32, bool)]>| {
+            cache.begin_pass(&dom, &sheet, 800.0, None, dirty);
+            build_cached(
+                &dom,
+                body,
+                Style::new(),
+                BoxStyle::default(),
+                &sheet,
+                None,
+                cache,
+            );
+        };
+        run(&mut cache, None);
+        assert!(cache.misses > 0, "cold pass resolves every element");
+        run(&mut cache, Some(&[]));
+        assert_eq!(cache.misses, 0, "unchanged widths reuse every style");
+        // layout measures a container width: cached styles were resolved with
+        // no container answer, so they must not survive
+        let mut boxes = vec![None; dom.nodes.len()];
+        boxes[id_by_attr(&dom, "box") as usize] = Some(crate::css::ContainerBox {
+            kind: crate::css::ContainerType::InlineSize,
+            names: Vec::new(),
+            width: 400.0,
+        });
+        assert!(sheet.set_container_boxes(boxes));
+        run(&mut cache, Some(&[]));
+        assert!(
+            cache.hits == 0 && cache.misses > 0,
+            "a container-width change re-cascades the page"
+        );
     }
 }

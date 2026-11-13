@@ -5931,3 +5931,53 @@ selector reasons (`:target` is gone), box tree unchanged at 1110 boxes.
 Test: `target_reads_the_url_fragment` (named element, other elements, no
 fragment, `:not(:target)`), `url_fragment_decodes_and_ignores_empty` (plain,
 percent-encoded, missing, empty). 1077 green.
+
+## @container size queries re-cascade against measured layout widths (P107, 2026-11-13)
+
+`@container` was skipped whole, so the 83 occurrences on github.com dropped
+their rules (the cached documents hold 40 blocks across 8 unique stylesheets). Every one of the
+cached github queries is an inline-size width comparison, including the range
+form `(width >= 1280px)`, the `min-width`/`max-width` feature form, and named
+containers such as `homepage-signup (width >= 28.5rem)`.
+
+The hard part is ordering: CSS resolves before layout, but a container query
+needs the container's used content width. The engine now runs layout, records
+each `container-type`/`container` element's content width, and, only for a page
+that has `@container` rules, re-cascades with those widths and lays out again.
+The container walk goes to the nearest ancestor with a matching name (or the
+nearest unnamed container), and a container cannot query itself. Widths are
+capped at three passes; after that a second-order change settles with the last
+widths, a documented shortcut. Unsupported preludes (height, style queries,
+`and`/`or`) still skip their block whole rather than half-applying it;
+nested `@container` blocks are not conjoined (none observed on the cached
+pages).
+
+Cached styles are the other trap: a slot resolved when no widths were known
+must not survive into the pass that can answer the query. `Sheet` keeps a
+container generation, and `StyleCache` clears every slot when it changes. On a
+fresh load the pre-script first paint measures widths but keeps the old frame
+(same interim frame github had before this change, like images/media); the
+post-script pass starts with those widths and re-cascades once (0 reused nodes
+on github, ~0.6-0.8 s of cascade + box tree). A page with no `@container` rules
+pays nothing.
+
+A local `data:` page proves the final frame: a 400 px container hides the child
+under `(width < 500px)` and keeps the one under `(width >= 500px)`; only the
+second `p` is in the box dump.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): the `@container`
+at-rule is gone (1 unimplemented at-rule left, `@position-try` 36), 32 692 ->
+32 866 rules (+174 parsed), 40 -> 38 distinct dropped properties
+(`container-type` 33 and `container` 9 are gone), 47 dropped selector reasons
+unchanged, box tree unchanged at 1110 boxes. Text runs 501-504 across these
+runs (scripts mutate markup; earlier runs 502-506), so no run-count claim is
+made. First paint varied 1.4-2.0 s and the worker 3.9-6.6 s across runs
+(network noise dominates); the final pass matches 7 more rules (22 524 ->
+22 531) and applies 9 more declarations than the pre-width pass.
+
+Tests: `container_size_query_follows_the_nearest_measured_container`,
+`container_shorthand_names_the_query_container`,
+`unsupported_container_features_skip_the_block_and_keep_parsing`,
+`container_boxes_capture_the_used_content_width`,
+`container_width_generation_invalidates_the_style_cache`,
+`container_keywords_are_ascii_case_insensitive`. 1083 green.

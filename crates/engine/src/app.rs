@@ -6227,7 +6227,10 @@ fn layout_page(
             }
         };
     }
-    // media queries evaluate against the window's CSS pixel width
+    // media queries evaluate against the window's CSS pixel width. `rem` in
+    // `@container` conditions resolves during parse, so pin the root font size
+    // to its initial value first (a previous page's root must not leak in).
+    css::set_root_px(16.0);
     let viewport = max_w + 2.0 * PADDING as f32;
     let (mut sheet, reused) = match sheet_cache.take() {
         Some((w, s)) if w == viewport => (s, true),
@@ -6274,9 +6277,26 @@ fn layout_page(
         .copied()
         .find(|&c| dom.tag(c) == "html")
         .unwrap_or(0);
-    sheet.scope_vars(dom, html_el);
-    stage!("scope vars");
     fonts.begin_page(owned_faces, !styles.warm());
+    // An `@container` condition depends on a width only layout knows, so a
+    // page with container rules is laid out, its query containers measured,
+    // and — if those widths decide any condition differently — cascaded and
+    // laid out once more. Pages without `@container` rules run exactly one
+    // pass (the loop breaks on `uses_containers` before any re-cascade).
+    let mut pass_no = 0usize;
+    let mut root_box;
+    let mut laid;
+    let bg = loop {
+        if pass_no > 0 {
+            sheet.begin_pass();
+            styles.begin_pass(dom, &sheet, viewport, hover, None);
+            eprintln!(
+                "[css] @container widths differ, re-cascading (pass {})",
+                pass_no + 1
+            );
+        }
+        sheet.scope_vars(dom, html_el);
+        stage!("scope vars");
 
     // cascade <html> FIRST: its computed font-size is the root of `rem` (see
     // css::ROOT_PX), so it must be known before the body's subtree resolves
@@ -6298,7 +6318,7 @@ fn layout_page(
         body.bx.cursor = html_st.bx.cursor;
     }
 
-    let mut root_box = layout::build_cached(dom, root, body.style, body.bx, &sheet, body.vars.as_ref(), styles);
+    root_box = layout::build_cached(dom, root, body.style, body.bx, &sheet, body.vars.as_ref(), styles);
     stage!("cascade + box tree");
     if timing {
         let (tested, matched, decls) = css::cascade_stats_take();
@@ -6329,13 +6349,8 @@ fn layout_page(
         working_set_mb(),
         layout::count_boxes(&root_box)
     );
-    // nothing below touches the sheet: park it for this page's next pass (the
-    // post-script layout of a cold load, a resize, a keystroke, a switch)
-    *sheet_cache = Some((viewport, sheet));
-
     // fetch + probe every <img> header (disk-cached; no pixel decode yet —
     // layout only needs the intrinsic size to size the box)
-    let mut img_budget = IMG_PIXEL_BUDGET;
     // the probe fetches every image in document order, one at a time; overlap
     // the round trips first (same reason as the markup preload)
     let mut img_urls = Vec::new();
@@ -6367,10 +6382,29 @@ fn layout_page(
 
     // layout_in_forms applies `state` (focus + typed values) so the caret,
     // accent border and live text paint correctly
-    let mut laid = layout::layout_in_forms(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st), state);
+    laid = layout::layout_in_forms(&mut root_box, max_w, vh, &|s: &str, st: &Style| fonts.measure(s, st), state);
     stage!("layout + text");
+    // feed the measured query-container widths back to the cascade: when a
+    // condition's answer moved, one more pass runs with the real sizes. A
+    // page without `@container` rules breaks here on the first test.
+    let measured = layout::container_boxes(&root_box);
+    let changed = sheet.set_container_boxes(measured);
+    // First paint keeps the pre-container-rules frame (the same frame this
+    // page showed before `@container` support) and hands the measured widths
+    // to the post-script pass; a correction here would only delay the frame
+    // that is about to be replaced. shortcut: the early frame can differ from
+    // the final one for a container-sized section, like it already does for
+    // images/media.
+    if first_paint || !changed || !sheet.uses_containers() || pass_no >= 2 {
+        break bg;
+    }
+    pass_no += 1;
+    };
+    // the sheet is final for this pass: park it for the page's next layout
+    *sheet_cache = Some((viewport, sheet));
     // decode pixels only now, one image at a time, resampled straight to the
     // laid-out display size — full-resolution buffers never accumulate
+    let mut img_budget = IMG_PIXEL_BUDGET;
     let mut sticky_next = 0usize; // sticky-group index counter, see decode_images
     let mut backdrop_next = 0usize; // backdrop-group index counter, same story
     let decodes_before = imgs.decodes;
