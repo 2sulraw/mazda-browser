@@ -2679,6 +2679,7 @@ const KNOWN: &[&str] = &[
     "user-select",
     "will-change",
     "contain",
+    "contain-intrinsic-size",
     "backface-visibility",
     "tap-highlight-color",
     "text-size-adjust",
@@ -4824,6 +4825,7 @@ fn apply_decl(
         // accepted no-ops (see the KNOWN table comment): none of these move
         // a static box in this engine
         "pointer-events" | "user-select" | "will-change" | "contain"
+        | "contain-intrinsic-size"
         | "backface-visibility" | "tap-highlight-color" | "text-size-adjust"
         | "font-smoothing" | "osx-font-smoothing" | "scroll-behavior"
         | "scroll-snap-type" | "scroll-snap-align" | "scrollbar-width"
@@ -13448,6 +13450,16 @@ mod tests {
         let d = parse_decls("animation-timeline: scroll(); animation-range: entry 0% cover 50%");
         assert_eq!(d.len(), 1, "timeline kept, range still unknown");
         assert_eq!(d[0].0, "animation-timeline");
+    }
+
+    #[test]
+    fn contain_intrinsic_size_is_an_accepted_noop() {
+        // size containment itself is already an accepted no-op, and
+        // content-visibility renders eagerly, so the intrinsic placeholder
+        // size can never affect this engine's layout
+        let d = parse_decls("contain-intrinsic-size: auto 32px");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, "contain-intrinsic-size");
     }
 
     #[test]

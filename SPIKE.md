@@ -6295,3 +6295,16 @@ rules, 35 selector reasons, 1110 boxes unchanged.
 
 Test: `text_underline_position_under_matches_the_existing_underline_placement`.
 1102 green.
+## accept contain-intrinsic-size as inert (P123, 2026-11-13)
+
+`contain` is already an accepted no-op (the engine models no containment
+boxes), and P120 made `content-visibility` render its content eagerly, so
+an intrinsic placeholder size can never affect this engine's layout. The
+12 cached declarations are all `auto 32px`; the property is now accepted
+as a no-op like `contain`.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 29 -> 28
+distinct dropped properties (`contain-intrinsic-size` gone), 32982
+rules, 35 selector reasons, 1110 boxes unchanged.
+
+Test: `contain_intrinsic_size_is_an_accepted_noop`. 1103 green.
