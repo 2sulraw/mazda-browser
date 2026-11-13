@@ -8629,7 +8629,12 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                     i += 1;
                 }
                 let name: String = b[st..i].iter().collect::<String>().to_ascii_lowercase();
-                if name == "before" || name == "after" || name == "marker" || name == "placeholder" {
+                if name == "before"
+                    || name == "after"
+                    || name == "marker"
+                    || name == "placeholder"
+                    || name == "-webkit-details-marker"
+                {
                     // the pseudo-element must CLOSE the compound and a
                     // compound carries at most one (`li::before.foo`,
                     // `li::before::after`, `li::before(x)` are invalid).
@@ -8644,6 +8649,10 @@ fn parse_compound_why(s: &str) -> Result<Seg, String> {
                         // the input hint's own style (`::placeholder { opacity: 0 }`
                         // is how a floating-label field hides it at rest)
                         "placeholder" => PseudoEl::Placeholder,
+                        // the legacy WebKit disclosure triangle; `summary` is
+                        // a block here and draws no marker, so the common
+                        // `{ display: none }` is inert, but the rule survives
+                        "-webkit-details-marker" => PseudoEl::Marker,
                         _ => PseudoEl::Marker,
                     });
                     break; // compound closed
@@ -14478,6 +14487,24 @@ mod tests {
         assert_eq!(
             sheet.resolve(&dom, li, Style::new(), None).style.color,
             Style::new().color
+        );
+    }
+
+    #[test]
+    fn webkit_details_marker_is_the_marker_pseudo() {
+        // pages hide the native disclosure triangle with this legacy
+        // pseudo-element; `summary` is a block here and draws no marker, so
+        // the rule parses into the `::marker` bucket and stays inert
+        let dom = dom_of("<details><summary>s</summary></details>");
+        let summary = by_tag(&dom, "summary");
+        let sheet = parse("summary::-webkit-details-marker { display: none }");
+        let out = sheet
+            .resolve_pseudo(&dom, summary, Style::new(), PseudoEl::Marker)
+            .expect("details-marker rule parsed");
+        assert!(out.display_none);
+        assert!(
+            !sheet.resolve(&dom, summary, Style::new(), None).display_none,
+            "the pseudo-element rule must not hide the summary itself"
         );
     }
 

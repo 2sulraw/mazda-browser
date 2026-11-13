@@ -6008,3 +6008,21 @@ declarations, exactly the pre-change numbers), so no layout change is claimed.
 
 Tests: `general_sibling_combinator`; `a_dropped_selector_names_why` now uses
 the still-unsupported column combinator `||`. 1084 green.
+
+## accept the legacy details-marker pseudo-element (P109, 2026-11-13)
+
+All 22 `::-webkit-details-marker` selectors on github.com dropped their rules,
+even though every cached one is `{ display: none }`: pages hide the native
+disclosure triangle and draw their own chevron. `summary` is a block box in
+the UA sheet and this engine draws no marker for it, so the declaration is
+inert - accepting the spelling as `::marker` recovers the rules at no visual
+cost and leaves a future summary marker with the right styles.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 46 -> 45 distinct
+dropped selector reasons (`pseudo-element ::-webkit-details-marker`, 22 gone);
+38 dropped properties, 1 at-rule and 1110 boxes unchanged. The parsed-rule
+count stays at 32 884 because `Sheet::len()` counts `rules`, `hover` and the
+`::before`/`::after` buckets only - marker/placeholder rules were never in
+that total (a separate accounting quirk, not a layout claim).
+
+Tests: `webkit_details_marker_is_the_marker_pseudo`. 1085 green.
