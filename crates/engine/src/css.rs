@@ -4211,7 +4211,15 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
             // form (`linear-gradient(C, C) 1`), which paints as a border
             // colour; every other shape (conic slices, real slicing) is still
             // a miss and stays in the table.
-            if !(p == "border-image" && solid_border_image_shape(v)) {
+            //
+            // `content-visibility: auto | visible` is accepted as eager
+            // rendering: skipping off-screen content is an optimization, so
+            // painting it is always the correct (if slower) result. `hidden`
+            // really hides content and stays a miss.
+            let cv_first = v.split_whitespace().next().unwrap_or("");
+            let cv_visible =
+                p == "content-visibility" && matches!(cv_first.to_ascii_lowercase().as_str(), "auto" | "visible");
+            if !(p == "border-image" && solid_border_image_shape(v)) && !cv_visible {
                 note_unknown_prop(&p);
                 continue;
             }
@@ -13422,6 +13430,21 @@ mod tests {
         assert_eq!(get("b").bx.bcolor, None, "two different stops are not solid");
         assert_eq!(get("c").bx.bcolor, None, "conic slices stay unsupported");
         assert_eq!(get("d").bx.bcolor, None, "border-image: initial is none");
+    }
+
+    #[test]
+    fn content_visibility_auto_and_visible_are_kept_hidden_is_dropped() {
+        // rendering off-screen content eagerly is always correct, so
+        // auto/visible are accepted; hidden changes what is painted
+        let decls = parse_decls(
+            "content-visibility: auto; content-visibility: visible; \
+             content-visibility: hidden; content-visibility: auto !important",
+        );
+        let vals: Vec<&str> = decls.iter().map(|d| d.1.as_str()).collect();
+        assert!(vals.contains(&"auto"), "auto kept: {vals:?}");
+        assert!(vals.contains(&"visible"), "visible kept: {vals:?}");
+        assert!(vals.iter().any(|v| v.starts_with("auto")), "important kept: {vals:?}");
+        assert!(!vals.contains(&"hidden"), "hidden dropped: {vals:?}");
     }
 
     #[test]

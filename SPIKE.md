@@ -6248,3 +6248,20 @@ gone), 32949 -> 32958 rules, 35 selector reasons, 1110 boxes unchanged.
 Tests: `dasharray_breaks_the_stroke_into_dashes` (dash/gap pixels plus the
 offset shift), `svg_class_stroke_dasharray_is_injected_as_inline_style`.
 1099 green (one pre-existing network-timing flake reran clean).
+## render content-visibility content eagerly (P120, 2026-11-13)
+
+`content-visibility` was github's largest fully-safe property gap after
+border-image (18 dropped declarations, all `auto` or `visible`).
+`auto` only lets the browser skip *rendering* off-screen content; painting
+it anyway is an optimization miss, never a wrong frame. `visible` is the
+initial value. Both values are now kept at the property gate (and have no
+layout effect), while `hidden` ? which really withholds content ? is
+still counted as a miss.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): 32 -> 31
+distinct dropped properties (`content-visibility` gone), 32958 -> 32976
+rules (the 18 declarations' rules now survive the empty-decl gate),
+35 selector reasons, 1110 boxes unchanged.
+
+Test: `content_visibility_auto_and_visible_are_kept_hidden_is_dropped`.
+1100 green.
