@@ -6201,3 +6201,26 @@ and 1110 boxes unchanged.
 Tests: `all_unset_resets_inherited_text_and_box_style`,
 `all_unset_suppresses_ua_control_chrome` (no UA border/fill/radius, the
 rule's own padding still applies, UA centering cleared). 1096 green.
+
+## read solid border-image gradients as a border colour (P118, 2026-11-13)
+
+`border-image` is github's single largest property gap (73 dropped
+declarations). 21 of the cached declarations are the same shape:
+`linear-gradient(var(--c), var(--c)) 1` on a 1px border (the full-bleed
+divider lines), where a two-stop gradient with identical stops is just a
+uniform border colour.
+
+The parser now keeps `border-image` only when the value is that solid
+linear form (identical stop text, slice omitted or all 1s) and the cascade
+resolves both stops to the same opaque colour, then writes it to the
+border colour. Conic-gradient slices, real slicing, `fill`/`/ <width>`
+tails and translucent stops are still dropped and still counted, so the
+miss table keeps showing the remaining gap.
+
+Measured on github.com (release, `MAZDA_MISS=1`, 1000 wide): the
+`border-image` miss count drops 73 -> 64 (34 distinct properties, 32949
+rules, 35 selector reasons, 1110 boxes unchanged).
+
+Test: `solid_border_image_gradient_becomes_the_border_colour` (uniform
+gradient supplies the colour; different stops, conic slices and
+`initial` do not). 1097 green.

@@ -4204,8 +4204,14 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         }
         // custom properties (--x) always survive: var() resolution needs them
         if !p.starts_with("--") && !KNOWN.contains(&p.as_str()) {
-            note_unknown_prop(&p);
-            continue;
+            // `border-image` is accepted only in its solid two-stop linear
+            // form (`linear-gradient(C, C) 1`), which paints as a border
+            // colour; every other shape (conic slices, real slicing) is still
+            // a miss and stays in the table.
+            if !(p == "border-image" && solid_border_image_shape(v)) {
+                note_unknown_prop(&p);
+                continue;
+            }
         }
         // image URLs are case-sensitive on real servers — a value carrying
         // a url() keeps its raw case (same reason the @font-face scanner
@@ -5589,6 +5595,17 @@ fn apply_decl(
             }
             bx.declared |= decl::BCOLOR;
         }
+        // the solid two-stop gradient form (`linear-gradient(C, C) 1`) is a
+        // uniform border colour; the shape gate in `parse_decls` kept only
+        // that form, and anything that does not resolve to one opaque colour
+        // after `var()` substitution leaves the border as authored
+        "border-image" => {
+            if let Some(c) = solid_border_image_color(&d.1) {
+                bx.bcolor = Some(c);
+                bx.btransparent = false;
+                bx.declared |= decl::BCOLOR;
+            }
+        }
         // `outline` and its longhands — a ring outside the border box (see
         // [`Outline`]). `outline-offset` is a separate property and can
         // arrive before or after the shorthand.
@@ -6784,6 +6801,58 @@ fn split_top_level_commas(v: &str) -> Vec<&str> {
     }
     parts.push(&v[start..]);
     parts
+}
+
+/// Split `linear-gradient(...) <tail>` into the parenthesised argument text
+/// and the trimmed remainder. None when the value does not start with it.
+fn linear_gradient_parts(v: &str) -> Option<(&str, &str)> {
+    let rest = v.trim().strip_prefix("linear-gradient(")?;
+    let mut depth = 1usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&rest[..i], rest[i + 1..].trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when `border-image` is the solid two-stop linear form
+/// `linear-gradient(<stop>, <stop>) 1` (slice omitted or all 1s). The stops
+/// must be textually identical (e.g. the same `var()`), which is how github
+/// spells a uniform border colour; conic slices stay unsupported.
+fn solid_border_image_shape(v: &str) -> bool {
+    let Some((args, tail)) = linear_gradient_parts(v) else {
+        return false;
+    };
+    if !matches!(tail, "" | "1" | "1 1 1 1") {
+        return false;
+    }
+    let stops = split_top_level_commas(args);
+    let a = stops.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+    stops.len() == 2 && a == stops.get(1).map(|s| s.trim())
+}
+
+/// The colour of the solid `border-image` form after `var()` substitution:
+/// both stops must parse to the same OPAQUE colour. Translucent gradients are
+/// left alone (the border colour channel has no alpha slot here).
+fn solid_border_image_color(v: &str) -> Option<u32> {
+    let (args, tail) = linear_gradient_parts(v)?;
+    if !matches!(tail, "" | "1" | "1 1 1 1") {
+        return None;
+    }
+    let stops = split_top_level_commas(args);
+    if stops.len() != 2 || !stops[0].trim().eq_ignore_ascii_case(stops[1].trim()) {
+        return None;
+    }
+    let (c, a) = parse_color_alpha(stops[0].trim())?;
+    (a == 255).then_some(c)
 }
 
 /// Parse the pre-stop part of `radial-gradient(...)`: an optional shape and
@@ -13320,6 +13389,36 @@ mod tests {
         // style longhands are accepted no-ops (all borders render solid)
         let c = get("c");
         assert_eq!(c.bx.bcolor, Some(0xff0000));
+    }
+
+    #[test]
+    fn solid_border_image_gradient_becomes_the_border_colour() {
+        // github's full-bleed rule: `border-image:
+        // linear-gradient(var(--c), var(--c)) 1` with a 1px border on top; a
+        // uniform gradient is just a border colour
+        let sheet = parse(
+            ".a { --c: #d1d9e0; border-top: 1px solid; \
+                  border-image: linear-gradient(var(--c), var(--c)) 1 }\n\
+             .b { border-top: 1px solid; \
+                  border-image: linear-gradient(#111111, #222222) 1 }\n\
+             .c { border-top: 1px solid; \
+                  border-image: conic-gradient(red 0, red 0) 0 / 10px }\n\
+             .d { border-top: 1px solid; border-image: initial }",
+        );
+        let dom = dom_of(
+            "<div class=a></div><div class=b></div><div class=c></div><div class=d></div>",
+        );
+        let get = |c: &str| sheet.resolve(&dom, by_attr(&dom, "class", c), Style::new(), None);
+        let a = get("a");
+        assert_eq!(a.bx.border[0], Len::Px(1.0), "border width stays");
+        assert_eq!(
+            a.bx.bcolor,
+            Some(0xd1d9e0),
+            "the uniform gradient supplies the border colour"
+        );
+        assert_eq!(get("b").bx.bcolor, None, "two different stops are not solid");
+        assert_eq!(get("c").bx.bcolor, None, "conic slices stay unsupported");
+        assert_eq!(get("d").bx.bcolor, None, "border-image: initial is none");
     }
 
     #[test]
